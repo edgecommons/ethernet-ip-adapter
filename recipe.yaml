@@ -1,0 +1,81 @@
+RecipeFormatVersion: '2020-01-25'
+ComponentName: com.mbreissi.edgecommons.EthernetIpAdapter
+ComponentVersion: 1.0.0
+ComponentDescription: Rust reference southbound EtherNet/IP adapter (Allen-Bradley CIP tag read/write) for the EdgeCommons ecosystem.
+ComponentPublisher: EdgeCommons
+ComponentConfiguration:
+  DefaultConfiguration:
+    ComponentConfig:
+      logging:
+        level: INFO
+        rust_format: '{timestamp} [{level}] [{component}] {target} - {message}'
+      heartbeat:
+        enabled: true
+        intervalSecs: 5
+        destination: local
+        measures:
+          cpu: true
+          memory: true
+          disk: false
+      metricEmission:
+        target: log
+        namespace: edgecommons
+        targetConfig:
+          logFileName: /greengrass/v2/work/{ComponentFullName}/metric.log
+      tags:
+        appId: Test
+        site: Chantilly
+      component:
+        global:
+          defaults:
+            pollIntervalMs: 5000
+          timeouts:
+            connectMs: 5000
+            reconnectBackoffMinMs: 1000
+            reconnectBackoffMaxMs: 60000
+          healthThresholds:
+            staleSignalSecs: 60
+        instances:
+        - id: device-1
+          adapter: sim
+          connection:
+            endpoint: sim://device-1
+          pollIntervalMs: 5000
+          writes:
+            allow: []
+    accessControl:
+      aws.greengrass.ipc.pubsub:
+        com.mbreissi.edgecommons.EthernetIpAdapter:pubsub:1:
+          policyDescription: Allows access to publish/subscribe to all local topics.
+          operations:
+          - aws.greengrass#PublishToTopic
+          - aws.greengrass#SubscribeToTopic
+          resources:
+          - '*'
+      aws.greengrass.ipc.mqttproxy:
+        com.mbreissi.edgecommons.EthernetIpAdapter:northbound:1:
+          policyDescription: Allows access to publish/subscribe to all topics on IoT Core.
+          operations:
+          - aws.greengrass#PublishToIoTCore
+          - aws.greengrass#SubscribeToIoTCore
+          resources:
+          - '*'
+      aws.greengrass.ShadowManager:
+        com.mbreissi.edgecommons.EthernetIpAdapter:shadow:1:
+          policyDescription: Allows access to thing shadows.
+          operations:
+          - aws.greengrass#GetThingShadow
+          - aws.greengrass#UpdateThingShadow
+          - aws.greengrass#DeleteThingShadow
+          resources:
+          - '*'
+Manifests:
+- Platform:
+    os: linux
+  Artifacts:
+  - URI: s3://BUCKET_NAME/COMPONENT_NAME/COMPONENT_VERSION/ethernetipadapter
+  Lifecycle:
+    Install:
+      Script: chmod +x {artifacts:path}/ethernetipadapter
+    Run:
+      Script: '{artifacts:path}/ethernetipadapter --platform GREENGRASS -c GG_CONFIG'

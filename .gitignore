@@ -1,0 +1,7 @@
+/target
+/greengrass-build
+*.metric.log
+# Local-dev core-lib path override (points at a machine-specific sibling checkout).
+/.cargo/
+# Cargo.lock is committed for binary components; the template ships without one so
+# the first build generates it for your crate.
