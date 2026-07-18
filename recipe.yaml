@@ -26,21 +26,44 @@ ComponentConfiguration:
         appId: Test
         site: Chantilly
       component:
+        # UNS component-token override: publishes under `ethernet-ip-adapter` without renaming the
+        # Greengrass component (a shipped core feature, config/identity.rs configured_component_token).
+        token: ethernet-ip-adapter
         global:
           defaults:
             pollIntervalMs: 5000
+            publishMode: onChange
+            batchMs: 0
           timeouts:
             connectMs: 5000
+            requestTimeoutMs: 2000
             reconnectBackoffMinMs: 1000
             reconnectBackoffMaxMs: 60000
           healthThresholds:
             staleSignalSecs: 60
+            keepaliveProbeIntervalMs: 60000
+          metricsIntervalSecs: 60
+        # A sim instance by default, so a bare deploy runs end-to-end without a PLC (§13). Point
+        # `adapter: ethernet-ip` + a real `connection.endpoint`/`slot` at a controller for live use.
         instances:
         - id: device-1
           adapter: sim
           connection:
             endpoint: sim://device-1
-          pollIntervalMs: 5000
+          pollGroups:
+          - id: default
+            pollIntervalMs: 5000
+            signals:
+            - name: line-speed
+              tagPath: LINE_SPEED
+              type: real
+            - name: product-count
+              tagPath: PRODUCT_COUNT
+              type: dint
+            - name: zone-temps
+              tagPath: ZONE_TEMPS
+              type: real
+              arrayCount: 8
           writes:
             allow: []
     accessControl:
@@ -73,9 +96,9 @@ Manifests:
 - Platform:
     os: linux
   Artifacts:
-  - URI: s3://BUCKET_NAME/COMPONENT_NAME/COMPONENT_VERSION/ethernetipadapter
+  - URI: s3://BUCKET_NAME/COMPONENT_NAME/COMPONENT_VERSION/ethernet-ip-adapter
   Lifecycle:
     Install:
-      Script: chmod +x {artifacts:path}/ethernetipadapter
+      Script: chmod +x {artifacts:path}/ethernet-ip-adapter
     Run:
-      Script: '{artifacts:path}/ethernetipadapter --platform GREENGRASS -c GG_CONFIG'
+      Script: '{artifacts:path}/ethernet-ip-adapter --platform GREENGRASS -c GG_CONFIG'

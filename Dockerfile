@@ -29,7 +29,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock* ./
 COPY src ./src
 
-RUN cargo build --release --bin ethernetipadapter
+RUN cargo build --release --bin ethernet-ip-adapter
 
 # ---- stage 2: runtime -----------------------------------------------------------------------
 # debian:bookworm-slim has glibc (the binary is glibc-linked) and is small.
@@ -39,7 +39,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /build/target/release/ethernetipadapter /usr/local/bin/component
+COPY --from=build /build/target/release/ethernet-ip-adapter /usr/local/bin/component
 
 # Run as a non-root, unprivileged user (matches the Deployment's runAsNonRoot securityContext).
 USER 65532:65532

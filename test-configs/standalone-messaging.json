@@ -3,7 +3,7 @@
     "local": {
       "host": "localhost",
       "port": 1883,
-      "clientId": "ethernetipadapter-local"
+      "clientId": "ethernet-ip-adapter-local"
     }
   }
 }

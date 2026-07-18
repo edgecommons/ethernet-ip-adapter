@@ -15,7 +15,9 @@
 //! ```
 
 mod app;
+mod config;
 mod device;
+mod sim;
 
 use edgecommons::prelude::*;
 

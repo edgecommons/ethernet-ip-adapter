@@ -5,37 +5,42 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: EthernetIpAdapter-config
+  name: ethernet-ip-adapter-config
   labels:
-    app.kubernetes.io/name: EthernetIpAdapter
+    app.kubernetes.io/name: ethernet-ip-adapter
 data:
   config.json: |-
     {
       "component": {
+        "token": "ethernet-ip-adapter",
         "global": {
-          "defaults": {
-            "pollIntervalMs": 5000
-          },
+          "defaults": { "pollIntervalMs": 5000, "publishMode": "onChange", "batchMs": 0 },
           "timeouts": {
             "connectMs": 5000,
+            "requestTimeoutMs": 2000,
             "reconnectBackoffMinMs": 1000,
             "reconnectBackoffMaxMs": 60000
           },
-          "healthThresholds": {
-            "staleSignalSecs": 60
-          }
+          "healthThresholds": { "staleSignalSecs": 60, "keepaliveProbeIntervalMs": 60000 },
+          "metricsIntervalSecs": 60
         },
         "instances": [
           {
             "id": "device-1",
             "adapter": "sim",
-            "connection": {
-              "endpoint": "sim://device-1"
-            },
-            "pollIntervalMs": 5000,
-            "writes": {
-              "allow": []
-            }
+            "connection": { "endpoint": "sim://device-1" },
+            "pollGroups": [
+              {
+                "id": "default",
+                "pollIntervalMs": 5000,
+                "signals": [
+                  { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" },
+                  { "name": "product-count", "tagPath": "PRODUCT_COUNT", "type": "dint" },
+                  { "name": "zone-temps", "tagPath": "ZONE_TEMPS", "type": "real", "arrayCount": 8 }
+                ]
+              }
+            ],
+            "writes": { "allow": [] }
           }
         ]
       },
@@ -44,7 +49,7 @@ data:
           "type": "mqtt",
           "host": "emqx.default.svc.cluster.local",
           "port": 1883,
-          "clientId": "EthernetIpAdapter"
+          "clientId": "ethernet-ip-adapter"
         }
       },
       "logging": {

@@ -1,23 +1,26 @@
 # Minimal Kubernetes Deployment for a edgecommons component. With --platform auto the library detects
 # KUBERNETES from the ServiceAccount token; config source defaults to CONFIGMAP, transport to MQTT
 # (broker config from the mounted ConfigMap), identity from the Downward API — so NO args are needed.
-# Build the image from ./Dockerfile and push to your registry (e.g. ghcr.io/<owner>/EthernetIpAdapter)
+# Build the image from ./Dockerfile and push to your registry (e.g. ghcr.io/<owner>/ethernet-ip-adapter)
 # or `kind load` it for a local cluster, then set `image:` below.
+#
+# NOTE: object names are DNS-1123 (lower-kebab) — the Greengrass component name is PascalCase, but a
+# Kubernetes metadata.name / ConfigMap name cannot be, so this pack uses `ethernet-ip-adapter`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: EthernetIpAdapter
+  name: ethernet-ip-adapter
   labels:
-    app.kubernetes.io/name: EthernetIpAdapter
+    app.kubernetes.io/name: ethernet-ip-adapter
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: EthernetIpAdapter
+      app.kubernetes.io/name: ethernet-ip-adapter
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: EthernetIpAdapter
+        app.kubernetes.io/name: ethernet-ip-adapter
     spec:
       automountServiceAccountToken: true   # the projected SA token is the platform=KUBERNETES auto-detect signal
       terminationGracePeriodSeconds: 30
@@ -25,7 +28,7 @@ spec:
         runAsNonRoot: true
       containers:
         - name: component
-          image: REPLACE_ME   # e.g. ghcr.io/<owner>/EthernetIpAdapter:latest (build ./Dockerfile)
+          image: REPLACE_ME   # e.g. ghcr.io/<owner>/ethernet-ip-adapter:latest (build ./Dockerfile)
           imagePullPolicy: IfNotPresent
           env:
             - name: POD_NAME
@@ -56,6 +59,6 @@ spec:
             - { name: tmp, mountPath: /tmp }
       volumes:
         - name: config
-          configMap: { name: EthernetIpAdapter-config }
+          configMap: { name: ethernet-ip-adapter-config }
         - name: tmp
           emptyDir: {}

@@ -1,15 +1,15 @@
 [package]
-name = "ethernetipadapter"
+name = "ethernet-ip-adapter"
 version = "1.0.0"
 edition = "2021"
 # Matches the edgecommons library's MSRV (edition-2024 crate).
 rust-version = "1.85"
-license = "Apache-2.0"
+license = "BUSL-1.1"
 description = "Rust reference southbound EtherNet/IP adapter (Allen-Bradley CIP tag read/write) for the EdgeCommons ecosystem."
 publish = false
 
 [[bin]]
-name = "ethernetipadapter"
+name = "ethernet-ip-adapter"
 path = "src/main.rs"
 
 # Runtime selection mirrors the edgecommons library:
@@ -41,6 +41,10 @@ anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# EtherNet/IP + CIP explicit-messaging client (D-EIP-1): pure Rust, async/Tokio, builds natively on
+# Windows/MSVC and Linux with zero C deps. Used by the `eip/` backend (added in slice S3); the `sim`
+# backend needs no protocol crate.
+rseip = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -19,9 +19,9 @@ cargo run -- \
   -t my-thing
 ```
 
-It ships a **simulated backend**, so it runs with no hardware: it publishes a moving
-`temperature-1` and a deliberately faulted `pressure-1` on
-`ecv1/{device}/ethernetipadapter/device-1/data/{signal}`.
+It ships a **simulated backend**, so it runs with no hardware: it polls the config-declared
+signals (e.g. `line-speed`, `zone-temps`) and publishes each on
+`ecv1/{device}/ethernet-ip-adapter/{instance}/data/{name}`.
 
 ## Where your code goes
 

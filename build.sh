@@ -19,7 +19,7 @@ COMPONENT_NAME="com.mbreissi.edgecommons.EthernetIpAdapter"
 # (For the GDK custom build system, use a concrete version in gdk-config.json rather
 # than NEXT_PATCH, so the staged artifact path matches what `gdk` expects.)
 COMPONENT_VERSION="$(python3 -c 'import json; c = json.load(open("gdk-config.json"))["component"]; print(next(iter(c.values()))["version"])')"
-BIN_NAME="ethernetipadapter"
+BIN_NAME="ethernet-ip-adapter"
 
 # Greengrass-mode features for the device build. Add edgecommons features here as
 # needed, e.g. "greengrass,cloudwatch" for the direct CloudWatch metric target.

@@ -29,30 +29,50 @@
     "site": "factory-1"
   },
   "component": {
+    "token": "ethernet-ip-adapter",
     "global": {
-      "defaults": {
-        "pollIntervalMs": 5000
-      },
+      "defaults": { "pollIntervalMs": 1000, "publishMode": "onChange", "batchMs": 0 },
       "timeouts": {
         "connectMs": 5000,
+        "requestTimeoutMs": 2000,
         "reconnectBackoffMinMs": 1000,
         "reconnectBackoffMaxMs": 60000
       },
-      "healthThresholds": {
-        "staleSignalSecs": 60
-      }
+      "healthThresholds": { "staleSignalSecs": 60, "keepaliveProbeIntervalMs": 60000 },
+      "metricsIntervalSecs": 60
     },
     "instances": [
       {
-        "id": "device-1",
-        "adapter": "sim",
-        "connection": {
-          "endpoint": "sim://device-1"
-        },
-        "pollIntervalMs": 5000,
-        "writes": {
-          "allow": []
-        }
+        "id": "filler-plc",
+        "adapter": "ethernet-ip",
+        "connection": { "endpoint": "127.0.0.1:44818", "connected": false },
+        "pollGroups": [
+          {
+            "id": "fast",
+            "pollIntervalMs": 500,
+            "signals": [
+              { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real",
+                "deadband": { "type": "absolute", "value": 0.5 } },
+              { "name": "fill-temp", "tagPath": "FILL_TEMP", "type": "real",
+                "deadband": { "type": "percent", "value": 1.0 } },
+              { "name": "tank-level", "tagPath": "TANK_LEVEL", "type": "real",
+                "scale": 0.1, "offset": 0.0 }
+            ]
+          },
+          {
+            "id": "slow",
+            "pollIntervalMs": 2000,
+            "publishMode": "always",
+            "signals": [
+              { "name": "product-count", "tagPath": "PRODUCT_COUNT", "type": "dint" },
+              { "name": "zone-temps", "tagPath": "ZONE_TEMPS", "type": "real",
+                "arrayCount": 8 },
+              { "name": "motor-run", "tagPath": "MOTOR_RUN", "type": "dint" },
+              { "name": "fill-setpoint", "tagPath": "FILL_SETPOINT", "type": "real" }
+            ]
+          }
+        ],
+        "writes": { "allow": ["FILL_SETPOINT", "MOTOR_RUN"] }
       }
     ]
   }

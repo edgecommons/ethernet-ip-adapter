@@ -5,20 +5,20 @@
 # but containerized, against a throw-away EMQX broker on the compose network.
 #
 #   docker compose up --build          # build the image (./Dockerfile) and start broker + component
-#   docker compose logs -f ethernetipadapter
+#   docker compose logs -f ethernet-ip-adapter
 #   docker compose down -v
 #
 # Watch the bus (the library publishes the state keepalive automatically):
-#   mosquitto_sub -h localhost -p 1883 -t 'ecv1/+/+/+/state' -t 'ecv1/+/+/+/app/#' -v
+#   mosquitto_sub -h localhost -p 1883 -t 'ecv1/+/+/+/state' -t 'ecv1/+/+/+/data/#' -v
 #
-# The device (thing) name defaults to ethernetipadapter-dev; override with THING_NAME=... docker compose up.
-name: ethernetipadapter
+# The device (thing) name defaults to ethernet-ip-adapter-dev; override with THING_NAME=... docker compose up.
+name: ethernet-ip-adapter
 
 services:
   # Local MQTT broker — the HOST platform's `messaging.local` target.
   emqx:
     image: emqx/emqx:latest
-    container_name: ethernetipadapter-emqx
+    container_name: ethernet-ip-adapter-emqx
     ports:
       - "1883:1883"     # MQTT
       - "18083:18083"   # EMQX dashboard (default login admin / public)
@@ -30,21 +30,21 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  ethernetipadapter:
+  ethernet-ip-adapter:
     build:
       context: .
-      dockerfile: Dockerfile          # multi-stage: cargo build --release --bin ethernetipadapter
+      dockerfile: Dockerfile          # multi-stage: cargo build --release --bin ethernet-ip-adapter
       # The cargo git dep on the private edgecommons repo needs credentials at build time; pass a
       # token through if your dep source is a git URL:
       #   args:
       #     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-    image: ethernetipadapter:dev
-    container_name: ethernetipadapter
+    image: ethernet-ip-adapter:dev
+    container_name: ethernet-ip-adapter
     depends_on:
       emqx:
         condition: service_healthy
-    # The image ENTRYPOINT is /usr/local/bin/component (the built ethernetipadapter binary); these are the
-    # standard runtime CLI args appended to it.
+    # The image ENTRYPOINT is /usr/local/bin/component (the built ethernet-ip-adapter binary); these
+    # are the standard runtime CLI args appended to it.
     command:
       - "--platform"
       - "HOST"
@@ -55,7 +55,7 @@ services:
       - "FILE"
       - "/etc/edgecommons/test-configs/config.json"
       - "-t"
-      - "${THING_NAME:-ethernetipadapter-dev}"
+      - "${THING_NAME:-ethernet-ip-adapter-dev}"
     volumes:
       # The component config source (-c FILE ...). Edit test-configs/ on the host and restart.
       - ./test-configs:/etc/edgecommons/test-configs:ro
@@ -75,7 +75,7 @@ configs:
           "local": {
             "host": "emqx",
             "port": 1883,
-            "clientId": "ethernetipadapter-local"
+            "clientId": "ethernet-ip-adapter-local"
           }
         }
       }

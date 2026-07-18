@@ -2,20 +2,31 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.edgecommons.mbreissi.com/schemas/EthernetIpAdapter/config.schema.json",
   "title": "EthernetIpAdapter component configuration",
-  "description": "The configuration EthernetIpAdapter itself understands: the object at `component.global`, with each entry of `component.instances[]` validated against `#/$defs/device`. A southbound adapter models ONE DEVICE PER INSTANCE — how to reach it, how often to read it, and what it is permitted to write. See docs/SOUTHBOUND.md for the contract this implements. The library envelope (logging, messaging, metricEmission, heartbeat, streaming, credentials, parameters, health, hierarchy, identity, topic, tags) is owned by the canonical schema and is deliberately not redeclared here.",
+  "description": "The configuration EthernetIpAdapter itself understands: the object at `component.global`, with each entry of `component.instances[]` validated against `#/$defs/device`. A southbound EtherNet/IP adapter models ONE DEVICE PER INSTANCE (one PLC / CIP endpoint) — how to reach it, how often to poll it, which CIP tags map to which signals, and what it is permitted to write. Signal updates are produced by scheduled polling; implicit class-1 I/O is not supported. See DESIGN.md and docs/SOUTHBOUND.md for the contract this implements. The library envelope (logging, messaging, metricEmission, heartbeat, streaming, credentials, parameters, health, hierarchy, identity, topic, tags, and the `component.token` UNS override) is owned by the canonical schema and is deliberately not redeclared here.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "defaults": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Defaults applied to every device that does not override them.",
+      "description": "Defaults applied to every device/group that does not override them (precedence: signal ▸ group ▸ device.defaults ▸ global.defaults ▸ built-in).",
       "properties": {
         "pollIntervalMs": {
           "type": "integer",
           "minimum": 1,
           "default": 5000,
-          "description": "How often each device is read."
+          "description": "Poll cadence for any group that does not override it."
+        },
+        "publishMode": {
+          "enum": ["onChange", "always"],
+          "default": "onChange",
+          "description": "Meaning: `onChange` publishes only samples that pass the deadband/change gate; `always` publishes every polled sample."
+        },
+        "batchMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Coalescing window: samples for one signal within the window ride one SouthboundSignalUpdate.samples[]. 0 = publish per poll cycle."
         }
       }
     },
@@ -28,7 +39,13 @@
           "type": "integer",
           "minimum": 1,
           "default": 5000,
-          "description": "How long a connect attempt may take before it is treated as failed."
+          "description": "Connect (incl. host lookup + RegisterSession) deadline."
+        },
+        "requestTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2000,
+          "description": "Per-CIP-request deadline (read/write/browse)."
         },
         "reconnectBackoffMinMs": {
           "type": "integer",
@@ -53,46 +70,80 @@
           "type": "integer",
           "minimum": 1,
           "default": 60,
-          "description": "A signal with no update for longer than this counts as stale. A signal that silently stops updating is otherwise indistinguishable from one that is simply not changing — which is why staleness is measured rather than assumed."
+          "description": "A signal with no successful (GOOD) read for longer than this counts as stale. Suspended while an instance is paused."
+        },
+        "keepaliveProbeIntervalMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 60000,
+          "description": "Paused-state liveness probe cadence: while paused, the adapter keeps `connected` truthful with a slow real CIP round-trip on this interval."
         }
       }
+    },
+    "metricsIntervalSecs": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 60,
+      "description": "Operational-metrics emit cadence, seconds. Interval counters reset on each emit; totals never reset."
     }
   },
   "$defs": {
     "device": {
       "title": "One device",
-      "description": "One entry of `component.instances[]`. Each device gets its own task and its own connection lifecycle.",
+      "description": "One entry of `component.instances[]`. One device == one PLC / CIP endpoint, with its own task and connection lifecycle.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "connection"],
+      "required": ["id", "connection", "pollGroups"],
       "properties": {
         "id": {
           "type": "string",
           "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
-          "description": "Unique device id. It is the `{instance}` token of this device's UNS topics and the `instance` dimension of its health metric, so it must be a valid UNS token (lower-kebab) and it must be stable."
+          "description": "Unique device id. It is the `{instance}` token of this device's UNS topics and the `instance` dimension of its metrics, so it must be a valid UNS token (lower-kebab) and stable."
         },
         "adapter": {
           "type": "string",
-          "default": "sim",
-          "description": "Which protocol backend to use. Matches `DeviceBackend::kind()` in `src/device.rs`, and is published in the `device.adapter` field of every SouthboundSignalUpdate."
+          "default": "ethernet-ip",
+          "description": "Which protocol backend to use. `ethernet-ip` is the CIP explicit-messaging backend; `sim` selects the in-process simulator. Matches `DeviceBackend::kind()` and is published in the `device.adapter` field of every SouthboundSignalUpdate."
         },
         "connection": {
           "type": "object",
           "required": ["endpoint"],
           "additionalProperties": true,
-          "description": "How to reach the device. Deliberately OPEN — every protocol needs different keys (a unit id, a security policy, a slave address), and this is the one place the adapter should not be strict. Everything else stays `additionalProperties: false`.",
+          "description": "How to reach the device. Deliberately OPEN — every protocol needs different keys, and this is the one place the adapter is not strict. Everything else stays `additionalProperties: false`.",
           "properties": {
             "endpoint": {
               "type": "string",
               "minLength": 1,
-              "description": "The endpoint, in whatever form the protocol uses. Published in the `device.endpoint` field."
+              "description": "`<host>` or `<host>:<port>` (default CIP port 44818). Published in the `device.endpoint` field."
+            },
+            "slot": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255,
+              "description": "ControlLogix CPU slot ⇒ backplane connection path (`1,<slot>`). Absent ⇒ no routing path (correct for cpppo / CompactLogix-direct)."
+            },
+            "connected": {
+              "type": "boolean",
+              "default": false,
+              "description": "Meaning: `true` ⇒ CIP connected messaging (ForwardOpen); `false` (default) ⇒ unconnected explicit messaging."
             }
           }
         },
-        "pollIntervalMs": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Per-device override of the read cadence."
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Per-device overrides of `global.defaults`.",
+          "properties": {
+            "pollIntervalMs": { "type": "integer", "minimum": 1 },
+            "publishMode": { "enum": ["onChange", "always"] },
+            "batchMs": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "pollGroups": {
+          "type": "array",
+          "minItems": 1,
+          "description": "The device's poll groups; each is read on its own cadence.",
+          "items": { "$ref": "#/$defs/pollGroup" }
         },
         "writes": {
           "type": "object",
@@ -103,7 +154,88 @@
               "type": "array",
               "items": { "type": "string", "minLength": 1 },
               "default": [],
-              "description": "Signal ids this adapter may write, matched on the STABLE `signal.id` (never a volatile index). Anything not listed is refused, whatever a command asks for. An empty list — the default — means the adapter is read-only, which is the correct posture for anything touching a control system."
+              "description": "Stable `signal.id`s (= CIP tag paths) this device may write. Anything not listed is refused, whatever a command asks for. An empty list — the default — means the device is read-only, the correct posture for anything touching a control system."
+            }
+          }
+        }
+      }
+    },
+    "pollGroup": {
+      "title": "A poll group",
+      "description": "A set of signals read together on one cadence.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signals"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The `pollGroup` metric dimension. Defaults to `group-<n>` (1-based) when absent."
+        },
+        "pollIntervalMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "This group's cadence; falls to device ▸ global ▸ built-in (5000)."
+        },
+        "publishMode": {
+          "enum": ["onChange", "always"],
+          "description": "This group's publish gate; falls to device ▸ global ▸ built-in (onChange)."
+        },
+        "signals": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/signal" }
+        }
+      }
+    },
+    "signal": {
+      "title": "A signal",
+      "description": "One CIP tag mapped to an EdgeCommons data point.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "tagPath", "type"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "description": "Human label AND the `data` topic channel. Lower-kebab (a valid UNS token), unique per device."
+        },
+        "tagPath": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The CIP tag path, verbatim/case-sensitive (`LINE_SPEED`, `Program:Main.FillPV`). It IS the stable `signal.id`. Unique per device."
+        },
+        "type": {
+          "enum": ["bool", "sint", "usint", "int", "uint", "dint", "udint", "lint", "ulint", "real", "lreal"],
+          "description": "Meaning: the CIP elementary type used to decode the tag. `string`, structures/UDTs, and multi-dimensional arrays are not supported and are rejected."
+        },
+        "arrayCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Present ⇒ the signal is a 1-D array read of that many elements; the value is a JSON array."
+        },
+        "scale": {
+          "type": "number",
+          "description": "Published value = `raw * scale + offset` (element-wise for arrays; numeric types only, not `bool`)."
+        },
+        "offset": {
+          "type": "number",
+          "description": "See `scale`."
+        },
+        "deadband": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The change/deadband gate for `onChange` publishing (numeric types only).",
+          "properties": {
+            "type": {
+              "enum": ["none", "absolute", "percent"],
+              "default": "none",
+              "description": "Meaning: `none` republishes on any change; `absolute` requires `|new−old| ≥ value`; `percent` is relative to the previous value. Arrays: exceeded if ANY element exceeds."
+            },
+            "value": {
+              "type": "number",
+              "minimum": 0,
+              "default": 0,
+              "description": "The threshold."
             }
           }
         }
