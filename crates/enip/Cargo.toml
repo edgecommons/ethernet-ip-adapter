@@ -16,10 +16,19 @@ name = "enip"
 # adapter's push-validation fallback. P1 adds its dependencies and body.
 testserver = []
 
-# Dependencies are added as P1 fills the module tree, drawn from the PROTOCOL-DESIGN §1 budget
-# (tokio, tokio-util, bytes, thiserror, tracing, rand — all seeded in the workspace). The S1
-# skeleton is empty modules, so it needs none yet.
+# Dependencies drawn from the PROTOCOL-DESIGN §1 budget (tokio, tokio-util, bytes, thiserror,
+# tracing, rand — all seeded in the workspace). P1 (encapsulation + CIP explicit decode/encode,
+# discovery, the framed codec) needs bytes (BytesMut buffers), thiserror (typed errors), tracing
+# (drop/skip logging), and tokio-util's `codec` for the Encoder/Decoder framing.
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio-util = { workspace = true, features = ["codec"] }
+
+[dev-dependencies]
+# Golden conformance vectors and roundtrip/truncation tests are self-contained (const byte
+# arrays + the public decode/encode API); no extra harness crates are required for P1.
 
 # Safety lints for the whole crate (PROTOCOL-DESIGN §4 / D-ENIP-2/3). P1 inherits these: every
 # decoder is bounds-checked, no unchecked indexing or wrapping arithmetic on wire-supplied numbers,

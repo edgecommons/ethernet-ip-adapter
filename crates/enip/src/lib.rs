@@ -24,13 +24,12 @@
 //! Layering (enforced by review + visibility): `wire` ← `encap`/`cpf`/`cip` ←
 //! `cm`/`logix`/`io`/`assembly` ← `client`/`discovery`. Nothing imports upward.
 //!
-//! **This is the slice-S1 skeleton: the module tree exists but is empty. P1 fills each module with
-//! its codecs and the public API re-exported here.**
+//! **Slice P1 is implemented**: the encapsulation layer, CPF, the CIP explicit request/reply layer
+//! (EPATH, message router, status, types), device discovery, and the framed codec — all with the
+//! no-panic decode invariant of §4 proven by truncation sweeps and golden vectors (§12). The
+//! session actor, connection manager, Logix tag services, class-1 I/O, assembly mapping, and the
+//! client handle are P2/P3 — their modules are still stubs, re-exported only where P1 needs a name.
 #![forbid(unsafe_code)]
-// P1: the modules are intentionally empty in S1 (structure only). `dead_code` is allowed at the
-// crate root so the skeleton builds clean under `-D warnings`; P1 removes this as the modules gain
-// their public surface and internal callers.
-#![allow(dead_code)]
 
 pub mod error;
 
@@ -42,17 +41,46 @@ pub mod cpf;
 
 pub mod cip;
 
+// P2: Connection Manager (ForwardOpen/Close, NCP bit-packing) — stub until the class-1 I/O slice.
 pub mod cm;
 
+// P2: Logix tag services (Read/Write Tag, enumeration, symbol-type word) — stub until the tag slice.
 pub mod logix;
 
+// P3: class-1 implicit I/O runtime (IoManager, produce/consume, watchdog) — stub until the I/O slice.
 pub mod io;
 
+// P2: assembly layout mapping — stub until the class-1 I/O slice.
 pub mod assembly;
 
+// P2/P3: the async client handle + session actor — stub until the session slice.
 pub mod client;
 
 pub mod discovery;
+
+// ---- P1 public re-exports (the surface `DESIGN.md` §3.3 consumes from this slice) ----
+
+pub use error::{EnipError, Result, WireError};
+
+pub use wire::{WireReader, WireWriter};
+
+pub use encap::codec::EncapCodec;
+pub use encap::{
+    Command, EncapFrame, EncapHeader, EncapStatus, DEFAULT_TCP_PORT, DEFAULT_UDP_PORT, HEADER_LEN,
+    MAX_DATA_LEN, PROTOCOL_VERSION,
+};
+
+pub use cpf::{Cpf, CpfItem, ItemType, SequencedAddress, SockAddrInfo};
+
+pub use cip::epath::{EPath, PathError, PortSegment, Segment, TagAddress};
+pub use cip::message::{MessageReply, MessageRequest};
+pub use cip::status::{CipStatus, GeneralStatus};
+pub use cip::types::{CipType, CipValue};
+
+pub use discovery::{
+    parse_list_interfaces, parse_list_services, DeviceIdentity, DeviceType, InterfaceItem,
+    ServiceItem, VendorId,
+};
 
 // The in-crate mock target (explicit-messaging responder + class-1 producer/consumer) used by the
 // state-machine tests and the adapter's push validation fallback (D-ENIP-14, §12.5). Feature-gated
