@@ -24,11 +24,19 @@
 //! Layering (enforced by review + visibility): `wire` ← `encap`/`cpf`/`cip` ←
 //! `cm`/`logix`/`io`/`assembly` ← `client`/`discovery`. Nothing imports upward.
 //!
-//! **Slice P1 is implemented**: the encapsulation layer, CPF, the CIP explicit request/reply layer
-//! (EPATH, message router, status, types), device discovery, and the framed codec — all with the
-//! no-panic decode invariant of §4 proven by truncation sweeps and golden vectors (§12). The
-//! session actor, connection manager, Logix tag services, class-1 I/O, assembly mapping, and the
-//! client handle are P2/P3 — their modules are still stubs, re-exported only where P1 needs a name.
+//! **Slices P1 and P2 are implemented.** P1: the encapsulation layer, CPF, the CIP explicit
+//! request/reply layer (EPATH, message router, status, types), device discovery, and the framed
+//! codec. P2: the async session actor with `sender_context` correlation, per-request deadlines, and
+//! stale-reply quarantine (§10.3–§10.4); the [`EipClient`] handle + [`ClientOptions`]; UCMM and
+//! routed Unconnected_Send; connected class-3 messaging with a hard sequence match; the Connection
+//! Manager (ForwardOpen/Close, NCP bit-packing); Logix Read/Write Tag with auto-fragmentation, tag
+//! enumeration, and [`SymbolType`]; and the generic CIP attribute services. Class-1 implicit I/O
+//! (`io`) and assembly mapping (`assembly`) are P3.
+//!
+//! There is deliberately **no embedded test server**: device simulators are external containers
+//! (cpppo/OpENer) validated in later integration slices. The P2 state-machine tests drive the
+//! session actor over in-memory [`tokio::io::duplex`] byte-stream fixtures (the actor is generic over
+//! any `AsyncRead + AsyncWrite + Unpin`).
 #![forbid(unsafe_code)]
 
 pub mod error;
@@ -41,19 +49,20 @@ pub mod cpf;
 
 pub mod cip;
 
-// P2: Connection Manager (ForwardOpen/Close, NCP bit-packing) — stub until the class-1 I/O slice.
+// Connection Manager: ForwardOpen/Close codecs + NCP bit-packing (P2 implements the class-3 path;
+// the class-1 use is P3).
 pub mod cm;
 
-// P2: Logix tag services (Read/Write Tag, enumeration, symbol-type word) — stub until the tag slice.
+// Logix tag services: Read/Write Tag (+ auto-fragmentation), tag enumeration, the symbol-type word.
 pub mod logix;
 
 // P3: class-1 implicit I/O runtime (IoManager, produce/consume, watchdog) — stub until the I/O slice.
 pub mod io;
 
-// P2: assembly layout mapping — stub until the class-1 I/O slice.
+// P3: assembly layout mapping — stub until the class-1 I/O slice.
 pub mod assembly;
 
-// P2/P3: the async client handle + session actor — stub until the session slice.
+// The async client handle + session actor (correlation, deadlines, quarantine) + connected class-3.
 pub mod client;
 
 pub mod discovery;
@@ -82,8 +91,13 @@ pub use discovery::{
     ServiceItem, VendorId,
 };
 
-// The in-crate mock target (explicit-messaging responder + class-1 producer/consumer) used by the
-// state-machine tests and the adapter's push validation fallback (D-ENIP-14, §12.5). Feature-gated
-// so it never ships in the adapter's release binary.
-#[cfg(feature = "testserver")]
-pub mod testserver;
+// ---- P2 public re-exports (the async client surface `DESIGN.md` §3.3 consumes) ----
+
+pub use client::{ClientOptions, ClientStats, EipClient, RoutePath};
+
+pub use cm::{
+    ConnType, ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
+    NetworkConnectionParams, Priority, TimeoutMultiplier, VariableLength,
+};
+
+pub use logix::{Scope, SymbolInfo, SymbolType, TagReadResult};

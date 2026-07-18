@@ -101,7 +101,7 @@ extras: `arbitrary`, `cargo-fuzz` harness, `serde`/`serde_json` for vector manif
 | **D-ENIP-11** | **The crate exposes a bounds-checked `AssemblyLayout` helper (§9)** that maps raw assembly bytes ⇄ typed fields (offset/type/bit), but the *naming and configuration* of fields stays in the adapter. | Field extraction from hostile bytes belongs inside the fuzz boundary; signal semantics (names, UNS channels, deadbands) are adapter business the crate must not learn. |
 | **D-ENIP-12** | **Fragmented read/write is auto-driven inside the crate** (status `0x06` → continue at the next offset; writes chunked to the negotiated size), with a configurable `max_value_bytes` cap (default 1 MiB) bounding reassembly memory. | The caller asks for a tag and gets the whole value or a typed error. Wire-supplied sizes never drive unbounded allocation (§4). |
 | **D-ENIP-13** | **v1 restricts routing to port numbers ≤ 14** (covers backplane port 1 + slot, the only routed path the adapter exposes). The extended-port encoding is implemented per spec but gated behind a conformance vector captured from real routed hardware before it is enabled. | The references disagree on extended-port byte order and we have no routed device to arbitrate; shipping an unverified encoding of a rarely-used path is how wire bugs are born. Declared limitation, not silent. |
-| **D-ENIP-14** | **The crate ships a minimal in-crate test target** (`testserver` feature: explicit-messaging responder + class-1 producer/consumer) used by unit/integration tests and by the adapter's push validation fallback. | The session/connection state machines need a live peer to test without hardware; owning a tiny target also gives CI a class-1 peer with no container dependency (§12.5). It is a test double, not a product. |
+| **D-ENIP-14** | **The crate ships NO embedded test target.** Session/connection state-machine tests run over in-memory `tokio::io::duplex` byte-stream fixtures — the session actor is generic over `AsyncRead + AsyncWrite`, so a fixture deterministically injects wrong-`sender_context`, stale, fragmented, and sequence-mismatch frames a real device cannot be scripted to send. Real device behavior is validated against the EXTERNAL cpppo (poll) and OpENer (push) containers in the adapter's integration suite (§12.5). | Keeps every device simulator external to match reality (user decision) while preserving deterministic adversarial testing via raw-byte fixtures: the duplex fixture is a byte pipe, not a peer implementation, so a decoder bug can never be masked by a matching encoder bug in an in-crate double. (The earlier `testserver` in-crate target idea was dropped for this reason — there is no `testserver` module or feature.) |
 
 ---
 
@@ -158,12 +158,14 @@ crates/enip/src/
     session.rs     the session actor: writer, reader, correlation, deadlines, quarantine (§11.1)
     connected.rs   class-3 connected messaging (ForwardOpen'd explicit path) (§7.6)
   discovery.rs     ListIdentity / ListServices / ListInterfaces parsing (§5.3)
-  testserver.rs    feature "testserver": mock explicit responder + class-1 target (§12.5)
 ```
+
+There is no `testserver` module or feature (D-ENIP-14): actor tests drive the session over
+in-memory `tokio::io::duplex` fixtures, and real-device conformance is external (§12.5).
 
 Layering rule (enforced by review + module visibility): `wire` ← `encap`/`cpf`/`cip` ←
 `cm`/`logix`/`io`/`assembly` ← `client`/`discovery`. Nothing imports upward; `client` is the only
-module that owns sockets besides `io`; `testserver` may reach anything (it is a test double).
+module that owns sockets besides `io`.
 
 ### 3.3 What the adapter consumes
 
@@ -821,16 +823,20 @@ every prefix `frame[..n]` must decode to `Err(Truncated)`, never panic (a shared
 type, transport trigger) gets exhaustive-domain tests. `CipStatus`/`EncapStatus` render/classify
 tests pin the typed-enum contract.
 
-### 12.2 State-machine tests (mock peer over real sockets)
+### 12.2 State-machine tests (in-memory `duplex` byte-stream fixtures)
 
-The `testserver` (D-ENIP-14) drives session/connection logic through real Tokio TCP/UDP:
-RegisterSession happy/rejected/garbage; correlation — delayed reply released *after* the caller
-timed out must be quarantined (assert `stale_replies == 1` and the next request gets the *right*
-answer); three-consecutive-timeouts ⇒ `ConnectionLost`; class-3 sequence mismatch dropped;
-fragmented read spanning ≥ 3 chunks incl. the `max_value_bytes` cap; ForwardOpen success/reject;
-class-1: Up on first frame, stale/dup/size-mismatch drops with exact counter assertions, gap
-counting, watchdog Lost on producer stop, produce cadence + heartbeat under
-`tokio::time::pause()`.
+The session actor is generic over `AsyncRead + AsyncWrite`, so tests drive it over
+`tokio::io::duplex` in-memory pipes (D-ENIP-14) and feed hand-scripted raw bytes onto the wire —
+no socket, no peer implementation, fully deterministic: RegisterSession happy/rejected/garbage;
+correlation — a delayed reply pushed onto the fixture *after* the caller timed out must be
+quarantined (assert `stale_replies == 1` and the next request gets the *right* answer);
+three-consecutive-timeouts ⇒ `ConnectionLost`; class-3 sequence mismatch dropped; fragmented read
+spanning ≥ 3 chunks incl. the `max_value_bytes` cap; ForwardOpen success/reject. Class-1 receive
+logic is driven the same way — crafted datagrams fed straight into the consume gauntlet / sequence
+window (the codec and window rules are pure): Up on first frame, stale/dup/size-mismatch drops
+with exact counter assertions, gap counting, watchdog Lost on producer stop, produce cadence +
+heartbeat under `tokio::time::pause()`. Because the fixture injects raw bytes rather than replaying
+the crate's own encoders, a decoder bug cannot be cancelled out by a matching encoder bug.
 
 ### 12.3 Fuzzing (the safety claim, made executable)
 
@@ -872,17 +878,21 @@ bytes; decode produces exactly the struct). Sources, in order of authority:
 The vector suite is the regression net that lets us refactor codecs fearlessly; a vector may only
 change with a spec citation in the commit.
 
-### 12.5 The class-1 test peer
+### 12.5 Test peers: `duplex` fixtures (unit) + external containers (integration)
 
-Unit/CI level: the in-crate `testserver` (D-ENIP-14) — a minimal target: accepts RegisterSession +
-ForwardOpen, produces a configurable assembly at the agreed RPI over UDP, consumes our O→T,
-supports scripted misbehavior (stop producing, wrong sizes, stale sequences, garbage) to drive
-the §12.2 assertions. It reuses the crate's *encoders* but is careful to also carry raw-byte
-scripted frames so decoder bugs can't cancel out encoder bugs.
+Unit/CI level: in-memory `tokio::io::duplex` byte-stream fixtures (D-ENIP-14, §12.2). The session
+actor is generic over `AsyncRead + AsyncWrite`; a fixture is one end of a byte pipe onto which the
+test writes hand-scripted frames — a happy reply, a stale reply after the deadline, a fragmented
+reply, a wrong-`sender_context` reply, a sequence-mismatched class-1 datagram, or pure garbage.
+Because the fixture carries raw bytes rather than replaying the crate's own encoders, a decoder bug
+cannot be cancelled out by a matching encoder bug. No socket, no container, no in-crate peer
+implementation — the crate ships no `testserver`.
 
-System level: **OpENer** (the ODVA-member OSS EtherNet/IP *adapter/target* stack) in a container
-as the independent conformance peer — the adapter-repo E2E plan (DESIGN.md §11) specifies it; the
-crate's own CI does not depend on containers.
+System level: real-device conformance is validated against EXTERNAL containers in the adapter's
+integration suite (DESIGN.md §11) — **cpppo** for poll (explicit messaging) and **OpENer** (the
+ODVA-member OSS EtherNet/IP *adapter/target* stack) for push (class-1 implicit I/O), each an
+independent implementation rather than our own code talking to itself. The crate's own CI does not
+depend on containers.
 
 ---
 

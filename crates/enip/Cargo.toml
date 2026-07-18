@@ -11,24 +11,30 @@ publish = false
 [lib]
 name = "enip"
 
-[features]
-# The in-crate mock target (PROTOCOL-DESIGN §12.5) — off by default, enabled by tests and by the
-# adapter's push-validation fallback. P1 adds its dependencies and body.
-testserver = []
-
 # Dependencies drawn from the PROTOCOL-DESIGN §1 budget (tokio, tokio-util, bytes, thiserror,
 # tracing, rand — all seeded in the workspace). P1 (encapsulation + CIP explicit decode/encode,
 # discovery, the framed codec) needs bytes (BytesMut buffers), thiserror (typed errors), tracing
-# (drop/skip logging), and tokio-util's `codec` for the Encoder/Decoder framing.
+# (drop/skip logging), and tokio-util's `codec` for the Encoder/Decoder framing. P2 adds the async
+# session actor + client, so `tokio` (net/time/sync/rt) and `rand` (connection serials/ids) join.
+#
+# There is deliberately NO embedded test-server: device simulators are EXTERNAL containers
+# (cpppo/OpENer) validated in later integration slices. The P2 state-machine tests instead drive the
+# session actor over in-memory `tokio::io::duplex()` byte-stream fixtures (the actor is generic over
+# any `AsyncRead + AsyncWrite + Unpin`), so no simulated peer is compiled into the crate.
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "io-util", "macros"] }
+rand = { workspace = true }
 
 [dev-dependencies]
-# Golden conformance vectors and roundtrip/truncation tests are self-contained (const byte
-# arrays + the public decode/encode API); no extra harness crates are required for P1.
+# Golden conformance vectors and roundtrip/truncation tests are self-contained. The P2 state-machine
+# tests need a Tokio runtime and the duplex/io helpers (the `duplex()` fixtures that stand in for a
+# device peer without any embedded server), plus `bytes` to craft raw response frames.
+tokio = { workspace = true, features = ["net", "time", "sync", "rt", "io-util", "macros", "test-util"] }
+bytes = { workspace = true }
 
 # Safety lints for the whole crate (PROTOCOL-DESIGN §4 / D-ENIP-2/3). P1 inherits these: every
 # decoder is bounds-checked, no unchecked indexing or wrapping arithmetic on wire-supplied numbers,

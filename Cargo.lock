@@ -943,7 +943,9 @@ name = "ec-enip"
 version = "1.0.0"
 dependencies = [
  "bytes",
+ "rand",
  "thiserror",
+ "tokio",
  "tokio-util",
  "tracing",
 ]
