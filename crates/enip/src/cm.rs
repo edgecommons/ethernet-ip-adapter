@@ -36,11 +36,62 @@ pub mod service {
 /// `direction(server=1) << 7 | trigger(application=2) << 4 | class(3)` = `0xA3`.
 pub const TRANSPORT_CLASS3_TRIGGER: u8 = (1 << 7) | (2 << 4) | 3;
 
+/// The transport class/trigger byte for **class-1** implicit I/O (§8.2), cyclic production:
+/// `direction(originator=0) << 7 | trigger(cyclic=0) << 4 | class(1)` = `0x01`. The scanner is the
+/// originator, so the direction bit is 0 (client). Use [`transport_class1_trigger`] for the
+/// change-of-state / application production triggers.
+pub const TRANSPORT_CLASS1_TRIGGER: u8 = 0x01;
+
+/// The production trigger for a class-1 I/O connection (§8.2 field 14, bits 4–6). Class-1 telemetry
+/// is almost always cyclic; change-of-state and application triggers are supported for adapters that
+/// negotiate them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionTrigger {
+    /// `0` — cyclic (produce at the RPI).
+    Cyclic,
+    /// `1` — change-of-state.
+    ChangeOfState,
+    /// `2` — application-triggered.
+    Application,
+}
+
+/// The class-1 transport class/trigger byte for the given production trigger (§8.2): originator
+/// direction (bit 7 = 0), the trigger in bits 4–6, transport class 1 in bits 0–3.
+#[must_use]
+pub fn transport_class1_trigger(trigger: ProductionTrigger) -> u8 {
+    match trigger {
+        ProductionTrigger::Cyclic => 0x01,
+        ProductionTrigger::ChangeOfState => 0x11,
+        ProductionTrigger::Application => 0x21,
+    }
+}
+
 /// The Message Router connection path used by class-3 (§7.6): Message Router = class `0x02`
 /// instance `0x01`. Callers prefix a [`crate::cip::epath::PortSegment`] when routed.
 #[must_use]
 pub fn message_router_path() -> EPath {
     EPath::new().class(0x02).instance(0x01)
+}
+
+/// The Connection Manager object path `[0x20 0x06 0x24 0x01]` (§8.2) — the target of every
+/// ForwardOpen / ForwardClose.
+#[must_use]
+pub fn connection_manager_path() -> EPath {
+    EPath::new().class(0x06).instance(0x01)
+}
+
+/// The class-1 I/O connection path (§8.4): Assembly object (class `0x04`), the optional config
+/// **instance** segment (`0x24`), then the output (O→T) and input (T→O) **connection points**
+/// (`0x2C`). Callers prefix route [`crate::cip::epath::PortSegment`]s via
+/// [`EPath::prepend`]-equivalent construction when the target is behind a chassis. Instances above
+/// 255 automatically widen to the 16-bit segment forms.
+#[must_use]
+pub fn io_connection_path(config: Option<u16>, output: u16, input: u16) -> EPath {
+    let mut p = EPath::new().class(0x04);
+    if let Some(config) = config {
+        p = p.instance(config);
+    }
+    p.connection_point(output).connection_point(input)
 }
 
 /// Connection type (§8.3, bits 13–14 / 29–30).
@@ -161,6 +212,26 @@ impl NetworkConnectionParams {
             variable: VariableLength::Variable,
             priority: Priority::Low,
             conn_type: ConnType::P2P,
+            redundant_owner: false,
+        }
+    }
+
+    /// A fully-specified I/O parameter set (§8.3) — the class-1 implicit path picks connection type
+    /// (P2P for O→T and directed T→O, multicast for a shared T→O group), priority, and fixed/variable
+    /// framing per direction. `size` is the on-wire connection size **including** the class-1 sequence
+    /// count and the 32-bit run/idle header when the direction carries one.
+    #[must_use]
+    pub fn io(
+        size: u16,
+        variable: VariableLength,
+        priority: Priority,
+        conn_type: ConnType,
+    ) -> Self {
+        Self {
+            size,
+            variable,
+            priority,
+            conn_type,
             redundant_owner: false,
         }
     }
@@ -343,6 +414,49 @@ impl ForwardOpenRequest {
             transport_class_trigger: TRANSPORT_CLASS3_TRIGGER,
             connection_path,
             large: false,
+        }
+    }
+
+    /// A class-1 implicit-I/O ForwardOpen (§8.2). The O→T connection id is left 0 (the target assigns
+    /// it for a P2P O→T); `t_o_connection_id` is the originator-chosen id the target will stamp on the
+    /// frames it produces. `large` selects LargeForwardOpen (`0x5B`); the class-1 driver sets it when
+    /// either direction's on-wire size exceeds 505 bytes. `connection_path` is built by
+    /// [`io_connection_path`] (optionally route-prefixed).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a ForwardOpen is an inherently wide wire record; the I/O caller builds it once"
+    )]
+    #[must_use]
+    pub fn class1(
+        t_o_connection_id: u32,
+        connection_serial: u16,
+        vendor_id: u16,
+        originator_serial: u32,
+        timeout_multiplier: TimeoutMultiplier,
+        o_t_rpi: u32,
+        o_t_params: NetworkConnectionParams,
+        t_o_rpi: u32,
+        t_o_params: NetworkConnectionParams,
+        transport_class_trigger: u8,
+        connection_path: EPath,
+        large: bool,
+    ) -> Self {
+        Self {
+            priority_time_tick: 0x0A,
+            timeout_ticks: 0x0E,
+            o_t_connection_id: 0,
+            t_o_connection_id,
+            connection_serial,
+            vendor_id,
+            originator_serial,
+            timeout_multiplier,
+            o_t_rpi,
+            o_t_params,
+            t_o_rpi,
+            t_o_params,
+            transport_class_trigger,
+            connection_path,
+            large,
         }
     }
 
@@ -632,6 +746,139 @@ mod tests {
         w.u8(0); // reserved
         let f = ForwardRequestFail::decode(w.as_slice()).unwrap();
         assert_eq!(f.remaining_path_size, Some(2));
+    }
+
+    #[test]
+    fn class1_trigger_bytes() {
+        assert_eq!(TRANSPORT_CLASS1_TRIGGER, 0x01);
+        assert_eq!(transport_class1_trigger(ProductionTrigger::Cyclic), 0x01);
+        assert_eq!(transport_class1_trigger(ProductionTrigger::ChangeOfState), 0x11);
+        assert_eq!(transport_class1_trigger(ProductionTrigger::Application), 0x21);
+        // Each decodes as direction=originator(0), class=1.
+        for t in [
+            ProductionTrigger::Cyclic,
+            ProductionTrigger::ChangeOfState,
+            ProductionTrigger::Application,
+        ] {
+            let b = transport_class1_trigger(t);
+            assert_eq!(b & 0x0F, 1, "class 1");
+            assert_eq!(b & 0x80, 0, "originator direction");
+        }
+    }
+
+    #[test]
+    fn io_connection_path_with_and_without_config() {
+        // config 151, output 150, input 100 — the OpENer/EIPScanner reference path.
+        let with = io_connection_path(Some(151), 150, 100).encode().unwrap();
+        assert_eq!(
+            with.as_ref(),
+            &[0x20, 0x04, 0x24, 151, 0x2C, 150, 0x2C, 100]
+        );
+        // Input-only (no config): just the assembly class and the two connection points.
+        let without = io_connection_path(None, 150, 100).encode().unwrap();
+        assert_eq!(without.as_ref(), &[0x20, 0x04, 0x2C, 150, 0x2C, 100]);
+        // A 16-bit instance widens the segment.
+        let wide = io_connection_path(Some(300), 150, 100).encode().unwrap();
+        assert_eq!(&wide[0..6], &[0x20, 0x04, 0x25, 0x00, 0x2C, 0x01]);
+    }
+
+    #[test]
+    fn io_ncp_roundtrips_all_forms() {
+        for conn_type in [ConnType::P2P, ConnType::Multicast] {
+            for variable in [VariableLength::Fixed, VariableLength::Variable] {
+                for priority in [Priority::Low, Priority::Scheduled, Priority::Urgent] {
+                    let p = NetworkConnectionParams::io(38, variable, priority, conn_type);
+                    assert_eq!(NetworkConnectionParams::decode_u16(p.encode_u16().unwrap()), p);
+                    assert_eq!(NetworkConnectionParams::decode_u32(p.encode_u32()), p);
+                    assert!(!p.redundant_owner);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn class1_forward_open_golden_vector() {
+        // Hand-assembled per §8.2/§8.4 (ODVA layout): a cyclic class-1 open, T→O id 0x11223344,
+        // serial 7, vendor 0x1337, orig serial 0xDEADBEEF, ×16 multiplier (code 2), 20 ms RPIs
+        // (20000 µs), O→T P2P fixed size 6 (2 seq + 4 header, heartbeat data), T→O P2P fixed size
+        // 34 (2 seq + 32 data, modeless), path config 151 / output 150 / input 100.
+        let o_t = NetworkConnectionParams::io(6, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let t_o = NetworkConnectionParams::io(34, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let req = ForwardOpenRequest::class1(
+            0x1122_3344,
+            0x0007,
+            0x1337,
+            0xDEAD_BEEF,
+            TimeoutMultiplier::X16,
+            20_000,
+            o_t,
+            20_000,
+            t_o,
+            TRANSPORT_CLASS1_TRIGGER,
+            io_connection_path(Some(151), 150, 100),
+            false,
+        );
+        assert_eq!(req.service(), service::FORWARD_OPEN);
+        let bytes = req.encode().unwrap();
+        // priority/tick, timeout tick
+        assert_eq!(&bytes[0..2], &[0x0A, 0x0E]);
+        // O→T id = 0 (target assigns), T→O id echoed back on the reply
+        assert_eq!(&bytes[2..6], &[0, 0, 0, 0]);
+        assert_eq!(&bytes[6..10], &0x1122_3344u32.to_le_bytes());
+        assert_eq!(&bytes[10..12], &0x0007u16.to_le_bytes());
+        assert_eq!(&bytes[12..14], &0x1337u16.to_le_bytes());
+        assert_eq!(&bytes[14..18], &0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(bytes[18], TimeoutMultiplier::X16.code()); // 2
+        assert_eq!(&bytes[19..22], &[0, 0, 0]); // reserved
+        assert_eq!(&bytes[22..26], &20_000u32.to_le_bytes()); // O→T RPI
+        assert_eq!(&bytes[26..28], &o_t.encode_u16().unwrap().to_le_bytes());
+        assert_eq!(&bytes[28..32], &20_000u32.to_le_bytes()); // T→O RPI
+        assert_eq!(&bytes[32..34], &t_o.encode_u16().unwrap().to_le_bytes());
+        assert_eq!(bytes[34], TRANSPORT_CLASS1_TRIGGER);
+        assert_eq!(bytes[35], 4); // path words: 8 bytes / 2
+        assert_eq!(&bytes[36..44], &[0x20, 0x04, 0x24, 151, 0x2C, 150, 0x2C, 100]);
+        // Round-trip the reply that would answer it (actual PIs differ from requested RPIs).
+        let mut w = WireWriter::new();
+        w.u32(0xAABB_CCDD); // O→T id target-assigned
+        w.u32(0x1122_3344); // T→O echo
+        w.u16(0x0007);
+        w.u16(0x1337);
+        w.u32(0xDEAD_BEEF);
+        w.u32(20_000); // O→T API
+        w.u32(20_000); // T→O API
+        w.u8(0);
+        w.u8(0);
+        let ok = ForwardOpenSuccess::decode(w.as_slice()).unwrap();
+        assert_eq!(ok.o_t_connection_id, 0xAABB_CCDD);
+        assert_eq!(ok.t_o_connection_id, 0x1122_3344);
+        assert_eq!(ok.o_t_api, 20_000);
+        assert_eq!(ok.t_o_api, 20_000);
+    }
+
+    #[test]
+    fn large_forward_open_widens_ncp_to_u32() {
+        // O→T size 1000 (> 505) forces LargeForwardOpen; the NCP fields become u32.
+        let o_t = NetworkConnectionParams::io(1000, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let t_o = NetworkConnectionParams::io(34, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let req = ForwardOpenRequest::class1(
+            0x1, 0x2, 0x3, 0x4, TimeoutMultiplier::X16, 20_000, o_t, 20_000, t_o,
+            TRANSPORT_CLASS1_TRIGGER, io_connection_path(Some(151), 150, 100), true,
+        );
+        assert_eq!(req.service(), service::LARGE_FORWARD_OPEN);
+        let bytes = req.encode().unwrap();
+        // O→T RPI at byte 22, then a 4-byte NCP (large), T→O RPI, 4-byte NCP.
+        assert_eq!(&bytes[22..26], &20_000u32.to_le_bytes());
+        assert_eq!(&bytes[26..30], &o_t.encode_u32().to_le_bytes());
+        assert_eq!(&bytes[30..34], &20_000u32.to_le_bytes());
+        assert_eq!(&bytes[34..38], &t_o.encode_u32().to_le_bytes());
+        // trigger + path-words follow the wider params.
+        assert_eq!(bytes[38], TRANSPORT_CLASS1_TRIGGER);
+        assert_eq!(bytes[39], 4);
+    }
+
+    #[test]
+    fn connection_manager_path_is_canonical() {
+        assert_eq!(connection_manager_path().encode().unwrap().as_ref(), &[0x20, 0x06, 0x24, 0x01]);
     }
 
     #[test]

@@ -11,8 +11,10 @@
 //! correctness claims are proven deterministically without any embedded server.
 
 pub mod connected;
+pub mod io_service;
 pub mod session;
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,6 +148,9 @@ pub struct ClientStats {
 pub struct EipClient {
     tx: tokio::sync::mpsc::Sender<SessionCommand>,
     inner: Arc<Inner>,
+    /// The TCP peer address, captured at [`EipClient::connect`]. Used by the class-1 I/O layer as the
+    /// default O→T transmit target (§8.2); `None` for an injected byte-stream fixture.
+    pub(crate) peer_addr: Option<SocketAddr>,
 }
 
 impl EipClient {
@@ -164,7 +169,10 @@ impl EipClient {
             Err(_elapsed) => return Err(EnipError::Timeout { op: "connect" }),
         };
         stream.set_nodelay(true).ok();
-        Self::connect_over(stream, opts).await
+        let peer_addr = stream.peer_addr().ok();
+        let mut client = Self::connect_over(stream, opts).await?;
+        client.peer_addr = peer_addr;
+        Ok(client)
     }
 
     /// Register a session over an already-connected byte stream and spawn the session actor. This is
@@ -225,6 +233,7 @@ impl EipClient {
                 stats: stats.clone(),
                 connected: None,
             }),
+            peer_addr: None,
         };
 
         let connected = if opts.connected_messaging {
@@ -242,6 +251,7 @@ impl EipClient {
                 stats,
                 connected,
             }),
+            peer_addr: None,
         })
     }
 
