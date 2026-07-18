@@ -1,50 +1,40 @@
-[package]
-name = "ethernet-ip-adapter"
+# EtherNet/IP adapter — Cargo workspace (D-EIP-17 / PROTOCOL-DESIGN §3.1).
+#
+# Two members, mirroring the `core/cli` convention:
+#   crates/enip                 the OWNED pure-Rust EtherNet/IP + CIP protocol library
+#                               (package `ec-enip`, lib `enip`) — knows NOTHING about EdgeCommons.
+#   crates/ethernet-ip-adapter  the adapter binary — the edgecommons component that consumes the
+#                               protocol crate through its `device.rs` seam (from slice S3).
+#
+# Build artifacts land in the workspace `target/` at this root, so the Dockerfile / build.sh /
+# supervisor paths keep working with the build-context adjustments in DESIGN.md §13. CI runs
+# `cargo test` / `cargo llvm-cov` workspace-wide — the protocol crate is inside the 90% gate.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "1.0.0"
 edition = "2021"
 # Matches the edgecommons library's MSRV (edition-2024 crate).
 rust-version = "1.85"
 license = "BUSL-1.1"
-description = "Rust reference southbound EtherNet/IP adapter (Allen-Bradley CIP tag read/write) for the EdgeCommons ecosystem."
-publish = false
 
-[[bin]]
-name = "ethernet-ip-adapter"
-path = "src/main.rs"
-
-# Runtime selection mirrors the edgecommons library:
-#   - `standalone` (default): dual-broker MQTT — runs on a laptop/container, no C
-#     toolchain. Use this for `cargo run` / `cargo test` during development.
-#   - `greengrass`: Greengrass IPC — the on-device build. Linux-only (the SDK is a
-#     C-FFI crate needing libclang). `build.sh` builds the artifact with this feature.
-[features]
-default = ["standalone"]
-standalone = ["edgecommons/standalone"]
-greengrass = ["edgecommons/greengrass"]
-# Direct CloudWatch metric target (AWS SDK PutMetricData); combine with `greengrass`.
-cloudwatch = ["edgecommons/cloudwatch"]
-
-[dependencies]
-# edgecommons Rust library. The dependency form is chosen by `--dep-source` at generation:
-#   local    -> path = "<abs path to libs/rust>"   (a monorepo checkout; the dev default)
-#   registry -> git = "https://github.com/edgecommons/edgecommons", tag = "rust-lib/vX.Y.Z"
-#
-# `local` IS this template's local-dev override: a Cargo path dependency resolves straight from
-# the sibling checkout's current source, so a freshly generated component needs no extra override
-# step. `registry` pins the published tag. Move between them later with
-# `edgecommons component upgrade --to <version>`.
+# Shared dependency versions. Members opt in with `<dep> = { workspace = true, features = [...] }`,
+# so a version bump happens once, here. The enip protocol-crate deps (tokio-util/bytes/rand) are
+# seeded so P1 references them by `{ workspace = true }` without re-pinning.
+[workspace.dependencies]
+# edgecommons Rust library — pinned by git rev. The gitignored `.cargo/config.toml` patches this to
+# the local sibling checkout for dev; CI builds the pinned rev. The `enip` crate never depends on it.
 edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "91d93d8bca6400615db6f64f6120efc55fc75a1a", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
-serde_json = "1"
-tracing = "0.1"
-anyhow = "1"
-async-trait = "0.1"
+tokio = { version = "1" }
+tokio-util = { version = "0.7" }
+bytes = { version = "1" }
 serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-# EtherNet/IP + CIP explicit-messaging client (D-EIP-1): pure Rust, async/Tokio, builds natively on
-# Windows/MSVC and Linux with zero C deps. Used by the `eip/` backend (added in slice S3); the `sim`
-# backend needs no protocol crate.
-rseip = "0.3"
-
-[dev-dependencies]
-tempfile = "3"
+serde_json = { version = "1" }
+tracing = { version = "0.1" }
+anyhow = { version = "1" }
+async-trait = { version = "0.1" }
+thiserror = { version = "2" }
+rand = { version = "0.8" }
+tempfile = { version = "3" }

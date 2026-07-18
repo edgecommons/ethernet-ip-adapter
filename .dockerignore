@@ -1,0 +1,11 @@
+# Keep the build context small and reproducible.
+#
+# The image build resolves `edgecommons` from the pinned git rev (needs network + git auth), NOT
+# the local sibling override — so the gitignored `.cargo/config.toml` patch must never enter the
+# context, or the build would try to read a host path that does not exist in the image.
+.cargo/
+target/
+greengrass-build/
+logs/
+*.metric.log
+.git/

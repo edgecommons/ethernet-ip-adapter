@@ -13,9 +13,9 @@ an OPC UA node without knowing either protocol.
 ## Run it
 
 ```bash
-cargo run -- \
-  --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
-  -c FILE ./test-configs/config.json \
+cargo run -p ethernet-ip-adapter -- \
+  --platform HOST --transport MQTT ./crates/ethernet-ip-adapter/test-configs/standalone-messaging.json \
+  -c FILE ./crates/ethernet-ip-adapter/test-configs/config.json \
   -t my-thing
 ```
 

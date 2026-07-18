@@ -29,12 +29,15 @@ TARGET="${EDGECOMMONS_TARGET:-}"
 # Honor CARGO_TARGET_DIR if the caller set one (else cargo's default ./target).
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
+# `-p ethernet-ip-adapter` selects the adapter crate in the workspace (D-EIP-17); without it the
+# per-package feature flags are not valid at the virtual-workspace root. The binary lands in the
+# shared workspace target/ regardless.
 echo "Building ${BIN_NAME} (release, features=${FEATURES})${TARGET:+ for ${TARGET}}..."
 if [[ -n "${TARGET}" ]]; then
-  cargo build --release --no-default-features --features "${FEATURES}" --target "${TARGET}"
+  cargo build --release -p ethernet-ip-adapter --no-default-features --features "${FEATURES}" --target "${TARGET}"
   BIN_DIR="${TARGET_DIR}/${TARGET}/release"
 else
-  cargo build --release --no-default-features --features "${FEATURES}"
+  cargo build --release -p ethernet-ip-adapter --no-default-features --features "${FEATURES}"
   BIN_DIR="${TARGET_DIR}/release"
 fi
 

@@ -1,0 +1,42 @@
+[package]
+name = "ethernet-ip-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust reference southbound EtherNet/IP adapter (Allen-Bradley CIP tag read/write) for the EdgeCommons ecosystem."
+publish = false
+
+[[bin]]
+name = "ethernet-ip-adapter"
+path = "src/main.rs"
+
+# Runtime selection mirrors the edgecommons library:
+#   - `standalone` (default): dual-broker MQTT — runs on a laptop/container, no C
+#     toolchain. Use this for `cargo run` / `cargo test` during development.
+#   - `greengrass`: Greengrass IPC — the on-device build. Linux-only (the SDK is a
+#     C-FFI crate needing libclang). `build.sh` builds the artifact with this feature.
+[features]
+default = ["standalone"]
+standalone = ["edgecommons/standalone"]
+greengrass = ["edgecommons/greengrass"]
+# Direct CloudWatch metric target (AWS SDK PutMetricData); combine with `greengrass`.
+cloudwatch = ["edgecommons/cloudwatch"]
+
+[dependencies]
+# The edgecommons Rust library (pinned rev + features via the workspace). The `.cargo/config.toml`
+# path override redirects it to the local sibling checkout for dev; CI uses the pinned rev.
+edgecommons = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# S3: ec-enip = { path = "../enip" } — the owned pure-Rust protocol crate (PROTOCOL-DESIGN). The
+# eip/ backend consumes it through the device.rs seam in slice S3; added then so it is never an
+# unused dependency before there is a caller.
+
+[dev-dependencies]
+tempfile = { workspace = true }

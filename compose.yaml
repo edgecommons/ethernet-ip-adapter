@@ -33,7 +33,7 @@ services:
   ethernet-ip-adapter:
     build:
       context: .
-      dockerfile: Dockerfile          # multi-stage: cargo build --release --bin ethernet-ip-adapter
+      dockerfile: Dockerfile          # multi-stage: cargo build --release -p ethernet-ip-adapter (workspace)
       # The cargo git dep on the private edgecommons repo needs credentials at build time; pass a
       # token through if your dep source is a git URL:
       #   args:
@@ -57,16 +57,16 @@ services:
       - "-t"
       - "${THING_NAME:-ethernet-ip-adapter-dev}"
     volumes:
-      # The component config source (-c FILE ...). Edit test-configs/ on the host and restart.
-      - ./test-configs:/etc/edgecommons/test-configs:ro
+      # The component config source (-c FILE ...). Edit the crate's test-configs/ and restart.
+      - ./crates/ethernet-ip-adapter/test-configs:/etc/edgecommons/test-configs:ro
     configs:
       - source: messaging
         target: /etc/edgecommons/messaging.json
     restart: unless-stopped
 
 configs:
-  # The --transport MQTT messaging config. test-configs/standalone-messaging.json is the same thing
-  # for a bare `cargo run` on your workstation (host: localhost); this inline copy points at the
+  # The --transport MQTT messaging config. crates/ethernet-ip-adapter/test-configs/standalone-messaging.json
+  # is the same thing for a bare `cargo run` on your workstation (host: localhost); this inline copy points at the
   # `emqx` service on the compose network instead.
   messaging:
     content: |

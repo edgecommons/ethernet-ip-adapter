@@ -19,14 +19,19 @@ agent tool. It is imported here in full:
   `cargo test` uses your working copy. CI keeps the pinned `rev` in `Cargo.toml`. Do NOT edit
   `.cargo/config.toml` or the `edgecommons` pin as part of feature work.
 - **The `greengrass` feature is Linux-only** (the IPC SDK). Ordinary `cargo build` / `cargo test` /
-  `cargo clippy` use the default `standalone` feature and run on Windows. `rseip` is pure Rust and
-  builds natively on Windows/MSVC — no C toolchain needed.
-- **Run the sim locally:**
+  `cargo clippy` use the default `standalone` feature and run on Windows. The owned `crates/enip`
+  protocol crate is pure Rust and builds natively on Windows/MSVC — no C toolchain needed.
+- **This is a Cargo workspace** (D-EIP-17): `crates/enip` (the `ec-enip` protocol library) +
+  `crates/ethernet-ip-adapter` (this binary). Use `--workspace` for builds/tests and
+  `-p ethernet-ip-adapter` to run the binary.
+- **Run the sim locally** (from the workspace root):
   ```bash
-  cargo run -- --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
-    -c FILE ./test-configs/config.json -t my-thing
+  cargo run -p ethernet-ip-adapter -- --platform HOST --transport MQTT \
+    ./crates/ethernet-ip-adapter/test-configs/standalone-messaging.json \
+    -c FILE ./crates/ethernet-ip-adapter/test-configs/config.json -t my-thing
   ```
-- **Coverage gate**: 90% line, Linux-authoritative (Windows undercounts Rust statements). Exclude
-  only `src/eip/client.rs` (the raw rseip call seam) and `tests/live_cpppo.rs` (sim-gated).
+- **Coverage gate**: 90% line, **workspace-wide**, Linux-authoritative (Windows undercounts Rust
+  statements). The protocol crate is inside the gate (D-EIP-17); only live-hardware suites
+  (sim-gated) are excluded.
 - Always unsubscribe / handle SIGTERM before exit (RAII on the `EdgeCommons` runtime handles it) so a
   run does not leak subscriptions and trip the shared-connection quota.

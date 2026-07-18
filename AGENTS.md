@@ -27,9 +27,12 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
 
 ## Key design choices (see DESIGN.md for rationale)
 
-- **Protocol client = `rseip` 0.3** (pure Rust, async/Tokio — builds natively on Windows/MSVC and
-  Linux with zero C deps). Explicit messaging only; implicit class-1 I/O is **not** supported — the
-  update model is scheduled polling (D-EIP-1/2).
+- **Protocol stack = the OWNED pure-Rust `crates/enip` crate** (package `ec-enip`, lib `enip`;
+  `PROTOCOL-DESIGN.md`) — async/Tokio, `#![forbid(unsafe_code)]`, zero C deps, builds natively on
+  Windows/MSVC and Linux. No external protocol library. It knows nothing about EdgeCommons; the
+  adapter consumes it only through the `src/device.rs` seam (D-EIP-1/17). Both update models exist:
+  `mode: "poll"` (scheduled explicit-messaging polling, the default) and `mode: "push"` (class-1
+  implicit I/O), per instance (D-EIP-2).
 - **Config lives entirely under `component.*`** (canonical-schema rule, no top-level block, no schema
   sync). `component.global` (defaults/timeouts/healthThresholds/metricsIntervalSecs) +
   `component.instances[]` (device → poll groups → signals). `#[serde(deny_unknown_fields)]`
@@ -57,8 +60,9 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
   `Dockerfile` + `k8s/`, `test-configs/`. The Greengrass **component** name stays PascalCase
   (`…EthernetIpAdapter`); the crate/bin/artifact and the UNS token are kebab (`ethernet-ip-adapter`).
 - CI: one caller → `edgecommons/.github/.github/workflows/component-ci.yml@main` (`language: RUST`,
-  `secrets: inherit`) + in-repo 90% gate (`cargo llvm-cov --fail-under-lines 90`), excluding the raw
-  `eip/client.rs` rseip seam and the sim-gated live suite.
+  `secrets: inherit`) + in-repo 90% gate (`cargo llvm-cov --fail-under-lines 90`), **workspace-wide**
+  — the owned `crates/enip` protocol crate is inside the coverage gate, not carved out (D-EIP-17).
+  Live hardware paths (the sim-gated live suite) are the only exclusion.
 - Docs: Diátaxis `.md`, no frontmatter, synced to the site — current behavior only, present tense.
 
 ## Registry

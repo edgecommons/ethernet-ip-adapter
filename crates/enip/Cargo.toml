@@ -1,0 +1,35 @@
+[package]
+name = "ec-enip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Owned, pure-Rust EtherNet/IP + CIP protocol stack (explicit messaging + class-1 I/O). No EdgeCommons dependency — protocol only."
+# Consumed by the adapter as a path dependency; not a published crate.
+publish = false
+
+[lib]
+name = "enip"
+
+[features]
+# The in-crate mock target (PROTOCOL-DESIGN §12.5) — off by default, enabled by tests and by the
+# adapter's push-validation fallback. P1 adds its dependencies and body.
+testserver = []
+
+# Dependencies are added as P1 fills the module tree, drawn from the PROTOCOL-DESIGN §1 budget
+# (tokio, tokio-util, bytes, thiserror, tracing, rand — all seeded in the workspace). The S1
+# skeleton is empty modules, so it needs none yet.
+[dependencies]
+
+# Safety lints for the whole crate (PROTOCOL-DESIGN §4 / D-ENIP-2/3). P1 inherits these: every
+# decoder is bounds-checked, no unchecked indexing or wrapping arithmetic on wire-supplied numbers,
+# no unwrap/expect in library code (test modules may `allow` locally). `unsafe_code = "forbid"`
+# doubles the crate-root `#![forbid(unsafe_code)]` so no module can opt back in.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unwrap_used = "deny"
+expect_used = "deny"

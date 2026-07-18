@@ -7,10 +7,11 @@
 //! all resources (RAII).
 //!
 //! ## Running locally (HOST platform, MQTT transport, against a local MQTT broker)
+//! From the workspace root (`-p` selects this binary; the config paths are relative to it):
 //! ```bash
-//! cargo run -- \
-//!   --platform HOST --transport MQTT ./test-configs/standalone-messaging.json \
-//!   -c FILE ./test-configs/config.json \
+//! cargo run -p ethernet-ip-adapter -- \
+//!   --platform HOST --transport MQTT ./crates/ethernet-ip-adapter/test-configs/standalone-messaging.json \
+//!   -c FILE ./crates/ethernet-ip-adapter/test-configs/config.json \
 //!   -t my-thing
 //! ```
 

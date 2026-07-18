@@ -388,8 +388,9 @@ async fn run_device(
 ) {
     let backend: Box<dyn DeviceBackend> = match cfg.adapter.as_str() {
         "sim" => Box::new(SimBackend),
-        // SLICE S3: the real rseip-backed `EipBackend` lands in slice S3. Until then the simulator
-        // stands in for `ethernet-ip` so a bare deploy runs end-to-end without a PLC.
+        // SLICE S3: the real `EipBackend` (built on the owned `enip` protocol crate) lands in slice
+        // S3. Until then the simulator stands in for `ethernet-ip` so a bare deploy runs end-to-end
+        // without a PLC.
         "ethernet-ip" => Box::new(SimBackend),
         other => {
             tracing::error!(instance = %cfg.id, adapter = %other, "unknown adapter");

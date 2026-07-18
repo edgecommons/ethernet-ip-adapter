@@ -24,12 +24,13 @@ RUN apt-get update \
 
 WORKDIR /build
 
-# Copy the crate manifest (+ lockfile if present) and sources, then build the release binary.
-COPY Cargo.toml ./
-COPY Cargo.lock* ./
-COPY src ./src
+# Copy the workspace manifest + lockfile and every member crate, then build the adapter binary from
+# the workspace root (D-EIP-17). `-p` selects the binary; the `enip` protocol crate builds with it
+# once the S3 dependency lands.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 
-RUN cargo build --release --bin ethernet-ip-adapter
+RUN cargo build --release -p ethernet-ip-adapter
 
 # ---- stage 2: runtime -----------------------------------------------------------------------
 # debian:bookworm-slim has glibc (the binary is glibc-linked) and is small.
