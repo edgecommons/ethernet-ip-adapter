@@ -12,7 +12,9 @@
 # `image:` in k8s/deployment.yaml.
 
 # ---- stage 1: build -------------------------------------------------------------------------
-FROM rust:1.85-slim AS build
+# The build toolchain must be recent enough for the committed Cargo.lock: the resolved transitive
+# dependency tree (e.g. time 0.3.x, icu 2.x via the edgecommons crate) requires rustc >= 1.88.
+FROM rust:1.88-slim AS build
 
 # Resolve the private edgecommons git dependency using the system git (honours GITHUB_TOKEN / SSH).
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true

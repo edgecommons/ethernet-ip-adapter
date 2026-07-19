@@ -54,6 +54,13 @@ services:
     build: ./test-infra/opener
     container_name: ethernet-ip-adapter-enip-io-sim
     command: ["eth0"]
+    # test-configs/config-opener.json targets the OpENer sample under the host name `opener-sim`
+    # (the same name the standalone `docker run --name opener-sim` convention in the Dockerfile /
+    # DESIGN §11.5 uses). Expose that alias so the push E2E resolves it on the compose network.
+    networks:
+      default:
+        aliases:
+          - opener-sim
     restart: unless-stopped
 
   # libplctag ab_server — a SECOND, INDEPENDENT Logix poll target (DESIGN §11.6). Built from
