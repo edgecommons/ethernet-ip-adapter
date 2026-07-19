@@ -20,8 +20,27 @@ use tokio::task::JoinHandle;
 
 use crate::config::{IoConfig, IoFieldSpec, Timeouts};
 use crate::device::{
-    ConnectionConfig, DeviceError, InputSnapshot, IoUpdate, PushSession, Quality, Reading, Result,
+    ConnectionConfig, DeviceError, InputSnapshot, IoLinkStats, IoUpdate, PushSession, Quality,
+    Reading, Result,
 };
+
+/// The class-1 connection's live counters, shared between the translator task (which refreshes it
+/// from the `enip` connection handle on every event) and [`PushSession::io_stats`] (which reads it
+/// for the periodic `EtherNetIpIo` metric emit). Reset to zero on a lost link (the handle's counters
+/// belong to one ForwardOpen).
+type SharedStats = Arc<Mutex<IoLinkStats>>;
+
+/// Map the protocol stack's per-connection counters into the protocol-agnostic seam struct.
+fn map_io_stats(s: enip::IoStats) -> IoLinkStats {
+    IoLinkStats {
+        frames_produced: s.frames_produced,
+        stale_frames: s.stale_frames,
+        size_mismatch: s.size_mismatch,
+        sequence_gaps: s.sequence_gaps,
+        malformed_frames: s.malformed_frames,
+        produce_overruns: s.produce_overruns,
+    }
+}
 
 /// The most-recent decoded input frame, shared between the translator task (which writes it on every
 /// accepted frame) and the session handle's [`PushSession::last_input`] (which reads it for push
@@ -116,6 +135,9 @@ pub struct EipPushSession {
     /// The most-recent decoded input frame (§7.2), written by the translator task; the source push
     /// `sb/read` answers from.
     snapshot: SharedSnapshot,
+    /// The class-1 connection's live drop/produce counters (§8.8), refreshed by the translator task;
+    /// read by [`PushSession::io_stats`] for the periodic `EtherNetIpIo` emit.
+    stats: SharedStats,
 }
 
 impl EipPushSession {
@@ -205,6 +227,7 @@ impl EipPushSession {
         let (updates_tx, updates_rx) = mpsc::channel(16);
         let (control_tx, control_rx) = mpsc::channel(8);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
+        let stats: SharedStats = Arc::new(Mutex::new(IoLinkStats::default()));
         let task = tokio::spawn(run_translator(
             handle,
             client,
@@ -215,6 +238,7 @@ impl EipPushSession {
             updates_tx,
             control_rx,
             Arc::clone(&snapshot),
+            Arc::clone(&stats),
         ));
 
         Ok(Self {
@@ -225,6 +249,7 @@ impl EipPushSession {
             out_fields,
             out_buf: vec![0u8; out_size],
             snapshot,
+            stats,
         })
     }
 }
@@ -242,8 +267,14 @@ async fn run_translator(
     updates_tx: mpsc::Sender<IoUpdate>,
     mut control_rx: mpsc::Receiver<PushControl>,
     snapshot: SharedSnapshot,
+    stats: SharedStats,
 ) {
     'task: loop {
+        // Refresh the shared counters from the live connection handle (§8.8). The handle's counters
+        // are updated by the I/O manager task; reading them here on every wakeup keeps the metric
+        // emit's `EtherNetIpIo` drop/produce measures fresh (frames arrive at the RPI cadence).
+        *stats.lock().unwrap() = map_io_stats(handle.stats());
+
         let mut do_output: Option<Vec<u8>> = None;
         let mut do_close: Option<oneshot::Sender<()>> = None;
 
@@ -344,6 +375,10 @@ impl PushSession for EipPushSession {
 
     fn last_input(&self) -> Option<InputSnapshot> {
         self.snapshot.lock().unwrap().clone()
+    }
+
+    fn io_stats(&self) -> Option<IoLinkStats> {
+        Some(*self.stats.lock().unwrap())
     }
 
     async fn set_output(&mut self, field: &IoFieldSpec, value: &serde_json::Value) -> Result<()> {

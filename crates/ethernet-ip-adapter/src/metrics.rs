@@ -401,6 +401,14 @@ struct IoCounters {
     run_mode: bool,
     last_seq: Option<u16>,
     last_frame_at: Option<Instant>,
+    /// Last absolute values read from the class-1 stack counters (§8.8), so a cumulative snapshot is
+    /// folded into the Total/Interval pairs as a delta. Reset on a lost link (counters belong to one
+    /// ForwardOpen), so a fresh connection's counts accrue from 0.
+    last_stats_frames_produced: u64,
+    last_stats_stale: u64,
+    last_stats_size_mismatch: u64,
+    last_stats_malformed: u64,
+    last_stats_produce_overruns: u64,
     /// Negotiated APIs from the ForwardOpen reply (ms), surfaced by `sb/status` (§7.1).
     o2t_api_ms: u32,
     t2o_api_ms: u32,
@@ -775,6 +783,26 @@ impl DeviceMetrics {
         io.last_frame_at = Some(received_at);
     }
 
+    /// Fold a cumulative class-1 stack-counter snapshot (§8.8) into the `EtherNetIpIo` drop/produce
+    /// pairs. The snapshot is cumulative-since-ForwardOpen, so we add the delta against the last read;
+    /// a decrease (a reconnect reset the stack counters) folds the new absolute value in from 0. This
+    /// is what makes `framesProduced` / `staleFramesDropped` / `sizeMismatchDropped` / `malformedFrames`
+    /// / `produceOverruns` read REAL values (the S5-flagged gap), rather than 0.
+    pub fn record_io_stats(&self, s: crate::device::IoLinkStats) {
+        fn feed(pair: &mut Pair, last: &mut u64, cur: u64) {
+            let delta = if cur >= *last { cur - *last } else { cur };
+            pair.add(delta as f64);
+            *last = cur;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let io = &mut inner.io;
+        feed(&mut io.frames_produced, &mut io.last_stats_frames_produced, s.frames_produced);
+        feed(&mut io.stale_frames_dropped, &mut io.last_stats_stale, s.stale_frames);
+        feed(&mut io.size_mismatch_dropped, &mut io.last_stats_size_mismatch, s.size_mismatch);
+        feed(&mut io.malformed_frames, &mut io.last_stats_malformed, s.malformed_frames);
+        feed(&mut io.produce_overruns, &mut io.last_stats_produce_overruns, s.produce_overruns);
+    }
+
     /// The class-1 connection was lost (watchdog / peer close, §8.8): a watchdog expiry is an
     /// `ioTimeouts` event.
     pub fn on_io_lost(&self) {
@@ -783,6 +811,13 @@ impl DeviceMetrics {
         inner.io.io_timeouts.add(1.0);
         inner.io.last_seq = None;
         inner.io.last_frame_at = None;
+        // The next connection's stack counters restart at 0; drop our deltas' baselines so they fold
+        // in from 0 rather than going negative.
+        inner.io.last_stats_frames_produced = 0;
+        inner.io.last_stats_stale = 0;
+        inner.io.last_stats_size_mismatch = 0;
+        inner.io.last_stats_malformed = 0;
+        inner.io.last_stats_produce_overruns = 0;
     }
 
     // ---- definition + emission ----
@@ -1226,6 +1261,72 @@ mod tests {
         assert_eq!(cycles_interval.len(), 2, "the (fast,success) row emitted twice");
         assert!(cycles_interval.contains(&1.0), "first emit reports the interval");
         assert!(cycles_interval.contains(&0.0), "second emit's interval reset while total stayed 1");
+    }
+
+    /// The class-1 stack counters fold into `EtherNetIpIo` as deltas of a cumulative snapshot, and a
+    /// lost link re-bases them so a reconnect's counts accrue from 0 (the S5-flagged real-stats gap).
+    #[tokio::test]
+    async fn io_stack_stats_fold_into_ethernetip_io_as_deltas() {
+        use crate::device::IoLinkStats;
+        let (svc, m) = dm(push_device());
+
+        // First cumulative snapshot after a ForwardOpen.
+        m.record_io_stats(IoLinkStats {
+            frames_produced: 10,
+            stale_frames: 2,
+            size_mismatch: 1,
+            malformed_frames: 0,
+            produce_overruns: 3,
+            sequence_gaps: 9, // sequenceGaps is fed from frame deltas, not this path — must not double-count
+        });
+        m.emit_io(false).await;
+        // A second snapshot: counters advanced (cumulative).
+        m.record_io_stats(IoLinkStats {
+            frames_produced: 25,
+            stale_frames: 2,
+            size_mismatch: 4,
+            malformed_frames: 1,
+            produce_overruns: 3,
+            sequence_gaps: 20,
+        });
+        m.emit_io(false).await;
+
+        // Snapshot the two IO emits as owned maps (drop the guard before any further await).
+        let io_emits: Vec<HashMap<String, f64>> = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted.iter().filter(|(n, _)| n == IO).map(|(_, v)| v.clone()).collect()
+        };
+        assert_eq!(io_emits.len(), 2, "two EtherNetIpIo emits");
+
+        // First emit: totals reflect the first snapshot's absolute values.
+        assert_eq!(io_emits[0]["framesProducedTotal"], 10.0);
+        assert_eq!(io_emits[0]["framesProducedInterval"], 10.0);
+        assert_eq!(io_emits[0]["produceOverrunsTotal"], 3.0);
+
+        // Second emit: Total is the new absolute (delta added); Interval is just the delta.
+        assert_eq!(io_emits[1]["framesProducedTotal"], 25.0, "10 + (25-10)");
+        assert_eq!(io_emits[1]["framesProducedInterval"], 15.0, "delta only");
+        assert_eq!(io_emits[1]["sizeMismatchDroppedTotal"], 4.0);
+        assert_eq!(io_emits[1]["sizeMismatchDroppedInterval"], 3.0);
+        assert_eq!(io_emits[1]["malformedFramesInterval"], 1.0);
+        assert_eq!(io_emits[1]["staleFramesDroppedInterval"], 0.0, "unchanged since last read");
+        assert_eq!(io_emits[1]["produceOverrunsInterval"], 0.0, "unchanged");
+
+        // sequenceGaps on the IO family is fed from frame deltas (record_frame_consumed), NOT the
+        // stats path — record_io_stats must not touch it, so it stays 0 here.
+        assert_eq!(io_emits[1]["sequenceGapsTotal"], 0.0, "record_io_stats does not feed sequenceGaps");
+
+        // A lost link rebases the deltas: after on_io_lost, a fresh connection's cumulative snapshot
+        // (restarting at low numbers) folds in from 0 rather than going negative.
+        m.on_io_lost();
+        m.record_io_stats(IoLinkStats { frames_produced: 5, ..Default::default() });
+        m.emit_io(false).await;
+        let last = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted.iter().rev().find(|(n, _)| n == IO).map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(last["framesProducedInterval"], 5.0, "reconnect counts fold in from 0");
+        assert_eq!(last["framesProducedTotal"], 30.0, "total stays monotonic across the reconnect");
     }
 
     #[tokio::test]

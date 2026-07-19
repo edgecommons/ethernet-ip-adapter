@@ -251,6 +251,28 @@ pub struct InputSnapshot {
     pub run_mode: bool,
 }
 
+/// A snapshot of the class-1 connection's live drop/produce counters (§8.8), surfaced from the
+/// protocol stack's per-connection counters through the seam so the adapter's `EtherNetIpIo` measures
+/// read REAL values, not 0 (the S5-flagged gap). The seam stays protocol-agnostic: the backend maps
+/// `enip::IoStats` into this struct; nothing above the seam sees the `enip` crate. All fields are
+/// **cumulative since the current ForwardOpen** (they reset when a lost link re-establishes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoLinkStats {
+    /// O→T frames produced onto the wire (data or heartbeat) — `framesProduced` (§8.8).
+    pub frames_produced: u64,
+    /// T→O frames dropped as duplicate / stale / reordered by the signed-window rule —
+    /// `staleFramesDropped` (§8.8).
+    pub stale_frames: u64,
+    /// T→O frames dropped for a size mismatch (or a runt frame) — `sizeMismatchDropped` (§8.8).
+    pub size_mismatch: u64,
+    /// Sum of forward sequence gaps observed (missed frames) — `sequenceGaps` (§8.8).
+    pub sequence_gaps: u64,
+    /// Datagrams dropped as malformed CPF (socket-wide) — `malformedFrames` (§8.8).
+    pub malformed_frames: u64,
+    /// Produce ticks skipped because a prior tick had not been serviced — `produceOverruns` (§8.8).
+    pub produce_overruns: u64,
+}
+
 /// A live **push** (class-1 implicit I/O) session to one device. **This is the trait a push backend
 /// implements** (§3.3). The engine owns the update receiver; the session owns translation from the
 /// transport into seam types.
@@ -277,6 +299,15 @@ pub trait PushSession: Send + Sync {
     // SLICE S6: dispatched by the `sb/write` command handler for push instances.
     #[allow(dead_code)]
     async fn set_output(&mut self, field: &IoFieldSpec, value: &serde_json::Value) -> Result<()>;
+
+    /// A snapshot of the class-1 connection's live drop/produce counters (§8.8), or `None` for a
+    /// backend that has no class-1 counters (e.g. the simulator). Cheap: reads shared atomics, no
+    /// wire I/O. The push engine reads it each metrics interval so `EtherNetIpIo`'s `framesProduced` /
+    /// `staleFramesDropped` / `sizeMismatchDropped` / `malformedFrames` / `produceOverruns` reflect
+    /// the real stack counters (the S5-flagged gap).
+    fn io_stats(&self) -> Option<IoLinkStats> {
+        None
+    }
 
     /// Close the connection (ForwardClose + socket teardown). Must be safe to call twice.
     async fn close(&mut self);

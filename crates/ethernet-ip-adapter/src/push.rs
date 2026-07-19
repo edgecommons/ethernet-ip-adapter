@@ -248,6 +248,12 @@ pub(crate) async fn consume_push(
                 engine.count_stale(fields.keys().map(String::as_str), stale_secs, now)
             };
             health.stale_signals.store(stale, Ordering::Relaxed);
+            // Fold the class-1 stack's live drop/produce counters into EtherNetIpIo before the emit,
+            // so framesProduced / staleFramesDropped / sizeMismatchDropped / malformedFrames /
+            // produceOverruns read REAL values (§8.8, the S5-flagged gap) rather than 0.
+            if let Some(stats) = session.io_stats() {
+                dm.record_io_stats(stats);
+            }
             // The full §8 family set for this push device (§8.7).
             dm.emit_periodic().await;
             since_health = now;

@@ -24,12 +24,11 @@ impl ForwardOpenService for EipClient {
     /// return the reply's CPF item list — both the Message Router reply and any Sockaddr Info items
     /// the target attaches (§8.2). Routing for an I/O connection lives in the connection path, so the
     /// ForwardOpen itself is sent unwrapped (null address), never inside Unconnected_Send.
-    async fn cm_ucmm(&self, request: MessageRequest) -> Result<Cpf> {
+    async fn cm_ucmm(&self, request: MessageRequest, extra_items: Vec<CpfItem>) -> Result<Cpf> {
         let mr_bytes = request.encode()?;
-        let cpf = Cpf::from_items(vec![
-            CpfItem::null_address(),
-            CpfItem::unconnected_data(mr_bytes),
-        ]);
+        let mut items = vec![CpfItem::null_address(), CpfItem::unconnected_data(mr_bytes)];
+        items.extend(extra_items);
+        let cpf = Cpf::from_items(items);
         let data = encap_data_with_cpf(&cpf)?;
         let frame = self.transaction(Command::SendRRData, data, "forward_open").await?;
         if !frame.header.status.is_ok() {
@@ -38,7 +37,12 @@ impl ForwardOpenService for EipClient {
         let mut r = WireReader::with_context(&frame.data, "sendrrdata reply");
         let _interface_handle = r.u32().map_err(EnipError::Malformed)?;
         let _timeout = r.u16().map_err(EnipError::Malformed)?;
-        Cpf::decode(r.take_rest()).map_err(EnipError::Malformed)
+        // Decode by the CPF item count WITHOUT asserting end-of-buffer: a real target (OpENer) may
+        // append the echoed O→T/T→O Sockaddr Info items to a ForwardOpen *reply* beyond the declared
+        // item count on some paths. Honor the count and ignore any trailing bytes rather than failing
+        // the whole reply (the counted items — the FO reply + any properly-counted sockaddr items —
+        // are all we consume). D-ENIP interop hardening (OpENer live).
+        Cpf::decode_from(&mut r).map_err(EnipError::Malformed)
     }
 
     /// The TCP peer's IP — the default O→T transmit target when the reply carries no O→T sockaddr

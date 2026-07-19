@@ -1120,10 +1120,21 @@ python -m cpppo.server.enip --address 0.0.0.0:44818 -v \
 | `ZONE_TEMPS` | REAL[8] | **array** read → JSON array of 8; array write shape |
 | `FILL_SETPOINT` | REAL | **writable** setpoint (in `writes.allow[]`) — confirmed write + poll-observed readback |
 | `MOTOR_RUN` | DINT (0/1) | writable command-style value (cpppo models BOOL awkwardly; DINT stands in — a real Logix BOOL uses `type: bool`) |
-| `RECIPE` | SSTRING | deliberately UNSUPPORTED type: proves config validation rejects `string` and `sb/browse` marks it `supported: false` |
+| `RECIPE` | SSTRING | deliberately UNSUPPORTED type: proves config validation rejects `string` (the `sb/browse`-marks-it-unsupported check is a real-Logix path — see the browse note below) |
 
 cpppo has no backplane ⇒ config omits `slot` (`PortSegment::default()`); the `slot` path is a
 lab-PLC concern (§12.4).
+
+**Live finding (S7) — tag-list browse is NOT servable by cpppo.** cpppo 3.9.7's `enip.server` does
+not implement the Logix tag-enumeration service (Get Instance Attribute List, `0x55` on the Symbol
+class `0x6B`): its request parser rejects the service at byte 0 and drops the TCP session (server
+status `0x08`). The request `enip` emits is the standard form a real Logix controller answers, so
+this is a cpppo capability gap, not an `enip` bug — and OpENer (a generic adapter with no Logix
+Symbol object) cannot serve it either. **Full `sb/browse` with `RECIPE` marked `supported:false` is
+therefore a real-Logix (lab, §12.4) validation path.** What the live suite proves against cpppo is
+that `enip` emits the well-formed request and surfaces the device's refusal as a *typed* error (the
+adapter's `BROWSE_UNSUPPORTED`), never a panic — the exact generic-CIP-device path
+(`crates/enip/tests/live_cpppo.rs::cpppo_live_tag_browse_is_gracefully_refused`).
 
 ### 11.2 compose.yaml — add the sim services
 
@@ -1167,12 +1178,35 @@ exactly the sibling pattern (Modbus's live-slave gating). Covered live paths —
 readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD; browse
 paging incl. `RECIPE` marked unsupported; reconnect after the sim's TCP drop (kill/restart
 container is manual — the automated test covers timeout-driven transient classification only).
-Push (`live_opener.rs`): ForwardOpen against the §4.6 assemblies; cyclic consume ≥ N frames
-with fields decoding to expected values; output write observed to change the produced O→T frame
-(verified via OpENer's mirrored output where available, else via a scanner-side capture);
-watchdog timeout classification when the container pauses. Both suites excluded from the
-coverage denominator (§12.2). *(The protocol crate's own `duplex`-fixture state-machine tests —
+Push (`live_opener.rs`): ForwardOpen against the OpENer sample assemblies (§11.5); cyclic consume
+≥ N frames with an advancing class-1 sequence; O→T produce observed via OpENer's sample
+output→input **mirror** (`AfterAssemblyDataReceived` copies the consumed output assembly into the
+produced input assembly, so a value we produce reappears in the next consumed frame); watchdog
+`IoEvent::Lost { Timeout }` when the target is silenced. Both suites excluded from the coverage
+denominator (§12.2). *(The protocol crate's own `duplex`-fixture state-machine tests —
 PROTOCOL-DESIGN §12.2 — need no container, are NOT gated, and run everywhere.)*
+
+**Live findings (S7) — two `enip` interop fixes surfaced by OpENer (the first real class-1 target).**
+
+1. **ForwardOpen must advertise the originator's I/O receive endpoint.** `IoManager::forward_open`
+   now appends the O→T (`0x8000`) and T→O (`0x8001`) **Sockaddr Info items** to the ForwardOpen CPF,
+   carrying the scanner's actual UDP receive port. A target defaults its T→O destination to the
+   standard implicit-I/O port `2222`; OpENer takes it from the T→O item's `sin_port` instead. This
+   both matches real-originator behavior and lets the scanner bind an ephemeral port rather than
+   fight the target for `:2222` when scanner and target share a host (`cm_ucmm` gained an
+   `extra_items` parameter; `forward_open` fills it, `close` passes none). OpENer validates incoming
+   O→T by source *IP only* (not port), so the scanner's single ephemeral socket serves both
+   directions.
+2. **The CM/UCMM reply decode tolerates trailing bytes.** OpENer echoes the Sockaddr Info items back
+   on a ForwardOpen *reply* and, on its reject path, leaves the CPF `item_count` at 2 while still
+   appending them. The reply decode now honors the declared item count and ignores trailing bytes
+   (`Cpf::decode_from` in `client/io_service.rs`) instead of asserting end-of-buffer, so a real
+   target's reply is never rejected as malformed. (The strict end-of-buffer `Cpf::decode` is retained
+   for the explicit-messaging reply paths.)
+
+Both fixes are covered by the `enip` unit suite (re-run green) and proven end-to-end against real
+OpENer; the class-1 UDP loop requires host/native networking on Linux (the Docker-Desktop-Windows
+WSL2 UDP NAT breaks the T→O return path — §11.2).
 
 ### 11.4 E2E validation plan (HOST, scripted; the "does it really work" pass)
 
@@ -1216,10 +1250,11 @@ via request/reply:
 **Recommendation: OpENer** (`EIPStackGroup/OpENer`, the ODVA-member OSS EtherNet/IP
 *adapter/target* stack) as the live push target: it is an independent implementation (a genuine
 conformance check, not our own code talking to itself), implements class-1 produced/consumed
-assemblies with the standard demo application (input/output/config assembly instances — the
-§4.6 worked config's `100/150/151` layout; **pin the exact instance ids and sizes from the
-OpENer sample app at S1-push time and update §4.6 if they differ**), and builds trivially on
-Linux. **Flag: there is no widely-published official OpENer container image** — the repo ships
+assemblies with the standard demo application. **Confirmed live (S7)** from the OpENer sample
+(`sample_application/sampleapplication.c`): input (T→O) **100** / output (O→T) **150** / config
+**151**, sizes **32 / 32 / 10** bytes, exclusive-owner (`150→100→151`) — exactly the §4.6 /
+`test-configs/config-opener.json` layout, so no config fork was needed. It builds trivially on
+Linux (`test-infra/opener/Dockerfile`; the only non-obvious dep is `libcap`). **Flag: there is no widely-published official OpENer container image** — the repo ships
 source + CMake, so `test-infra/opener/Dockerfile` (a ~15-line build stage over the sample app)
 is part of this design, not an off-the-shelf pull.
 

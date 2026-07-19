@@ -30,6 +30,32 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # cpppo Allen-Bradley tag server — the POLL live target (DESIGN §11.1/§11.2). Serves the §11.1 tag
+  # layout on TCP 44818. test-configs/config-cpppo.json (adapter: ethernet-ip) points its endpoint here.
+  enip-sim:
+    image: cpppo/cpppo:latest
+    container_name: ethernet-ip-adapter-enip-sim
+    command: >
+      python -m cpppo.server.enip --address 0.0.0.0:44818 -v
+      LINE_SPEED=REAL FILL_TEMP=REAL TANK_LEVEL=REAL PRODUCT_COUNT=DINT
+      FILL_SETPOINT=REAL ZONE_TEMPS=REAL[8] MOTOR_RUN=DINT RECIPE=SSTRING
+    restart: unless-stopped
+
+  # OpENer sample I/O adapter — the PUSH (class-1 implicit I/O) live target (DESIGN §11.5). Built from
+  # test-infra/opener/Dockerfile; serves the exclusive-owner demo assemblies (input 100 / output 150 /
+  # config 151). test-configs/config-opener.json (adapter: ethernet-ip, mode: push) points its endpoint here.
+  #
+  # Class-1 UDP :2222 is bidirectional. On a Linux docker host keep this service and the adapter on the
+  # same compose network so the T→O return path is symmetric; the adapter advertises its receive port
+  # in the ForwardOpen's T→O Sockaddr Info item, so it never fights OpENer for :2222. (On
+  # Docker-Desktop-for-Windows the WSL2 UDP NAT breaks the class-1 return path — run the class-1 leg on
+  # a Linux docker host or natively; the protocol-level live proof is crates/enip/tests/live_opener.rs.)
+  enip-io-sim:
+    build: ./test-infra/opener
+    container_name: ethernet-ip-adapter-enip-io-sim
+    command: ["eth0"]
+    restart: unless-stopped
+
   ethernet-ip-adapter:
     build:
       context: .
@@ -45,6 +71,11 @@ services:
         condition: service_healthy
     # The image ENTRYPOINT is /usr/local/bin/component (the built ethernet-ip-adapter binary); these
     # are the standard runtime CLI args appended to it.
+    #
+    # Default config.json is the hardware-free `sim` backend. For the LIVE poll E2E against the real
+    # cpppo target, swap in test-configs/config-cpppo.json (adapter: ethernet-ip, endpoint enip-sim);
+    # for the LIVE push E2E, config-opener.json (endpoint enip-io-sim). Add the matching sim service to
+    # `depends_on` when you do.
     command:
       - "--platform"
       - "HOST"

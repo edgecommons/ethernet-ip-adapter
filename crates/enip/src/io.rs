@@ -231,6 +231,7 @@ pub enum DropReason {
 #[derive(Debug, Default)]
 struct ConnCounters {
     frames_accepted: AtomicU64,
+    frames_produced: AtomicU64,
     size_mismatch: AtomicU64,
     stale_frames: AtomicU64,
     sequence_gaps: AtomicU64,
@@ -251,6 +252,8 @@ struct ManagerCounters {
 pub struct IoStats {
     /// T→O frames accepted and delivered.
     pub frames_accepted: u64,
+    /// O→T frames produced onto the wire (data or heartbeat) by the produce scheduler (§8.7).
+    pub frames_produced: u64,
     /// Frames dropped for a size mismatch (or a runt frame).
     pub size_mismatch: u64,
     /// Frames dropped as duplicate / stale / reordered by the signed-window rule.
@@ -271,6 +274,7 @@ impl ConnCounters {
     fn snapshot(&self) -> IoStats {
         IoStats {
             frames_accepted: self.frames_accepted.load(Ordering::Relaxed),
+            frames_produced: self.frames_produced.load(Ordering::Relaxed),
             size_mismatch: self.size_mismatch.load(Ordering::Relaxed),
             stale_frames: self.stale_frames.load(Ordering::Relaxed),
             sequence_gaps: self.sequence_gaps.load(Ordering::Relaxed),
@@ -579,6 +583,7 @@ impl IoConnection {
             data,
         };
         let payload = frame.encode(format);
+        self.counters.frames_produced.fetch_add(1, Ordering::Relaxed);
         let seq_addr = SequencedAddress {
             connection_id: self.params.o2t_connection_id,
             encap_sequence: self.encap_seq,
@@ -712,7 +717,14 @@ impl Registry {
 /// [`crate::client::EipClient`], so `io` never imports upward (§3.2).
 pub trait ForwardOpenService {
     /// Send a Connection-Manager `MessageRequest` over UCMM and return the reply CPF item list.
-    fn cm_ucmm(&self, request: MessageRequest) -> impl core::future::Future<Output = Result<Cpf>> + Send;
+    /// `extra_items` are appended to the request CPF after the null-address + unconnected-data pair —
+    /// the class-1 ForwardOpen uses this to carry the O→T / T→O **Sockaddr Info items** (§8.2) that
+    /// tell the target which UDP endpoint the originator receives T→O on (ForwardClose passes none).
+    fn cm_ucmm(
+        &self,
+        request: MessageRequest,
+        extra_items: Vec<CpfItem>,
+    ) -> impl core::future::Future<Output = Result<Cpf>> + Send;
 
     /// The target device's IP, used as the default O→T transmit address when the reply carries no
     /// O→T sockaddr redirect. `None` for a non-socket session (in-memory test fixtures).
@@ -786,7 +798,20 @@ impl IoManager {
 
         let open = build_class1_open(&spec, t2o_connection_id, connection_serial, originator_serial)?;
         let mr = MessageRequest::new(open.service(), connection_manager_path(), open.encode()?);
-        let reply_cpf = session.cm_ucmm(mr).await?;
+        // Advertise the UDP endpoint the originator receives T→O on, and sends O→T from, via the
+        // O→T (0x8000) + T→O (0x8001) Sockaddr Info items (§8.2). Targets take the T→O item's port as
+        // the destination for the frames they produce; without it a target defaults to the standard
+        // implicit-I/O port 2222, which collides with our own socket when scanner and target share a
+        // host. `sin_addr` = 0 (INADDR_ANY): a point-to-point target sends to the TCP-peer IP and
+        // ignores this field, so the connection's IP is used.
+        let recv_port = self.local_addr.port();
+        let sock_o2t = SockAddrInfo::ipv4(0, recv_port).encode();
+        let sock_t2o = SockAddrInfo::ipv4(0, recv_port).encode();
+        let extra_items = vec![
+            CpfItem::new(ItemType::SockAddrOtoT, sock_o2t),
+            CpfItem::new(ItemType::SockAddrTtoO, sock_t2o),
+        ];
+        let reply_cpf = session.cm_ucmm(mr, extra_items).await?;
 
         let data_item = reply_cpf
             .find(ItemType::UnconnectedData)
@@ -941,7 +966,7 @@ impl IoConnectionHandle {
             close.encode()?,
         );
         // Best-effort: the target may already consider the connection dead.
-        let _ = session.cm_ucmm(mr).await;
+        let _ = session.cm_ucmm(mr, Vec::new()).await;
         let _ = self
             .cmd
             .send(ManagerCommand::Remove { connection_id: self.connection_id })
@@ -1348,6 +1373,8 @@ mod tests {
         conn.poll_produce(Instant::now()).unwrap().unwrap();
         assert_eq!(conn.last_produced_sequence(), 2);
         assert_eq!(conn.last_encap_sequence(), 2);
+        // Each produced datagram (data or heartbeat) counts toward frames_produced (§8.7).
+        assert_eq!(conn.stats().frames_produced, 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1376,6 +1403,7 @@ mod tests {
         assert_eq!(conn.stats().produce_overruns, 2);
         // Only one frame was produced despite three periods elapsing.
         assert_eq!(conn.last_encap_sequence(), 1);
+        assert_eq!(conn.stats().frames_produced, 1, "one fire despite two skipped ticks");
     }
 
     // -- forward-open sizing / trigger -------------------------------------
