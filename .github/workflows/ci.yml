@@ -57,8 +57,11 @@ jobs:
     #     (`map_enip_error`), and the codec (`eip/types`) stay in covered files and are unit-tested.
     #   These five are validated by the S7a live cpppo/OpENer integration suites (§11) + the S9 deployed
     #   regression — the analog of how `file-replicator` excludes its `dest/*/client.rs` I/O seams.
-    #   - `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs` — live-sim-gated suites
-    #     (§11.3); they self-skip when their sim port is down.
+    #   - `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs`,
+    #     `crates/enip/tests/live_ab_server.rs`, `crates/enip/tests/live_ethernetipsharp.rs` — the four
+    #     live-sim-gated suites (§11.3): cpppo (poll/tags), OpENer (push/class-1), libplctag ab_server
+    #     (poll/tags via Unconnected_Send route), EthernetIPSharp (poll/tags + browse 0x55). Each
+    #     self-skips when its sim port is down.
     #   - `crates/enip/fuzz/**` — libFuzzer harnesses. They EXERCISE covered product code; they are not
     #     product code (§12.2). (Also a separate workspace, so not even built here — belt-and-suspenders.)
     #   - `crates/ethernet-ip-adapter/src/testutil.rs` — `#[cfg(test)]`-only recording test doubles.
@@ -97,7 +100,7 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: >
           cargo llvm-cov --workspace
-          --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener)\.rs|testutil\.rs|fuzz[/\\])'
+          --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp)\.rs|testutil\.rs|fuzz[/\\])'
           --fail-under-lines 90
           --cobertura --output-path target/cobertura.xml
 

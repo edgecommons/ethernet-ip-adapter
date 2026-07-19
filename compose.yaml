@@ -56,6 +56,29 @@ services:
     command: ["eth0"]
     restart: unless-stopped
 
+  # libplctag ab_server — a SECOND, INDEPENDENT Logix poll target (DESIGN §11.6). Built from
+  # test-infra/ab-server/Dockerfile (the CIP PLC simulator inside libplctag, MPL-2.0). Reached through a
+  # real Unconnected_Send (0x52) route wrapper — the CompactLogix/ControlLogix backplane path cpppo
+  # never exercises. Serves Read/Write Named Tag; it does NOT serve tag-list browse (0x55) — that gap is
+  # closed by enip-sharp below (§11.7). Bare TCP/CIP (no class-1 UDP), so plain port publishing works on
+  # any docker host. Host :44820 to coexist with cpppo (:44818) and OpENer (:44819).
+  enip-ab-server:
+    build: ./test-infra/ab-server
+    container_name: ethernet-ip-adapter-enip-ab-server
+    ports: ["44820:44818"]
+    restart: unless-stopped
+
+  # EthernetIPSharp — a THIRD, INDEPENDENT EtherNet/IP implementation (C#, MIT) run as a Logix server
+  # (DESIGN §11.7). Built from test-infra/ethernetip-sharp/Dockerfile. Its LogixDispatcher/SymbolObject
+  # serves Read/Write Named Tag AND — uniquely among the container sims — the Logix tag-LIST service
+  # Get_Instance_Attribute_List (0x55) on the Symbol class (0x6B), so it CLOSES the sb/browse gap with a
+  # real, non-ours 0x55 implementation. Bare TCP/CIP. Host :44821.
+  enip-sharp:
+    build: ./test-infra/ethernetip-sharp
+    container_name: ethernet-ip-adapter-enip-sharp
+    ports: ["44821:44818"]
+    restart: unless-stopped
+
   ethernet-ip-adapter:
     build:
       context: .

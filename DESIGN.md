@@ -1099,8 +1099,22 @@ unsubscribes and the `STOPPED` state (the org unsubscribe-before-exit rule is sa
 
 ## 11. Simulator & validation
 
-Two live targets, one per mode (D-EIP-6): **cpppo** serves poll (explicit messaging — proven,
-kept); **OpENer** serves push (class-1 implicit I/O — cpppo cannot do it, §11.5).
+**Four** external live targets, three of them independent implementations, spanning both modes
+(D-EIP-6) and — now — the tag-list browse path:
+
+| Target | Mode / paths | Role | §, port |
+|---|---|---|---|
+| **cpppo** (Python) | poll: read/write, direct UCMM | first independent poll peer | §11.1, `:44818` |
+| **OpENer** (C, ODVA) | push: class-1 implicit I/O | independent push peer (cpppo can't) | §11.5, `:44819` |
+| **libplctag `ab_server`** (C) | poll: read/write via Unconnected_Send route | 2nd independent poll peer; the **backplane-routed** path cpppo never exercises | §11.6, `:44820` |
+| **EthernetIPSharp** (C#) | poll: read/write **+ browse `0x55`** | 3rd independent peer; **closes the `sb/browse` gap** with a real Get-Instance-Attribute-List impl | §11.7, `:44821` |
+
+**Browse-gap status: CLOSED (sim-grade).** The tag-list service (Get Instance Attribute List `0x55`
+on the Symbol class `0x6B`) — which cpppo and ab_server both refuse — is served by EthernetIPSharp,
+so `enip::list_tags` now has a genuine on-the-wire validation against an independent implementation
+(§11.7). The **real-Logix** browse path (a physical controller, multi-page enumeration of hundreds of
+tags, `RECIPE`/UDT `supported:false` semantics on real Rockwell symbol types) remains a lab-hardware
+path (§12.4) — sim-grade `0x55` conformance is not plant-grade.
 
 ### 11.1 The cpppo simulator (POLL) — tag layout (the sim contract)
 
@@ -1130,11 +1144,13 @@ not implement the Logix tag-enumeration service (Get Instance Attribute List, `0
 class `0x6B`): its request parser rejects the service at byte 0 and drops the TCP session (server
 status `0x08`). The request `enip` emits is the standard form a real Logix controller answers, so
 this is a cpppo capability gap, not an `enip` bug — and OpENer (a generic adapter with no Logix
-Symbol object) cannot serve it either. **Full `sb/browse` with `RECIPE` marked `supported:false` is
-therefore a real-Logix (lab, §12.4) validation path.** What the live suite proves against cpppo is
-that `enip` emits the well-formed request and surfaces the device's refusal as a *typed* error (the
-adapter's `BROWSE_UNSUPPORTED`), never a panic — the exact generic-CIP-device path
-(`crates/enip/tests/live_cpppo.rs::cpppo_live_tag_browse_is_gracefully_refused`).
+Symbol object) cannot serve it either. What the live suite proves against cpppo is that `enip` emits
+the well-formed request and surfaces the device's refusal as a *typed* error (the adapter's
+`BROWSE_UNSUPPORTED`), never a panic — the exact generic-CIP-device path
+(`crates/enip/tests/live_cpppo.rs::cpppo_live_tag_browse_is_gracefully_refused`). **The positive
+browse path — a real `0x55` reply decoded by `enip::list_tags` — is now served by EthernetIPSharp
+(§11.7); `RECIPE`/UDT `supported:false` semantics on real Rockwell symbol types stay a real-Logix
+(lab, §12.4) path.**
 
 ### 11.2 compose.yaml — add the sim services
 
@@ -1169,22 +1185,34 @@ restart — E2E writes must not assume persistence. **Class-1 note:** the adapte
 locally; compose must run the adapter and `opener-sim` on the same network so the UDP path is
 symmetric (host-mode caveats documented in the compose file).
 
-### 11.3 Sim-gated integration tests (`tests/live_cpppo.rs`, `tests/live_opener.rs`)
+### 11.3 Sim-gated integration tests (four suites)
 
-Self-skipping: a `TcpStream::connect` probe (`127.0.0.1:44818` / `:44819`) with a short timeout
-at suite start; on failure every test returns early with an eprintln "skipped (no sim)" —
-exactly the sibling pattern (Modbus's live-slave gating). Covered live paths — poll
-(`live_cpppo.rs`): connect; scalar/array/DINT reads with exact values seeded via cpppo; write +
-readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD; browse
-paging incl. `RECIPE` marked unsupported; reconnect after the sim's TCP drop (kill/restart
-container is manual — the automated test covers timeout-driven transient classification only).
-Push (`live_opener.rs`): ForwardOpen against the OpENer sample assemblies (§11.5); cyclic consume
-≥ N frames with an advancing class-1 sequence; O→T produce observed via OpENer's sample
-output→input **mirror** (`AfterAssemblyDataReceived` copies the consumed output assembly into the
-produced input assembly, so a value we produce reappears in the next consumed frame); watchdog
-`IoEvent::Lost { Timeout }` when the target is silenced. Both suites excluded from the coverage
-denominator (§12.2). *(The protocol crate's own `duplex`-fixture state-machine tests —
-PROTOCOL-DESIGN §12.2 — need no container, are NOT gated, and run everywhere.)*
+All four self-skip: a `TcpStream::connect` probe with a short timeout at suite start; on failure
+every test returns early with an eprintln "skipped (no sim)" — exactly the sibling pattern (Modbus's
+live-slave gating). Each has its own default port (overridable by env var) so it fires only when its
+own sim is up. Covered live paths:
+
+- **`live_cpppo.rs`** (poll, `:44818`): connect; scalar/array/DINT reads with exact seeded values;
+  write + readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD; and
+  that browse (`0x55`) is *typed-refused* — cpppo does not implement the tag-list service (§11.1), so
+  the client surfaces the refusal as a typed error, never a panic.
+- **`live_opener.rs`** (push, `:44819`): ForwardOpen against the OpENer sample assemblies (§11.5);
+  cyclic consume ≥ N frames with an advancing class-1 sequence; O→T produce observed via OpENer's
+  sample output→input **mirror** (`AfterAssemblyDataReceived` copies the consumed output assembly into
+  the produced input assembly, so a value we produce reappears in the next consumed frame); watchdog
+  `IoEvent::Lost { Timeout }` when the target is silenced.
+- **`live_ab_server.rs`** (poll, `:44820`, §11.6): the same read/write surface as cpppo but reached
+  through a real Unconnected_Send (`0x52`) **route wrapper** (`ClientOptions.route =
+  RoutePath::backplane_slot(0)`) — the backplane path cpppo never exercises; browse is typed-refused
+  (`0x08` — ab_server has no `0x55` service).
+- **`live_ethernetipsharp.rs`** (poll + browse, `:44821`, §11.7): read/write cross-check against a
+  third independent implementation, plus the **browse gap-closer** — a real `0x55`
+  Get-Instance-Attribute-List reply paged to completion and decoded by `enip::list_tags`, asserting
+  the enumerated tags' symbol types (scalars value-supported, the REAL[8] array value-unsupported).
+
+All four are excluded from the coverage denominator (§12.2). *(The protocol crate's own
+`duplex`-fixture state-machine tests — PROTOCOL-DESIGN §12.2 — need no container, are NOT gated, and
+run everywhere.)*
 
 **Live findings (S7) — two `enip` interop fixes surfaced by OpENer (the first real class-1 target).**
 
@@ -1270,6 +1298,72 @@ for a release, that is a **blocking validation gap**, reported as such.
 cpppo has no backplane and OpENer routes directly ⇒ both sim configs omit `slot`; the
 `slot`/backplane path stays a lab-PLC concern (§12.4).
 
+### 11.6 The second independent poll target — libplctag `ab_server` (external container)
+
+**libplctag's `ab_server`** (`libplctag/libplctag`, `src/tools/ab_server`, MPL-2.0) is the CIP PLC
+simulator libplctag tests its own client against — a C implementation independent of both `enip` and
+cpppo, so a genuine *second* poll conformance peer. `test-infra/ab-server/Dockerfile` compiles the
+self-contained POSIX C sources (a single `-I src` for one header; ab_server's own `utils.c` supplies
+the referenced symbol) and runs it as ControlLogix on the backplane path `1,0`, serving the §11.1
+tag layout (ab_server requires an explicit array size on every CIP tag, so scalars are `[1]`).
+
+**What it uniquely adds: the Unconnected_Send route path.** ab_server dispatches read/write only when
+the request arrives wrapped in a real Unconnected_Send (`0x52`) to the Connection Manager (or over a
+connected session); a bare Message-Router request hits its `default` → `0x08`. So the live suite runs
+with `ClientOptions.route = RoutePath::backplane_slot(0)`, and `enip` wraps every read/write in a
+`0x52` with the backplane-slot route — the CompactLogix/ControlLogix path cpppo (direct UCMM) never
+exercises. **Confirmed live (S8):** connect (RegisterSession); scalar REAL / DINT / REAL[8]-array
+reads with exact seeded values; write + read-back of `FILL_SETPOINT`; a nonexistent tag returns a
+typed per-tag CIP error (`0x03`) while a real tag stays GOOD in the same session
+(`crates/enip/tests/live_ab_server.rs::ab_server_live_read_write_routed`).
+
+**Browse: NOT served.** Verified in `cip.c` (the `0x55` case is absent from `cip_dispatch_request`;
+the `CIP_LIST_TAGS` bytes are commented out) and across the repo's full git history: ab_server has
+*never* implemented Get Instance Attribute List. It answers `0x55` with `CIP_ERR_UNSUPPORTED`
+(`0x08`), which `enip` surfaces as a typed refusal
+(`ab_server_live_browse_is_gracefully_refused`) — so **ab_server does not close the browse gap**
+(contrary to a common assumption that it is the libplctag "LIST_TAGS" server); EthernetIPSharp does
+(§11.7).
+
+**Two sim-side spec-conformance patches (S8), applied in the Dockerfile, NOT to `enip`.** ab_server's
+*encapsulation* layer is stricter than the spec (Vol 2 §2-4) in two ways that reject any client which
+stamps a Sender Context — `enip` does, as do most real clients, and cpppo/OpENer both accept it, so
+these are ab_server limitations, not `enip` bugs (`enip`'s RegisterSession is proven against cpppo
+*and* OpENer): (1) RegisterSession rejects a non-zero Sender Context, though the field is opaque and
+merely echoed; (2) ab_server echoes an unassigned `plc->sender_context` (always `0`) instead of the
+request's Sender Context, which `enip`'s reply-correlation (one in-flight request keyed on a
+monotonic context, §10.3) requires. Two one-line `sed` patches in `test-infra/ab-server/Dockerfile`
+make ab_server *more* spec-compliant (accept any context; echo the request's context); its CIP
+read/write/error logic is untouched, so it stays a fully independent peer. **No `enip` change was
+needed** for ab_server.
+
+### 11.7 The independent browse target — EthernetIPSharp (external container)
+
+**EthernetIPSharp** (`CristianMori/EthernetIpSharp`, C#, MIT) is a third, fully independent
+EtherNet/IP implementation whose `LogixDispatcher`/`SymbolObject` serves Read/Write Named Tag AND —
+uniquely among the container sims — the Logix tag-LIST service **Get Instance Attribute List
+(`0x55`) on the Symbol class (`0x6B`)**. It is therefore the peer that **closes the `sb/browse`
+gap**: the first genuine on-the-wire validation of `enip::list_tags` against a real, non-ours `0x55`
+implementation (previously exercised only against `duplex` fixtures). `test-infra/ethernetip-sharp/
+Dockerfile` builds the dependency-free library projects with the .NET 8 SDK and runs a small host
+(`test-infra/ethernetip-sharp/Program.cs`, which overwrites the repo's loopback-only sample host to
+bind `0.0.0.0` and serve the §11.1 tag layout).
+
+**Confirmed live (S8)**, read/write cross-check: scalar REAL / DINT reads with exact host-seeded
+values; REAL[8] array read; write + read-back of `FILL_SETPOINT`; a nonexistent tag returns a typed
+per-tag CIP error (`0x05`) while a real tag stays GOOD
+(`crates/enip/tests/live_ethernetipsharp.rs::sharp_live_read_write`). **Browse (`0x55`), the
+gap-closer:** `enip::list_tags` pages a real Get-Instance-Attribute-List reply to completion and
+decodes it correctly — the seven defined tags enumerate with their symbol-type words (REAL `0x00CA`,
+DINT `0x00C4`, REAL[8] `0x20CA`), scalars value-supported and the array value-unsupported (array
+dims), exactly as `SymbolType` decodes them (`sharp_live_tag_browse_enumerates`). **No `enip` change
+was needed** — the `0x55` request encoding and page decode were already correct.
+
+All device sims are external containers (no in-crate CI fallback, user decision). ab_server and
+EthernetIPSharp are bare TCP/CIP targets (no class-1 UDP), so unlike OpENer they run correctly under
+Docker-Desktop-for-Windows port publishing. If a required target is unavailable for a release, that
+is a **blocking validation gap**, reported as such.
+
 ---
 
 ## 12. Testing & coverage plan
@@ -1281,7 +1375,7 @@ into one denominator), met on the **unit-testable surface**, same bar as the sib
 
 ```bash
 cargo llvm-cov --workspace \
-  --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener)\.rs|testutil\.rs|fuzz[/\\])' \
+  --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp)\.rs|testutil\.rs|fuzz[/\\])' \
   --fail-under-lines 90
 ```
 
@@ -1318,7 +1412,9 @@ tested logic. Excluded, with the reason pinned here:
   (`eip::push::assembly_to_readings` / `map_lost_reason`), the error classification
   (`eip::map_enip_error`), the `client_options` builder, and the JSON⇄CIP codec (`eip::types`) stay in
   covered files and are unit-tested (over `duplex` fixtures / a mock session, no container).
-- `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs` — sim-gated by definition.
+- `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs`,
+  `crates/enip/tests/live_ab_server.rs`, `crates/enip/tests/live_ethernetipsharp.rs` — the four
+  sim-gated live suites (§11.3), self-skipping on a port probe.
 - `crates/enip/fuzz/` — fuzz harnesses (they *exercise* covered code; they are not product code).
 - `src/testutil.rs` — `#[cfg(test)]`-only recording test doubles.
 
@@ -1367,10 +1463,11 @@ a ship blocker.
 | Unit + coverage gate (workspace: protocol crate + adapter) | local (Linux-authoritative) + CI | **in scope** (P-slices + S7) |
 | Decoder fuzzing (D-EIP-19) | Linux (CI/WSL — libFuzzer) | **in scope** (P4; PR smoke budget in CI) |
 | Live protocol + E2E (§11.4, both modes) | local Docker: EMQX + cpppo + OpENer | **in scope** (S7/S9) |
+| Live protocol: 2nd/3rd independent poll peers + Unconnected_Send route + browse `0x55` | local Docker: ab_server (§11.6) + EthernetIPSharp (§11.7) | **in scope** (S8): read/write cross-checked on two more independent impls; the `0x52` route wrapper exercised via ab_server; `enip::list_tags` browse validated against EthernetIPSharp's real `0x55`. No `enip` change needed. |
 | HOST/dual-MQTT smoke | local | **in scope** (S9) |
 | Kubernetes | kind cluster, `k8s/` manifests + cpppo & OpENer as cluster services (UDP :2222 pod-to-pod for push) | **in scope** (S9, smoke: pod Ready, data on bus both modes, probes green) |
 | Greengrass deployed regression | `lab-5950x` (build via WSL `--features greengrass`, `greengrass-cli` local deploy) | **required before the component is "done"** (org rule: new capability ⇒ deployed GG regression). Scheduled S9; if the lab is unreachable in a session, report a **blocking validation gap** — do not claim completion. |
-| Real-PLC `slot`/backplane path + connected class-3 messaging + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6; the simulators cannot exercise backplane routing, and OpENer-only push validation is sim-grade conformance, not plant-grade. |
+| True `slot`/backplane **routing semantics** + connected class-3 messaging + real-Logix browse (hundreds of tags, UDT/`RECIPE` `supported:false` on real Rockwell symbol types) + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6. `enip` now *emits* a well-formed Unconnected_Send route (validated vs ab_server, §11.6) and *decodes* a real `0x55` browse page (validated vs EthernetIPSharp, §11.7), but ab_server ignores the route content (no real slot-routing) and sim browse is a handful of atomic tags — so plant-grade backplane routing and real-Logix browse semantics still need a physical controller; push conformance beyond OpENer likewise stays sim-grade. |
 
 CI: `.github/workflows/ci.yml` calls the org reusable
 `edgecommons/.github/.github/workflows/component-ci.yml@main` (`language: RUST`,
