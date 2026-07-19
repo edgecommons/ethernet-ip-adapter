@@ -1,102 +1,91 @@
-# EthernetIpAdapter
+# EtherNet/IP Adapter
 
-A **southbound protocol adapter**: it connects to devices, reads signals, and publishes them onto
-the UNS in the shape the rest of the fleet expects — so a consumer can chart a Modbus register and
-an OPC UA node without knowing either protocol.
+`com.mbreissi.edgecommons.EthernetIpAdapter` is the **Rust reference southbound EtherNet/IP adapter**
+for the EdgeCommons ecosystem. It connects to EtherNet/IP devices — Allen-Bradley
+ControlLogix/CompactLogix PLCs and generic CIP endpoints — and bridges their data onto the Unified
+Namespace as normalized `SouthboundSignalUpdate` messages, so a consumer can chart an EtherNet/IP signal
+next to a Modbus register or an OPC UA node without knowing the protocol.
 
-```text
-  connect ──► poll ──► publish SouthboundSignalUpdate ──► report health
-     ▲                                                         │
-     └──────────── reconnect with backoff ◄────────────────────┘
-```
+It is built on the `edgecommons` Rust library and an owned pure-Rust EtherNet/IP + CIP stack (the `enip`
+crate), and runs on all three platforms — Greengrass v2, HOST (standalone process/container), and
+Kubernetes.
 
-## Run it
+## Two modes, equal citizens
+
+Each configured device runs in one of EtherNet/IP's two native data models:
+
+- **Poll** (default) — scheduled **explicit-messaging** reads of CIP tags, grouped by cadence into
+  `pollGroups[]`. This is the model for ControlLogix/CompactLogix tags.
+- **Push** — **class-1 implicit I/O**: the device produces an assembly at the RPI and the adapter maps
+  its byte-offset fields to signals (`io` block). This is the model for remote-I/O adapters and drives.
+
+Either mode publishes value changes on the `data` class, emits `southbound_health` plus operational
+metrics, and serves a command surface: nine `sb/*`/`reconnect`/`repoll` verbs including on-demand read,
+allow-listed write, tag browse, and per-instance pause/resume. Writes are **allow-listed and empty by
+default** — every device is read-only until you list the signal ids it may write, and the allow-list is
+checked before any device I/O.
+
+## Quick start
+
+Run against the built-in hardware-free simulator (no PLC needed), publishing to a local MQTT broker:
 
 ```bash
+docker run -d -p 1883:1883 emqx/emqx            # a local broker
 cargo run -p ethernet-ip-adapter -- \
   --platform HOST --transport MQTT ./crates/ethernet-ip-adapter/test-configs/standalone-messaging.json \
   -c FILE ./crates/ethernet-ip-adapter/test-configs/config.json \
   -t my-thing
 ```
 
-It ships a **simulated backend**, so it runs with no hardware: it polls the config-declared
-signals (e.g. `line-speed`, `zone-temps`) and publishes each on
-`ecv1/{device}/ethernet-ip-adapter/{instance}/data/{name}`.
+Watch the values flow (one wildcard covers the fleet):
 
-## Where your code goes
-
-`src/device.rs`. A protocol implements two traits:
-
-```rust
-#[async_trait]
-pub trait DeviceSession: Send + Sync {
-    async fn read_signals(&mut self) -> Result<Vec<Reading>>;
-    async fn write_signal(&mut self, signal_id: &str, value: &Value) -> Result<()>;
-    async fn close(&mut self);
-}
-
-#[async_trait]
-pub trait DeviceBackend: Send + Sync {
-    fn kind(&self) -> &'static str;
-    async fn connect(&self, cfg: &ConnectionConfig) -> Result<Box<dyn DeviceSession>>;
-}
+```bash
+mosquitto_sub -t 'ecv1/+/+/+/data/#' -v
 ```
 
-**The boundary rule, worth enforcing in review:** a backend knows *protocols*. It does not know
-EdgeCommons topics, the UNS, message envelopes, or metrics. If your `impl DeviceSession` imports
-`edgecommons::uns`, the seam has leaked.
+The bundled `compose.yaml` also brings up a [cpppo](https://github.com/pjkundert/cpppo) tag server (live
+poll target) and an [OpENer](https://github.com/EIPStackGroup/OpENer) I/O adapter (live class-1 push
+target) — see the [tutorial](docs/tutorial.md).
 
-Replace `SimBackend` with your protocol. Everything above the seam — the connection lifecycle,
-backoff, publishing, health, the command surface — is written against the traits and does not change.
+## CLI
 
-## The contract this implements (`docs/SOUTHBOUND.md`)
+| Flag | Values |
+|------|--------|
+| `--platform` | `GREENGRASS` \| `HOST` \| `KUBERNETES` \| `auto` (default) |
+| `--transport` | `MQTT [messaging.json]` \| `IPC` (Greengrass-only) |
+| `-c/--config` | `FILE <path>` \| `GG_CONFIG` \| `CONFIGMAP` \| … (default by platform) |
+| `-t/--thing` | IoT Thing name — the `{device}` token of every UNS topic |
 
-**Publish through the `data()` facade, never by hand.** It constructs the `SouthboundSignalUpdate`
-body (`{device, signal, samples}`), mints
-`ecv1/{device}/{component}/{instance}/data/{signal}`, and stamps identity. A hand-rolled topic is a
-topic that will eventually disagree with the envelope.
+## Documentation
 
-**Quality on every sample**, normalized to `GOOD | BAD | UNCERTAIN`, with the protocol's own status
-code kept in `qualityRaw` for diagnosis. This is what lets a consumer gate on quality without
-knowing your protocol — and it is why **a failed read is published as `BAD`, not swallowed**. A
-signal that silently stops updating is indistinguishable from one that is simply not changing. The
-simulator's `pressure-1` demonstrates exactly this.
+Full docs live under [`docs/`](docs/) (synced to
+[docs.edgecommons.mbreissi.com](https://docs.edgecommons.mbreissi.com)):
 
-**`southbound_health`, dimensioned by instance** — `connectionState`, `pollLatencyMs`, `readErrors`,
-`reconnects` — so an operator sees a link go down without reading logs.
+| Doc | For |
+|-----|-----|
+| [Tutorial](docs/tutorial.md) | Bring the adapter up against a simulator, end to end. |
+| [How-to guides](docs/how-to-guides.md) | Configure poll/push devices, allow-list writes, pause, browse, deploy. |
+| [Explanation](docs/explanation.md) | Poll vs push, the signal model, secure-by-default writes, the connection lifecycle. |
+| [Sample configurations](docs/sample-configurations.md) | Annotated complete poll and push configs. |
+| [Reference — Configuration](docs/reference/configuration.md) | Every config key, type, and default. |
+| [Reference — Messaging](docs/reference/messaging-interface.md) | Topics, the `SouthboundSignalUpdate` body, the nine verbs, error codes. |
+| [Reference — Metrics](docs/reference/metrics.md) | Every metric family, measure, and dimension. |
+| [Reference — Data Types](docs/reference/data-types.md) | The CIP types, arrays, scaling, and quality. |
 
-**Per-instance connectivity, from one provider.** `App::run` registers an instance-connectivity
-provider reporting one entry per configured device. The library reads it twice: it pushes the
-sample into every `state` keepalive's `instances[]`, and it returns the same sample from the
-built-in `status` command verb when a console asks. A watcher and an asker cannot get different
-answers.
+## Capabilities and limits
 
-```json
-{ "instance": "device-1", "connected": true, "state": "ONLINE",
-  "detail": "sim://device-1", "attributes": { "adapter": "sim" } }
-```
+- **Value types:** CIP elementary scalars (`bool`, `sint`/`usint`/`int`/`uint`/`dint`/`udint`/`lint`/
+  `ulint`, `real`, `lreal`) and 1-D arrays thereof. Structures/UDTs, Logix `STRING`, and
+  multi-dimensional arrays are not supported.
+- **Poll** uses CIP explicit messaging (one request per signal per cycle); **push** uses class-1
+  implicit I/O.
+- **Security:** EtherNet/IP here is plaintext (TCP `44818`, class-1 UDP `2222`); there is no CIP
+  Security / TLS. Deploy on an isolated OT network segment.
 
-`connected` is the **normalized** flag — always present, so a console renders a health dot without
-knowing your protocol. `state` is this adapter's **own** vocabulary (`CONNECTING` / `ONLINE` /
-`BACKOFF`), because a boolean cannot tell "reconnecting" from "administratively disabled".
-`attributes` is an **open** bag for domain data, so what only your adapter understands rides along
-without destabilizing the two fields every consumer relies on.
+## License
 
-## Writes are allow-listed, and the list is empty by default
-
-```json
-{ "id": "device-1", "adapter": "sim",
-  "connection": { "endpoint": "sim://device-1" },
-  "pollIntervalMs": 5000,
-  "writes": { "allow": [] } }
-```
-
-Only signal ids in `writes.allow` can be written, matched on the **stable `signal.id`** and checked
-before the write ever reaches the device. Anything else is refused, whatever the command asks for.
-An adapter that will write any address it is handed is a control-system vulnerability, not a
-convenience — so the default is read-only, and opening it is a deliberate act.
-
-A write is **confirmed**: the command's reply is the device's answer, not "we sent it".
-
-`connection` is deliberately **open** — every protocol needs different keys (a unit id, a security
-policy, a slave address). Everything else in `config.schema.json` is closed, so a typo is caught.
+Business Source License 1.1 (BSL 1.1) — see [LICENSE](LICENSE). You may use, copy, modify, and self-host
+the Licensed Work free of charge for development, testing, staging, evaluation, academic research, and
+personal/non-commercial use; production use in a commercial product or service requires a separate
+commercial license. Each released version converts to the Mozilla Public License 2.0 on its fourth
+anniversary. See the license file for the exact terms.

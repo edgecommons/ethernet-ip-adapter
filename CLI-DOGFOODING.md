@@ -79,7 +79,7 @@ The template is a *minimal* archetype, not a parity-level reference. To match `m
 9. **No integration-test layout.** Only inline unit tests. Sibling adapters carry `tests/*.rs`
    (simulator-gated, self-skipping). Added a simulator-gated live suite.
 10. **No `AGENTS.md` / `CLAUDE.md` / `DESIGN.md` / `LICENSE`.** Sibling repos carry all four
-    (Apache-2.0). Added.
+    (BSL 1.1 / `BUSL-1.1`). Added.
 11. **No edge-console panels.** Sibling adapters register `inbox.register_panel(...)`
     (overview / signals / diagnostics) surfaced by the built-in `describe`. The base registers none.
     Added.
