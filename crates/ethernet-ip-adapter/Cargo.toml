@@ -39,6 +39,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# RFC-3339 timestamps for the explicit `serverTs` stamped on the older samples of a coalesced batch
+# (§6.2). Already in the lock (a transitive edgecommons dep); pinned here for the direct use.
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

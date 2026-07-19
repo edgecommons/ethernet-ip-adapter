@@ -25,13 +25,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use edgecommons::prelude::*;
 use serde_json::json;
 
 use crate::config::{DeviceConfig, GlobalConfig, SignalSpec};
-use crate::device::{DeviceBackend, IoUpdate, PushSession, Quality, Reading};
+use crate::device::DeviceBackend;
 use crate::sim::SimBackend;
 
 /// The metric every southbound adapter emits (SOUTHBOUND.md §5). The full `EtherNetIp*` families
@@ -109,7 +109,9 @@ impl LinkState {
 }
 
 /// The `southbound_health` measures, per instance (SOUTHBOUND.md §5), plus the link condition the
-/// connectivity provider reports.
+/// connectivity provider reports **and** the engine counters slice S5 wires into the full
+/// `EtherNetIp*` metric families (§8). The engines ([`crate::poll`] / [`crate::push`]) produce these;
+/// this slice keeps only the single `southbound_health` metric emitting — S5 consumes the rest.
 #[derive(Default)]
 pub struct Health {
     /// 1 = connected, 0 = down.
@@ -120,6 +122,44 @@ pub struct Health {
     pub read_errors: AtomicU64,
     pub reconnects: AtomicU64,
     pub signals_published: AtomicU64,
+
+    // ---- engine counters (consumed by the S5 metric families; §8) ----
+    /// Publish latency of the last `data.publish().await`, ms (§6.2).
+    // SLICE S5: EtherNetIpPublish.publishLatencyMs / southbound_health.publishLatencyMs.
+    #[allow(dead_code)]
+    pub publish_latency_ms: AtomicU64,
+    /// Poll cycles run (per group tick).
+    // SLICE S5: EtherNetIpPoll.pollCycles.
+    #[allow(dead_code)]
+    pub poll_cycles: AtomicU64,
+    /// Consumed class-1 frames (push).
+    // SLICE S5: EtherNetIpIo.framesConsumed.
+    #[allow(dead_code)]
+    pub frames_consumed: AtomicU64,
+    /// Samples read GOOD.
+    // SLICE S5: EtherNetIpPoll.samplesGood.
+    #[allow(dead_code)]
+    pub samples_good: AtomicU64,
+    /// Samples read BAD (a per-signal failure, published not swallowed).
+    // SLICE S5: EtherNetIpPoll.samplesBad.
+    #[allow(dead_code)]
+    pub samples_bad: AtomicU64,
+    /// Samples that passed the onChange gate (published because they changed).
+    // SLICE S5: EtherNetIpPublish.samplesChanged.
+    #[allow(dead_code)]
+    pub samples_changed: AtomicU64,
+    /// Samples gated out (deadband / sampleMs floor).
+    // SLICE S5: EtherNetIpPublish.samplesSuppressed.
+    #[allow(dead_code)]
+    pub samples_suppressed: AtomicU64,
+    /// Poll cycles that overran their interval.
+    // SLICE S5: EtherNetIpPoll.overruns.
+    #[allow(dead_code)]
+    pub overruns: AtomicU64,
+    /// Signals currently stale (no GOOD read within `staleSignalSecs`), as of the last emit.
+    // SLICE S5: EtherNetIpInventory.staleSignals.
+    #[allow(dead_code)]
+    pub stale_signals: AtomicU64,
 }
 
 impl Health {
@@ -406,6 +446,7 @@ async fn run_device(
     if matches!(cfg.mode, crate::config::DeviceMode::Push) {
         run_push(
             &cfg,
+            &global,
             backend.as_ref(),
             &data,
             &events,
@@ -442,7 +483,7 @@ async fn run_device(
                     .clear_alarm(Severity::Critical, "device-unreachable", None)
                     .await;
 
-                poll_until_disconnected(
+                crate::poll::poll_until_disconnected(
                     &cfg,
                     &global,
                     session,
@@ -492,104 +533,13 @@ async fn run_device(
     }
 }
 
-/// Poll each group on its own cadence and publish, until the link breaks.
-///
-/// A single task owns the session (it is not `Sync`), so all poll groups and the write channel are
-/// serialized here. Each group carries its own deadline; the loop sleeps until the earliest one,
-/// polls that group, and re-arms it — a per-group [`tokio::time::interval`] without racing N
-/// tickers in a static `select!`.
-#[allow(clippy::too_many_arguments)]
-async fn poll_until_disconnected(
-    cfg: &DeviceConfig,
-    global: &GlobalConfig,
-    mut session: Box<dyn crate::device::DeviceSession>,
-    data: &DataFacade,
-    metrics: &Arc<dyn MetricService>,
-    health: &Arc<Health>,
-    adapter: &str,
-    writes: &mut tokio::sync::mpsc::Receiver<WriteRequest>,
-) {
-    let intervals: Vec<Duration> = cfg
-        .poll_groups
-        .iter()
-        .map(|g| Duration::from_millis(cfg.effective_poll_ms(g, global).max(1)))
-        .collect();
-    let mut deadlines: Vec<Instant> = intervals.iter().map(|d| Instant::now() + *d).collect();
-    let mut since_health = Instant::now();
-
-    loop {
-        // Earliest group deadline.
-        let mut idx = 0;
-        let mut due = deadlines[0];
-        for (i, d) in deadlines.iter().enumerate() {
-            if *d < due {
-                due = *d;
-                idx = i;
-            }
-        }
-        let wait = due.saturating_duration_since(Instant::now());
-
-        tokio::select! {
-            biased;
-
-            // A write shares this one task, so it can never race a read on the same connection.
-            Some(req) = writes.recv() => {
-                let result = session
-                    .write_signal(&req.signal, &req.value)
-                    .await
-                    .map_err(|e| e.to_string());
-                if let Err(e) = &result {
-                    tracing::warn!(instance = %cfg.id, tag_path = %req.signal.tag_path, error = %e, "write failed");
-                }
-                let _ = req.ack.send(result);
-                continue;
-            }
-
-            _ = tokio::time::sleep(wait) => {}
-        }
-
-        // Re-arm this group (guard against catch-up storms if a cycle overran).
-        deadlines[idx] = (deadlines[idx] + intervals[idx]).max(Instant::now());
-
-        let group = &cfg.poll_groups[idx];
-        let started = Instant::now();
-        let readings = match session.read_signals(&group.signals).await {
-            Ok(r) => r,
-            Err(e) => {
-                // The link is gone (transient) or misconfigured (permanent). Either way, leave the
-                // poll loop so the connect loop can back off.
-                tracing::warn!(instance = %cfg.id, error = %e, transient = e.is_transient(), "read failed; reconnecting");
-                health.read_errors.fetch_add(1, Ordering::Relaxed);
-                session.close().await;
-                return;
-            }
-        };
-        let latency = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        health.poll_latency_ms.store(latency, Ordering::Relaxed);
-
-        // SLICE S4: deadband/change gating and batchMs coalescing plug in here — this slice
-        // publishes every polled sample.
-        let by_id: HashMap<&str, &Reading> =
-            readings.iter().map(|r| (r.signal_id.as_str(), r)).collect();
-        for spec in &group.signals {
-            if let Some(reading) = by_id.get(spec.tag_path.as_str()) {
-                publish_reading(spec, reading, data, cfg, adapter, health).await;
-            }
-        }
-
-        if since_health.elapsed() >= Duration::from_secs(60) {
-            emit_health(metrics, health).await;
-            since_health = Instant::now();
-        }
-    }
-}
-
-/// One push device's lifecycle: open the class-1 connection, consume the [`IoUpdate`] stream, and
-/// reconnect on loss with the same backoff ladder as poll (§10.2). The full deadband/batch/publish
-/// engine is slice S4; this keeps the connectivity/health surface truthful and consumes every frame.
+/// One push device's lifecycle: open the class-1 connection, consume the [`IoUpdate`] stream through
+/// the push engine ([`crate::push::consume_push`]), and reconnect on loss with the same backoff
+/// ladder as poll (§10.2).
 #[allow(clippy::too_many_arguments)]
 async fn run_push(
     cfg: &DeviceConfig,
+    global: &GlobalConfig,
     backend: &dyn DeviceBackend,
     data: &DataFacade,
     events: &EventsFacade,
@@ -598,8 +548,6 @@ async fn run_push(
     backoff: Backoff,
     connect_timeout: Duration,
 ) {
-    // SLICE S4: the push publish engine binds the data facade here (deadband/batch/publish).
-    let _ = data;
     let Some(io) = cfg.io.clone() else {
         tracing::error!(instance = %cfg.id, "push device has no io block");
         return;
@@ -613,7 +561,17 @@ async fn run_push(
         match outcome {
             Ok(Ok(mut session)) => {
                 attempt = 0;
-                consume_push(cfg, session.as_mut(), events, metrics, health, backend.kind()).await;
+                crate::push::consume_push(
+                    cfg,
+                    global,
+                    session.as_mut(),
+                    data,
+                    events,
+                    metrics,
+                    health,
+                    backend.kind(),
+                )
+                .await;
                 session.close().await;
 
                 health.set_link(LinkState::Backoff);
@@ -651,102 +609,10 @@ async fn run_push(
     }
 }
 
-/// Consume one push session's update stream until the link is lost (returns on `Lost`/end-of-stream).
-async fn consume_push(
-    cfg: &DeviceConfig,
-    session: &mut dyn PushSession,
-    events: &EventsFacade,
-    metrics: &Arc<dyn MetricService>,
-    health: &Arc<Health>,
-    adapter: &str,
-) {
-    let mut since_health = Instant::now();
-    loop {
-        match session.updates().recv().await {
-            Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms }) => {
-                health.set_link(LinkState::Online);
-                emit_health(metrics, health).await;
-                let _ = events
-                    .emit(
-                        Severity::Info,
-                        "device-connected",
-                        Some(format!("class-1 connection up to {}", cfg.connection.endpoint)),
-                        Some(json!({
-                            "instance": cfg.id, "adapter": adapter,
-                            "o2tApiMs": o2t_api_ms, "t2oApiMs": t2o_api_ms
-                        })),
-                    )
-                    .await;
-                let _ = events
-                    .clear_alarm(Severity::Critical, "device-unreachable", None)
-                    .await;
-            }
-            Some(IoUpdate::Data { readings, sequence, run_mode, .. }) => {
-                // SLICE S4: deadband/change gating, batchMs coalescing, and the SouthboundSignalUpdate
-                // publish plug in here. This slice keeps the frame observable + the counters moving.
-                health
-                    .signals_published
-                    .fetch_add(readings.len() as u64, Ordering::Relaxed);
-                tracing::debug!(
-                    instance = %cfg.id, sequence, run_mode, fields = readings.len(),
-                    "push frame received"
-                );
-                if since_health.elapsed() >= Duration::from_secs(60) {
-                    emit_health(metrics, health).await;
-                    since_health = Instant::now();
-                }
-            }
-            Some(IoUpdate::Lost { error }) => {
-                tracing::warn!(instance = %cfg.id, error = %error, "class-1 connection lost; reconnecting");
-                health.read_errors.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            None => {
-                tracing::warn!(instance = %cfg.id, "push session ended; reconnecting");
-                return;
-            }
-        }
-    }
-}
-
-/// Publish one reading as a `SouthboundSignalUpdate`. The `data()` facade builds the body, mints the
-/// topic (channel = the config `name`, §5.3), and stamps identity — none of the three is
-/// hand-built. `signal.id` is the tag path (D-EIP-9).
-async fn publish_reading(
-    spec: &SignalSpec,
-    reading: &Reading,
-    data: &DataFacade,
-    cfg: &DeviceConfig,
-    adapter: &str,
-    health: &Health,
-) {
-    let quality = match reading.quality {
-        Quality::Good => edgecommons::facades::Quality::Good,
-        Quality::Bad => edgecommons::facades::Quality::Bad,
-        Quality::Uncertain => edgecommons::facades::Quality::Uncertain,
-    };
-    let mut sample = Sample::with_quality(reading.value.clone(), quality);
-    if let Some(raw) = &reading.quality_raw {
-        sample = sample.quality_raw(raw);
-    }
-
-    let update = data
-        .signal(&spec.tag_path)
-        .name(&spec.name)
-        .address(spec.address_json(&cfg.connection))
-        .device_parts(adapter, &cfg.id, &cfg.connection.endpoint)
-        .signal_path(&spec.name)
-        .sample(sample)
-        .build();
-
-    if let Err(e) = data.publish(update).await {
-        tracing::warn!(instance = %cfg.id, tag_path = %spec.tag_path, error = %e, "publish failed");
-    } else {
-        health.signals_published.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-async fn emit_health(metrics: &Arc<dyn MetricService>, health: &Arc<Health>) {
+/// Emit the single `southbound_health` metric (SOUTHBOUND.md §5). The full `EtherNetIp*` families are
+/// slice S5; the engine counters they consume live on [`Health`], populated by [`crate::poll`] /
+/// [`crate::push`].
+pub(crate) async fn emit_health(metrics: &Arc<dyn MetricService>, health: &Arc<Health>) {
     let mut v = HashMap::new();
     v.insert(
         "connectionState".to_string(),
