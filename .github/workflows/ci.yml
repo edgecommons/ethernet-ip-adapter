@@ -1,0 +1,116 @@
+name: ci
+
+on:
+  push:
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+jobs:
+  ci:
+    # Reusable component CI from the org defaults repo (DESIGN §12.4, the file-replicator/
+    # telemetry-processor pattern). `secrets: inherit` passes the org-level EDGECOMMONS_READ_TOKEN so
+    # cargo can fetch the private edgecommons git dependency; the repo must be on that secret's
+    # repository allow-list (org Actions secrets, via the REST API).
+    #
+    # This repo is a Cargo **virtual workspace** (root Cargo.toml has `[workspace]` and NO `[package]`,
+    # D-EIP-17: `crates/enip` + `crates/ethernet-ip-adapter`). In a virtual manifest a bare
+    # `cargo build` / `cargo test` / `cargo clippy` at the root operates on ALL members — i.e. the
+    # reusable workflow's `cargo build --all-targets` / `cargo test` / `cargo clippy --all-targets`
+    # ARE workspace-wide here, covering both crates, without needing an explicit `--workspace`. (The
+    # `crates/enip/fuzz` harness is its own separate workspace, so it is correctly excluded from these
+    # commands and built only by the `fuzz-smoke` job below.)
+    permissions:
+      contents: read
+    uses: edgecommons/.github/.github/workflows/component-ci.yml@main
+    with:
+      language: RUST
+      # No `rust-features`: the adapter's default feature is `standalone` (dual-broker MQTT, no C
+      # toolchain), which is exactly what CI should build/test on Linux. `greengrass` is Linux-only via
+      # the C-FFI SDK and is validated on the lab device (DESIGN §12.4), not in this hosted job.
+    secrets: inherit
+
+  coverage:
+    # The 90%-line coverage gate (NFR / DESIGN §12.1), actually RUN here — the reusable component-ci
+    # only does build/test/clippy. Measured WORKSPACE-WIDE (D-EIP-17 folded the protocol crate into
+    # the same denominator as the adapter; there is no per-crate carve-out).
+    #
+    # Excluded from the denominator (DESIGN §12.1 regex + §12.2 justification — "coverage laundering"
+    # is forbidden, so every exclusion is pinned to a reason):
+    #   - `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs` — the two live-sim-gated
+    #     integration suites (§11.3). They self-skip when their sim port is down (no cpppo/OpENer is
+    #     provisioned in this job), so their bodies would only partly run and would erode the margin.
+    #   - `crates/enip/fuzz/**` — libFuzzer harnesses. They EXERCISE covered product code; they are not
+    #     product code (§12.2). (Also a separate workspace, so not even built here — belt-and-suspenders.)
+    #   - `crates/ethernet-ip-adapter/src/testutil.rs` — `#[cfg(test)]`-only recording test doubles
+    #     (`RecordingMetrics`/`RecordingEvents` + constructors). Test support, not product code — the
+    #     file's own header declares it excluded, matching the file-replicator approach §12.2 cites.
+    # Nothing else is excluded: the adapter's `eip/` backend + the whole protocol crate sit INSIDE the
+    # gate, unit-tested over in-memory `tokio::io::duplex` byte-stream fixtures / a mock `DeviceSession`
+    # (no container). Do NOT add exclusions to dodge the gate — add tests (DESIGN §12.2).
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Authenticate to the private edgecommons git dependency
+        env:
+          # Same org read token the reusable workflow uses (secrets: inherit); the repo must be on that
+          # secret's allow-list. Rewrites the https git URL so cargo can fetch the private dep. (The
+          # `enip` crate has no edgecommons dep, but the adapter crate does — D-EIP-17.)
+          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
+            "https://github.com/edgecommons/edgecommons.git"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
+            "https://github.com/edgecommons/edgecommons"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+      - name: Coverage gate (90% lines, workspace-wide; live suites + fuzz + test doubles excluded)
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: >
+          cargo llvm-cov --workspace
+          --ignore-filename-regex '(tests[/\\]live_(cpppo|opener)|fuzz[/\\]|testutil\.rs)'
+          --fail-under-lines 90
+          --cobertura --output-path target/cobertura.xml
+
+  fuzz-smoke:
+    # Decoder fuzzing as a release gate (D-EIP-19 / PROTOCOL-DESIGN §12.3): a reproducible panic/OOM
+    # found by fuzzing is a ship blocker. Runs on every PR with a SHORT budget (a smoke, not a
+    # campaign — longer runs are a periodic job). The `crates/enip/fuzz` harness is a separate
+    # workspace with NO edgecommons dependency (the protocol crate knows nothing about EdgeCommons,
+    # D-EIP-17), so this job needs no private-git token.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain (libFuzzer needs nightly + the sanitizer runtime)
+        run: rustup toolchain install nightly --profile minimal --component llvm-tools-preview
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+      - name: Build every fuzz target (a target that stops compiling is a defect)
+        working-directory: crates/enip
+        run: cargo +nightly fuzz build
+      - name: Smoke-run representative targets over the checked-in corpus + regressions
+        working-directory: crates/enip
+        # Three targets spanning the highest-value hostile surfaces (§12.3): TCP framing, the runt
+        # class-1 datagram gauntlet (the EIPScanner bug class D-EIP-1 calls out), and MR replies with
+        # extended-status size lies. -max_total_time keeps each a short smoke; the whole PR-gate fuzz
+        # cadence is intentionally cheap. A crash exits non-zero and is committed as a regression input.
+        run: |
+          for target in fuzz_encap_frame fuzz_io_frame fuzz_message_reply; do
+            echo "::group::fuzz smoke: $target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            echo "::endgroup::"
+          done

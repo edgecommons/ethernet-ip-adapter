@@ -1,0 +1,5 @@
+# Normalize line endings so a Windows checkout doesn't churn CRLF into the tree (the source is
+# authored/built on Windows + WSL + Linux CI). `text=auto` lets Git decide per file and store LF in
+# the repo; shell scripts are forced LF so they stay executable under WSL/Linux/containers.
+* text=auto eol=lf
+*.sh text eol=lf
