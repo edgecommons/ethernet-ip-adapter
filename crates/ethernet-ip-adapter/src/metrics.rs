@@ -771,22 +771,38 @@ impl DeviceMetrics {
             .ok()
             .flatten()
             .is_some_and(|s| s.is_tls());
-        if !is_tls {
-            return serde_json::json!({ "mode": "plaintext" });
-        }
+        let sec = self.health.security();
         let mut out = serde_json::Map::new();
-        out.insert("mode".into(), serde_json::json!("tls"));
-        if let Some(st) = self.health.security() {
-            out.insert("tlsVersion".into(), serde_json::json!(st.tls_version));
-            out.insert("cipherSuite".into(), serde_json::json!(st.cipher_suite));
-            out.insert("peerVerified".into(), serde_json::json!(st.peer_verified));
-            out.insert("peer".into(), serde_json::json!(st.peer));
-            out.insert(
-                "clientCertNotAfter".into(),
-                serde_json::json!(st.client_cert_not_after),
-            );
+        out.insert(
+            "mode".into(),
+            serde_json::json!(if is_tls { "tls" } else { "plaintext" }),
+        );
+        if is_tls {
+            if let Some(st) = &sec {
+                out.insert("tlsVersion".into(), serde_json::json!(st.tls_version));
+                out.insert("cipherSuite".into(), serde_json::json!(st.cipher_suite));
+                out.insert("peerVerified".into(), serde_json::json!(st.peer_verified));
+                out.insert("peer".into(), serde_json::json!(st.peer));
+                out.insert(
+                    "clientCertNotAfter".into(),
+                    serde_json::json!(st.client_cert_not_after),
+                );
+            }
+            out.insert("handshakeFailures".into(), hs);
         }
-        out.insert("handshakeFailures".into(), hs);
+        // Phase 2a: the target's decoded CIP Security posture (both modes), when it was read on
+        // connect. `targetSupportsCipSecurity` is present whenever a posture read was attempted (i.e.
+        // the session is up); `target` carries the decoded objects only when the device implements
+        // them. A generic CIP device / cpppo reports `targetSupportsCipSecurity: false`.
+        if let Some(st) = &sec {
+            out.insert(
+                "targetSupportsCipSecurity".into(),
+                serde_json::json!(st.target.is_some()),
+            );
+            if let Some(t) = &st.target {
+                out.insert("target".into(), security_target_view(t));
+            }
+        }
         serde_json::Value::Object(out)
     }
 
@@ -1019,6 +1035,59 @@ impl DeviceMetrics {
         let values = self.inner.lock().unwrap().io.drain();
         self.emit_combo(IO, &[("instance", self.instance())], values, now).await;
     }
+}
+
+/// Render a target CIP Security posture (Phase 2a, DESIGN-cip-security.md §4.1) into the
+/// `sb/status.security.target` JSON. Arrays are always present (possibly empty); scalar fields are
+/// included only when decoded (a device need not expose every attribute). `pullModel` mirrors the
+/// certificate object's pull capability for a console's quick posture read.
+#[must_use]
+fn security_target_view(t: &crate::device::TargetSecurityPosture) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(state) = &t.state {
+        out.insert("state".into(), serde_json::json!(state));
+    }
+    out.insert("profiles".into(), serde_json::json!(t.profiles));
+    out.insert(
+        "allowedCipherSuites".into(),
+        serde_json::json!(t.allowed_cipher_suites),
+    );
+    out.insert(
+        "availableCipherSuites".into(),
+        serde_json::json!(t.available_cipher_suites),
+    );
+    if let Some(v) = t.verify_client {
+        out.insert("verifyClient".into(), serde_json::json!(v));
+    }
+    if let Some(v) = t.send_certificate_chain {
+        out.insert("sendCertificateChain".into(), serde_json::json!(v));
+    }
+    if let Some(v) = t.check_expiration {
+        out.insert("checkExpiration".into(), serde_json::json!(v));
+    }
+    if let Some(cert) = &t.certificate {
+        if let Some(v) = cert.pull_supported {
+            out.insert("pullModel".into(), serde_json::json!(v));
+        }
+        let mut c = serde_json::Map::new();
+        if let Some(v) = cert.push_supported {
+            c.insert("pushSupported".into(), serde_json::json!(v));
+        }
+        if let Some(v) = cert.pull_supported {
+            c.insert("pullSupported".into(), serde_json::json!(v));
+        }
+        if let Some(v) = &cert.name {
+            c.insert("name".into(), serde_json::json!(v));
+        }
+        if let Some(v) = &cert.state {
+            c.insert("state".into(), serde_json::json!(v));
+        }
+        if let Some(v) = &cert.encoding {
+            c.insert("encoding".into(), serde_json::json!(v));
+        }
+        out.insert("certificate".into(), serde_json::Value::Object(c));
+    }
+    serde_json::Value::Object(out)
 }
 
 #[cfg(test)]
@@ -1542,5 +1611,91 @@ mod tests {
         assert_eq!(v["read"]["total"], 2.0);
         assert_eq!(v["readErrors"]["total"], 1.0, "a BAD read is a tagReadError");
         assert_eq!(v["write"]["total"], 1.0);
+    }
+
+    // --- Phase 2a: sb/status.security target posture rendering ---
+
+    /// Build a `DeviceMetrics` whose session security has been set to `sec` (Phase 2a).
+    fn dm_with_security(
+        device: DeviceConfig,
+        sec: Option<crate::device::SecurityStatus>,
+    ) -> DeviceMetrics {
+        let svc = Arc::new(RecordingMetrics::default());
+        let global = GlobalConfig::default();
+        let health = Arc::new(Health::default());
+        health.set_security(sec);
+        DeviceMetrics::new(svc, config(), device, &global, health)
+    }
+
+    #[test]
+    fn security_view_plaintext_no_session_is_bare() {
+        // No security block, no posture read ⇒ `{ "mode": "plaintext" }` (backward compatible).
+        let (_svc, m) = dm(poll_device());
+        let v = m.security_view();
+        assert_eq!(v["mode"], "plaintext");
+        assert!(v.get("targetSupportsCipSecurity").is_none());
+        assert!(v.get("target").is_none());
+    }
+
+    #[test]
+    fn security_view_reports_target_unavailable_for_generic_device() {
+        // A posture read happened but the device has no CIP Security objects.
+        let sec = crate::device::SecurityStatus { tls: false, target: None, ..Default::default() };
+        let m = dm_with_security(poll_device(), Some(sec));
+        let v = m.security_view();
+        assert_eq!(v["mode"], "plaintext");
+        assert_eq!(v["targetSupportsCipSecurity"], false);
+        assert!(v.get("target").is_none());
+    }
+
+    #[test]
+    fn security_view_renders_decoded_target_posture() {
+        use crate::device::{SecurityStatus, TargetCertificateSummary, TargetSecurityPosture};
+        let target = TargetSecurityPosture {
+            state: Some("Configured".to_string()),
+            profiles: vec!["EtherNet/IP Confidentiality".to_string()],
+            allowed_cipher_suites: vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".to_string()],
+            available_cipher_suites: vec![
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".to_string(),
+                "0xC023".to_string(),
+            ],
+            verify_client: Some(true),
+            send_certificate_chain: Some(true),
+            check_expiration: Some(false),
+            certificate: Some(TargetCertificateSummary {
+                push_supported: Some(true),
+                pull_supported: Some(false),
+                name: Some("Device".to_string()),
+                state: Some("Verified".to_string()),
+                encoding: Some("PEM".to_string()),
+            }),
+        };
+        let sec = SecurityStatus { tls: false, target: Some(target), ..Default::default() };
+        let m = dm_with_security(poll_device(), Some(sec));
+        let v = m.security_view();
+        assert_eq!(v["targetSupportsCipSecurity"], true);
+        let t = &v["target"];
+        assert_eq!(t["state"], "Configured");
+        assert_eq!(t["profiles"][0], "EtherNet/IP Confidentiality");
+        assert_eq!(t["allowedCipherSuites"][0], "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256");
+        assert_eq!(t["availableCipherSuites"].as_array().unwrap().len(), 2);
+        assert_eq!(t["verifyClient"], true);
+        assert_eq!(t["checkExpiration"], false);
+        assert_eq!(t["pullModel"], false);
+        assert_eq!(t["certificate"]["pushSupported"], true);
+        assert_eq!(t["certificate"]["name"], "Device");
+        assert_eq!(t["certificate"]["encoding"], "PEM");
+    }
+
+    #[test]
+    fn security_target_view_arrays_always_present() {
+        // An empty posture still renders the array keys (a console can bind unconditionally).
+        let t = crate::device::TargetSecurityPosture::default();
+        let v = security_target_view(&t);
+        assert!(v["profiles"].is_array());
+        assert!(v["allowedCipherSuites"].is_array());
+        assert!(v["availableCipherSuites"].is_array());
+        assert!(v.get("state").is_none());
+        assert!(v.get("certificate").is_none());
     }
 }

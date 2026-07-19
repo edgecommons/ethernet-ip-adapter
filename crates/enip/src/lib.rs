@@ -98,6 +98,16 @@ pub use cip::message::{MessageReply, MessageRequest};
 pub use cip::status::{CipStatus, GeneralStatus};
 pub use cip::types::{CipType, CipValue};
 
+// CIP Security object model (0x5D/0x5E/0x5F) posture reads (Phase 2a, DESIGN-cip-security.md §4.1).
+// Pure decoders + typed reads over the generic attribute services; the `read_*` methods live on
+// `EipClient`. Available unconditionally (no feature gate — it is decode-only, §4.1).
+pub use cip::security::{
+    CertificateCapabilities, CertificateEncoding, CertificateInstance,
+    CertificateManagementSummary, CertificateState, CipSecurityObject, CipSecurityState,
+    CipherSuiteId, CipherSuiteList, EipSecurityObject, SecurityPosture, SecurityProfiles,
+    CLASS_CERTIFICATE_MANAGEMENT, CLASS_CIP_SECURITY, CLASS_EIP_SECURITY,
+};
+
 pub use discovery::{
     parse_list_interfaces, parse_list_services, DeviceIdentity, DeviceType, InterfaceItem,
     ServiceItem, VendorId,

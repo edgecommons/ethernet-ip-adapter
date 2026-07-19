@@ -214,6 +214,13 @@ pub fn discovery(data: &[u8]) {
     let _ = parse_list_interfaces(data);
 }
 
+/// Exercise the CIP Security posture decoders (`fuzz_security_attrs`, DESIGN-cip-security.md §4.1):
+/// every 0x5D/0x5E/0x5F attribute decoder over arbitrary bytes (cipher-suite count lies, short
+/// strings, width-tolerant flags). The single source of truth is the decoder module's own entry.
+pub fn security_attrs(data: &[u8]) {
+    crate::cip::security::fuzz_security_attrs(data);
+}
+
 /// One named decode surface: its fuzz-target / corpus-directory name and its exercise function.
 pub type Surface = (&'static str, fn(&[u8]));
 
@@ -230,4 +237,5 @@ pub const SURFACES: &[Surface] = &[
     ("fuzz_assembly_decode", assembly_decode),
     ("fuzz_tag_path", tag_path),
     ("fuzz_discovery", discovery),
+    ("fuzz_security_attrs", security_attrs),
 ];

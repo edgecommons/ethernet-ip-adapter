@@ -100,7 +100,7 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: >
           cargo llvm-cov --workspace
-          --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls)\.rs|testutil\.rs|fuzz[/\\])'
+          --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls|cip_security)\.rs|testutil\.rs|fuzz[/\\])'
           --fail-under-lines 90
           --cobertura --output-path target/cobertura.xml
 

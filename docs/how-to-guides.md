@@ -236,10 +236,27 @@ mutual X.509 authentication. Add a `security` block to the device's `connection`
 }
 ```
 
+**With inline `$secret` references** (the ecosystem `$secret` convention — each PEM resolved from the
+vault at connect time, and never written into the logged config):
+
+```jsonc
+"security": {
+  "mode": "tls",
+  "client": {
+    "cert": { "$secret": "tls/cip-client-cert" },
+    "key":  { "$secret": "tls/cip-client-key" }
+  },
+  "ca": { "cert": { "$secret": "tls/plant-root" } }
+}
+```
+
 Notes:
 
+- Each credential (client cert/key, CA) is sourced by exactly **one** style — a typed vault ref
+  (`certSecret`/`ca.secret`), files (`certFile`/`keyFile`/`ca.file`), or an inline `{"$secret": …}`
+  (`client.cert`+`client.key`/`ca.cert`). Mixing styles on one credential is a startup error.
 - `mode: tls` requires a client identity; with `verifyPeer: true` it also requires trust anchors
-  (`ca.*`, or a `certSecret` bundle carrying `caPem`).
+  (any `ca` style, or a `certSecret` bundle carrying `caPem`).
 - The device is dialed by IP by default, so its certificate must carry the endpoint IP as a
   Subject Alternative Name. Set `serverName` to override the verified name.
 - Only GCM-based and TLS 1.3 cipher suites are supported. A device that offers only CBC-based suites
@@ -249,6 +266,11 @@ Notes:
 - `sb/status` returns a `security` object (`mode`, `tlsVersion`, `cipherSuite`, `peerVerified`,
   `peer`, `clientCertNotAfter`, `handshakeFailures`); a `tls-handshake-failed` event fires on a
   handshake failure.
+- On connect the adapter reads the target's CIP Security objects and reports the device's posture
+  under `security.target` (state, security profiles, allowed/available cipher suites, client-cert and
+  expiration policy, certificate summary), with `security.targetSupportsCipSecurity` telling you
+  whether the device implements them. This works on plaintext instances too — a device without CIP
+  Security reports `targetSupportsCipSecurity: false`.
 
 For `verifyPeer: false` (commissioning/debug, accepts any device certificate), the adapter connects
 without verifying the device and raises a `tls-peer-unverified` event.

@@ -242,6 +242,15 @@ pub fn connectivity_of(cfg: &DeviceConfig, health: &Health) -> InstanceConnectiv
         "security".to_string(),
         json!(if security_mode { "tls" } else { "plaintext" }),
     );
+    // Phase 2a (§4.1): reflect whether the connected target implements the CIP Security objects, so a
+    // fleet consumer watching `state` sees the posture without an `sb/status` round-trip. Present only
+    // once a session posture has been read (both modes).
+    if let Some(sec) = health.security() {
+        attributes.insert(
+            "targetCipSecurity".to_string(),
+            json!(sec.target.is_some()),
+        );
+    }
     if let Some(slot) = cfg.connection.slot {
         attributes.insert("slot".to_string(), json!(slot));
     }
@@ -544,6 +553,31 @@ mod tests {
 
         health.set_link(LinkState::Backoff);
         assert!(!connectivity_of(&cfg, &health).connected);
+    }
+
+    #[test]
+    fn state_attributes_reflect_target_cip_security_posture() {
+        let cfg = a_device();
+        let health = Health::default();
+        // No posture read yet ⇒ no targetCipSecurity attribute.
+        assert!(connectivity_of(&cfg, &health).attributes.get("targetCipSecurity").is_none());
+
+        // A session that read a target posture ⇒ targetCipSecurity: true.
+        health.set_security(Some(crate::device::SecurityStatus {
+            target: Some(crate::device::TargetSecurityPosture::default()),
+            ..Default::default()
+        }));
+        assert_eq!(
+            connectivity_of(&cfg, &health).attributes["targetCipSecurity"],
+            json!(true)
+        );
+
+        // A generic device (posture read, no objects) ⇒ targetCipSecurity: false.
+        health.set_security(Some(crate::device::SecurityStatus::default()));
+        assert_eq!(
+            connectivity_of(&cfg, &health).attributes["targetCipSecurity"],
+            json!(false)
+        );
     }
 
     #[test]

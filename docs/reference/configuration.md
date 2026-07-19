@@ -110,19 +110,41 @@ configured with `security.mode: tls` is rejected at startup.
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `mode` | `plaintext` \| `tls` | `plaintext` | `tls` wraps the session in mutual TLS on TCP `2221` (the default port when the endpoint has no explicit port). |
-| `client.certSecret` | string | — | A credentials-vault secret holding a `{certPem, keyPem[, caPem]}` TLS bundle — the adapter's client identity. |
-| `client.certFile` / `client.keyFile` | string | — | A PEM client certificate + private-key file pair, as an alternative to `certSecret`. |
-| `ca.secret` | string | — | A credentials-vault secret holding CA certificate PEM (one or more roots) for verifying the device. |
-| `ca.file` | string | — | A CA-certificate PEM file path, as an alternative to `ca.secret`. |
+| `client` | object | — | The adapter's client identity for mutual TLS. Sourced by exactly one style (below). |
+| `ca` | object | — | Trust anchors for verifying the device certificate. Sourced by exactly one style (below). |
 | `verifyPeer` | boolean | `true` | `true` verifies the device certificate against the trust anchors; `false` accepts any device certificate (a commissioning/debug posture that raises a `tls-peer-unverified` event). |
 | `serverName` | string | endpoint host | The verification / SNI name. An IP literal is verified against the device certificate's IP SAN. |
 | `checkExpiration` | boolean | `true` | `false` tolerates an expired / not-yet-valid device certificate (for devices without a real-time clock). |
 | `cipherSuites` | string[] | GCM + TLS 1.3 | An optional cipher-suite allow-list (IANA / rustls names). Only GCM-based and TLS 1.3 suites are supported. |
 
-`mode: tls` requires a client identity (`client.certSecret`, or `client.certFile` + `client.keyFile`);
-with `verifyPeer: true` it also requires trust anchors (`ca.secret`/`ca.file`, or a `certSecret` bundle
-that carries `caPem`). Devices that offer only CBC-based cipher suites are not supported — enable
-GCM-based suites on the device. See the how-to guide "Connect to a CIP Security device."
+Each credential — the client certificate, the client key, and the CA — is sourced by exactly **one**
+of three styles; mixing styles on one credential is a startup error.
+
+| Credential | Vault ref (typed) | File path | Inline `$secret` content |
+|------------|-------------------|-----------|--------------------------|
+| Client identity | `client.certSecret` — a `{certPem, keyPem[, caPem]}` vault bundle (cert + key together) | `client.certFile` + `client.keyFile` | `client.cert` + `client.key`, each `{"$secret": "<name>"}` |
+| CA trust anchors | `ca.secret` — a vault PEM secret | `ca.file` | `ca.cert` — `{"$secret": "<name>"}` |
+
+An inline reference is `{"$secret": "<vault-name>"}` (the ecosystem-wide `$secret` convention): the
+PEM content is resolved from the credentials vault at connect time and never lands in the logged
+config. Add `"field": "<key>"` to read one JSON field of the secret (for example, a
+`{certPem, keyPem}` bundle referenced field-by-field). Example:
+
+```json
+"security": {
+  "mode": "tls",
+  "client": {
+    "cert": { "$secret": "tls/cip-client-cert" },
+    "key":  { "$secret": "tls/cip-client-key" }
+  },
+  "ca": { "cert": { "$secret": "tls/plant-root" } }
+}
+```
+
+`mode: tls` requires a client identity (any one style); with `verifyPeer: true` it also requires trust
+anchors (any one `ca` style, or a `certSecret` bundle that carries `caPem`). Devices that offer only
+CBC-based cipher suites are not supported — enable GCM-based suites on the device. See the how-to guide
+"Connect to a CIP Security device."
 
 ### `pollGroups[]` (poll mode)
 
@@ -251,3 +273,9 @@ after `ecv1` on a multi-site broker.
   `2222` — a push instance configured with TLS is rejected at startup. Certificate commissioning
   (enrollment/rotation of the adapter's own certificate) is not part of this adapter; provision the
   client certificate and trust anchors through the credentials vault or files.
+- **Security posture reporting** — on connect the adapter reads the target's CIP Security objects and
+  reports the device's posture (state, security profiles, allowed/available cipher suites, client-cert
+  and expiration policy, and a certificate summary) on `sb/status` under `security.target`, with
+  `security.targetSupportsCipSecurity` indicating whether the device implements them. This is automatic
+  and needs no configuration; a device without CIP Security simply reports
+  `targetSupportsCipSecurity: false`. See the [messaging interface](messaging-interface.md) reference.

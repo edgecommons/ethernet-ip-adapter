@@ -23,7 +23,9 @@ use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvi
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore};
 
-use crate::device::{ConnectionConfig, SecurityStatus};
+use crate::device::{
+    ConnectionConfig, SecurityStatus, TargetCertificateSummary, TargetSecurityPosture,
+};
 
 /// The `connection.security` block (DESIGN-cip-security.md §3.3) — a strict typed island inside the
 /// deliberately-open `connection` object. Absent ⇒ plaintext (the default).
@@ -65,22 +67,108 @@ pub enum SecurityMode {
     Tls,
 }
 
-/// The adapter's client identity: a vault TLS bundle (`certSecret`) OR a PEM cert+key file pair.
+/// An inline `{"$secret": "<name>"[, "field": "<key>"]}` content reference — the ecosystem's
+/// universal `$secret` convention (`core/docs/CREDENTIALS.md`), resolved to PEM text at connect time.
+/// The whole-secret form yields the secret's UTF-8 value; the `field` form yields that JSON field of
+/// the secret. Distinct on the wire from a `*Secret` typed vault ref (a bare string) and a `*File`
+/// path (a bare string): this is always a JSON object with a `$secret` key.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    /// The vault secret name.
+    #[serde(rename = "$secret")]
+    pub secret: String,
+    /// An optional JSON field of the secret to read (whole value when absent).
+    #[serde(default)]
+    pub field: Option<String>,
+}
+
+impl SecretRef {
+    /// Resolve the reference to PEM text via the vault. `what` names the credential for errors.
+    ///
+    /// # Errors
+    ///
+    /// A config-legible message when no vault is configured, the secret is absent, or the requested
+    /// field is missing / not a string.
+    fn resolve(
+        &self,
+        creds: Option<&Arc<dyn CredentialService>>,
+        what: &str,
+    ) -> std::result::Result<String, String> {
+        let creds = creds.ok_or_else(|| {
+            format!(
+                "{what} uses {{\"$secret\": \"{}\"}} but no credentials vault is configured",
+                self.secret
+            )
+        })?;
+        let secret = creds
+            .get(&self.secret)
+            .map_err(|e| format!("vault get(`{}`) for {what}: {e}", self.secret))?
+            .ok_or_else(|| format!("vault secret `{}` (referenced by {what}) not found", self.secret))?;
+        match &self.field {
+            None => secret
+                .as_str()
+                .map(str::to_string)
+                .map_err(|e| format!("secret `{}` for {what}: {e}", self.secret)),
+            Some(f) => secret
+                .as_json()
+                .map_err(|e| format!("secret `{}` for {what}: {e}", self.secret))?
+                .get(f)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!("secret `{}` field `{f}` (for {what}) missing or not a string", self.secret)
+                }),
+        }
+    }
+}
+
+/// The adapter's client identity for mutual TLS. Exactly one of three sourcing **styles** is given
+/// (validated in [`SecurityConfig::validate`], §3.3):
+///
+/// 1. **bundle vault ref** — `certSecret`: a vault `{certPem, keyPem[, caPem]}` TLS bundle (one ref
+///    yields cert + key together);
+/// 2. **files** — `certFile` + `keyFile`: PEM file paths (both required);
+/// 3. **inline `$secret` content** — `cert` + `key`: each a `{"$secret": …}` yielding one PEM (both
+///    required), the ecosystem `$secret` convention.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClientIdentity {
-    /// A vault secret name holding a `{certPem, keyPem[, caPem]}` TLS bundle.
+    /// Style 1: a vault secret name holding a `{certPem, keyPem[, caPem]}` TLS bundle.
     #[serde(default)]
     pub cert_secret: Option<String>,
-    /// A PEM certificate (chain) file path.
+    /// Style 2: a PEM certificate (chain) file path.
     #[serde(default)]
     pub cert_file: Option<String>,
-    /// A PEM private-key file path.
+    /// Style 2: a PEM private-key file path.
     #[serde(default)]
     pub key_file: Option<String>,
+    /// Style 3: an inline `{"$secret": …}` yielding the client certificate (chain) PEM.
+    #[serde(default)]
+    pub cert: Option<SecretRef>,
+    /// Style 3: an inline `{"$secret": …}` yielding the client private-key PEM.
+    #[serde(default)]
+    pub key: Option<SecretRef>,
 }
 
-/// The trust anchors: a vault secret name (PEM, possibly several roots) OR a PEM file path.
+impl ClientIdentity {
+    /// Whether the bundle (`certSecret`) style is used.
+    fn has_bundle(&self) -> bool {
+        self.cert_secret.is_some()
+    }
+    /// Whether any file field is set.
+    fn has_files(&self) -> bool {
+        self.cert_file.is_some() || self.key_file.is_some()
+    }
+    /// Whether any inline `$secret` field is set.
+    fn has_inline(&self) -> bool {
+        self.cert.is_some() || self.key.is_some()
+    }
+}
+
+/// The trust anchors for verifying the device certificate. Exactly one of three sourcing styles:
+/// a vault secret name (`secret`), a PEM file path (`file`), or an inline `{"$secret": …}` (`cert`)
+/// — the `client`-identity styles' CA analog (§3.3/§4.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaSource {
@@ -90,6 +178,22 @@ pub struct CaSource {
     /// A CA PEM file path.
     #[serde(default)]
     pub file: Option<String>,
+    /// An inline `{"$secret": …}` yielding the CA certificate PEM (one or more roots).
+    #[serde(default)]
+    pub cert: Option<SecretRef>,
+}
+
+impl CaSource {
+    /// The number of sourcing styles configured (should be exactly one).
+    fn style_count(&self) -> usize {
+        usize::from(self.secret.is_some())
+            + usize::from(self.file.is_some())
+            + usize::from(self.cert.is_some())
+    }
+    /// Whether any CA source is configured at all.
+    fn is_configured(&self) -> bool {
+        self.style_count() > 0
+    }
 }
 
 fn d_true() -> bool {
@@ -146,37 +250,66 @@ impl SecurityConfig {
                  instance — implicit I/O requires DTLS, which is not available; see limitations"
             ));
         }
-        // A partial file identity (only one of certFile/keyFile) is a specific, common mistake — name
-        // it precisely, ahead of the generic "requires a client identity" message.
+        // The client identity is sourced by exactly ONE of three styles — bundle (certSecret), files
+        // (certFile+keyFile), or inline (cert+key {"$secret": …}). Mixing them is ambiguous (which
+        // wins?), so it is a startup error, and each chosen style must be complete.
         if let Some(c) = &self.client {
-            if c.cert_secret.is_none() && c.cert_file.is_some() != c.key_file.is_some() {
+            let styles =
+                usize::from(c.has_bundle()) + usize::from(c.has_files()) + usize::from(c.has_inline());
+            if styles > 1 {
                 return Err(format!(
-                    "device `{device_id}`: security.client needs BOTH certFile and keyFile \
-                     (or use certSecret)"
+                    "device `{device_id}`: security.client mixes sourcing styles — use exactly ONE of \
+                     certSecret (vault bundle), certFile+keyFile (files), or cert+key inline \
+                     {{\"$secret\": …}}"
+                ));
+            }
+            // A partial file identity (only one of certFile/keyFile) is a specific, common mistake.
+            if c.has_files() && !(c.cert_file.is_some() && c.key_file.is_some()) {
+                return Err(format!(
+                    "device `{device_id}`: security.client needs BOTH certFile and keyFile"
+                ));
+            }
+            // Likewise a partial inline identity (only one of cert/key).
+            if c.has_inline() && !(c.cert.is_some() && c.key.is_some()) {
+                return Err(format!(
+                    "device `{device_id}`: security.client needs BOTH cert and key inline \
+                     {{\"$secret\": …}} references"
                 ));
             }
         }
         // A CIP Security device requires a client certificate (0x5E attr 9), so an identity-less TLS
         // config is almost certainly a misconfiguration.
         let has_client = self.client.as_ref().is_some_and(|c| {
-            c.cert_secret.is_some() || (c.cert_file.is_some() && c.key_file.is_some())
+            c.has_bundle()
+                || (c.cert_file.is_some() && c.key_file.is_some())
+                || (c.cert.is_some() && c.key.is_some())
         });
         if !has_client {
             return Err(format!(
                 "device `{device_id}`: security.mode `tls` requires a client identity \
-                 (client.certSecret, or client.certFile + client.keyFile)"
+                 (client.certSecret, client.certFile + client.keyFile, or client.cert + client.key \
+                 inline {{\"$secret\": …}})"
             ));
         }
-        // Verifying the peer needs trust anchors — either an explicit ca source, or a certSecret
-        // bundle that may carry caPem (resolved at connect time).
+        // The CA source is likewise exactly one style (secret / file / cert inline) when present.
+        if let Some(ca) = &self.ca {
+            if ca.style_count() > 1 {
+                return Err(format!(
+                    "device `{device_id}`: security.ca mixes sourcing styles — use exactly ONE of \
+                     secret (vault), file (path), or cert inline {{\"$secret\": …}}"
+                ));
+            }
+        }
+        // Verifying the peer needs trust anchors — either an explicit ca source (any style), or a
+        // certSecret bundle that may carry caPem (resolved at connect time).
         if self.verify_peer {
-            let has_ca = self.ca.as_ref().is_some_and(|c| c.secret.is_some() || c.file.is_some());
-            let bundle_may_have_ca =
-                self.client.as_ref().is_some_and(|c| c.cert_secret.is_some());
+            let has_ca = self.ca.as_ref().is_some_and(CaSource::is_configured);
+            let bundle_may_have_ca = self.client.as_ref().is_some_and(ClientIdentity::has_bundle);
             if !has_ca && !bundle_may_have_ca {
                 return Err(format!(
                     "device `{device_id}`: security.mode `tls` with verifyPeer requires a CA source \
-                     (ca.secret or ca.file) unless the client bundle (certSecret) carries caPem"
+                     (ca.secret, ca.file, or ca.cert inline {{\"$secret\": …}}) unless the client \
+                     bundle (certSecret) carries caPem"
                 ));
             }
         }
@@ -275,9 +408,10 @@ pub fn build_client_config(
     let mut client_cert_pem: Option<String> = None;
     let mut client_key_pem: Option<String> = None;
 
-    // ---- client identity ----
+    // ---- client identity (exactly one style, per validate()) ----
     if let Some(c) = &sec.client {
         if let Some(name) = &c.cert_secret {
+            // Style 1: a vault TLS bundle (cert + key + optional CA together).
             let creds = creds.ok_or_else(|| {
                 format!("client.certSecret `{name}` is set but no credentials vault is configured")
             })?;
@@ -290,13 +424,18 @@ pub fn build_client_config(
             if let Some(ca) = bundle.ca_pem {
                 root_pems.push(ca);
             }
+        } else if let (Some(cert), Some(key)) = (&c.cert, &c.key) {
+            // Style 3: inline {"$secret": …} refs, each resolved to one PEM.
+            client_cert_pem = Some(cert.resolve(creds, "client.cert")?);
+            client_key_pem = Some(key.resolve(creds, "client.key")?);
         } else if let (Some(cf), Some(kf)) = (&c.cert_file, &c.key_file) {
+            // Style 2: file paths.
             client_cert_pem = Some(read_pem_file(cf, "client certificate")?);
             client_key_pem = Some(read_pem_file(kf, "client key")?);
         }
     }
 
-    // ---- trust anchors ----
+    // ---- trust anchors (exactly one style, per validate()) ----
     if let Some(ca) = &sec.ca {
         if let Some(name) = &ca.secret {
             let creds = creds.ok_or_else(|| {
@@ -307,6 +446,9 @@ pub fn build_client_config(
                 .map_err(|e| format!("vault get_string(`{name}`): {e}"))?
                 .ok_or_else(|| format!("vault CA secret `{name}` not found"))?;
             root_pems.push(pem);
+        } else if let Some(cert) = &ca.cert {
+            // Inline {"$secret": …} CA content.
+            root_pems.push(cert.resolve(creds, "ca.cert")?);
         } else if let Some(f) = &ca.file {
             root_pems.push(read_pem_file(f, "CA certificate")?);
         }
@@ -405,7 +547,62 @@ pub fn security_status(
         peer_verified: meta.verify_peer,
         peer,
         client_cert_not_after: meta.client_cert_not_after.clone(),
+        target: None,
     }
+}
+
+/// A plaintext-session [`SecurityStatus`] carrying (only) the target's posture — so a `mode:
+/// plaintext` instance that read a target's CIP Security objects still surfaces them (and reports
+/// `targetSupportsCipSecurity`). `tls: false` marks the session plaintext.
+#[must_use]
+pub fn plaintext_status(target: Option<TargetSecurityPosture>) -> SecurityStatus {
+    SecurityStatus {
+        tls: false,
+        target,
+        ..SecurityStatus::default()
+    }
+}
+
+/// Map the `enip` crate's decoded [`enip::SecurityPosture`] into the protocol-agnostic seam
+/// [`TargetSecurityPosture`] (Phase 2a, §4.1). `None` when the device implements no CIP Security
+/// object — the seam never sees the `enip` types.
+#[must_use]
+pub fn map_target_posture(p: &enip::SecurityPosture) -> Option<TargetSecurityPosture> {
+    if !p.is_available() {
+        return None;
+    }
+    let mut out = TargetSecurityPosture::default();
+    if let Some(cip) = &p.cip_security {
+        out.state = Some(cip.state.description().to_string());
+        if let Some(prof) = &cip.profiles_supported {
+            out.profiles = prof.names().into_iter().map(String::from).collect();
+        }
+    }
+    if let Some(eip) = &p.eip_security {
+        if let Some(a) = &eip.allowed_cipher_suites {
+            out.allowed_cipher_suites = a.labels();
+        }
+        if let Some(a) = &eip.available_cipher_suites {
+            out.available_cipher_suites = a.labels();
+        }
+        out.verify_client = eip.verify_client_certificate;
+        out.send_certificate_chain = eip.send_certificate_chain;
+        out.check_expiration = eip.check_expiration;
+    }
+    if let Some(cert) = &p.certificate_management {
+        let mut cs = TargetCertificateSummary::default();
+        if let Some(caps) = &cert.capabilities {
+            cs.push_supported = Some(caps.push_supported());
+            cs.pull_supported = Some(caps.pull_supported());
+        }
+        if let Some(inst) = &cert.instance1 {
+            cs.name = inst.name.clone();
+            cs.state = inst.state.map(|s| s.description().to_string());
+            cs.encoding = inst.encoding.map(|e| e.description().to_string());
+        }
+        out.certificate = Some(cs);
+    }
+    Some(out)
 }
 
 /// Extract a certificate's `notAfter` as an RFC-3339 string (best-effort; `None` on any parse error).
@@ -640,6 +837,93 @@ mod tests {
         assert!(s.validate("plc", false).is_ok());
     }
 
+    // ---- Change 1: inline `$secret` sourcing style + collision rejection ----
+
+    #[test]
+    fn tls_inline_secret_client_and_ca_parse_and_validate() {
+        let c = conn(json!({
+            "endpoint": "10.0.0.1",
+            "security": {
+                "mode": "tls",
+                "client": {
+                    "cert": { "$secret": "tls/cip-client-cert" },
+                    "key": { "$secret": "tls/cip-client-key" }
+                },
+                "ca": { "cert": { "$secret": "tls/plant-root" } }
+            }
+        }));
+        let s = SecurityConfig::from_connection(&c).unwrap().unwrap();
+        let client = s.client.as_ref().unwrap();
+        assert_eq!(client.cert.as_ref().unwrap().secret, "tls/cip-client-cert");
+        assert_eq!(client.key.as_ref().unwrap().secret, "tls/cip-client-key");
+        assert_eq!(s.ca.as_ref().unwrap().cert.as_ref().unwrap().secret, "tls/plant-root");
+        assert!(s.validate("plc", false).is_ok());
+    }
+
+    #[test]
+    fn secret_ref_field_form_parses() {
+        let c = conn(json!({
+            "endpoint": "h",
+            "security": { "mode": "tls",
+                "client": { "cert": { "$secret": "bundle", "field": "certPem" },
+                            "key": { "$secret": "bundle", "field": "keyPem" } },
+                "verifyPeer": false }
+        }));
+        let s = SecurityConfig::from_connection(&c).unwrap().unwrap();
+        let key = s.client.unwrap().key.unwrap();
+        assert_eq!(key.secret, "bundle");
+        assert_eq!(key.field.as_deref(), Some("keyPem"));
+    }
+
+    #[test]
+    fn client_mixing_bundle_and_inline_is_rejected() {
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "certSecret": "pki/eip", "cert": { "$secret": "x" }, "key": { "$secret": "y" } } }));
+        let err = s.validate("plc", false).unwrap_err();
+        assert!(err.contains("mixes sourcing styles"), "{err}");
+    }
+
+    #[test]
+    fn client_mixing_files_and_inline_is_rejected() {
+        let s = sec_of(json!({ "mode": "tls", "verifyPeer": false,
+            "client": { "certFile": "c.pem", "keyFile": "k.pem", "cert": { "$secret": "x" }, "key": { "$secret": "y" } } }));
+        let err = s.validate("plc", false).unwrap_err();
+        assert!(err.contains("mixes sourcing styles"), "{err}");
+    }
+
+    #[test]
+    fn client_partial_inline_identity_is_rejected() {
+        let s = sec_of(json!({ "mode": "tls", "verifyPeer": false,
+            "client": { "cert": { "$secret": "x" } } }));
+        let err = s.validate("plc", false).unwrap_err();
+        assert!(err.contains("BOTH cert and key inline"), "{err}");
+    }
+
+    #[test]
+    fn ca_mixing_file_and_inline_is_rejected() {
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "certFile": "c.pem", "keyFile": "k.pem" },
+            "ca": { "file": "ca.pem", "cert": { "$secret": "root" } } }));
+        let err = s.validate("plc", false).unwrap_err();
+        assert!(err.contains("security.ca mixes sourcing styles"), "{err}");
+    }
+
+    #[test]
+    fn ca_inline_secret_satisfies_verify_peer() {
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "certFile": "c.pem", "keyFile": "k.pem" },
+            "ca": { "cert": { "$secret": "root" } } }));
+        assert!(s.validate("plc", false).is_ok());
+    }
+
+    #[test]
+    fn unknown_key_in_secret_ref_is_rejected() {
+        // The inline object is strict: only `$secret` and `field` are allowed.
+        let c = conn(json!({ "endpoint": "h", "security": { "mode": "tls",
+            "client": { "cert": { "$secret": "x", "bogus": 1 }, "key": { "$secret": "y" } } } }));
+        assert!(SecurityConfig::from_connection(&c).is_err());
+    }
+
     #[test]
     fn plaintext_validate_is_noop() {
         assert!(sec_of(json!({})).validate("plc", false).is_ok());
@@ -758,6 +1042,102 @@ mod tests {
         assert!(meta.client_cert_not_after.is_some());
     }
 
+    /// A vault holding the cert / key / CA as three separate plain-PEM string secrets (the inline
+    /// `$secret` style stores each credential independently, not as a bundle).
+    fn vault_with_items(fx: &Fx) -> Arc<dyn CredentialService> {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FileKeyProvider::from_bytes([9u8; 32])) as Arc<dyn KeyProvider>;
+        let vault = LocalVault::open(dir.path().join("vault"), provider, 2).unwrap();
+        let svc = DefaultCredentialService::new(vault);
+        svc.put("tls/cip-client-cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
+        svc.put("tls/cip-client-key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        svc.put("tls/plant-root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        std::mem::forget(dir);
+        Arc::new(svc)
+    }
+
+    #[test]
+    fn build_client_config_from_inline_secret_cert_key_and_ca() {
+        let fx = mint();
+        let creds = vault_with_items(&fx);
+        let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
+        let s = sec_of(json!({
+            "mode": "tls",
+            "client": {
+                "cert": { "$secret": "tls/cip-client-cert" },
+                "key": { "$secret": "tls/cip-client-key" }
+            },
+            "ca": { "cert": { "$secret": "tls/plant-root" } }
+        }));
+        let (opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
+        assert!(matches!(opts.server_name, ServerName::IpAddress(_)));
+        assert!(meta.verify_peer);
+        assert!(meta.client_cert_not_after.is_some(), "inline client cert notAfter parsed");
+    }
+
+    #[test]
+    fn build_inline_secret_field_form_reads_a_bundle_field() {
+        // Store a JSON bundle and reference individual fields via `{"$secret": …, "field": …}`.
+        let fx = mint();
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FileKeyProvider::from_bytes([3u8; 32])) as Arc<dyn KeyProvider>;
+        let vault = LocalVault::open(dir.path().join("vault"), provider, 2).unwrap();
+        let svc = DefaultCredentialService::new(vault);
+        let bundle = json!({ "certPem": fx.client_cert_pem, "keyPem": fx.client_key_pem });
+        svc.put("tls/bundle", serde_json::to_vec(&bundle).unwrap().as_slice(), PutOptions::default()).unwrap();
+        svc.put("tls/root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        std::mem::forget(dir);
+        let creds: Arc<dyn CredentialService> = Arc::new(svc);
+
+        let c = conn(json!({ "endpoint": "127.0.0.1" }));
+        let s = sec_of(json!({
+            "mode": "tls",
+            "client": {
+                "cert": { "$secret": "tls/bundle", "field": "certPem" },
+                "key": { "$secret": "tls/bundle", "field": "keyPem" }
+            },
+            "ca": { "cert": { "$secret": "tls/root" } }
+        }));
+        let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
+        assert!(meta.client_cert_not_after.is_some());
+    }
+
+    #[test]
+    fn build_inline_secret_without_vault_errors() {
+        let c = conn(json!({ "endpoint": "h" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "tls/c" }, "key": { "$secret": "tls/k" } },
+            "verifyPeer": false }));
+        let err = build_client_config(&s, &c, None).unwrap_err();
+        assert!(err.contains("no credentials vault"), "{err}");
+    }
+
+    #[test]
+    fn build_inline_secret_missing_from_vault_errors() {
+        let fx = mint();
+        let creds = vault_with_items(&fx);
+        let c = conn(json!({ "endpoint": "h" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "tls/absent" }, "key": { "$secret": "tls/cip-client-key" } },
+            "verifyPeer": false }));
+        let err = build_client_config(&s, &c, Some(&creds)).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn build_inline_secret_missing_field_errors() {
+        let fx = mint();
+        let creds = vault_with_items(&fx);
+        let c = conn(json!({ "endpoint": "h" }));
+        // `tls/plant-root` is a bare PEM (not JSON), so a field read fails legibly.
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "tls/plant-root", "field": "certPem" },
+                        "key": { "$secret": "tls/cip-client-key" } },
+            "verifyPeer": false }));
+        let err = build_client_config(&s, &c, Some(&creds)).unwrap_err();
+        assert!(err.contains("client.cert"), "{err}");
+    }
+
     #[test]
     fn build_no_verify_needs_no_ca_and_reports_unverified() {
         let fx = mint();
@@ -854,6 +1234,70 @@ mod tests {
         assert!(st.peer_verified);
         assert_eq!(st.peer.as_deref(), Some("192.168.10.60"), "falls back to endpoint host");
         assert_eq!(st.client_cert_not_after.as_deref(), Some("2027-01-01T00:00:00Z"));
+    }
+
+    // ---- Phase 2a: enip posture → seam mapping ----
+
+    #[test]
+    fn map_target_posture_maps_a_full_posture() {
+        let posture = enip::SecurityPosture {
+            cip_security: Some(enip::CipSecurityObject {
+                state: enip::CipSecurityState::Configured,
+                profiles_supported: Some(enip::SecurityProfiles { bits: 0x0002 }),
+                profiles_configured: None,
+            }),
+            eip_security: Some(enip::EipSecurityObject {
+                state: 2,
+                capability_flags: None,
+                available_cipher_suites: Some(enip::CipherSuiteList {
+                    suites: vec![enip::CipherSuiteId { id: 0xC02B }],
+                }),
+                allowed_cipher_suites: Some(enip::CipherSuiteList {
+                    suites: vec![enip::CipherSuiteId { id: 0xC02B }],
+                }),
+                verify_client_certificate: Some(true),
+                send_certificate_chain: Some(false),
+                check_expiration: Some(true),
+            }),
+            certificate_management: Some(enip::CertificateManagementSummary {
+                capabilities: Some(enip::CertificateCapabilities { flags: 0x0000_0001 }),
+                instance1: Some(enip::CertificateInstance {
+                    name: Some("Device".to_string()),
+                    state: Some(enip::CertificateState::Verified),
+                    encoding: Some(enip::CertificateEncoding::Pem),
+                }),
+            }),
+        };
+        let mapped = map_target_posture(&posture).expect("available posture maps");
+        assert_eq!(mapped.state.as_deref(), Some("Configured"));
+        assert_eq!(mapped.profiles, vec!["EtherNet/IP Confidentiality".to_string()]);
+        assert_eq!(
+            mapped.allowed_cipher_suites,
+            vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".to_string()]
+        );
+        assert_eq!(mapped.verify_client, Some(true));
+        let cert = mapped.certificate.expect("cert summary");
+        assert_eq!(cert.push_supported, Some(true));
+        assert_eq!(cert.pull_supported, Some(false));
+        assert_eq!(cert.name.as_deref(), Some("Device"));
+        assert_eq!(cert.state.as_deref(), Some("Verified"));
+        assert_eq!(cert.encoding.as_deref(), Some("PEM"));
+    }
+
+    #[test]
+    fn map_target_posture_none_for_empty() {
+        assert!(map_target_posture(&enip::SecurityPosture::default()).is_none());
+    }
+
+    #[test]
+    fn plaintext_status_carries_only_the_target() {
+        let st = plaintext_status(Some(TargetSecurityPosture {
+            state: Some("Factory Default".to_string()),
+            ..Default::default()
+        }));
+        assert!(!st.tls);
+        assert!(st.target.is_some());
+        assert!(st.tls_version.is_none());
     }
 
     #[test]

@@ -101,3 +101,10 @@ path = "fuzz_targets/fuzz_discovery.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_security_attrs"
+path = "fuzz_targets/fuzz_security_attrs.rs"
+test = false
+doc = false
+bench = false

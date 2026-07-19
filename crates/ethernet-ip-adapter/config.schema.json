@@ -88,11 +88,22 @@
     }
   },
   "$defs": {
+    "secretRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["$secret"],
+      "title": "Inline vault reference",
+      "description": "The ecosystem `{\"$secret\": \"<name>\"}` convention: the PEM content is resolved from the credentials vault at connect time and never lands in the logged config. Add `field` to read one JSON field of the secret.",
+      "properties": {
+        "$secret": { "type": "string", "minLength": 1, "description": "The credentials-vault secret name to resolve to PEM text." },
+        "field": { "type": "string", "minLength": 1, "description": "Optional: read this JSON field of the secret instead of its whole value." }
+      }
+    },
     "security": {
       "type": "object",
       "additionalProperties": false,
       "title": "Connection security (CIP Security)",
-      "description": "TLS on the explicit-messaging path (CIP Security). Absent ⇒ plaintext. `mode: tls` wraps the EtherNet/IP session in mutual TLS on TCP 2221; it is rejected on a `mode: push` (class-1 I/O) instance. Cert/key/CA material comes from the credentials vault (`certSecret`/`ca.secret`) or from files (`certFile`/`keyFile`/`ca.file`).",
+      "description": "TLS on the explicit-messaging path (CIP Security). Absent ⇒ plaintext. `mode: tls` wraps the EtherNet/IP session in mutual TLS on TCP 2221; it is rejected on a `mode: push` (class-1 I/O) instance. Each credential (client cert/key, CA) is sourced by exactly ONE style: a typed vault ref (`certSecret`/`ca.secret`), a file path (`certFile`/`keyFile`/`ca.file`), or an inline `{\"$secret\": …}` content reference (`client.cert`+`client.key`/`ca.cert`). Mixing styles on one credential is a startup error.",
       "properties": {
         "mode": {
           "enum": ["plaintext", "tls"],
@@ -102,20 +113,23 @@
         "client": {
           "type": "object",
           "additionalProperties": false,
-          "description": "The adapter's own identity for mutual TLS (required for `mode: tls`). Use `certSecret` (a vault TLS bundle) OR `certFile` + `keyFile`.",
+          "description": "The adapter's own identity for mutual TLS (required for `mode: tls`). Use exactly ONE style: `certSecret` (a vault TLS bundle), `certFile` + `keyFile` (files), or `cert` + `key` (inline `{\"$secret\": …}` content references).",
           "properties": {
-            "certSecret": { "type": "string", "minLength": 1, "description": "A credentials-vault secret name holding a `{certPem, keyPem[, caPem]}` TLS bundle." },
-            "certFile": { "type": "string", "minLength": 1, "description": "A PEM client-certificate (chain) file path." },
-            "keyFile": { "type": "string", "minLength": 1, "description": "A PEM client private-key file path." }
+            "certSecret": { "type": "string", "minLength": 1, "description": "Style 1: a credentials-vault secret name holding a `{certPem, keyPem[, caPem]}` TLS bundle." },
+            "certFile": { "type": "string", "minLength": 1, "description": "Style 2: a PEM client-certificate (chain) file path." },
+            "keyFile": { "type": "string", "minLength": 1, "description": "Style 2: a PEM client private-key file path." },
+            "cert": { "$ref": "#/$defs/secretRef", "description": "Style 3: an inline `{\"$secret\": …}` yielding the client certificate (chain) PEM." },
+            "key": { "$ref": "#/$defs/secretRef", "description": "Style 3: an inline `{\"$secret\": …}` yielding the client private-key PEM." }
           }
         },
         "ca": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Trust anchors for verifying the device certificate. Use `secret` (a vault PEM secret) OR `file`; may be omitted when `certSecret` carries `caPem`, or when `verifyPeer` is false.",
+          "description": "Trust anchors for verifying the device certificate. Use exactly ONE style: `secret` (a vault PEM secret), `file` (a PEM path), or `cert` (an inline `{\"$secret\": …}`). May be omitted when `certSecret` carries `caPem`, or when `verifyPeer` is false.",
           "properties": {
-            "secret": { "type": "string", "minLength": 1, "description": "A credentials-vault secret name holding CA certificate PEM (one or more roots)." },
-            "file": { "type": "string", "minLength": 1, "description": "A CA-certificate PEM file path." }
+            "secret": { "type": "string", "minLength": 1, "description": "Style 1: a credentials-vault secret name holding CA certificate PEM (one or more roots)." },
+            "file": { "type": "string", "minLength": 1, "description": "Style 2: a CA-certificate PEM file path." },
+            "cert": { "$ref": "#/$defs/secretRef", "description": "Style 3: an inline `{\"$secret\": …}` yielding the CA certificate PEM (one or more roots)." }
           }
         },
         "verifyPeer": {

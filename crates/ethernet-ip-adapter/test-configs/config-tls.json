@@ -65,6 +65,34 @@
           }
         ],
         "writes": { "allow": ["FILL_SETPOINT"] }
+      },
+      {
+        "id": "filler-plc-tls-inline",
+        "adapter": "ethernet-ip",
+        "connection": {
+          "endpoint": "enip-tls",
+          "connected": false,
+          "security": {
+            "mode": "tls",
+            "client": {
+              "cert": { "$secret": "tls/cip-client-cert" },
+              "key": { "$secret": "tls/cip-client-key" }
+            },
+            "ca": { "cert": { "$secret": "tls/plant-root" } },
+            "verifyPeer": true,
+            "serverName": "enip-tls"
+          }
+        },
+        "pollGroups": [
+          {
+            "id": "fast",
+            "pollIntervalMs": 500,
+            "signals": [
+              { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" }
+            ]
+          }
+        ],
+        "writes": { "allow": [] }
       }
     ]
   }

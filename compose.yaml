@@ -119,6 +119,22 @@ services:
       - ./test-infra/enip-tls/certs:/etc/stunnel/certs:ro
     restart: unless-stopped
 
+  # OpENer CIPSecurity branch — the CIP Security **object-model** target for the Phase-2a posture reads
+  # (DESIGN-cip-security.md §4.1/§5.2). Built from test-infra/opener-cipsecurity/Dockerfile (the OpENer
+  # `CIPSecurity` branch + OpENerFileObject, `OPENER_CIP_SECURITY`), it serves the 0x5D/0x5E/0x5F
+  # security objects over the plaintext explicit session on 44818 (the branch stubs the TLS transport).
+  # crates/enip/tests/live_cip_security.rs (self-skipping on a :44822 probe) drives the real
+  # enip::read_security_posture against it.
+  #
+  #   docker compose up --build opener-cipsec
+  #   cargo test -p ec-enip --test live_cip_security -- --nocapture
+  opener-cipsec:
+    build: ./test-infra/opener-cipsecurity
+    container_name: ethernet-ip-adapter-opener-cipsec
+    command: ["eth0"]
+    ports: ["44822:44818"]
+    restart: unless-stopped
+
   ethernet-ip-adapter:
     build:
       context: .

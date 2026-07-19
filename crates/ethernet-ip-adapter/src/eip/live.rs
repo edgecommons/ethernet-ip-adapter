@@ -50,7 +50,9 @@ impl DeviceBackend for EipBackend {
             let client = enip::EipClient::connect_tls(&conn.endpoint, opts, tls_opts)
                 .await
                 .map_err(map_enip_error)?;
-            let status = super::tls::security_status(client.tls_session_info(), &meta, conn);
+            let mut status = super::tls::security_status(client.tls_session_info(), &meta, conn);
+            // Phase 2a: read the target's CIP Security posture over the established (TLS) session.
+            status.target = read_target_posture(&client).await;
             return Ok(Box::new(super::session::EipSession::new_secure(
                 client,
                 request_timeout,
@@ -62,7 +64,18 @@ impl DeviceBackend for EipBackend {
         let client = enip::EipClient::connect(&conn.endpoint, opts)
             .await
             .map_err(map_enip_error)?;
-        Ok(Box::new(super::session::EipSession::new(client, request_timeout)))
+        // Phase 2a: a plaintext session still reads the target's posture (best-effort). A generic CIP
+        // device reports none (targetSupportsCipSecurity: false); a CIP Security device polled
+        // plaintext surfaces its objects. When no posture is read, the session stays a bare plaintext
+        // session (`security()` = None ⇒ `{"mode":"plaintext"}`).
+        match read_target_posture(&client).await {
+            Some(target) => Ok(Box::new(super::session::EipSession::new_secure(
+                client,
+                request_timeout,
+                super::tls::plaintext_status(Some(target)),
+            ))),
+            None => Ok(Box::new(super::session::EipSession::new(client, request_timeout))),
+        }
     }
 
     async fn open_push(
@@ -72,6 +85,31 @@ impl DeviceBackend for EipBackend {
     ) -> Result<Box<dyn PushSession>> {
         let session = EipPushSession::open(conn, io, self.timeouts(), VENDOR_ID).await?;
         Ok(Box::new(session))
+    }
+}
+
+/// Read the target's CIP Security posture over an established session (Phase 2a, §4.1), mapped to the
+/// protocol-agnostic seam type. Best-effort: a device that does not implement the objects yields
+/// `None`, and a connection-level read failure is swallowed (logged) so it never fails the connect —
+/// the posture is a diagnostic surface, not a liveness gate. A device found in the `Factory Default`
+/// state while being polled gets a WARN (an unprovisioned device on a secured poll path, §4.1).
+async fn read_target_posture(client: &enip::EipClient) -> Option<crate::device::TargetSecurityPosture> {
+    match client.read_security_posture().await {
+        Ok(posture) => {
+            if let Some(cip) = &posture.cip_security {
+                if cip.state == enip::CipSecurityState::FactoryDefault {
+                    tracing::warn!(
+                        "target reports CIP Security state `Factory Default` — the device is \
+                         unprovisioned; provision operational credentials before relying on TLS"
+                    );
+                }
+            }
+            super::tls::map_target_posture(&posture)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "reading target CIP Security posture failed (ignored)");
+            None
+        }
     }
 }
 

@@ -163,11 +163,20 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
   adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} },
   security: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
   framesConsumed, staleDropped, sequenceGaps }`.
-- **`security`** — the connection's TLS posture. A plaintext instance reports `{ mode: "plaintext" }`.
-  A TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified, peer,
-  clientCertNotAfter, handshakeFailures: {interval,total} }` — the negotiated fields are present once
-  the session is up. The `state` keepalive carries the same posture as `attributes.security`
+- **`security`** — the connection's security posture. A plaintext instance reports
+  `{ mode: "plaintext" }`; a TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified,
+  peer, clientCertNotAfter, handshakeFailures: {interval,total} }` — the negotiated fields are present
+  once the session is up. The `state` keepalive carries the same posture as `attributes.security`
   (`"tls"`|`"plaintext"`).
+
+  While a session is up, `security` also carries **`targetSupportsCipSecurity`** (boolean) and, when
+  the device implements the CIP Security objects, a **`target`** object with the device's decoded
+  posture: `{ state, profiles: [...], allowedCipherSuites: [...], availableCipherSuites: [...],
+  verifyClient, sendCertificateChain, checkExpiration, pullModel, certificate: { pushSupported,
+  pullSupported, name, state, encoding } }`. The adapter reads the target's CIP Security (0x5D),
+  EtherNet/IP Security (0x5E), and Certificate Management (0x5F) objects on connect (both plaintext and
+  TLS instances). A device that does not implement these objects reports
+  `targetSupportsCipSecurity: false` and no `target`.
 - **`sb/signals`** → the resolved config view, no device I/O. Poll: `{ id, mode:"poll", signals:[{ name,
   id, address, pollGroup, pollIntervalMs, publishMode, writable, deadband }] }`. Push: `{ id,
   mode:"push", signals:[{ name, id, address, direction ("input"|"output"), publishMode, writable,

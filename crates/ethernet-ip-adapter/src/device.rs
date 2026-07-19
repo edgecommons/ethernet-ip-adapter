@@ -133,6 +133,52 @@ pub struct SecurityStatus {
     /// The adapter's own client-certificate `notAfter`, RFC-3339 (drives Phase-2 rotation; surfaced
     /// now for operators). `None` when no client cert / not parseable.
     pub client_cert_not_after: Option<String>,
+    /// The **target's** decoded CIP Security posture (Phase 2a, DESIGN-cip-security.md §4.1), read
+    /// once per connect. `None` when the device implements none of the 0x5D/0x5E/0x5F objects (a
+    /// generic CIP device) — surfaced as `targetSupportsCipSecurity: false`, never an error.
+    pub target: Option<TargetSecurityPosture>,
+}
+
+/// The **target device's** decoded CIP Security posture (Phase 2a, DESIGN-cip-security.md §4.1) — the
+/// protocol-agnostic view the adapter surfaces on `sb/status.security.target`. The EtherNet/IP backend
+/// fills it from the target's CIP Security (0x5D), EtherNet/IP Security (0x5E), and Certificate
+/// Management (0x5F) objects; nothing above the seam sees the `enip`/`rustls` types. Read best-effort
+/// on connect: a device that does not implement these objects yields no posture (`None` at the
+/// `SecurityStatus.target` level), not an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetSecurityPosture {
+    /// The CIP Security Object state (e.g. `"Configured"`, `"Factory Default"`).
+    pub state: Option<String>,
+    /// The security profiles the device supports (named bits, e.g. `"EtherNet/IP Confidentiality"`).
+    pub profiles: Vec<String>,
+    /// The cipher suites the device will negotiate (IANA names, or `0xXXXX` when unrecognized).
+    pub allowed_cipher_suites: Vec<String>,
+    /// The cipher suites the device offers.
+    pub available_cipher_suites: Vec<String>,
+    /// Whether the device requires a client certificate (mutual-TLS enforcement, 0x5E attr 9).
+    pub verify_client: Option<bool>,
+    /// Whether the device sends its certificate chain (0x5E attr 10).
+    pub send_certificate_chain: Option<bool>,
+    /// Whether the device checks certificate expiration (0x5E attr 11).
+    pub check_expiration: Option<bool>,
+    /// The device certificate summary (push/pull capability + primary certificate instance).
+    pub certificate: Option<TargetCertificateSummary>,
+}
+
+/// A summary of the target's Certificate Management Object (0x5F) — the provisioning model it supports
+/// and its primary certificate instance's identity/state/encoding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetCertificateSummary {
+    /// Whether the device supports the push provisioning model (config tool writes certs).
+    pub push_supported: Option<bool>,
+    /// Whether the device supports the pull provisioning model (device enrolls via EST).
+    pub pull_supported: Option<bool>,
+    /// The primary certificate instance name.
+    pub name: Option<String>,
+    /// The primary certificate instance state (e.g. `"Verified"`).
+    pub state: Option<String>,
+    /// The primary certificate encoding (e.g. `"PEM"`).
+    pub encoding: Option<String>,
 }
 
 /// A live connection to one device. **This is the trait a backend implements.**

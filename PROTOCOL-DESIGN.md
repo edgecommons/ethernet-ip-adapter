@@ -74,6 +74,13 @@ decision below; DESIGN-cip-security.md). `rustls` speaks the GCM + TLS 1.3 suite
 mandates; legacy CBC/NULL/PSK-only firmware is the documented interop boundary, surfaced as the typed
 `EnipError::Tls { NoCipherOverlap }`.
 
+**Reading the target's security posture (Phase 2a, in scope, no feature gate).** The crate decodes the
+target's CIP Security object model — the **CIP Security Object (0x5D)**, **EtherNet/IP Security Object
+(0x5E)**, and **Certificate Management Object (0x5F)** — as typed, bounds-checked posture reads over
+the shipped generic `Get_Attribute_Single` service (§7.5, §7.7). This is pure decoding (no new
+transport, no new dependency, always available); the crate reads the *originator's* view of the target
+and never acts as a CIP Security *target* or writes the commissioning objects (that stays a non-goal).
+
 **Non-goals (v1).** UDT/structure *value* decoding (struct tags are detected and reported, not
 decoded); Logix STRING values; CIP Multiple Service Packet batching; **DTLS on the implicit (class-1)
 I/O path** — CIP Security for class-1 needs DTLS, which `rustls` does not provide and which has no OSS
@@ -529,6 +536,28 @@ T→O id. Class-3 connections idle-timeout on the target: the session sends a NO
 (a Get_Attribute_Single of Identity revision) if no request has flowed for ¾ of the inactivity
 window. ForwardClose on shutdown.
 
+### 7.7 CIP Security posture reads (0x5D / 0x5E / 0x5F)
+
+`cip/security.rs` adds *typed decoding* of the target's security object model on top of §7.5's
+`Get_Attribute_Single` — no new wire capability, no feature gate. The decoders are total functions
+over `WireReader` (§4): a truncated attribute, an over-long cipher-suite count, or an unknown scalar
+value yields a typed `WireError` or an `Unknown(_)` variant, never a panic (fuzz target
+`fuzz_security_attrs`).
+
+- **CIP Security Object 0x5D** — `CipSecurityState` (attr 1: Factory Default / Configuration In
+  Progress / Configured / …), `SecurityProfiles` bitmaps (attrs 2/3, WORD → named bits).
+- **EtherNet/IP Security Object 0x5E** — object state (attr 1), capability flags (attr 2), the
+  available / allowed **cipher-suite lists** (attrs 3/4: a USINT count + count × 2-byte IANA id, each
+  mapped to its suite name), and the verify-client / send-chain / check-expiration booleans (attrs
+  9/10/11).
+- **Certificate Management Object 0x5F** — push/pull `CertificateCapabilities` (class attr 8), and the
+  instance-1 `CertificateInstance` name / state / encoding (instance attrs 1/2/5).
+
+`EipClient::read_security_posture` reads all three and returns a `SecurityPosture`, mapping any CIP
+status (object/attribute unavailable) to "absent" so a generic CIP device reports an empty posture
+rather than an error; only a connection-level failure propagates. Validated against the OpENer
+`CIPSecurity` branch (§12.5) and duplex-fixture reads.
+
 ---
 
 ## 8. Implicit messaging (push / class-1 I/O)
@@ -880,6 +909,7 @@ surface — the invariant for all: **no panic, no OOM (allocation caps hold), de
 | `fuzz_io_frame` | UDP datagram → consume gauntlet (runt frames — the EIPScanner bug class) |
 | `fuzz_assembly_decode` | `AssemblyLayout::decode` against arbitrary layouts + data |
 | `fuzz_tag_path` | `TagAddress::parse` (caller-supplied strings) |
+| `fuzz_security_attrs` | CIP Security object attrs (0x5D/0x5E/0x5F): cipher-suite count lies, short strings, width-tolerant flags (§7.7) |
 
 Structured fuzzing via `arbitrary` for round-trip targets (`encode(x)` then mutate). Corpus
 seeded from the §12.4 vectors. CI: every PR runs each target for a fixed short budget

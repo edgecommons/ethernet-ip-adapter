@@ -33,7 +33,7 @@ Grounding artifacts (re-read them, do not work from memory):
 ## Table of contents
 
 1. [Overview & scope](#1-overview--scope)
-2. [Decisions register (D-EIP-1…D-EIP-20)](#2-decisions-register)
+2. [Decisions register (D-EIP-1…D-EIP-22)](#2-decisions-register)
 3. [Module architecture](#3-module-architecture)
 4. [Configuration schema](#4-configuration-schema)
 5. [Signal & data-type model](#5-signal--data-type-model)
@@ -146,6 +146,8 @@ performed, by this work).
 | **D-EIP-18** | **Push signals are config-declared assembly-layout fields** (`byte offset + type [+ bit] [+ arrayCount]` within the input/output assembly), with stable `signal.id` = `a<assemblyInstance>/<offset>/<type>[.<bit>]`. | Raw I/O is just bytes — the layout IS the signal model (the Modbus register-map analog for push). The id form mirrors Modbus's `u<unit>/<table>/<addr>/<type>`: derived from real addressing, stable across restarts, independent of the display `name`. Bounds are validated at startup by the crate's `AssemblyLayout` (construction-time, so runtime extraction cannot go out of bounds). |
 | **D-EIP-19** | **Decoder fuzzing is a release gate**: the protocol crate's cargo-fuzz targets (PROTOCOL-DESIGN §12.3) run in CI on every PR (short budget, checked-in corpus + regressions); a reproducible panic/OOM found by fuzzing is a ship blocker. | The memory-safety claim (D-EIP-1's reason to exist) must be executable, not aspirational. Fuzzing runs on Linux (CI/WSL — libFuzzer). |
 | **D-EIP-20** | **Pause in push mode keeps the I/O connection OPEN**: O→T production continues (heartbeat/outputs, run/idle unchanged), consumed frames still update the last-value snapshot and drive connectivity — but nothing is published to `data`. | Per-instance pause suspends *telemetry production* whichever mode the instance runs (user clarification). Closing the connection would conflate "operator muted the data flow" with "link is down" (same rationale as D-EIP-14), and stopping O→T production would make the *target* time the connection out (PROTOCOL-DESIGN D-ENIP-9). Push needs no keepalive probe: T→O reception itself is the liveness signal. |
+| **D-EIP-21** | **CIP Security Phase 1 — TLS on the explicit (poll) path.** A poll instance's `connection.security` block (`mode: plaintext\|tls`, client identity, CA, `verifyPeer`, `serverName`, `checkExpiration`, `cipherSuites`) wraps the explicit-messaging session in mutual X.509 TLS on TCP 2221 via `enip::connect_tls` (crate `tls` feature). The adapter builds the `rustls::ClientConfig`; the crate stays EdgeCommons-free. Cert/key/CA material is sourced by exactly one style per credential — a vault bundle/secret (`certSecret`/`ca.secret`), files (`certFile`/`keyFile`/`ca.file`), or an inline `{"$secret": …}` content ref (`client.cert`+`key`/`ca.cert`); mixing styles is a startup error. `tls` on a push instance is refused (no DTLS, no silent downgrade). | Poll mode is the security-sensitive path (writes) and TLS-on-TCP maps 1:1 onto the transport-generic session-actor seam (PROTOCOL-DESIGN §11.1). Only GCM + TLS 1.3 suites (`rustls`); CBC-only legacy firmware is a documented interop boundary (typed `NoCipherOverlap`). The three sourcing styles honor the ecosystem `$secret` convention while keeping file/vault/inline unambiguous. DESIGN-cip-security.md §3. |
+| **D-EIP-22** | **CIP Security Phase 2a — security-posture reads (originator).** On connect the adapter reads the target's CIP Security (0x5D), EtherNet/IP Security (0x5E), and Certificate Management (0x5F) objects and surfaces the decoded posture on `sb/status.security.target` (+ `targetSupportsCipSecurity`) and the session's `SecurityStatus`. The `enip` crate carries typed, bounds-checked (`WireReader`) decoders (`cip/security.rs`) over the shipped `get_attribute_single` service — no new transport, no feature gate, fuzzed by `fuzz_security_attrs`. A device implementing none of the objects reports `targetSupportsCipSecurity: false`, never an error. | Reading the target's posture makes Phase-1 TLS *operable* (an operator sees whether the device requires client certs, which suites it allows, its cert state) and is cheap: pure decoding over the existing generic services (the objects are reachable over plaintext or TLS). The typed-refusal pattern (unavailable ≠ error) mirrors `sb/browse`. Validated against the OpENer `CIPSecurity` branch (independent implementation of 0x5D/0x5E/0x5F). DESIGN-cip-security.md §4.1. |
 
 ---
 
@@ -743,6 +745,16 @@ the posture column unconditionally. A TLS instance reports the negotiated facts:
 as `attributes.security` (`"tls"`|`"plaintext"`), and `EtherNetIpConnection.tlsHandshakeFailures`
 (§8.2) counts handshake failures.
 
+**Target posture (Phase 2a, D-EIP-22).** Whenever a session is up (either mode), `security` also
+carries `targetSupportsCipSecurity` (bool) and, when the device implements the CIP Security objects, a
+`target` sub-object with the decoded posture:
+`"target": { "state": "Configured", "profiles": ["EtherNet/IP Confidentiality"],
+"allowedCipherSuites": ["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"], "availableCipherSuites": [...],
+"verifyClient": true, "sendCertificateChain": true, "checkExpiration": true, "pullModel": false,
+"certificate": { "pushSupported": true, "pullSupported": false, "name": "…", "state": "Verified",
+"encoding": "PEM" } }`. A generic CIP device (e.g. cpppo) reports `targetSupportsCipSecurity: false`
+and no `target`.
+
 A push instance answers the same shape plus an `io` object:
 `"io": { "o2tApiMs": 100, "t2oApiMs": 100, "run": true, "peerRun": true,
 "framesConsumed": {...}, "staleDropped": {...}, "sequenceGaps": {...} }` (negotiated APIs from
@@ -1112,8 +1124,8 @@ unsubscribes and the `STOPPED` state (the org unsubscribe-before-exit rule is sa
 
 ## 11. Simulator & validation
 
-**Four** external live targets, three of them independent implementations, spanning both modes
-(D-EIP-6) and — now — the tag-list browse path:
+**Six** external live targets, four of them independent implementations, spanning both modes
+(D-EIP-6), the tag-list browse path, and the CIP Security explicit/posture paths:
 
 | Target | Mode / paths | Role | §, port |
 |---|---|---|---|
@@ -1122,6 +1134,7 @@ unsubscribes and the `STOPPED` state (the org unsubscribe-before-exit rule is sa
 | **libplctag `ab_server`** (C) | poll: read/write via Unconnected_Send route | 2nd independent poll peer; the **backplane-routed** path cpppo never exercises | §11.6, `:44820` |
 | **EthernetIPSharp** (C#) | poll: read/write **+ browse `0x55`** | 3rd independent peer; **closes the `sb/browse` gap** with a real Get-Instance-Attribute-List impl | §11.7, `:44821` |
 | **stunnel → cpppo** (OpenSSL) | poll over **TLS** (CIP Security Phase 1): mutual X.509, read/write + negative matrix | independent TLS impl carrying independent EtherNet/IP, at exactly the layer Phase 1 changes | DESIGN-cip-security.md §5.2, `:2221`; CBC-only leg `:2223` |
+| **OpENer `CIPSecurity`** (C, ODVA) | **CIP Security posture reads** (Phase 2a): 0x5D/0x5E/0x5F `Get_Attribute_Single` | independent implementation of the three security objects; decodes state/profiles/cipher-suite-lists/cert-summary | DESIGN-cip-security.md §5.2, `test-infra/opener-cipsecurity/`, `:44822` |
 
 **CIP Security Phase-1 validation.** EtherNet/IP-over-TLS is byte-identical EtherNet/IP inside a
 standard TLS tunnel on TCP 2221, so an OpenSSL `stunnel` terminator (`test-infra/enip-tls/`) fronting
@@ -1131,6 +1144,20 @@ the already-validated cpppo poll target is a faithful Phase-1 peer at exactly th
 — wrong CA (`PeerUnverified`), missing client cert (rejected by `verify=2`), and a **CBC-only** legacy
 terminator on `:2223` proving the typed `NoCipherOverlap`. This is not a certified Vol 8 device: the
 real-CIP-Security-PLC row is a declared lab-hardware gap (§14.6, DESIGN-cip-security.md §5.2).
+
+**CIP Security Phase-2a validation.** The OpENer `CIPSecurity` branch implements the three security
+objects (0x5D/0x5E/0x5F) as real CIP objects — but stubs the TLS transport — so it serves genuine
+`Get_Attribute_Single` reads of the posture over the plaintext explicit session
+(`test-infra/opener-cipsecurity/`, `:44822`). `crates/enip/tests/live_cip_security.rs` (self-skipping on
+a `:44822` probe) drives the real `enip::read_security_posture` against it and asserts the typed decode
+against an independent implementation: CIP Security state (`Factory Default`), the EtherNet/IP
+Confidentiality **profile** bitmap, the count-prefixed **cipher-suite lists**, the verify-client /
+check-expiration flags, and the Certificate Management summary (push capability, cert instance name
+`"Default Device Certificate"` / state `Verified` / encoding `PEM`) — all decoded correctly. The branch
+is stalled (Dec 2023) and its Certificate Management object depends on the separate OpENerFileObject
+project; the Dockerfile carries the vendoring/link/init patches to stand it up (never patching `enip`),
+per the ab_server precedent. Real-device posture semantics (a commissioned Vol 8 PLC's populated suite
+lists / `Configured` state) remain the declared lab-hardware gap (§14.6).
 
 **Browse-gap status: CLOSED (sim-grade).** The tag-list service (Get Instance Attribute List `0x55`
 on the Symbol class `0x6B`) — which cpppo and ab_server both refuse — is served by EthernetIPSharp,
@@ -1398,7 +1425,7 @@ into one denominator), met on the **unit-testable surface**, same bar as the sib
 
 ```bash
 cargo llvm-cov --workspace \
-  --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp)\.rs|testutil\.rs|fuzz[/\\])' \
+  --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls|cip_security)\.rs|testutil\.rs|fuzz[/\\])' \
   --fail-under-lines 90
 ```
 
@@ -1437,11 +1464,15 @@ tested logic. Excluded, with the reason pinned here:
   covered files and are unit-tested (over `duplex` fixtures / a mock session, no container).
 - `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs`,
   `crates/enip/tests/live_ab_server.rs`, `crates/enip/tests/live_ethernetipsharp.rs`,
-  `crates/enip/tests/live_tls.rs` — the sim-gated live suites (§11.3), self-skipping on a port probe.
+  `crates/enip/tests/live_tls.rs`, `crates/enip/tests/live_cip_security.rs` — the sim-gated live suites
+  (§11.3), self-skipping on a port probe.
   (The `tls` connect surfaces themselves are NOT excluded: `enip/client/tls.rs`'s `connect_tls_over` +
   error mapping + session-info capture are unit-tested over a rustls-acceptor duplex, and the adapter's
   `eip/tls.rs` ClientConfig-builder/config-parse/validation are unit-tested — only the thin
-  `connect_tls` TCP-socket wrapper is uncovered, consistent with `client/mod.rs`'s `connect`.)
+  `connect_tls` TCP-socket wrapper is uncovered, consistent with `client/mod.rs`'s `connect`. The
+  CIP-Security **posture decoders** (`enip/cip/security.rs`) and the `read_security_posture`
+  orchestration are unit-tested over duplex fixtures (`tests/security_posture.rs`) and are counted in
+  the gate; only the adapter's on-connect posture read in `eip/live.rs` is in the excluded seam.)
 - `crates/enip/fuzz/` — fuzz harnesses (they *exercise* covered code; they are not product code).
 - `src/testutil.rs` — `#[cfg(test)]`-only recording test doubles.
 
@@ -1492,6 +1523,7 @@ a ship blocker.
 | Live protocol + E2E (§11.4, both modes) | local Docker: EMQX + cpppo + OpENer | **in scope** (S7/S9) |
 | Live protocol: 2nd/3rd independent poll peers + Unconnected_Send route + browse `0x55` | local Docker: ab_server (§11.6) + EthernetIPSharp (§11.7) | **in scope** (S8): read/write cross-checked on two more independent impls; the `0x52` route wrapper exercised via ab_server; `enip::list_tags` browse validated against EthernetIPSharp's real `0x55`. No `enip` change needed. |
 | CIP Security Phase 1: poll over TLS (mutual X.509) + negative matrix | local Docker: `test-infra/enip-tls/` stunnel (OpenSSL) fronting cpppo on `:2221` (+ CBC-only `:2223`) | **in scope**: `crates/enip/tests/live_tls.rs` drives real `enip::connect_tls` — mutual-TLS read/write over TLS, wrong-CA `PeerUnverified`, missing-client-cert rejection, and CBC-only `NoCipherOverlap`, against an independent TLS + EtherNet/IP pair at exactly the changed layer (DESIGN-cip-security.md §5.2). |
+| CIP Security Phase 2a: posture reads (0x5D/0x5E/0x5F) | local Docker: `test-infra/opener-cipsecurity/` OpENer `CIPSecurity` branch on `:44822` | **in scope**: `crates/enip/tests/live_cip_security.rs` drives real `enip::read_security_posture` — decodes CIP Security state/profiles, EtherNet/IP Security cipher-suite lists + flags, and the Certificate Management summary against an independent implementation of the three objects (DESIGN-cip-security.md §4.1). Duplex-fixture decoder tests (`tests/security_posture.rs`) + fuzz (`fuzz_security_attrs`) cover the decoders in-gate. |
 | CIP Security against a **certified Vol 8 device** (44818-closed port policy, Vol-8-exact suite lists, `Send Certificate Chain` / `Verify Client Certificate` corner semantics, device-side EST/commissioning) | lab CIP-Security PLC (none on the bench) | **deferred to lab hardware** (§14.6) — the stunnel terminator covers the changed *layer* faithfully but is not a real CIP-Security device. Acquire a CompactLogix 5380 / ControlLogix 5580 v32+ or a 1756-EN4TR (commissioned with FactoryTalk Policy Manager) when CIP Security becomes a shipping claim (DESIGN-cip-security.md §5.2/§6.3). |
 | HOST/dual-MQTT smoke | local | **in scope** (S9) |
 | Kubernetes | kind cluster, `k8s/` manifests + cpppo & OpENer as cluster services (UDP :2222 pod-to-pod for push) | **in scope** (S9, smoke: pod Ready, data on bus both modes, probes green) |
@@ -1571,10 +1603,17 @@ language) in the user-facing docs where relevant.
    DESIGN-cip-security.md §3). Only GCM + TLS 1.3 suites are supported (`rustls`); CBC-only legacy
    firmware is the documented interop boundary (typed `NoCipherOverlap`). A `mode: push` instance
    configured with TLS is refused at validation — class-1 implicit I/O stays plaintext UDP 2222
-   (**no silent downgrade**; CT23-deprecated TLS-session-opens-plaintext-I/O is not done). **Roadmap
-   (Phase 2, not built):** typed reads of the target's 0x5D/0x5E/0x5F security objects (D-EIP-22);
-   vault-native trust/cert rotation; EST enrollment of the adapter's own certificate (D-EIP-23); and
-   DTLS on the implicit path. See DESIGN-cip-security.md §4/§6 for the phase gates.
+   (**no silent downgrade**; CT23-deprecated TLS-session-opens-plaintext-I/O is not done).
+   **Phase 2a (security-posture reads) shipped:** on connect the adapter reads the target's CIP
+   Security (0x5D), EtherNet/IP Security (0x5E), and Certificate Management (0x5F) objects and surfaces
+   the decoded posture on `sb/status.security.target` + `targetSupportsCipSecurity` (**D-EIP-22**;
+   §4.1, §7.1; DESIGN-cip-security.md §4.1). The `enip` crate carries typed, bounds-checked
+   (`WireReader`) decoders for these objects over the shipped `get_attribute_single` service (no new
+   transport, no feature gate). A device that implements none of them reports
+   `targetSupportsCipSecurity: false`, never an error (the generic-CIP-device path, validated against
+   cpppo and the OpENer `CIPSecurity` branch). **Roadmap (Phase 2b/2c, not built):** vault-native
+   trust/cert rotation; EST enrollment of the adapter's own certificate (D-EIP-23); and DTLS on the
+   implicit path. See DESIGN-cip-security.md §4/§6 for the phase gates.
 6. **Lab-hardware-only validation paths, declared:** the `slot`/backplane routing path,
    connected class-3 messaging, **multicast T→O consume**, push against a real PLC/remote-I/O
    device, and **CIP Security against a certified Vol 8 device** (port policy with 44818 closed,
