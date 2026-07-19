@@ -25,18 +25,15 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use edgecommons::prelude::*;
 use serde_json::json;
 
 use crate::config::{DeviceConfig, GlobalConfig, SignalSpec};
 use crate::device::DeviceBackend;
+use crate::metrics::DeviceMetrics;
 use crate::sim::SimBackend;
-
-/// The metric every southbound adapter emits (SOUTHBOUND.md §5). The full `EtherNetIp*` families
-/// land in slice S5.
-const HEALTH_METRIC: &str = "southbound_health";
 
 /// Reconnect backoff. Exponential with full jitter and a cap — so a site whose PLC reboots does
 /// not get every adapter in the plant reconnecting in lockstep on the same second.
@@ -120,8 +117,15 @@ pub struct Health {
     link: AtomicU8,
     pub poll_latency_ms: AtomicU64,
     pub read_errors: AtomicU64,
+    /// Failed confirmed writes over the interval (`southbound_health.writeErrors`, §8.1). Bumped by
+    /// the poll write path; consumed (swap-reset) by the metrics emitter.
+    pub write_errors: AtomicU64,
     pub reconnects: AtomicU64,
     pub signals_published: AtomicU64,
+    /// 1 = this instance is paused (§7.4 / §8.1 `paused` gauge). Owned here so the connectivity
+    /// token, the `paused` attribute, and the gauge all derive from one source (§9.2). S6 sets it;
+    /// it reads `false` until then.
+    pub paused: std::sync::atomic::AtomicBool,
 
     // ---- engine counters (consumed by the S5 metric families; §8) ----
     /// Publish latency of the last `data.publish().await`, ms (§6.2).
@@ -144,6 +148,10 @@ pub struct Health {
     // SLICE S5: EtherNetIpPoll.samplesBad.
     #[allow(dead_code)]
     pub samples_bad: AtomicU64,
+    /// Samples that decoded but scaled non-finite (§5.4) — neither GOOD nor BAD.
+    // SLICE S5: EtherNetIpPoll.samplesUncertain.
+    #[allow(dead_code)]
+    pub samples_uncertain: AtomicU64,
     /// Samples that passed the onChange gate (published because they changed).
     // SLICE S5: EtherNetIpPublish.samplesChanged.
     #[allow(dead_code)]
@@ -277,32 +285,31 @@ impl App {
         for device in &self.devices {
             let instance = gg.instance(&device.id)?;
 
-            // The health metric is dimensioned BY INSTANCE, so a fleet view can show one device
-            // down without averaging it away against the others.
-            self.metrics.define_metric(
-                MetricBuilder::create(HEALTH_METRIC)
-                    .with_config(&self.config)
-                    .add_measure("connectionState", "Count", 1)
-                    .add_measure("pollLatencyMs", "Milliseconds", 1)
-                    .add_measure("readErrors", "Count", 60)
-                    .add_measure("reconnects", "Count", 60)
-                    .add_measure("signalsPublished", "Count", 60)
-                    .add_dimension("instance", &device.id)
-                    .build(),
-            );
-
             let (write_tx, write_rx) = tokio::sync::mpsc::channel::<WriteRequest>(16);
             writers.insert(device.id.clone(), write_tx);
 
             let health = Arc::new(Health::default());
             reported.push((device.clone(), Arc::clone(&health)));
 
+            // The full §8 metric set for this device, dimensioned BY INSTANCE (a fleet view can show
+            // one device down without averaging it away): the mandatory `southbound_health` plus the
+            // six `EtherNetIp*` families, pre-defined at startup and emitted on the
+            // `metricsIntervalSecs` cadence + connect/disconnect/pause/resume/push-up/lost transitions.
+            let dm = Arc::new(DeviceMetrics::new(
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.config),
+                device.clone(),
+                &self.global,
+                Arc::clone(&health),
+            ));
+            dm.define_all();
+
             tokio::spawn(run_device(
                 device.clone(),
                 Arc::clone(&self.global),
                 instance.data(),
                 instance.events(),
-                Arc::clone(&self.metrics),
+                dm,
                 health,
                 write_rx,
             ));
@@ -422,7 +429,7 @@ async fn run_device(
     global: Arc<GlobalConfig>,
     data: DataFacade,
     events: EventsFacade,
-    metrics: Arc<dyn MetricService>,
+    dm: Arc<DeviceMetrics>,
     health: Arc<Health>,
     mut writes: tokio::sync::mpsc::Receiver<WriteRequest>,
 ) {
@@ -450,7 +457,7 @@ async fn run_device(
             backend.as_ref(),
             &data,
             &events,
-            &metrics,
+            &dm,
             &health,
             backoff,
             connect_timeout,
@@ -463,13 +470,18 @@ async fn run_device(
 
     loop {
         // Connect within the configured deadline (§4.1 connectMs).
+        dm.on_connect_attempt();
+        let started = Instant::now();
         let outcome = tokio::time::timeout(connect_timeout, backend.connect(&cfg.connection)).await;
 
         match outcome {
             Ok(Ok(session)) => {
                 attempt = 0;
+                let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                dm.on_connected(latency_ms, Instant::now());
                 health.set_link(LinkState::Online);
-                emit_health(&metrics, &health).await;
+                // A transition: flush southbound_health + connection immediately (§8.7).
+                dm.emit_now().await;
                 let _ = events
                     .emit(
                         Severity::Info,
@@ -488,16 +500,17 @@ async fn run_device(
                     &global,
                     session,
                     &data,
-                    &metrics,
+                    &dm,
                     &health,
                     backend.kind(),
                     &mut writes,
                 )
                 .await;
 
+                dm.on_connection_dropped(Instant::now());
                 health.set_link(LinkState::Backoff);
                 health.reconnects.fetch_add(1, Ordering::Relaxed);
-                emit_health(&metrics, &health).await;
+                dm.emit_now().await;
                 let _ = events
                     .raise_alarm(
                         Severity::Critical,
@@ -511,6 +524,7 @@ async fn run_device(
             // Connect failed (Err) or timed out (Elapsed). A permanent failure will fail identically
             // forever, so back off to the ceiling immediately.
             other => {
+                dm.on_connect_failure();
                 health.set_link(LinkState::Backoff);
                 let permanent = matches!(&other, Ok(Err(e)) if !e.is_transient());
                 let wait = if permanent {
@@ -543,7 +557,7 @@ async fn run_push(
     backend: &dyn DeviceBackend,
     data: &DataFacade,
     events: &EventsFacade,
-    metrics: &Arc<dyn MetricService>,
+    dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     backoff: Backoff,
     connect_timeout: Duration,
@@ -556,27 +570,34 @@ async fn run_push(
 
     loop {
         health.set_link(LinkState::Connecting);
+        dm.on_connect_attempt();
+        let started = Instant::now();
         let outcome =
             tokio::time::timeout(connect_timeout, backend.open_push(&cfg.connection, &io)).await;
         match outcome {
             Ok(Ok(mut session)) => {
                 attempt = 0;
+                // The class-1 ForwardOpen succeeded (§8.8 forwardOpens; §8.2 sessionConnected).
+                dm.on_forward_open(true);
+                let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                dm.on_connected(latency_ms, Instant::now());
                 crate::push::consume_push(
                     cfg,
                     global,
                     session.as_mut(),
                     data,
                     events,
-                    metrics,
+                    dm,
                     health,
                     backend.kind(),
                 )
                 .await;
                 session.close().await;
 
+                dm.on_connection_dropped(Instant::now());
                 health.set_link(LinkState::Backoff);
                 health.reconnects.fetch_add(1, Ordering::Relaxed);
-                emit_health(metrics, health).await;
+                dm.emit_now().await;
                 let _ = events
                     .raise_alarm(
                         Severity::Critical,
@@ -587,6 +608,9 @@ async fn run_push(
                     .await;
             }
             other => {
+                // The ForwardOpen was refused / timed out (§8.8 forwardOpenFailures; §8.2 connectFailures).
+                dm.on_forward_open(false);
+                dm.on_connect_failure();
                 health.set_link(LinkState::Backoff);
                 let permanent = matches!(&other, Ok(Err(e)) if !e.is_transient());
                 let wait = if permanent {
@@ -606,36 +630,6 @@ async fn run_push(
                 tokio::time::sleep(wait).await;
             }
         }
-    }
-}
-
-/// Emit the single `southbound_health` metric (SOUTHBOUND.md §5). The full `EtherNetIp*` families are
-/// slice S5; the engine counters they consume live on [`Health`], populated by [`crate::poll`] /
-/// [`crate::push`].
-pub(crate) async fn emit_health(metrics: &Arc<dyn MetricService>, health: &Arc<Health>) {
-    let mut v = HashMap::new();
-    v.insert(
-        "connectionState".to_string(),
-        health.connection_state.load(Ordering::Relaxed) as f64,
-    );
-    v.insert(
-        "pollLatencyMs".to_string(),
-        health.poll_latency_ms.load(Ordering::Relaxed) as f64,
-    );
-    v.insert(
-        "readErrors".to_string(),
-        health.read_errors.swap(0, Ordering::Relaxed) as f64,
-    );
-    v.insert(
-        "reconnects".to_string(),
-        health.reconnects.swap(0, Ordering::Relaxed) as f64,
-    );
-    v.insert(
-        "signalsPublished".to_string(),
-        health.signals_published.swap(0, Ordering::Relaxed) as f64,
-    );
-    if let Err(e) = metrics.emit_metric(HEALTH_METRIC, v).await {
-        tracing::warn!(error = %e, "health metric emit failed");
     }
 }
 

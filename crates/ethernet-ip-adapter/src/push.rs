@@ -16,12 +16,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use edgecommons::prelude::{DataFacade, EventsFacade, MetricService, Sample, Severity};
+use edgecommons::prelude::{DataFacade, EventsFacade, Sample, Severity};
 use serde_json::json;
 
 use crate::app::{Health, LinkState};
 use crate::config::{DeadbandSpec, DeviceConfig, GlobalConfig, IoFieldSpec, PublishMode};
 use crate::device::{IoUpdate, PushSession, Quality, Reading};
+use crate::metrics::DeviceMetrics;
 use crate::publish::{self, Engine, Publish};
 
 /// Consume one push session's [`IoUpdate`] stream until the link is lost (§3.2). Gates + batches each
@@ -34,7 +35,7 @@ pub(crate) async fn consume_push(
     session: &mut dyn PushSession,
     data: &DataFacade,
     events: &EventsFacade,
-    metrics: &Arc<dyn MetricService>,
+    dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     adapter: &str,
 ) {
@@ -51,6 +52,8 @@ pub(crate) async fn consume_push(
         .publish_mode
         .or(global.defaults.publish_mode)
         .unwrap_or(PublishMode::OnChange);
+    // The single `publishMode` dimension value this push device emits under (§8.5).
+    let mode_token = mode.as_str();
     let stale_secs = global.health_thresholds.stale_signal_secs;
     let metrics_interval = Duration::from_secs(global.metrics_interval_secs.max(1));
 
@@ -87,7 +90,10 @@ pub(crate) async fn consume_push(
                 match update {
                     Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms }) => {
                         health.set_link(LinkState::Online);
-                        crate::app::emit_health(metrics, health).await;
+                        // The class-1 connection is open (§8.8 ioConnectionState); a transition ⇒
+                        // flush southbound_health + connection + io immediately (§8.7).
+                        dm.on_io_up();
+                        dm.emit_now().await;
                         let _ = events
                             .emit(
                                 Severity::Info,
@@ -103,20 +109,24 @@ pub(crate) async fn consume_push(
                             .clear_alarm(Severity::Critical, "device-unreachable", None)
                             .await;
                     }
-                    Some(IoUpdate::Data { readings, sequence, run_mode, .. }) => {
+                    Some(IoUpdate::Data { readings, sequence, run_mode, received_at }) => {
                         health.frames_consumed.fetch_add(1, Ordering::Relaxed);
+                        // §8.8: count the frame, infer sequence gaps, record the lived inter-arrival + run/idle.
+                        dm.record_frame_consumed(sequence, received_at, run_mode);
                         tracing::debug!(
                             instance = %cfg.id, sequence, run_mode, fields = readings.len(),
                             "push frame received"
                         );
                         let now = Instant::now();
                         for p in process_frame(&mut engine, &readings, &deadbands, mode, sample_ms, batch_ms, now, health) {
-                            publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health).await;
+                            publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, false).await;
                         }
                     }
                     Some(IoUpdate::Lost { error }) => {
                         tracing::warn!(instance = %cfg.id, error = %error, "class-1 connection lost; reconnecting");
                         health.read_errors.fetch_add(1, Ordering::Relaxed);
+                        // The watchdog expiry / peer close (§8.8 ioTimeouts; ioConnectionState → 0).
+                        dm.on_io_lost();
                         return;
                     }
                     None => {
@@ -131,12 +141,14 @@ pub(crate) async fn consume_push(
 
         let now = Instant::now();
         for p in engine.take_due(batch_ms, now) {
-            publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health).await;
+            // A coalescing-window flush (§8.5 batchFlushes/batchSize).
+            publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, true).await;
         }
         if now.saturating_duration_since(since_health) >= metrics_interval {
             let stale = engine.count_stale(fields.keys().map(String::as_str), stale_secs, now);
             health.stale_signals.store(stale, Ordering::Relaxed);
-            crate::app::emit_health(metrics, health).await;
+            // The full §8 family set for this push device (§8.7).
+            dm.emit_periodic().await;
             since_health = now;
         }
     }
@@ -229,6 +241,9 @@ async fn publish_field(
     signal_id: &str,
     samples: Vec<Sample>,
     health: &Health,
+    dm: &DeviceMetrics,
+    publish_mode: &'static str,
+    from_batch: bool,
 ) {
     let Some(field) = fields.get(signal_id) else {
         return;
@@ -247,15 +262,16 @@ async fn publish_field(
         samples,
     )
     .await;
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
     match res {
         Ok(()) => {
             health.signals_published.fetch_add(n, Ordering::Relaxed);
-            health
-                .publish_latency_ms
-                .store(u64::try_from(latency.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+            health.publish_latency_ms.store(latency_ms, Ordering::Relaxed);
+            dm.record_publish(publish_mode, n, from_batch, latency_ms, true);
         }
         Err(e) => {
             tracing::warn!(instance = %cfg.id, signal_id = %field.signal_id(assembly), error = %e, "publish failed");
+            dm.record_publish(publish_mode, n, from_batch, latency_ms, false);
         }
     }
 }

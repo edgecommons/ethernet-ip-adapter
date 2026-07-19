@@ -12,16 +12,53 @@
 //! module owns the *poll-specific* decisions — per-group scheduling, resolving a group's readings
 //! against the config, and driving the writes/keepalive-free select loop the S2 template established.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use edgecommons::prelude::{DataFacade, MetricService, Sample};
+use edgecommons::prelude::{DataFacade, Sample};
 
 use crate::app::{Health, WriteRequest};
 use crate::config::{DeviceConfig, GlobalConfig, PollGroup, PublishMode, SignalSpec};
 use crate::device::{DeviceSession, Quality, Reading};
+use crate::metrics::{DeviceMetrics, RESULT_ERROR, RESULT_SUCCESS};
 use crate::publish::{self, Engine, Publish};
+
+/// The per-cycle deltas of the shared [`Health`] sample counters — used to attribute one poll
+/// cycle's samples to its `(pollGroup, result)` metric combo (§8.4) without threading the emitter
+/// into the gating hot path.
+#[derive(Clone, Copy, Default)]
+struct SampleSnapshot {
+    good: u64,
+    bad: u64,
+    uncertain: u64,
+    changed: u64,
+    suppressed: u64,
+}
+
+impl SampleSnapshot {
+    fn take(health: &Health) -> Self {
+        Self {
+            good: health.samples_good.load(Ordering::Relaxed),
+            bad: health.samples_bad.load(Ordering::Relaxed),
+            uncertain: health.samples_uncertain.load(Ordering::Relaxed),
+            changed: health.samples_changed.load(Ordering::Relaxed),
+            suppressed: health.samples_suppressed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The counts accrued between `self` (before the cycle) and `now` (after it).
+    fn delta_since(self, before: Self) -> Self {
+        Self {
+            good: self.good - before.good,
+            bad: self.bad - before.bad,
+            uncertain: self.uncertain - before.uncertain,
+            changed: self.changed - before.changed,
+            suppressed: self.suppressed - before.suppressed,
+        }
+    }
+}
 
 /// Poll each group on its own cadence, gate + batch + publish, until the link breaks (§3.2).
 ///
@@ -36,7 +73,7 @@ pub(crate) async fn poll_until_disconnected(
     global: &GlobalConfig,
     mut session: Box<dyn DeviceSession>,
     data: &DataFacade,
-    metrics: &Arc<dyn MetricService>,
+    dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     adapter: &str,
     writes: &mut tokio::sync::mpsc::Receiver<WriteRequest>,
@@ -51,6 +88,16 @@ pub(crate) async fn poll_until_disconnected(
         .poll_groups
         .iter()
         .map(|g| cfg.effective_publish_mode(g, global))
+        .collect();
+    // signal.id → its group's publishMode token, so a batched flush (which has lost the group
+    // context) still attributes to the right `EtherNetIpPublish.publishMode` combo (§8.5).
+    let mode_of: HashMap<String, &'static str> = cfg
+        .poll_groups
+        .iter()
+        .flat_map(|g| {
+            let mode = cfg.effective_publish_mode(g, global).as_str();
+            g.signals.iter().map(move |s| (s.tag_path.clone(), mode))
+        })
         .collect();
     let batch_ms = cfg.effective_batch_ms(global);
     let stale_secs = global.health_thresholds.stale_signal_secs;
@@ -81,6 +128,8 @@ pub(crate) async fn poll_until_disconnected(
                     .map_err(|e| e.to_string());
                 if let Err(e) = &result {
                     tracing::warn!(instance = %cfg.id, tag_path = %req.signal.tag_path, error = %e, "write failed");
+                    // A failed confirmed write (§8.1 southbound_health.writeErrors).
+                    health.write_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 let _ = req.ack.send(result);
                 continue;
@@ -91,9 +140,10 @@ pub(crate) async fn poll_until_disconnected(
 
         let now = Instant::now();
 
-        // 1. Flush any batch windows that closed.
+        // 1. Flush any batch windows that closed (a coalescing-window flush → EtherNetIpPublish, §8.5).
         for p in engine.take_due(batch_ms, now) {
-            publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health).await;
+            let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| PublishMode::OnChange.as_str());
+            publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, true).await;
         }
 
         // 2. Poll the earliest due group (there may be none — we woke for a flush/health tick).
@@ -105,6 +155,9 @@ pub(crate) async fn poll_until_disconnected(
             deadlines[idx] = (deadlines[idx] + intervals[idx]).max(now);
 
             let group = &cfg.poll_groups[idx];
+            let group_id = group.id.as_deref().unwrap_or("group").to_string();
+            let tag_reads = group.signals.len() as u64;
+            let before = SampleSnapshot::take(health);
             let started = Instant::now();
             let readings = match session.read_signals(&group.signals).await {
                 Ok(r) => r,
@@ -113,27 +166,44 @@ pub(crate) async fn poll_until_disconnected(
                     // the connect loop can back off; the per-signal failures came back as BAD readings.
                     tracing::warn!(instance = %cfg.id, error = %e, transient = e.is_transient(), "read failed; reconnecting");
                     health.read_errors.fetch_add(1, Ordering::Relaxed);
+                    // An error poll cycle (§8.4 result=error).
+                    dm.record_poll_cycle(&group_id, RESULT_ERROR, 0, tag_reads, false, 0, 0, 0, 0, 0);
                     session.close().await;
                     return;
                 }
             };
             let elapsed = started.elapsed();
-            health
-                .poll_latency_ms
-                .store(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+            let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            health.poll_latency_ms.store(elapsed_ms, Ordering::Relaxed);
             record_cycle(elapsed, intervals[idx], health);
 
             let now2 = Instant::now();
             for p in process_group(&mut engine, group, modes[idx], batch_ms, &readings, now2, health) {
-                publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health).await;
+                let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| modes[idx].as_str());
+                publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
             }
+
+            // Attribute this cycle's samples to its (pollGroup, success) combo (§8.4).
+            let d = SampleSnapshot::take(health).delta_since(before);
+            dm.record_poll_cycle(
+                &group_id,
+                RESULT_SUCCESS,
+                elapsed_ms,
+                tag_reads,
+                publish::cycle_overran(elapsed, intervals[idx]),
+                d.good,
+                d.bad,
+                d.uncertain,
+                d.changed,
+                d.suppressed,
+            );
         }
 
-        // 3. Health emit cadence.
+        // 3. Metrics emit cadence: the full §8 family set for this poll device (§8.7).
         if now.saturating_duration_since(since_health) >= metrics_interval {
             let stale = engine.count_stale(cfg.signals().map(|s| s.tag_path.as_str()), stale_secs, now);
             health.stale_signals.store(stale, Ordering::Relaxed);
-            crate::app::emit_health(metrics, health).await;
+            dm.emit_periodic().await;
             since_health = now;
         }
     }
@@ -169,12 +239,16 @@ fn process_group(
                 health.samples_good.fetch_add(1, Ordering::Relaxed);
                 st.last_good = Some(now);
             }
-            // A BAD read is a per-signal failure, published not swallowed; UNCERTAIN is neither
-            // GOOD nor BAD (non-finite scale) — counted in neither tally.
+            // A BAD read is a per-signal failure, published not swallowed. It counts as both a bad
+            // sample (§8.4) and a signal-read failure (§8.1 readErrors). UNCERTAIN is neither GOOD nor
+            // BAD (non-finite scale) — its own tally (§8.4 samplesUncertain).
             Quality::Bad => {
                 health.samples_bad.fetch_add(1, Ordering::Relaxed);
+                health.read_errors.fetch_add(1, Ordering::Relaxed);
             }
-            Quality::Uncertain => {}
+            Quality::Uncertain => {
+                health.samples_uncertain.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         if !publish::should_publish(
@@ -223,7 +297,9 @@ fn record_cycle(elapsed: Duration, interval: Duration, health: &Health) {
 }
 
 /// Resolve a stable id to its configured signal and publish its samples (§6.1). Records the publish
-/// latency + published-sample count on `health`.
+/// latency + published-sample count on `health` and the per-`publishMode` [`EtherNetIpPublish`]
+/// counters on `dm` (§8.5). `from_batch` marks a coalescing-window flush.
+#[allow(clippy::too_many_arguments)]
 async fn publish_by_id(
     data: &DataFacade,
     cfg: &DeviceConfig,
@@ -231,14 +307,18 @@ async fn publish_by_id(
     signal_id: &str,
     samples: Vec<Sample>,
     health: &Health,
+    dm: &DeviceMetrics,
+    publish_mode: &'static str,
+    from_batch: bool,
 ) {
     let Some(spec) = cfg.find_signal(signal_id) else {
         return;
     };
-    publish_samples(data, cfg, adapter, spec, samples, health).await;
+    publish_samples(data, cfg, adapter, spec, samples, health, dm, publish_mode, from_batch).await;
 }
 
 /// Publish one signal's samples through the mode-agnostic [`publish`] path.
+#[allow(clippy::too_many_arguments)]
 async fn publish_samples(
     data: &DataFacade,
     cfg: &DeviceConfig,
@@ -246,6 +326,9 @@ async fn publish_samples(
     spec: &SignalSpec,
     samples: Vec<Sample>,
     health: &Health,
+    dm: &DeviceMetrics,
+    publish_mode: &'static str,
+    from_batch: bool,
 ) {
     let n = samples.len() as u64;
     let (res, latency) = publish::publish(
@@ -261,15 +344,16 @@ async fn publish_samples(
         samples,
     )
     .await;
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
     match res {
         Ok(()) => {
             health.signals_published.fetch_add(n, Ordering::Relaxed);
-            health
-                .publish_latency_ms
-                .store(u64::try_from(latency.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+            health.publish_latency_ms.store(latency_ms, Ordering::Relaxed);
+            dm.record_publish(publish_mode, n, from_batch, latency_ms, true);
         }
         Err(e) => {
             tracing::warn!(instance = %cfg.id, tag_path = %spec.tag_path, error = %e, "publish failed");
+            dm.record_publish(publish_mode, n, from_batch, latency_ms, false);
         }
     }
 }
