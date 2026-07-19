@@ -9,6 +9,7 @@
 //! per type, including a live array and a writable setpoint that reflects the last write), answers
 //! `browse` with the cpppo tag set, and answers `probe`.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -18,8 +19,8 @@ use tokio::task::JoinHandle;
 
 use crate::config::{EipType, IoConfig, IoFieldSpec, SignalSpec};
 use crate::device::{
-    BrowsePage, BrowsedTag, ConnectionConfig, DeviceBackend, DeviceError, DeviceSession, IoUpdate,
-    PushSession, Quality, Reading, Result,
+    BrowsePage, BrowsedTag, ConnectionConfig, DeviceBackend, DeviceError, DeviceSession,
+    InputSnapshot, IoUpdate, PushSession, Quality, Reading, Result,
 };
 use crate::eip::push::assembly_to_readings;
 
@@ -83,6 +84,8 @@ pub struct SimPushSession {
     out_layout: Option<enip::AssemblyLayout>,
     out_fields: Vec<IoFieldSpec>,
     out_buf: Vec<u8>,
+    /// The most-recent produced input frame (§7.2), for push `sb/read`.
+    snapshot: Arc<Mutex<Option<InputSnapshot>>>,
 }
 
 impl SimPushSession {
@@ -109,6 +112,8 @@ impl SimPushSession {
         let period = Duration::from_millis(io.rpi_ms.clamp(20, 200));
 
         let (tx, rx) = mpsc::channel(16);
+        let snapshot: Arc<Mutex<Option<InputSnapshot>>> = Arc::new(Mutex::new(None));
+        let snap_task = Arc::clone(&snapshot);
         let task = tokio::spawn(async move {
             if tx
                 .send(IoUpdate::Up { o2t_api_ms, t2o_api_ms })
@@ -127,11 +132,18 @@ impl SimPushSession {
                     *b = tick.wrapping_add(i as u64) as u8;
                 }
                 let readings = assembly_to_readings(&in_layout, &in_fields, in_inst, &buf, true);
+                let received_at = Instant::now();
+                // Keep the latest snapshot live for push `sb/read` (answered even while paused).
+                *snap_task.lock().unwrap() = Some(InputSnapshot {
+                    readings: readings.clone(),
+                    received_at,
+                    run_mode: true,
+                });
                 let update = IoUpdate::Data {
                     readings,
                     sequence: tick as u16,
                     run_mode: true,
-                    received_at: Instant::now(),
+                    received_at,
                 };
                 if tx.send(update).await.is_err() {
                     return;
@@ -145,6 +157,7 @@ impl SimPushSession {
             out_layout,
             out_fields,
             out_buf: vec![0u8; out_size],
+            snapshot,
         })
     }
 }
@@ -153,6 +166,10 @@ impl SimPushSession {
 impl PushSession for SimPushSession {
     fn updates(&mut self) -> &mut mpsc::Receiver<IoUpdate> {
         &mut self.updates
+    }
+
+    fn last_input(&self) -> Option<InputSnapshot> {
+        self.snapshot.lock().unwrap().clone()
     }
 
     async fn set_output(&mut self, field: &IoFieldSpec, value: &Value) -> Result<()> {

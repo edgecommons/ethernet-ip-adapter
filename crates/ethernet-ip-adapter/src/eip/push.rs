@@ -11,6 +11,7 @@
 //! [`assembly_to_readings`] — the field-extraction → `Reading`s translation — is shared with the
 //! simulator's push session so the sim exercises the same codec path with no OpENer.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,8 +20,14 @@ use tokio::task::JoinHandle;
 
 use crate::config::{IoConfig, IoFieldSpec, Timeouts};
 use crate::device::{
-    ConnectionConfig, DeviceError, IoUpdate, PushSession, Quality, Reading, Result,
+    ConnectionConfig, DeviceError, InputSnapshot, IoUpdate, PushSession, Quality, Reading, Result,
 };
+
+/// The most-recent decoded input frame, shared between the translator task (which writes it on every
+/// accepted frame) and the session handle's [`PushSession::last_input`] (which reads it for push
+/// `sb/read`). Kept live independently of the engine's consumption so an on-demand read works while
+/// paused (§7.2).
+type SharedSnapshot = Arc<Mutex<Option<InputSnapshot>>>;
 
 use super::map_enip_error;
 use super::types::{self, Decoded};
@@ -106,6 +113,9 @@ pub struct EipPushSession {
     out_layout: Option<enip::AssemblyLayout>,
     out_fields: Vec<IoFieldSpec>,
     out_buf: Vec<u8>,
+    /// The most-recent decoded input frame (§7.2), written by the translator task; the source push
+    /// `sb/read` answers from.
+    snapshot: SharedSnapshot,
 }
 
 impl EipPushSession {
@@ -194,8 +204,17 @@ impl EipPushSession {
 
         let (updates_tx, updates_rx) = mpsc::channel(16);
         let (control_tx, control_rx) = mpsc::channel(8);
+        let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let task = tokio::spawn(run_translator(
-            handle, client, io_manager, in_layout, in_fields, in_inst, updates_tx, control_rx,
+            handle,
+            client,
+            io_manager,
+            in_layout,
+            in_fields,
+            in_inst,
+            updates_tx,
+            control_rx,
+            Arc::clone(&snapshot),
         ));
 
         Ok(Self {
@@ -205,6 +224,7 @@ impl EipPushSession {
             out_layout,
             out_fields,
             out_buf: vec![0u8; out_size],
+            snapshot,
         })
     }
 }
@@ -221,6 +241,7 @@ async fn run_translator(
     in_inst: u16,
     updates_tx: mpsc::Sender<IoUpdate>,
     mut control_rx: mpsc::Receiver<PushControl>,
+    snapshot: SharedSnapshot,
 ) {
     'task: loop {
         let mut do_output: Option<Vec<u8>> = None;
@@ -249,12 +270,19 @@ async fn run_translator(
                         let readings = assembly_to_readings(
                             &in_layout, &in_fields, in_inst, &latest.data, latest.run_mode,
                         );
+                        let received_at = latest.received_at.into_std();
+                        // Keep the latest snapshot live for push `sb/read` (answered even while paused).
+                        *snapshot.lock().unwrap() = Some(InputSnapshot {
+                            readings: readings.clone(),
+                            received_at,
+                            run_mode: latest.run_mode,
+                        });
                         let _ = updates_tx
                             .send(IoUpdate::Data {
                                 readings,
                                 sequence: latest.sequence,
                                 run_mode: latest.run_mode,
-                                received_at: latest.received_at.into_std(),
+                                received_at,
                             })
                             .await;
                         match carried {
@@ -312,6 +340,10 @@ async fn run_translator(
 impl PushSession for EipPushSession {
     fn updates(&mut self) -> &mut mpsc::Receiver<IoUpdate> {
         &mut self.updates
+    }
+
+    fn last_input(&self) -> Option<InputSnapshot> {
+        self.snapshot.lock().unwrap().clone()
     }
 
     async fn set_output(&mut self, field: &IoFieldSpec, value: &serde_json::Value) -> Result<()> {

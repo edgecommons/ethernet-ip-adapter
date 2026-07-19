@@ -291,6 +291,27 @@ impl Engine {
         out
     }
 
+    /// Re-base the staleness clock for every tracked signal to `now`. Used on **resume** (§7.4.5,
+    /// §9.3) so the paused span does not count a signal as stale — a paused signal is paused, not
+    /// stale.
+    pub(crate) fn rebase_stale(&mut self, now: Instant) {
+        for st in self.state.values_mut() {
+            st.last_good = Some(now);
+        }
+    }
+
+    /// Re-base change-detection **and** staleness from a set of `(signal_id, value)` current readings.
+    /// Used on **push resume** (§7.4.8) so the paused span's accumulated drift is not published as one
+    /// giant "change" burst: each field's onChange baseline is set to its current value and its
+    /// staleness clock re-based to `now`.
+    pub(crate) fn rebase_from(&mut self, readings: &[(String, Value)], now: Instant) {
+        for (id, value) in readings {
+            let st = self.state.entry(id.clone()).or_default();
+            st.baseline = Some(value.clone());
+            st.last_good = Some(now);
+        }
+    }
+
     /// The earliest open batch window's close time (for the run loop's wake), or `None`.
     #[must_use]
     pub(crate) fn next_batch_deadline(&self, batch_ms: u64) -> Option<Instant> {

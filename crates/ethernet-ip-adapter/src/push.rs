@@ -16,14 +16,31 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use edgecommons::prelude::{DataFacade, EventsFacade, Sample, Severity};
+use edgecommons::prelude::{DataFacade, Sample, Severity};
 use serde_json::json;
 
-use crate::app::{Health, LinkState};
+use crate::app::{apply_pause, DeviceControl, EventSink, Health, LinkState};
 use crate::config::{DeadbandSpec, DeviceConfig, GlobalConfig, IoFieldSpec, PublishMode};
 use crate::device::{IoUpdate, PushSession, Quality, Reading};
 use crate::metrics::DeviceMetrics;
 use crate::publish::{self, Engine, Publish};
+
+/// How [`consume_push`] left the consume loop (§7.5, §10.2) — the push analog of
+/// [`crate::poll::PollExit`].
+pub(crate) enum PushExit {
+    /// The class-1 link was lost (watchdog / peer close / end of stream) — reconnect.
+    LinkLost,
+    /// An `sb/reconnect` asked to ForwardClose + ForwardOpen now (§7.5).
+    Reconnect(tokio::sync::oneshot::Sender<std::result::Result<(), String>>),
+}
+
+/// What woke the consume loop — returned by the `select!` so `session` is no longer borrowed by the
+/// time a control message is serviced (the update branch borrows the session's update receiver).
+enum Woke {
+    Control(Option<DeviceControl>),
+    Update(Option<IoUpdate>),
+    Tick,
+}
 
 /// Consume one push session's [`IoUpdate`] stream until the link is lost (§3.2). Gates + batches each
 /// consumed frame's fields and publishes what survives; returns on `Lost` / end-of-stream so the
@@ -34,14 +51,15 @@ pub(crate) async fn consume_push(
     global: &GlobalConfig,
     session: &mut dyn PushSession,
     data: &DataFacade,
-    events: &EventsFacade,
+    events: &dyn EventSink,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     adapter: &str,
-) {
+    control: &mut tokio::sync::mpsc::Receiver<DeviceControl>,
+) -> PushExit {
     let Some(io) = cfg.io.as_ref() else {
         tracing::error!(instance = %cfg.id, "push device has no io block");
-        return;
+        return PushExit::LinkLost;
     };
     let assembly = io.assemblies.input;
     let sample_ms = io.input.sample_ms;
@@ -74,78 +92,161 @@ pub(crate) async fn consume_push(
     let start = Instant::now();
     let mut engine = Engine::new(start);
     let mut since_health = start;
+    // A pause that arrived while the link was down carries in through the shared flag (§9.2).
+    let mut paused = health.paused.load(Ordering::Relaxed);
 
     loop {
         // Frames arrive on the channel; we also wake for the next batch close and the health tick.
+        // While paused, batches don't accrue (nothing is published), so only the health tick matters.
         let mut wake = since_health + metrics_interval;
-        if let Some(bd) = engine.next_batch_deadline(batch_ms) {
-            wake = wake.min(bd);
+        if !paused {
+            if let Some(bd) = engine.next_batch_deadline(batch_ms) {
+                wake = wake.min(bd);
+            }
         }
         let wait = wake.saturating_duration_since(Instant::now());
 
-        tokio::select! {
+        // Return only a plain value from each arm so `session` is free (the update arm borrows its
+        // receiver) by the time a control message is serviced below.
+        let woke = tokio::select! {
             biased;
+            ctrl = control.recv() => Woke::Control(ctrl),
+            update = session.updates().recv() => Woke::Update(update),
+            _ = tokio::time::sleep(wait) => Woke::Tick,
+        };
 
-            update = session.updates().recv() => {
-                match update {
-                    Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms }) => {
-                        health.set_link(LinkState::Online);
-                        // The class-1 connection is open (§8.8 ioConnectionState); a transition ⇒
-                        // flush southbound_health + connection + io immediately (§8.7).
-                        dm.on_io_up();
-                        dm.emit_now().await;
-                        let _ = events
-                            .emit(
-                                Severity::Info,
-                                "device-connected",
-                                Some(format!("class-1 connection up to {}", cfg.connection.endpoint)),
-                                Some(json!({
-                                    "instance": cfg.id, "adapter": adapter,
-                                    "o2tApiMs": o2t_api_ms, "t2oApiMs": t2o_api_ms
-                                })),
-                            )
-                            .await;
-                        let _ = events
-                            .clear_alarm(Severity::Critical, "device-unreachable", None)
-                            .await;
+        match woke {
+            Woke::Control(None) => {
+                // The control channel closed (component shutting down) — leave cleanly.
+                return PushExit::LinkLost;
+            }
+            Woke::Control(Some(ctrl)) => {
+                match ctrl {
+                    // The push on-demand read: answer from the last consumed frame (§7.2) — live even
+                    // while paused, since consumption never stopped.
+                    DeviceControl::Snapshot { reply } => {
+                        let _ = reply.send(session.last_input());
                     }
-                    Some(IoUpdate::Data { readings, sequence, run_mode, received_at }) => {
-                        health.frames_consumed.fetch_add(1, Ordering::Relaxed);
-                        // §8.8: count the frame, infer sequence gaps, record the lived inter-arrival + run/idle.
-                        dm.record_frame_consumed(sequence, received_at, run_mode);
-                        tracing::debug!(
-                            instance = %cfg.id, sequence, run_mode, fields = readings.len(),
-                            "push frame received"
-                        );
+                    // A push write stages an OUTPUT-assembly field into the O→T producer buffer
+                    // (applied next-frame, §7.3).
+                    DeviceControl::WriteOutput { field, value, reply } => {
+                        let result = session.set_output(&field, &value).await.map_err(|e| e.to_string());
+                        if result.is_err() {
+                            health.write_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let _ = reply.send(result);
+                    }
+                    DeviceControl::Pause { by, reply } => {
+                        let changed = apply_pause(cfg, health, dm, events, true, by.as_deref()).await;
+                        paused = true;
+                        let _ = reply.send(changed);
+                    }
+                    DeviceControl::Resume { reply } => {
+                        let changed = apply_pause(cfg, health, dm, events, false, None).await;
+                        if changed {
+                            // Re-base change-detection + staleness to the current snapshot so the paused
+                            // span's accumulated drift is not published as one giant burst (§7.4.8).
+                            if let Some(snap) = session.last_input() {
+                                let pairs: Vec<(String, serde_json::Value)> = snap
+                                    .readings
+                                    .iter()
+                                    .map(|r| (r.signal_id.clone(), r.value.clone()))
+                                    .collect();
+                                engine.rebase_from(&pairs, Instant::now());
+                            }
+                        }
+                        paused = false;
+                        let _ = reply.send(changed);
+                    }
+                    DeviceControl::Reconnect { reply } => {
+                        return PushExit::Reconnect(reply);
+                    }
+                    // Poll-only verbs never route to a push task; answer defensively.
+                    DeviceControl::ReadNow { reply, .. } => {
+                        let _ = reply.send(Err("push instance - reads answer from the input snapshot".to_string()));
+                    }
+                    DeviceControl::Write(req) => {
+                        let _ = req.ack.send(Err("push instance - writes target the output assembly".to_string()));
+                    }
+                    DeviceControl::Repoll { reply } => {
+                        let _ = reply.send(Err("push instance - data arrives cyclically".to_string()));
+                    }
+                    // Push browse is answered from the configured layout by the commander — it never
+                    // routes here; answer defensively.
+                    DeviceControl::Browse { reply, .. } => {
+                        let _ = reply.send(Err(crate::app::BrowseError::Unsupported));
+                    }
+                }
+                continue;
+            }
+            Woke::Update(update) => match update {
+                Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms }) => {
+                    health.set_link(LinkState::Online);
+                    // The class-1 connection is open (§8.8 ioConnectionState); a transition ⇒
+                    // flush southbound_health + connection + io immediately (§8.7).
+                    dm.on_io_up(o2t_api_ms, t2o_api_ms);
+                    dm.emit_now().await;
+                    events
+                        .emit(
+                            Severity::Info,
+                            "device-connected",
+                            Some(format!("class-1 connection up to {}", cfg.connection.endpoint)),
+                            Some(json!({
+                                "instance": cfg.id, "adapter": adapter,
+                                "o2tApiMs": o2t_api_ms, "t2oApiMs": t2o_api_ms
+                            })),
+                        )
+                        .await;
+                    events
+                        .clear_alarm(Severity::Critical, "device-unreachable", None)
+                        .await;
+                }
+                Some(IoUpdate::Data { readings, sequence, run_mode, received_at }) => {
+                    health.frames_consumed.fetch_add(1, Ordering::Relaxed);
+                    // §8.8: count the frame, infer sequence gaps, record the lived inter-arrival + run/idle.
+                    // Consumption continues while paused (the snapshot + sequence validation stay live);
+                    // only PUBLISHING is gated off (§7.4).
+                    dm.record_frame_consumed(sequence, received_at, run_mode);
+                    tracing::debug!(
+                        instance = %cfg.id, sequence, run_mode, paused, fields = readings.len(),
+                        "push frame received"
+                    );
+                    if !paused {
                         let now = Instant::now();
                         for p in process_frame(&mut engine, &readings, &deadbands, mode, sample_ms, batch_ms, now, health) {
                             publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, false).await;
                         }
                     }
-                    Some(IoUpdate::Lost { error }) => {
-                        tracing::warn!(instance = %cfg.id, error = %error, "class-1 connection lost; reconnecting");
-                        health.read_errors.fetch_add(1, Ordering::Relaxed);
-                        // The watchdog expiry / peer close (§8.8 ioTimeouts; ioConnectionState → 0).
-                        dm.on_io_lost();
-                        return;
-                    }
-                    None => {
-                        tracing::warn!(instance = %cfg.id, "push session ended; reconnecting");
-                        return;
-                    }
                 }
-            }
-
-            _ = tokio::time::sleep(wait) => {}
+                Some(IoUpdate::Lost { error }) => {
+                    tracing::warn!(instance = %cfg.id, error = %error, "class-1 connection lost; reconnecting");
+                    health.read_errors.fetch_add(1, Ordering::Relaxed);
+                    // The watchdog expiry / peer close (§8.8 ioTimeouts; ioConnectionState → 0).
+                    dm.on_io_lost();
+                    return PushExit::LinkLost;
+                }
+                None => {
+                    tracing::warn!(instance = %cfg.id, "push session ended; reconnecting");
+                    return PushExit::LinkLost;
+                }
+            },
+            Woke::Tick => {}
         }
 
         let now = Instant::now();
-        for p in engine.take_due(batch_ms, now) {
-            // A coalescing-window flush (§8.5 batchFlushes/batchSize).
-            publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, true).await;
+        if !paused {
+            for p in engine.take_due(batch_ms, now) {
+                // A coalescing-window flush (§8.5 batchFlushes/batchSize).
+                publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, true).await;
+            }
         }
         if now.saturating_duration_since(since_health) >= metrics_interval {
-            let stale = engine.count_stale(fields.keys().map(String::as_str), stale_secs, now);
+            // Staleness is suspended while paused (§9.3).
+            let stale = if paused {
+                0
+            } else {
+                engine.count_stale(fields.keys().map(String::as_str), stale_secs, now)
+            };
             health.stale_signals.store(stale, Ordering::Relaxed);
             // The full §8 family set for this push device (§8.7).
             dm.emit_periodic().await;
@@ -329,6 +430,9 @@ mod tests {
     impl PushSession for ScriptedPush {
         fn updates(&mut self) -> &mut mpsc::Receiver<IoUpdate> {
             &mut self.rx
+        }
+        fn last_input(&self) -> Option<crate::device::InputSnapshot> {
+            None
         }
         async fn set_output(&mut self, _f: &IoFieldSpec, _v: &Value) -> DevResult<()> {
             Err(DeviceError::Unsupported("scripted"))

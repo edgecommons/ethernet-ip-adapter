@@ -16,6 +16,7 @@
 //! ```
 
 mod app;
+mod commands;
 mod config;
 mod device;
 mod eip;
@@ -24,6 +25,8 @@ mod poll;
 mod publish;
 mod push;
 mod sim;
+#[cfg(test)]
+mod testutil;
 
 use edgecommons::prelude::*;
 

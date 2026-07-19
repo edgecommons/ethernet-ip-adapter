@@ -234,6 +234,23 @@ pub enum IoUpdate {
     },
 }
 
+/// The most-recent decoded input frame — the source push `sb/read` answers from (§7.2, §7.3). Held
+/// by the [`PushSession`] and returned by [`PushSession::last_input`]; because class-1 consumption
+/// keeps running while an instance is paused (§7.4), the snapshot stays live and an on-demand read
+/// works even while paused. There is no per-field device round-trip in implicit I/O — the last frame
+/// *is* the read.
+#[derive(Debug, Clone)]
+pub struct InputSnapshot {
+    /// One [`Reading`] per configured input field, from the last accepted frame (§5).
+    pub readings: Vec<Reading>,
+    /// When the frame was accepted (monotonic) — the push `serverTs` (§5.4/§7.2).
+    pub received_at: Instant,
+    /// Run (`true`) / Idle (`false`) from the frame's run/idle header. The per-reading quality already
+    /// carries this (Idle ⇒ UNCERTAIN, §5.4); kept on the snapshot for diagnostics.
+    #[allow(dead_code)]
+    pub run_mode: bool,
+}
+
 /// A live **push** (class-1 implicit I/O) session to one device. **This is the trait a push backend
 /// implements** (§3.3). The engine owns the update receiver; the session owns translation from the
 /// transport into seam types.
@@ -242,6 +259,12 @@ pub trait PushSession: Send + Sync {
     /// The consumed-I/O stream: decoded field updates + connection lifecycle. The engine drives this
     /// receiver; a `None` means the session's translator task ended (treat as a lost link).
     fn updates(&mut self) -> &mut tokio::sync::mpsc::Receiver<IoUpdate>;
+
+    /// The most-recent decoded input frame (§7.2), or `None` until the first frame arrives / while the
+    /// connection is down. Answered even while paused — the source for push `sb/read`. Cheap: it clones
+    /// a held snapshot, it does not touch the wire.
+    // SLICE S6: dispatched by the `sb/read` command handler for push instances.
+    fn last_input(&self) -> Option<InputSnapshot>;
 
     /// Set one output-assembly field (already coerced/validated by the codec) into the producer
     /// buffer; it rides the next O→T frame. `Ok(())` means the field is staged (§7.3 honesty note).

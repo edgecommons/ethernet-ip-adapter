@@ -72,6 +72,20 @@ pub const COMMAND_VERBS: [&str; 9] = [
 const UNIT_COUNT: &str = "Count";
 const UNIT_MS: &str = "Milliseconds";
 
+/// The per-verb tallies [`DeviceMetrics::record_command`] adds to a command's `(verb, result)` row
+/// (§8.6). Measures irrelevant to a verb stay 0.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CommandTally {
+    /// `sb/read` entries served.
+    pub read_signals: u64,
+    /// `sb/write` entries attempted.
+    pub write_signals: u64,
+    /// `sb/write` entries that failed (incl. allow-list refusals).
+    pub write_failures: u64,
+    /// `sb/browse` tags returned.
+    pub browsed_tags: u64,
+}
+
 // ===================================================================================
 // The definition schema (§8) — the executable parity contract's data source
 // ===================================================================================
@@ -387,6 +401,9 @@ struct IoCounters {
     run_mode: bool,
     last_seq: Option<u16>,
     last_frame_at: Option<Instant>,
+    /// Negotiated APIs from the ForwardOpen reply (ms), surfaced by `sb/status` (§7.1).
+    o2t_api_ms: u32,
+    t2o_api_ms: u32,
 }
 
 impl IoCounters {
@@ -441,6 +458,9 @@ pub struct DeviceMetrics {
     publish_modes: Vec<&'static str>,
     inventory: Vec<InventoryRow>,
     health: Arc<Health>,
+    /// The O→T run/idle we produce (push output.run, default true) — the `run` field of the status
+    /// `io` view (§7.1). `false`/irrelevant for poll devices.
+    produced_run: bool,
     inner: Mutex<Inner>,
 }
 
@@ -525,6 +545,12 @@ impl DeviceMetrics {
             }
         }
 
+        let produced_run = device
+            .io
+            .as_ref()
+            .and_then(|io| io.output.as_ref())
+            .is_none_or(|o| o.run);
+
         Self {
             svc,
             config,
@@ -533,6 +559,7 @@ impl DeviceMetrics {
             publish_modes,
             inventory,
             health,
+            produced_run,
             inner: Mutex::new(inner),
         }
     }
@@ -649,9 +676,83 @@ impl DeviceMetrics {
         }
     }
 
-    /// The class-1 connection came up (first accepted frame, §8.8).
-    pub fn on_io_up(&self) {
-        self.inner.lock().unwrap().io.io_connection_state = true;
+    /// The class-1 connection came up (first accepted frame, §8.8); records the negotiated APIs from
+    /// the ForwardOpen reply for `sb/status` (§7.1).
+    pub fn on_io_up(&self, o2t_api_ms: u32, t2o_api_ms: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.io.io_connection_state = true;
+        inner.io.o2t_api_ms = o2t_api_ms;
+        inner.io.t2o_api_ms = t2o_api_ms;
+    }
+
+    /// Record one `sb/*` command outcome for the `(verb, result)` combo (§8.6): the request, its
+    /// latency, an error (when `!ok`), and the per-verb tallies. The pause/resume/reconnect/repoll
+    /// request counters are bumped from `verb` so each verb's row carries its own counter (§8.6).
+    pub fn record_command(&self, verb: &'static str, ok: bool, latency_ms: u64, tally: CommandTally) {
+        let result = if ok { RESULT_SUCCESS } else { RESULT_ERROR };
+        let mut inner = self.inner.lock().unwrap();
+        let c = inner.command.entry((verb, result)).or_default();
+        c.command_requests.add(1.0);
+        c.command_latency_ms += latency_ms as f64;
+        if !ok {
+            c.command_errors.add(1.0);
+        }
+        c.read_signals.add(tally.read_signals as f64);
+        c.write_signals.add(tally.write_signals as f64);
+        c.write_failures.add(tally.write_failures as f64);
+        c.browsed_tags.add(tally.browsed_tags as f64);
+        match verb {
+            "sb/pause" => c.pause_requests.add(1.0),
+            "sb/resume" => c.resume_requests.add(1.0),
+            "reconnect" => c.reconnect_requests.add(1.0),
+            "repoll" => c.repoll_requests.add(1.0),
+            _ => {}
+        }
+    }
+
+    /// The `sb/status` counter snapshot (§7.1): `{ read, write, readErrors }`, each `{interval, total}`.
+    /// `read` is CIP reads (poll `tagReads`) or accepted frames (push `framesConsumed`); `write` is
+    /// `sb/write` entries attempted; `readErrors` is `tagReadErrors` (poll) or IO timeouts (push).
+    #[must_use]
+    pub fn counters_view(&self) -> serde_json::Value {
+        let inner = self.inner.lock().unwrap();
+        let pair = |p: &Pair| serde_json::json!({ "interval": p.interval, "total": p.total });
+        let (read, read_errors) = if self.is_push {
+            (pair(&inner.io.frames_consumed), pair(&inner.io.io_timeouts))
+        } else {
+            let mut reads = Pair::default();
+            let mut errs = Pair::default();
+            for c in inner.poll.values() {
+                reads.total += c.tag_reads.total;
+                reads.interval += c.tag_reads.interval;
+                errs.total += c.tag_read_errors.total;
+                errs.interval += c.tag_read_errors.interval;
+            }
+            (pair(&reads), pair(&errs))
+        };
+        let mut writes = Pair::default();
+        for c in inner.command.values() {
+            writes.total += c.write_signals.total;
+            writes.interval += c.write_signals.interval;
+        }
+        serde_json::json!({ "read": read, "write": pair(&writes), "readErrors": read_errors })
+    }
+
+    /// The push `sb/status` `io` object (§7.1): negotiated APIs, run/peerRun, and the §8.8 counters.
+    #[must_use]
+    pub fn io_view(&self) -> serde_json::Value {
+        let inner = self.inner.lock().unwrap();
+        let io = &inner.io;
+        let pair = |p: &Pair| serde_json::json!({ "interval": p.interval, "total": p.total });
+        serde_json::json!({
+            "o2tApiMs": io.o2t_api_ms,
+            "t2oApiMs": io.t2o_api_ms,
+            "run": self.produced_run,
+            "peerRun": io.run_mode,
+            "framesConsumed": pair(&io.frames_consumed),
+            "staleDropped": pair(&io.stale_frames_dropped),
+            "sequenceGaps": pair(&io.sequence_gaps),
+        })
     }
 
     /// One accepted T→O frame (push, §8.8): counts the frame, infers a sequence gap from a forward
