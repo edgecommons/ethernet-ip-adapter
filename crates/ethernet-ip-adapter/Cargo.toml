@@ -27,6 +27,11 @@ cloudwatch = ["edgecommons/cloudwatch"]
 # The edgecommons Rust library (pinned rev + features via the workspace). The `.cargo/config.toml`
 # path override redirects it to the local sibling checkout for dev; CI uses the pinned rev.
 edgecommons = { workspace = true }
+# The owned pure-Rust EtherNet/IP + CIP protocol crate (package `ec-enip`, lib `enip`;
+# PROTOCOL-DESIGN, D-EIP-17). Consumed here (S2) so the push `io` config builds a validated
+# `enip::AssemblyLayout` at config-parse time; the eip/ backend consumes the rest of its surface
+# through the device.rs seam in slice S3.
+ec-enip = { path = "../enip" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -34,9 +39,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-# S3: ec-enip = { path = "../enip" } — the owned pure-Rust protocol crate (PROTOCOL-DESIGN). The
-# eip/ backend consumes it through the device.rs seam in slice S3; added then so it is never an
-# unused dependency before there is a caller.
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Validates the worked test-configs against config.schema.json in a unit test (the schema is a
+# published contract; a drift between it and the parser is a defect). Already in the workspace lock.
+jsonschema = "0.46"

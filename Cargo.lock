@@ -1018,7 +1018,9 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "ec-enip",
  "edgecommons",
+ "jsonschema",
  "serde",
  "serde_json",
  "tempfile",

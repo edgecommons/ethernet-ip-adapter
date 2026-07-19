@@ -1,0 +1,87 @@
+{
+  "logging": {
+    "level": "DEBUG",
+    "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}"
+  },
+  "hierarchy": {
+    "levels": [
+      "site",
+      "device"
+    ]
+  },
+  "identity": {
+    "site": "factory-1"
+  },
+  "heartbeat": {
+    "enabled": true,
+    "intervalSecs": 5,
+    "measures": {
+      "cpu": true,
+      "memory": true
+    },
+    "destination": "local"
+  },
+  "metricEmission": {
+    "target": "log",
+    "namespace": "edgecommons"
+  },
+  "tags": {
+    "site": "factory-1"
+  },
+  "component": {
+    "token": "ethernet-ip-adapter",
+    "global": {
+      "defaults": { "pollIntervalMs": 1000, "publishMode": "onChange", "batchMs": 0 },
+      "timeouts": {
+        "connectMs": 5000,
+        "requestTimeoutMs": 2000,
+        "reconnectBackoffMinMs": 1000,
+        "reconnectBackoffMaxMs": 60000
+      },
+      "healthThresholds": { "staleSignalSecs": 60, "keepaliveProbeIntervalMs": 60000 },
+      "metricsIntervalSecs": 60
+    },
+    "instances": [
+      {
+        "id": "palletizer-io",
+        "adapter": "ethernet-ip",
+        "mode": "push",
+        "connection": { "endpoint": "opener-sim:44818" },
+        "io": {
+          "rpiMs": 100,
+          "connectionType": "p2p",
+          "priority": "scheduled",
+          "timeoutMultiplier": 16,
+          "assemblies": { "config": 151, "output": 150, "input": 100 },
+          "input": {
+            "sizeBytes": 32,
+            "realTimeFormat": "modeless",
+            "sampleMs": 500,
+            "signals": [
+              { "name": "din-word", "offset": 0, "type": "udint" },
+              { "name": "motor-run", "offset": 0, "type": "bool", "bit": 0 },
+              { "name": "fault", "offset": 0, "type": "bool", "bit": 1,
+                "deadband": { "type": "none" } },
+              { "name": "line-speed", "offset": 4, "type": "real",
+                "deadband": { "type": "absolute", "value": 0.5 } },
+              { "name": "fill-temp", "offset": 8, "type": "real",
+                "deadband": { "type": "percent", "value": 1.0 } },
+              { "name": "product-count", "offset": 12, "type": "dint" },
+              { "name": "zone-temps", "offset": 16, "type": "real", "arrayCount": 4 }
+            ]
+          },
+          "output": {
+            "sizeBytes": 32,
+            "realTimeFormat": "header32",
+            "run": true,
+            "signals": [
+              { "name": "dout-word", "offset": 0, "type": "udint" },
+              { "name": "fill-setpoint", "offset": 4, "type": "real" }
+            ]
+          }
+        },
+        "writes": { "allow": ["a150/0/udint", "a150/4/real"] }
+      }
+    ]
+  }
+}

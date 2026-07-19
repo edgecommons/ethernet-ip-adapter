@@ -386,6 +386,18 @@ async fn run_device(
     health: Arc<Health>,
     mut writes: tokio::sync::mpsc::Receiver<WriteRequest>,
 ) {
+    // S3: the class-1 push engine (the `enip` IoManager consuming the input assembly at the RPI)
+    // lands in slice S3. The push config is fully parsed + validated (§4.6, its AssemblyLayout is
+    // built at startup), but there is no wire backend yet — stand in with a log rather than entering
+    // the poll loop (which has no poll groups for a push device).
+    if matches!(cfg.mode, crate::config::DeviceMode::Push) {
+        tracing::info!(
+            instance = %cfg.id, endpoint = %cfg.connection.endpoint,
+            "push mode: class-1 I/O backend lands in S3"
+        );
+        return;
+    }
+
     let backend: Box<dyn DeviceBackend> = match cfg.adapter.as_str() {
         "sim" => Box::new(SimBackend),
         // SLICE S3: the real `EipBackend` (built on the owned `enip` protocol crate) lands in slice
