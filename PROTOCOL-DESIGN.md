@@ -811,8 +811,14 @@ Everything is deadline-bounded, returns `Result<_, EnipError>`, and is documente
 ## 12. Testing, fuzzing & conformance vectors
 
 The protocol crate sits **inside** the workspace 90% line-coverage gate (`cargo llvm-cov`
-workspace-wide) — this design removes the old "raw client seam excluded from coverage" carve-out,
-because the stack is now fully testable without hardware.
+workspace-wide) — no `enip` file is excluded from the denominator. The pure codec, state machines,
+and class-1 receive/produce logic reach the bar offline over `duplex` fixtures (§12.2). The crate's
+live-socket **runtime** — the class-1 UDP `IoManager`/`manager_task`/`IoConnectionHandle` in `io.rs`,
+`client/io_service.rs`, and the TCP connect in `client/mod.rs` — needs a real peer, so it is exercised
+by the live OpENer/cpppo suites (§12.4) rather than offline; it stays **counted against the gate**
+(not carved out), and the well-tested codec keeps the crate over the bar without excluding it. (The
+adapter applies the same discipline to its own live-loop drivers, but there it isolates them into thin
+excluded seam files — see DESIGN §12.2.)
 
 ### 12.1 Unit tests (per codec, no I/O)
 

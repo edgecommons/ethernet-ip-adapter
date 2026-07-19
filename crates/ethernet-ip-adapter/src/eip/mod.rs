@@ -7,8 +7,9 @@
 //! (`CipValue`, `EnipError`, `IoEvent`, `AssemblyLayout`) never cross it.
 //!
 //! * [`types`] — the pure JSON ⇄ `CipValue` codec (§5.1, fully unit-tested).
-//! * [`session`] — [`EipSession`]: the poll [`DeviceSession`] over `EipClient` (read/write/browse/probe).
-//! * [`push`] — [`push::EipPushSession`]: the [`PushSession`] over `IoManager` (class-1 implicit I/O).
+//! * [`session`] — [`session::EipSession`]: the poll [`DeviceSession`] over `EipClient`.
+//! * [`push`] — the pure class-1 translators ([`push::assembly_to_readings`] / [`push::map_lost_reason`]).
+//! * [`live`] — the excluded live-socket seam: `EipBackend`'s connect/ForwardOpen + the `EipPushSession`.
 //!
 //! **Error classification (§10.1).** [`map_enip_error`] implements the normative `EnipError →
 //! DeviceError` table: `EnipError::is_transient()` is the default, overridden per row (a peer that
@@ -19,19 +20,16 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
+use crate::config::Timeouts;
+use crate::device::{ConnectionConfig, DeviceError};
 
-use crate::config::{IoConfig, Timeouts};
-use crate::device::{
-    ConnectionConfig, DeviceBackend, DeviceError, DeviceSession, PushSession, Result,
-};
-
+pub mod live;
 pub mod push;
 pub mod session;
 pub mod types;
 
 /// The originator vendor id stamped into ForwardOpen / class-1 opens (matches the `enip` default).
-const VENDOR_ID: u16 = 0x1337;
+pub(crate) const VENDOR_ID: u16 = 0x1337;
 
 /// Opens sessions over the owned `enip` EtherNet/IP stack (kind `"ethernet-ip"`, §3.4). Holds the
 /// configured connection timeouts (the [`DeviceBackend::connect`] signature carries only the
@@ -46,11 +44,16 @@ impl EipBackend {
     pub fn new(timeouts: Timeouts) -> Self {
         Self { timeouts }
     }
+
+    /// The configured connection timeouts (used by the live-socket seam [`live`]).
+    pub(crate) fn timeouts(&self) -> &Timeouts {
+        &self.timeouts
+    }
 }
 
 /// Build the `enip` client options from the connection config + timeouts (§3.4): slot ⇒ backplane
 /// route, `connected` ⇒ connected class-3 messaging, deadlines from `timeouts`.
-fn client_options(conn: &ConnectionConfig, timeouts: &Timeouts) -> enip::ClientOptions {
+pub(crate) fn client_options(conn: &ConnectionConfig, timeouts: &Timeouts) -> enip::ClientOptions {
     enip::ClientOptions {
         route: conn.slot.map(enip::RoutePath::backplane_slot),
         connect_timeout: Duration::from_millis(timeouts.connect_ms.max(1)),
@@ -61,30 +64,8 @@ fn client_options(conn: &ConnectionConfig, timeouts: &Timeouts) -> enip::ClientO
     }
 }
 
-#[async_trait]
-impl DeviceBackend for EipBackend {
-    fn kind(&self) -> &'static str {
-        "ethernet-ip"
-    }
-
-    async fn connect(&self, conn: &ConnectionConfig) -> Result<Box<dyn DeviceSession>> {
-        let opts = client_options(conn, &self.timeouts);
-        let request_timeout = opts.request_timeout;
-        let client = enip::EipClient::connect(&conn.endpoint, opts)
-            .await
-            .map_err(map_enip_error)?;
-        Ok(Box::new(session::EipSession::new(client, request_timeout)))
-    }
-
-    async fn open_push(
-        &self,
-        conn: &ConnectionConfig,
-        io: &IoConfig,
-    ) -> Result<Box<dyn PushSession>> {
-        let session = push::EipPushSession::open(conn, io, &self.timeouts, VENDOR_ID).await?;
-        Ok(Box::new(session))
-    }
-}
+// The `impl DeviceBackend for EipBackend` (live TCP connect / ForwardOpen) lives in the excluded
+// live-socket seam [`live`]; the pure error-classification below is what the unit tests drive.
 
 /// Classify an `enip` error into the seam's [`DeviceError`] per the §10.1 table (the adapter's
 /// normative reconnect behavior). Only connection-level failures reach here — per-tag CIP statuses
@@ -198,5 +179,43 @@ mod tests {
     fn row_unsupported_maps_to_unsupported() {
         let mapped = map_enip_error(EnipError::Unsupported { what: "struct value" });
         assert!(matches!(mapped, DeviceError::Unsupported("struct value")));
+    }
+
+    /// `client_options` maps the connection + timeouts onto the `enip` client (§3.4): a `slot` ⇒ a
+    /// backplane route, `connected` ⇒ connected class-3 messaging, and the deadlines carry through.
+    #[test]
+    fn client_options_maps_slot_route_connected_and_deadlines() {
+        use crate::config::GlobalConfig;
+        use crate::device::ConnectionConfig;
+        let timeouts = GlobalConfig::from_value(&serde_json::json!({
+            "timeouts": { "connectMs": 3000, "requestTimeoutMs": 750 }
+        }))
+        .unwrap()
+        .timeouts;
+
+        // Routed (ControlLogix slot) + connected messaging.
+        let routed: ConnectionConfig =
+            serde_json::from_value(serde_json::json!({ "endpoint": "plc:44818", "slot": 2, "connected": true })).unwrap();
+        let opts = super::client_options(&routed, &timeouts);
+        assert!(opts.route.is_some(), "a slot yields a backplane route");
+        assert!(opts.connected_messaging, "connected ⇒ class-3 messaging");
+        assert_eq!(opts.connect_timeout, std::time::Duration::from_millis(3000));
+        assert_eq!(opts.request_timeout, std::time::Duration::from_millis(750));
+        assert_eq!(opts.vendor_id, super::VENDOR_ID);
+
+        // Direct (cpppo / CompactLogix): no slot ⇒ no route, unconnected.
+        let direct: ConnectionConfig =
+            serde_json::from_value(serde_json::json!({ "endpoint": "sim:44818" })).unwrap();
+        let opts = super::client_options(&direct, &timeouts);
+        assert!(opts.route.is_none(), "no slot ⇒ no routing path");
+        assert!(!opts.connected_messaging);
+    }
+
+    #[test]
+    fn backend_new_carries_its_timeouts() {
+        use crate::config::GlobalConfig;
+        let timeouts = GlobalConfig::default().timeouts;
+        let backend = super::EipBackend::new(timeouts.clone());
+        assert_eq!(backend.timeouts().connect_ms, timeouts.connect_ms);
     }
 }

@@ -36,19 +36,37 @@ jobs:
     # only does build/test/clippy. Measured WORKSPACE-WIDE (D-EIP-17 folded the protocol crate into
     # the same denominator as the adapter; there is no per-crate carve-out).
     #
-    # Excluded from the denominator (DESIGN §12.1 regex + §12.2 justification — "coverage laundering"
-    # is forbidden, so every exclusion is pinned to a reason):
-    #   - `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs` — the two live-sim-gated
-    #     integration suites (§11.3). They self-skip when their sim port is down (no cpppo/OpENer is
-    #     provisioned in this job), so their bodies would only partly run and would erode the margin.
+    # Option B, the file-replicator discipline (DESIGN §12.2): the untestable live-infra loop DRIVERS
+    # are refactored into dedicated, as-thin-as-possible seam files so a file-level exclusion excludes
+    # ONLY untestable I/O glue and never launders tested logic — the pure gating/decision logic stays in
+    # the covered files and IS unit-tested. Excluded from the denominator, each pinned to a reason:
+    #   - `crates/ethernet-ip-adapter/src/supervisor.rs` — the connect→poll/consume→reconnect drivers
+    #     (`App::run` / `run_device` / `run_push` / `FacadeEventSink`): they `.await` a live `EdgeCommons`
+    #     runtime, a live `DeviceBackend` socket, and the `data()` facade. Backoff math / connectivity /
+    #     `apply_pause` / `serve_control_disconnected` / `connect_reason` / `rand01` stay in `app.rs`, tested.
+    #   - `crates/ethernet-ip-adapter/src/poll_driver.rs` — `poll_until_disconnected` + `repoll`/publish
+    #     glue: the select-loop over a live `DeviceSession` + `data.publish().await`. The gating/batching/
+    #     stale/overrun logic it composes lives in `poll.rs` / `publish.rs` and is unit-tested.
+    #   - `crates/ethernet-ip-adapter/src/push_driver.rs` — `consume_push` + publish glue: the loop over a
+    #     live class-1 `PushSession` stream + `data.publish().await`. `process_frame` is in `push.rs`, tested.
+    #   - `crates/ethernet-ip-adapter/src/publish_sink.rs` — the one-function `publish()` seam driving
+    #     `data.publish().await`; its pure assembly (`build_update`) is in `publish.rs`, tested.
+    #   - `crates/ethernet-ip-adapter/src/eip/live.rs` — the EtherNet/IP live-socket drivers: `EipBackend`'s
+    #     TCP `connect` / ForwardOpen `open_push` and the class-1 `EipPushSession` + translator task. The
+    #     pure translators (`assembly_to_readings` / `map_lost_reason`), the error classification
+    #     (`map_enip_error`), and the codec (`eip/types`) stay in covered files and are unit-tested.
+    #   These five are validated by the S7a live cpppo/OpENer integration suites (§11) + the S9 deployed
+    #   regression — the analog of how `file-replicator` excludes its `dest/*/client.rs` I/O seams.
+    #   - `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs` — live-sim-gated suites
+    #     (§11.3); they self-skip when their sim port is down.
     #   - `crates/enip/fuzz/**` — libFuzzer harnesses. They EXERCISE covered product code; they are not
     #     product code (§12.2). (Also a separate workspace, so not even built here — belt-and-suspenders.)
-    #   - `crates/ethernet-ip-adapter/src/testutil.rs` — `#[cfg(test)]`-only recording test doubles
-    #     (`RecordingMetrics`/`RecordingEvents` + constructors). Test support, not product code — the
-    #     file's own header declares it excluded, matching the file-replicator approach §12.2 cites.
-    # Nothing else is excluded: the adapter's `eip/` backend + the whole protocol crate sit INSIDE the
-    # gate, unit-tested over in-memory `tokio::io::duplex` byte-stream fixtures / a mock `DeviceSession`
-    # (no container). Do NOT add exclusions to dodge the gate — add tests (DESIGN §12.2).
+    #   - `crates/ethernet-ip-adapter/src/testutil.rs` — `#[cfg(test)]`-only recording test doubles.
+    # NOTHING ELSE is excluded. The protocol crate's live-socket runtime (`enip/io.rs`'s class-1 UDP
+    # manager, `client/io_service.rs`, `client/mod.rs`'s TCP connect) and the binary entry `main.rs` stay
+    # INSIDE the denominator — counted AGAINST the gate, not laundered out — and the well-tested codec
+    # keeps the aggregate comfortably over 90% (last local run: 93.5%). Do NOT add exclusions to dodge the
+    # gate — add tests (DESIGN §12.2).
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,12 +92,12 @@ jobs:
           git config --global \
             url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
-      - name: Coverage gate (90% lines, workspace-wide; live suites + fuzz + test doubles excluded)
+      - name: Coverage gate (90% lines, workspace-wide; thin live-infra seams + live suites + fuzz + doubles excluded)
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: >
           cargo llvm-cov --workspace
-          --ignore-filename-regex '(tests[/\\]live_(cpppo|opener)|fuzz[/\\]|testutil\.rs)'
+          --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener)\.rs|testutil\.rs|fuzz[/\\])'
           --fail-under-lines 90
           --cobertura --output-path target/cobertura.xml
 

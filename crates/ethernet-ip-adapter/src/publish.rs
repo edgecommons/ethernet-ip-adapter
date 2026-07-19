@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use edgecommons::prelude::{DataFacade, Sample, SignalUpdate};
+use edgecommons::prelude::{Sample, SignalUpdate};
 use serde_json::Value;
 
 use crate::config::{DeadbandKind, DeadbandSpec, PublishMode};
@@ -91,23 +91,9 @@ pub(crate) fn build_update(
         .build()
 }
 
-/// The single publish call both engines use (§6.1): assemble the update and publish it, returning the
-/// result and the **publish latency** — the wall time of the `data.publish().await` (§6.2, recorded
-/// into `southbound_health.publishLatencyMs` / `EtherNetIpPublish.publishLatencyMs`).
-pub(crate) async fn publish(
-    data: &DataFacade,
-    stable_id: &str,
-    name: &str,
-    address: Value,
-    device: &DeviceParts<'_>,
-    samples: Vec<Sample>,
-) -> (std::result::Result<(), String>, Duration) {
-    let update = build_update(stable_id, name, address, device, samples);
-    let start = Instant::now();
-    let res = data.publish(update).await;
-    let latency = start.elapsed();
-    (res.map_err(|e| e.to_string()), latency)
-}
+// The single `publish()` call that drives `data.publish().await` lives in the excluded live-broker
+// seam [`crate::publish_sink`]; the pure assembly ([`build_update`]) + gate primitives below are what
+// the unit tests drive.
 
 // =====================================================================================
 // The publish gate (§4.4 / §6.2) — shared by both engines, mode-agnostic and pure.
@@ -542,5 +528,59 @@ mod tests {
         assert!(
             time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339).is_ok()
         );
+    }
+
+    /// The shared [`Engine`] state: buffered batches flush across signals via [`Engine::take_due`];
+    /// [`Engine::next_batch_deadline`] reports the earliest open window.
+    #[test]
+    fn engine_take_due_flushes_every_closed_window_across_signals() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(t0);
+        // Two signals each open a 100ms window at t0.
+        e.state.entry("A".into()).or_default().batcher.add(
+            sample_of(json!(1), Quality::Good, None, Some("t".into())), t0, 100);
+        e.state.entry("B".into()).or_default().batcher.add(
+            sample_of(json!(2), Quality::Good, None, Some("t".into())), t0, 100);
+        // No window is due yet ⇒ nothing flushes, but the next deadline is known.
+        assert!(e.take_due(100, t0 + Duration::from_millis(50)).is_empty());
+        assert_eq!(e.next_batch_deadline(100), Some(t0 + Duration::from_millis(100)));
+        // At t0+100 both windows close ⇒ one Publish each.
+        let mut due = e.take_due(100, t0 + Duration::from_millis(100));
+        due.sort_by(|a, b| a.signal_id.cmp(&b.signal_id));
+        assert_eq!(due.len(), 2);
+        assert_eq!(due[0].signal_id, "A");
+        assert_eq!(due[1].signal_id, "B");
+        // Windows are closed now.
+        assert!(e.next_batch_deadline(100).is_none());
+    }
+
+    /// `rebase_stale` (poll resume, §7.4.5) re-bases every tracked signal's staleness clock to `now`,
+    /// so a paused span does not count a signal as stale.
+    #[test]
+    fn engine_rebase_stale_resets_every_last_good() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(t0);
+        e.state.entry("A".into()).or_default().last_good = Some(t0);
+        e.state.entry("B".into()).or_default(); // never read
+        let resume = t0 + Duration::from_secs(120);
+        e.rebase_stale(resume);
+        // With a 60s threshold, neither is stale immediately after the rebase.
+        assert_eq!(e.count_stale(["A", "B"].into_iter(), 60, resume + Duration::from_secs(30)), 0);
+    }
+
+    /// `rebase_from` (push resume, §7.4.8) sets each field's onChange baseline to its current value AND
+    /// re-bases its staleness clock, so the paused drift is not published as one giant change burst.
+    #[test]
+    fn engine_rebase_from_sets_baseline_and_last_good() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(t0);
+        let now = t0 + Duration::from_secs(30);
+        e.rebase_from(&[("a100/0/udint".into(), json!(7))], now);
+        let st = e.state.get("a100/0/udint").expect("state seeded");
+        assert_eq!(st.baseline.as_ref(), Some(&json!(7)), "baseline set to the current value");
+        assert_eq!(st.last_good, Some(now), "staleness clock re-based to now");
+        // The re-based baseline means the same value now suppresses under onChange.
+        assert!(!should_publish(st.baseline.as_ref(), &json!(7), Quality::Good,
+            PublishMode::OnChange, &db(DeadbandKind::None, 0.0)));
     }
 }

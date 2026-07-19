@@ -440,4 +440,95 @@ mod tests {
         assert_eq!(page.tags[1].type_name, "DINT");
         assert!(page.next_cursor.is_none());
     }
+
+    /// Browse over the full elementary-type spread plus a structure and an unknown code, exercising the
+    /// `symbol_type_name` / `cip_type_name` mapping (§7.5, §5.1). A structure ⇒ "STRUCT"; an unrecognized
+    /// code ⇒ its raw hex.
+    #[tokio::test]
+    async fn browse_maps_every_elementary_type_a_struct_and_an_unknown() {
+        // (name, symbol type code, expected type_name).
+        let rows: Vec<(&str, u16, &str)> = vec![
+            ("B", 0x00C1, "BOOL"), ("SI", 0x00C2, "SINT"), ("I", 0x00C3, "INT"),
+            ("DI", 0x00C4, "DINT"), ("LI", 0x00C5, "LINT"), ("USI", 0x00C6, "USINT"),
+            ("UI", 0x00C7, "UINT"), ("UDI", 0x00C8, "UDINT"), ("ULI", 0x00C9, "ULINT"),
+            ("R", 0x00CA, "REAL"), ("LR", 0x00CB, "LREAL"),
+            ("UDT", 0x8100, "STRUCT"), ("MYSTERY", 0x00FF, "UNKNOWN"),
+        ];
+        let payload = rows.clone();
+        let (client_half, server_half) = tokio::io::duplex(8192);
+        spawn_device(server_half, move |_idx, service, _mr| {
+            assert_eq!(service, 0x55);
+            let mut data = Vec::new();
+            for (i, (name, sym, _)) in payload.iter().enumerate() {
+                data.extend_from_slice(&tag_record(i as u32 + 1, name, *sym));
+            }
+            (0x00, data)
+        });
+        let mut session = connect(client_half).await;
+
+        let page = session.browse(None, 100).await.unwrap();
+        assert_eq!(page.tags.len(), rows.len());
+        for (got, (_, _, want)) in page.tags.iter().zip(rows.iter()) {
+            assert_eq!(&got.type_name, want, "tag `{}` type name", got.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_finite_after_scale_read_is_uncertain() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |_idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            (0x00, tagged_real(1e30))
+        });
+        let mut session = connect(client_half).await;
+        // scale 1e300 overflows the read value to a non-finite number ⇒ UNCERTAIN (§5.4).
+        let sp: SignalSpec = serde_json::from_value(
+            json!({ "name": "overflow", "tagPath": "OVERFLOW", "type": "real", "scale": 1e300 }),
+        )
+        .unwrap();
+        let readings = session.read_signals(&[sp]).await.unwrap();
+        assert_eq!(readings[0].quality, Quality::Uncertain);
+        assert_eq!(readings[0].quality_raw.as_deref(), Some("NON_FINITE_AFTER_SCALE"));
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_to_encode_is_permanent_before_any_io() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        // The device would ack, but a non-numeric value never encodes, so no write is ever sent.
+        spawn_device(server_half, |_idx, _service, _mr| (0x00, Vec::new()));
+        let mut session = connect(client_half).await;
+        let sp = spec("fill-setpoint", "FILL_SETPOINT", "real", None);
+        let err = session.write_signal(&sp, &json!("not a number")).await.unwrap_err();
+        assert!(!err.is_transient(), "a coercion failure is permanent, not a link error");
+    }
+
+    #[tokio::test]
+    async fn a_device_rejected_write_is_permanent() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |_idx, service, _mr| {
+            assert_eq!(service, 0x4D, "write tag");
+            (0x08, Vec::new()) // ServiceNotSupported-style CIP status ⇒ rejected write
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("fill-setpoint", "FILL_SETPOINT", "real", None);
+        let err = session.write_signal(&sp, &json!(55.5)).await.unwrap_err();
+        assert!(!err.is_transient(), "a CIP-rejected write is permanent for this value");
+    }
+
+    #[tokio::test]
+    async fn a_probe_against_a_dead_session_returns_err() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        // Answer RegisterSession, then drop the socket so the ListIdentity probe hits EOF.
+        tokio::spawn(async move {
+            let mut s = server_half;
+            let reg = read_frame(&mut s).await.unwrap();
+            let reply = EncapFrame::new(
+                EncapHeader::request(Command::RegisterSession, 0, 1, reg.header.sender_context),
+                Bytes::from(vec![1, 0, 0, 0]),
+            );
+            write_frame(&mut s, &reply).await;
+        });
+        let mut session = connect(client_half).await;
+        assert!(session.probe().await.is_err(), "a probe over a dropped link fails");
+    }
 }

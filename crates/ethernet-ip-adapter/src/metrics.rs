@@ -995,6 +995,13 @@ mod tests {
         emitted: Mutex<Vec<(String, HashMap<String, f64>)>>,
     }
 
+    impl RecordingMetrics {
+        /// The most recent emit of `name`, or `None`.
+        fn last(&self, name: &str) -> Option<HashMap<String, f64>> {
+            self.emitted.lock().unwrap().iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        }
+    }
+
     #[async_trait]
     impl MetricService for RecordingMetrics {
         fn define_metric(&self, metric: Metric) {
@@ -1344,5 +1351,152 @@ mod tests {
         assert!(v.contains_key("publishLatencyMs") && v.contains_key("staleSignals"));
         // readErrors is an interval counter: it swap-resets, so a re-read is 0.
         assert_eq!(m.health.read_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// The connection lifecycle counters (§8.2): a first connect sets `sessionConnected` and does NOT
+    /// bump `reconnects`; a drop + reconnect does, and `connectedDurationMs` accrues while up and
+    /// resets on emit. Drives `on_connect_attempt`/`on_connected`/`on_connect_failure`/
+    /// `on_connection_dropped` + `ConnCounters::accrue`/`drain`.
+    #[tokio::test]
+    async fn connection_lifecycle_counts_attempts_reconnects_and_up_duration() {
+        let (svc, m) = dm(poll_device());
+        let t0 = Instant::now();
+        m.on_connect_attempt();
+        m.on_connect_failure(); // one failed attempt
+        m.on_connect_attempt();
+        m.on_connected(12, t0); // first success: no reconnect
+        m.emit_connection(false).await;
+
+        let first = svc.last("EtherNetIpConnection").expect("connection emitted");
+        assert_eq!(first["sessionConnected"], 1.0);
+        assert_eq!(first["connectAttemptsTotal"], 2.0);
+        assert_eq!(first["connectFailuresTotal"], 1.0);
+        assert_eq!(first["reconnectsInterval"], 0.0, "the first connect is not a reconnect");
+        assert_eq!(first["connectLatencyMs"], 12.0);
+
+        // A drop then a re-established connection: reconnects bumps, sessionConnected flips off then on.
+        m.on_connection_dropped(t0 + std::time::Duration::from_millis(500));
+        let dropped = { let mut i = m.inner.lock().unwrap(); i.conn.drain(Instant::now()) };
+        assert_eq!(dropped["sessionConnected"], 0.0);
+        assert_eq!(dropped["connectionDropsInterval"], 1.0);
+        assert!(dropped["connectedDurationMs"] > 0.0, "up-duration accrued while connected");
+
+        m.on_connect_attempt();
+        m.on_connected(5, Instant::now()); // ever_connected ⇒ a reconnect
+        m.emit_connection(false).await;
+        let re = svc.last("EtherNetIpConnection").unwrap();
+        assert_eq!(re["reconnectsInterval"], 1.0, "the re-establishment is a reconnect");
+    }
+
+    /// `record_publish` (§8.5): a batch flush sets `batchSize` + `batchFlushes`; a failure bumps
+    /// `publishFailures` and does not add samples. An overrun poll cycle bumps `pollOverruns`.
+    #[tokio::test]
+    async fn publish_and_poll_recording_cover_batch_failure_and_overrun() {
+        let (svc, m) = dm(poll_device());
+        m.record_publish("onChange", 3, true, 7, true); // a batch flush of 3 samples
+        m.record_publish("onChange", 1, false, 0, false); // a failed publish
+        m.emit_publish().await;
+        let p = svc
+            .emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == PUBLISH)
+            .map(|(_, v)| v.clone())
+            .find(|v| v["dataMessagesPublishedTotal"] == 2.0)
+            .expect("onChange publish row");
+        assert_eq!(p["samplesPublishedTotal"], 3.0, "only the ok publish added samples");
+        assert_eq!(p["publishFailuresTotal"], 1.0);
+        assert_eq!(p["batchFlushesTotal"], 1.0);
+        assert_eq!(p["batchSize"], 3.0);
+
+        m.record_poll_cycle("fast", RESULT_SUCCESS, 900, 2, true, 2, 0, 0, 0, 0); // overran
+        m.emit_poll().await;
+        let poll_row = svc
+            .emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == POLL)
+            .map(|(_, v)| v.clone())
+            .find(|v| v["pollOverrunsTotal"] == 1.0);
+        assert!(poll_row.is_some(), "an overran cycle bumps pollOverruns");
+    }
+
+    /// The full periodic emit for a POLL device (§8.7) publishes every poll family; `emit_now` flushes
+    /// the transition subset. Drives `emit_periodic`/`emit_now`/`emit_inventory`/`emit_command`.
+    #[tokio::test]
+    async fn periodic_emit_publishes_every_poll_family() {
+        let (svc, m) = dm(poll_device());
+        m.record_command("sb/status", true, 2, CommandTally::default());
+        m.emit_periodic().await;
+        let names: std::collections::BTreeSet<String> =
+            svc.emitted.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
+        for f in [HEALTH, CONNECTION, INVENTORY, POLL, PUBLISH, COMMAND] {
+            assert!(names.contains(f), "periodic emit includes {f}");
+        }
+        assert!(!names.contains(IO), "a poll device never emits EtherNetIpIo");
+
+        // A poll device's inventory row carries the config-derived gauges (§8.3).
+        let inv = svc.last(INVENTORY).expect("inventory emitted");
+        assert!(inv.contains_key("configuredSignals") && inv.contains_key("requestsPerCycle"));
+
+        // emit_now flushes just health + connection (poll has no IO).
+        let (svc2, m2) = dm(poll_device());
+        m2.emit_now().await;
+        let now_names: std::collections::BTreeSet<String> =
+            svc2.emitted.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
+        assert!(now_names.contains(HEALTH) && now_names.contains(CONNECTION));
+        assert!(!now_names.contains(POLL), "the transition emit is not the full periodic set");
+    }
+
+    /// The push IO lifecycle (§8.8): `on_forward_open`, `on_io_up`, `record_frame_consumed` (sequence
+    /// gap + inter-frame), the periodic IO emit, and the `sb/status` `io`/counter views.
+    #[tokio::test]
+    async fn push_io_recording_and_status_views() {
+        let (svc, m) = dm(push_device());
+        m.on_forward_open(true);
+        m.on_forward_open(false);
+        m.on_io_up(100, 100);
+        let base = Instant::now();
+        m.record_frame_consumed(1, base, true);
+        // A forward jump 1 → 4 is two missed frames (sequenceGaps += 2).
+        m.record_frame_consumed(4, base + std::time::Duration::from_millis(30), true);
+        m.emit_periodic().await;
+
+        let names: std::collections::BTreeSet<String> =
+            svc.emitted.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
+        assert!(names.contains(IO), "a push device emits EtherNetIpIo");
+        assert!(!names.contains(POLL) && !names.contains(INVENTORY), "no poll families on push");
+
+        let io = svc.last(IO).unwrap();
+        assert_eq!(io["ioConnectionState"], 1.0);
+        assert_eq!(io["forwardOpensTotal"], 1.0);
+        assert_eq!(io["forwardOpenFailuresTotal"], 1.0);
+        assert_eq!(io["framesConsumedTotal"], 2.0);
+        assert_eq!(io["sequenceGapsTotal"], 2.0, "1→4 is two missed frames");
+        assert_eq!(io["runMode"], 1.0);
+        assert!(io["interFrameMs"] > 0.0, "the lived inter-arrival is recorded");
+
+        // The push status counter + io views (§7.1).
+        let counters = m.counters_view();
+        assert!(counters["read"]["total"].as_f64().unwrap() >= 2.0, "read = accepted frames");
+        let iov = m.io_view();
+        assert_eq!(iov["o2tApiMs"], 100);
+        assert_eq!(iov["peerRun"], true);
+        assert!(iov.get("framesConsumed").is_some());
+    }
+
+    /// The poll `sb/status` counter view (§7.1) sums `tagReads`/`tagReadErrors` across groups and
+    /// `writeSignals` across the command matrix.
+    #[test]
+    fn poll_counters_view_sums_reads_and_writes() {
+        let (_svc, m) = dm(poll_device());
+        m.record_poll_cycle("fast", RESULT_SUCCESS, 5, 2, false, 2, 1, 0, 0, 0); // 2 reads, 1 bad
+        m.record_command("sb/write", true, 1, CommandTally { write_signals: 1, ..CommandTally::default() });
+        let v = m.counters_view();
+        assert_eq!(v["read"]["total"], 2.0);
+        assert_eq!(v["readErrors"]["total"], 1.0, "a BAD read is a tagReadError");
+        assert_eq!(v["write"]["total"], 1.0);
     }
 }
