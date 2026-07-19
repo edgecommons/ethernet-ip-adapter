@@ -2,7 +2,7 @@
   "component": {
     "com.mbreissi.edgecommons.EthernetIpAdapter": {
       "author": "EdgeCommons",
-      "version": "NEXT_PATCH",
+      "version": "1.0.0",
       "build": {
         "build_system": "custom",
         "custom_build_command": ["bash", "build.sh"]
