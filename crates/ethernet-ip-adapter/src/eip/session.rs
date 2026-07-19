@@ -18,7 +18,7 @@ use async_trait::async_trait;
 
 use crate::config::SignalSpec;
 use crate::device::{
-    BrowsePage, BrowsedTag, DeviceError, DeviceSession, Quality, Reading, Result,
+    BrowsePage, BrowsedTag, DeviceError, DeviceSession, Quality, Reading, Result, SecurityStatus,
 };
 
 use super::map_enip_error;
@@ -30,14 +30,33 @@ pub struct EipSession {
     /// The per-request deadline from `component.global.timeouts` (§4.1); the `enip` client enforces
     /// it internally, and the defensive backstop below is derived from it.
     request_timeout: Duration,
+    /// The negotiated security posture (CIP Security Phase 1) — `Some` for a `mode: tls` session,
+    /// `None` for a plaintext session (DESIGN-cip-security.md §3.4).
+    security: Option<SecurityStatus>,
 }
 
 impl EipSession {
-    /// Wrap a connected `enip` client as a poll session (used by [`super::EipBackend::connect`] and,
-    /// via [`enip::EipClient::connect_over`], by the duplex unit tests).
+    /// Wrap a connected (plaintext) `enip` client as a poll session (used by
+    /// [`super::EipBackend::connect`] and, via [`enip::EipClient::connect_over`], by the duplex unit
+    /// tests).
     #[must_use]
     pub fn new(client: enip::EipClient, request_timeout: Duration) -> Self {
-        Self { client, request_timeout }
+        Self { client, request_timeout, security: None }
+    }
+
+    /// Wrap a connected TLS `enip` client as a poll session, carrying its negotiated security posture
+    /// for the `sb/status`/state/metrics surface (DESIGN-cip-security.md §3.4).
+    #[must_use]
+    pub fn new_secure(
+        client: enip::EipClient,
+        request_timeout: Duration,
+        security: SecurityStatus,
+    ) -> Self {
+        Self {
+            client,
+            request_timeout,
+            security: Some(security),
+        }
     }
 
     /// The defensive backstop deadline: comfortably longer than the crate's own per-request deadline
@@ -235,6 +254,10 @@ impl DeviceSession for EipSession {
                 "probe exceeded the defensive request backstop"
             ))),
         }
+    }
+
+    fn security(&self) -> Option<SecurityStatus> {
+        self.security.clone()
     }
 
     async fn close(&mut self) {

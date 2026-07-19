@@ -23,6 +23,11 @@ pub const MAX_DATA_LEN: usize = (u16::MAX as usize) - HEADER_LEN;
 /// The default EtherNet/IP TCP port (0xAF12).
 pub const DEFAULT_TCP_PORT: u16 = 44818;
 
+/// The default EtherNet/IP-over-TLS TCP port (CIP Security, Vol 8 — explicit messaging inside TLS).
+/// A secure connection is addressed by dialing this port and speaking TLS on it; there is no in-band
+/// STARTTLS upgrade on 44818 (DESIGN-cip-security.md §2.1).
+pub const DEFAULT_TLS_PORT: u16 = 2221;
+
 /// The default EtherNet/IP UDP port for class-0/1 I/O and discovery (0x08AE).
 pub const DEFAULT_UDP_PORT: u16 = 2222;
 

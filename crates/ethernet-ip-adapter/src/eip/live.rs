@@ -37,6 +37,26 @@ impl DeviceBackend for EipBackend {
     }
 
     async fn connect(&self, conn: &ConnectionConfig) -> Result<Box<dyn DeviceSession>> {
+        let sec = super::tls::SecurityConfig::from_connection(conn)
+            .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?;
+        // A `mode: tls` connection wraps the explicit session in TLS (CIP Security Phase 1): build the
+        // rustls ClientConfig from the security block + vault material, then dial port 2221 over TLS.
+        if let Some(sec) = sec.as_ref().filter(|s| s.is_tls()) {
+            let mut opts = client_options(conn, self.timeouts());
+            opts.port = enip::DEFAULT_TLS_PORT;
+            let request_timeout = opts.request_timeout;
+            let (tls_opts, meta) = super::tls::build_client_config(sec, conn, self.creds())
+                .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?;
+            let client = enip::EipClient::connect_tls(&conn.endpoint, opts, tls_opts)
+                .await
+                .map_err(map_enip_error)?;
+            let status = super::tls::security_status(client.tls_session_info(), &meta, conn);
+            return Ok(Box::new(super::session::EipSession::new_secure(
+                client,
+                request_timeout,
+                status,
+            )));
+        }
         let opts = client_options(conn, self.timeouts());
         let request_timeout = opts.request_timeout;
         let client = enip::EipClient::connect(&conn.endpoint, opts)

@@ -13,6 +13,10 @@
 pub mod connected;
 pub mod io_service;
 pub mod session;
+// TLS transport (CIP Security Phase 1) — off by default; adds `connect_tls`/`TlsOptions` over the
+// transport-generic session actor (DESIGN-cip-security.md §3.1).
+#[cfg(feature = "tls")]
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -151,6 +155,10 @@ pub struct EipClient {
     /// The TCP peer address, captured at [`EipClient::connect`]. Used by the class-1 I/O layer as the
     /// default O→T transmit target (§8.2); `None` for an injected byte-stream fixture.
     pub(crate) peer_addr: Option<SocketAddr>,
+    /// The negotiated TLS session facts, set by [`EipClient::connect_tls`] (feature `tls`); `None`
+    /// for a plaintext client. Read via [`EipClient::tls_session_info`].
+    #[cfg(feature = "tls")]
+    pub(crate) tls_info: Option<tls::TlsSessionInfo>,
 }
 
 impl EipClient {
@@ -234,6 +242,8 @@ impl EipClient {
                 connected: None,
             }),
             peer_addr: None,
+            #[cfg(feature = "tls")]
+            tls_info: None,
         };
 
         let connected = if opts.connected_messaging {
@@ -252,6 +262,8 @@ impl EipClient {
                 connected,
             }),
             peer_addr: None,
+            #[cfg(feature = "tls")]
+            tls_info: None,
         })
     }
 

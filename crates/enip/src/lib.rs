@@ -107,6 +107,18 @@ pub use discovery::{
 
 pub use client::{ClientOptions, ClientStats, EipClient, RoutePath};
 
+// TLS transport (CIP Security Phase 1, feature `tls`, DESIGN-cip-security.md §3.1): the `connect_tls`
+// entry points live on `EipClient`; these are the supporting types + a re-export of the `rustls`
+// facade the caller builds a `ClientConfig` with (so the adapter pins one rustls, ours).
+#[cfg(feature = "tls")]
+pub use client::tls::{TlsOptions, TlsSessionInfo};
+#[cfg(feature = "tls")]
+pub use encap::DEFAULT_TLS_PORT;
+#[cfg(feature = "tls")]
+pub use error::TlsErrorKind;
+#[cfg(feature = "tls")]
+pub use tokio_rustls::rustls;
+
 pub use cm::{
     connection_manager_path, io_connection_path, transport_class1_trigger, ConnType,
     ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,

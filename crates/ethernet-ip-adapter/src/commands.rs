@@ -179,6 +179,9 @@ impl Commander {
         out.insert("endpoint".into(), json!(h.cfg.connection.endpoint));
         out.insert("adapter".into(), json!(h.cfg.adapter));
         out.insert("metrics".into(), h.dm.counters_view());
+        // CIP Security posture (DESIGN-cip-security.md §3.4): always present so a console can render
+        // the security column unconditionally (`{"mode":"plaintext"}` on a plaintext instance).
+        out.insert("security".into(), h.dm.security_view());
         if matches!(h.cfg.mode, DeviceMode::Push) {
             out.insert("io".into(), h.dm.io_view());
         }

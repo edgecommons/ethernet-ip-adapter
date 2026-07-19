@@ -26,12 +26,23 @@ cloudwatch = ["edgecommons/cloudwatch"]
 [dependencies]
 # The edgecommons Rust library (pinned rev + features via the workspace). The `.cargo/config.toml`
 # path override redirects it to the local sibling checkout for dev; CI uses the pinned rev.
-edgecommons = { workspace = true }
+# `credentials` (pure-Rust vault, builds natively on Windows) is enabled so the CIP Security TLS path
+# can source cert/key/CA material from `gg.credentials()` and resolve `{"$secret": …}` refs.
+edgecommons = { workspace = true, features = ["credentials"] }
 # The owned pure-Rust EtherNet/IP + CIP protocol crate (package `ec-enip`, lib `enip`;
 # PROTOCOL-DESIGN, D-EIP-17). Consumed here (S2) so the push `io` config builds a validated
 # `enip::AssemblyLayout` at config-parse time; the eip/ backend consumes the rest of its surface
-# through the device.rs seam in slice S3.
-ec-enip = { path = "../enip" }
+# through the device.rs seam in slice S3. The `tls` feature (CIP Security Phase 1) is enabled so a
+# `mode: tls` connection wraps the explicit session in TLS (DESIGN-cip-security.md).
+ec-enip = { path = "../enip", features = ["tls"] }
+# rustls (ring provider, no aws-lc-rs/NASM) — the adapter BUILDS the `rustls::ClientConfig` from the
+# `connection.security` block + vault material and hands it to `enip::connect_tls` (isolation split,
+# DESIGN-cip-security.md §3.2). Same rustls 0.23 the `enip` `tls` feature re-exports, so the types unify.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+# Read the client leaf certificate's notAfter + peer subject for the `sb/status` security surface
+# (pure-Rust X.509 decode; no C).
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "sync"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -48,6 +59,10 @@ tempfile = { workspace = true }
 # The eip poll-backend unit tests drive `enip::EipClient::connect_over` over a `tokio::io::duplex`
 # fixture and hand-craft CIP reply frames (Bytes) — no socket, no PLC (S3, §12.3).
 bytes = { workspace = true }
+# `test-util` (paused-clock tests) for the adapter's own test suite.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+# The TLS ClientConfig-builder tests mint throwaway CA/client certs in-memory (pure Rust, ring).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # Validates the worked test-configs against config.schema.json in a unit test (the schema is a
 # published contract; a drift between it and the parser is a defect). Already in the workspace lock.
 jsonschema = "0.46"

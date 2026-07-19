@@ -55,7 +55,7 @@ on success, or `{"ok": false, "error": {"code", "message"}}` on failure.
 
 | Verb | Modes | Body | Result (on `ok:true`) |
 |------|-------|------|-----------------------|
-| `sb/status` | poll, push | `{instance?}` | `{id, mode, connected, state, paused, endpoint, adapter, metrics, io?}` |
+| `sb/status` | poll, push | `{instance?}` | `{id, mode, connected, state, paused, endpoint, adapter, metrics, security, io?}` |
 | `sb/read` | poll, push | `{instance?, signals:[ref…]}` | `{id, reads:[…]}` |
 | `sb/write` | poll, push | `{instance?, writes:[{ref…, value}]}` (or a single `{ref…, value}`) | `{id, written, results:[…]}` |
 | `sb/signals` | poll, push | `{instance?}` | `{id, mode, signals:[…]}` |
@@ -160,9 +160,14 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
 ## Control plane
 
 - **`sb/status`** → `{ id, mode, connected, state ("ONLINE"|"BACKOFF"|"PAUSED"|…), paused, endpoint,
-  adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} } }`. A
-  push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun, framesConsumed, staleDropped,
-  sequenceGaps }`.
+  adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} },
+  security: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
+  framesConsumed, staleDropped, sequenceGaps }`.
+- **`security`** — the connection's TLS posture. A plaintext instance reports `{ mode: "plaintext" }`.
+  A TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified, peer,
+  clientCertNotAfter, handshakeFailures: {interval,total} }` — the negotiated fields are present once
+  the session is up. The `state` keepalive carries the same posture as `attributes.security`
+  (`"tls"`|`"plaintext"`).
 - **`sb/signals`** → the resolved config view, no device I/O. Poll: `{ id, mode:"poll", signals:[{ name,
   id, address, pollGroup, pollIntervalMs, publishMode, writable, deadband }] }`. Push: `{ id,
   mode:"push", signals:[{ name, id, address, direction ("input"|"output"), publishMode, writable,
@@ -197,6 +202,10 @@ Published through the library's `events()` facade: severity **derives** the chan
 | `evt/info/adapter-resumed` | Info | `sb/resume` moved the instance back to running. |
 | `evt/info/write-audit` | Info | An `sb/write` entry succeeded. `context` carries `{instance, signalId, ok, value}`. |
 | `evt/warning/write-audit` | Warning | An `sb/write` entry failed or was refused. `context` adds `error`. |
+| `evt/warning/tls-handshake-failed` | Warning | A TLS instance's handshake failed (bad certificate, no cipher overlap, protocol mismatch) — fired on the transition into failing. `context` carries `{instance, security:"tls"}`. |
+| `evt/warning/tls-peer-unverified` | Warning | A TLS instance connected with `verifyPeer:false` (the device certificate was not verified). |
+
+On a TLS instance, `device-connected` carries `context.security: "tls"`.
 
 A fleet consumer subscribing `ecv1/+/+/+/evt/critical/#` sees only alarm-grade events without per-adapter
 knowledge of the channel shape.

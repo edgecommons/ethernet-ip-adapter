@@ -21,6 +21,15 @@ name = "enip"
 # (cpppo/OpENer) validated in later integration slices. The P2 state-machine tests instead drive the
 # session actor over in-memory `tokio::io::duplex()` byte-stream fixtures (the actor is generic over
 # any `AsyncRead + AsyncWrite + Unpin`), so no simulated peer is compiled into the crate.
+[features]
+# CIP Security — Phase 1: TLS on the explicit-messaging transport (wraps the encapsulation TCP
+# session in a rustls TlsStream via the session actor's AsyncRead+AsyncWrite seam). Off by default so
+# the core protocol stays dependency-lean; the adapter enables it for secured connections
+# (DESIGN-cip-security.md §3.2, D-ENIP-15). The `ring` crypto provider is selected explicitly (it is
+# already in the workspace lock via the edgecommons MQTT stack) so no aws-lc-rs / NASM C-toolchain is
+# pulled in — the crate keeps building natively on Windows/MSVC and Linux with zero C deps.
+tls = ["dep:tokio-rustls", "dep:rustls"]
+
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
@@ -28,6 +37,10 @@ tracing = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "io-util", "macros"] }
 rand = { workspace = true }
+# TLS transport (feature `tls`, off by default). `default-features = false` + `ring` keeps the pure-Rust
+# ring provider and drops aws-lc-rs; `tls12` enables the TLS 1.2 GCM suites Vol 8 ≥1.13 mandates.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 
 [dev-dependencies]
 # Golden conformance vectors and roundtrip/truncation tests are self-contained. The P2 state-machine
@@ -35,6 +48,14 @@ rand = { workspace = true }
 # device peer without any embedded server), plus `bytes` to craft raw response frames.
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "io-util", "macros", "test-util"] }
 bytes = { workspace = true }
+# The `tls` unit tests drive a real rustls SERVER (tokio-rustls acceptor) on the other end of a
+# duplex byte pipe (DESIGN-cip-security.md §3.5) with ephemeral test certs — a TLS endpoint on a byte
+# pipe, not an embedded EtherNet/IP peer (D-ENIP-14 preserved). `rcgen` mints throwaway CA/server/client
+# certs in-memory (pure Rust, `ring` backend), so nothing is checked in and the tests are hermetic.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# The live_tls.rs suite parses the generated test PEMs to drive `enip::connect_tls` through the
+# stunnel terminator (self-skips when :2221 is not up).
+rustls-pemfile = "2"
 
 # Safety lints for the whole crate (PROTOCOL-DESIGN §4 / D-ENIP-2/3). P1 inherits these: every
 # decoder is bounds-checked, no unchecked indexing or wrapping arithmetic on wire-supplied numbers,

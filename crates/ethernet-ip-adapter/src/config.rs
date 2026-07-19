@@ -918,6 +918,13 @@ impl DeviceConfig {
     /// The §4.4 startup validations + poll-group id assignment. Returned warnings are logged by the
     /// caller (they are not rejections).
     fn validate(&mut self) -> std::result::Result<(), String> {
+        // The `connection.security` block (CIP Security Phase 1): validate it fail-fast — TLS is
+        // refused on a push instance, requires a client identity, and (with verifyPeer) a CA source
+        // (DESIGN-cip-security.md §3.3).
+        let is_push = matches!(self.mode, DeviceMode::Push);
+        if let Some(sec) = crate::eip::tls::SecurityConfig::from_connection(&self.connection)? {
+            sec.validate(&self.id, is_push)?;
+        }
         // Mode is exclusive: poll ⇒ pollGroups + no io; push ⇒ io + no pollGroups (§4.2). Reject
         // clearly either way before the mode-specific checks.
         match self.mode {
@@ -1812,6 +1819,13 @@ mod tests {
     #[test]
     fn worked_push_config_matches_schema() {
         assert_config_matches_schema(include_str!("../test-configs/config-push.json"));
+    }
+
+    #[test]
+    fn worked_tls_config_matches_schema() {
+        // The CIP Security TLS variant validates against the schema AND parses (security block +
+        // `mode: tls`), exercising the `connection.security` def and the tls-on-poll validation.
+        assert_config_matches_schema(include_str!("../test-configs/config-tls.json"));
     }
 
     #[test]

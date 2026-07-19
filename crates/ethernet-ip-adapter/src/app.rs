@@ -128,6 +128,14 @@ pub struct Health {
     /// token, the `paused` attribute, and the gauge all derive from one source (§9.2). S6 sets it;
     /// it reads `false` until then.
     pub paused: std::sync::atomic::AtomicBool,
+    /// The negotiated TLS security posture of the current session (CIP Security Phase 1,
+    /// DESIGN-cip-security.md §3.4), or `None` when down / plaintext. Set on connect, cleared on drop;
+    /// read by the `sb/status` `security` object. Owned here so the status, keepalive, and metric all
+    /// derive from one source.
+    pub security: std::sync::Mutex<Option<crate::device::SecurityStatus>>,
+    /// 1 = the instance is currently in a TLS-handshake-failing state (§3.4). Drives the transition
+    /// edge for the `tls-handshake-failed` event (fired on the transition into failing, not per retry).
+    pub tls_handshake_failing: std::sync::atomic::AtomicBool,
 
     // ---- engine counters (consumed by the S5 metric families; §8) ----
     /// Publish latency of the last `data.publish().await`, ms (§6.2).
@@ -185,6 +193,17 @@ impl Health {
     pub fn link(&self) -> LinkState {
         LinkState::from_u8(self.link.load(Ordering::Relaxed))
     }
+
+    /// Store the negotiated security posture of a freshly-established session (CIP Security §3.4).
+    pub fn set_security(&self, security: Option<crate::device::SecurityStatus>) {
+        *self.security.lock().unwrap() = security;
+    }
+
+    /// The current session's security posture, if any (read by the `sb/status` `security` object).
+    #[must_use]
+    pub fn security(&self) -> Option<crate::device::SecurityStatus> {
+        self.security.lock().unwrap().clone()
+    }
 }
 
 /// One device's connectivity sample, for the instance-connectivity provider registered in
@@ -213,6 +232,16 @@ pub fn connectivity_of(cfg: &DeviceConfig, health: &Health) -> InstanceConnectiv
     // The §7.4 reflection attribute: it derives from the SAME AtomicBool as the token and the gauge,
     // so no two surfaces can disagree (§9.2).
     attributes.insert("paused".to_string(), json!(paused));
+    // CIP Security posture (§3.4): "tls" when the instance is configured for TLS, else "plaintext",
+    // beside connectionMode so a console can render the posture unconditionally.
+    let security_mode = crate::eip::tls::SecurityConfig::from_connection(&cfg.connection)
+        .ok()
+        .flatten()
+        .is_some_and(|s| s.is_tls());
+    attributes.insert(
+        "security".to_string(),
+        json!(if security_mode { "tls" } else { "plaintext" }),
+    );
     if let Some(slot) = cfg.connection.slot {
         attributes.insert("slot".to_string(), json!(slot));
     }

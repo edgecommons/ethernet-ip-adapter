@@ -113,6 +113,28 @@ pub struct BrowsedTag {
     pub instance_id: u32,
 }
 
+/// The security posture of a live session — the protocol-agnostic view the adapter surfaces on
+/// `sb/status`, the `state` keepalive, and the metrics (DESIGN-cip-security.md §3.4). The seam stays
+/// protocol-agnostic: the EtherNet/IP backend fills this from the negotiated TLS session; nothing
+/// above the seam sees the `enip`/`rustls` types. A plaintext session reports `tls: false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecurityStatus {
+    /// `true` ⇒ the session runs over TLS (CIP Security explicit path); `false` ⇒ plaintext.
+    pub tls: bool,
+    /// The negotiated TLS version, e.g. `"1.3"` (`None` for plaintext / unavailable).
+    pub tls_version: Option<String>,
+    /// The negotiated cipher suite, e.g. `"TLS13_AES_128_GCM_SHA256"`.
+    pub cipher_suite: Option<String>,
+    /// Whether the peer (device) certificate was verified against the configured trust anchors — the
+    /// adapter's `verifyPeer` policy (a no-verify session reports `false`).
+    pub peer_verified: bool,
+    /// A human peer identity — the device certificate subject when present, else the endpoint host.
+    pub peer: Option<String>,
+    /// The adapter's own client-certificate `notAfter`, RFC-3339 (drives Phase-2 rotation; surfaced
+    /// now for operators). `None` when no client cert / not parseable.
+    pub client_cert_not_after: Option<String>,
+}
+
 /// A live connection to one device. **This is the trait a backend implements.**
 #[async_trait]
 pub trait DeviceSession: Send + Sync {
@@ -156,6 +178,13 @@ pub trait DeviceSession: Send + Sync {
     // SLICE S6: dispatched by the paused keepalive (§7.4.3); the sim already implements it.
     #[allow(dead_code)]
     async fn probe(&mut self) -> Result<()>;
+
+    /// The session's security posture (DESIGN-cip-security.md §3.4). Default: `None` (the backend has
+    /// no security surface — e.g. the simulator). The EtherNet/IP backend returns the negotiated TLS
+    /// facts for a `mode: tls` connection, or a plaintext marker otherwise.
+    fn security(&self) -> Option<SecurityStatus> {
+        None
+    }
 
     /// Close the connection. Must be safe to call twice.
     async fn close(&mut self) {}

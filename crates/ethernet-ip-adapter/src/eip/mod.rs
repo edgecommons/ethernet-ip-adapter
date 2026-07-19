@@ -18,7 +18,10 @@
 //! mapped here — they become BAD samples in [`session`] (§5.4); only connection-level failures reach
 //! this function.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use edgecommons::credentials::CredentialService;
 
 use crate::config::Timeouts;
 use crate::device::{ConnectionConfig, DeviceError};
@@ -26,6 +29,7 @@ use crate::device::{ConnectionConfig, DeviceError};
 pub mod live;
 pub mod push;
 pub mod session;
+pub mod tls;
 pub mod types;
 
 /// The originator vendor id stamped into ForwardOpen / class-1 opens (matches the `enip` default).
@@ -36,18 +40,35 @@ pub(crate) const VENDOR_ID: u16 = 0x1337;
 /// connection, but the `enip` client needs the connect/request deadlines from `component.global`).
 pub struct EipBackend {
     timeouts: Timeouts,
+    /// The credentials vault for sourcing TLS cert/key/CA material on a `mode: tls` connection
+    /// (`gg.credentials()`, DESIGN-cip-security.md §3.2). `None` when the component has no credentials
+    /// section — a file-only or plaintext deployment.
+    creds: Option<Arc<dyn CredentialService>>,
 }
 
 impl EipBackend {
-    /// A backend with the given connection timeouts (from `component.global.timeouts`, §4.1).
+    /// A backend with the given connection timeouts (from `component.global.timeouts`, §4.1) and no
+    /// credentials vault (plaintext / file-cert deployments).
     #[must_use]
     pub fn new(timeouts: Timeouts) -> Self {
-        Self { timeouts }
+        Self { timeouts, creds: None }
+    }
+
+    /// Attach the credentials vault used to source TLS material for `mode: tls` connections.
+    #[must_use]
+    pub fn credentials(mut self, creds: Option<Arc<dyn CredentialService>>) -> Self {
+        self.creds = creds;
+        self
     }
 
     /// The configured connection timeouts (used by the live-socket seam [`live`]).
     pub(crate) fn timeouts(&self) -> &Timeouts {
         &self.timeouts
+    }
+
+    /// The credentials vault (used by the live-socket seam [`live`] for TLS material sourcing).
+    pub(crate) fn creds(&self) -> Option<&Arc<dyn CredentialService>> {
+        self.creds.as_ref()
     }
 }
 

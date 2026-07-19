@@ -32,6 +32,9 @@ pub struct App {
     metrics: Arc<dyn MetricService>,
     global: Arc<GlobalConfig>,
     devices: Vec<DeviceConfig>,
+    /// The credentials vault, when the component declares a `credentials` section — the source of TLS
+    /// cert/key/CA material for `mode: tls` connections (CIP Security Phase 1). `None` otherwise.
+    creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
 }
 
 struct ConfigListener;
@@ -83,6 +86,7 @@ impl App {
             metrics,
             global: Arc::new(global),
             devices,
+            creds: gg.credentials(),
         })
     }
 
@@ -136,6 +140,7 @@ impl App {
                 dm,
                 health,
                 control_rx,
+                self.creds.clone(),
             ));
         }
 
@@ -186,6 +191,7 @@ impl EventSink for FacadeEventSink {
 /// drops out of the poll loop and back into connect — which is the only place that knows how to
 /// back off. An explicit `reconnect` short-circuits the backoff; `pause`/`resume` are serviced in
 /// both the loop and the backoff wait, so they take effect whether the device is up or reconnecting.
+#[allow(clippy::too_many_arguments)]
 async fn run_device(
     cfg: DeviceConfig,
     global: Arc<GlobalConfig>,
@@ -194,14 +200,18 @@ async fn run_device(
     dm: Arc<DeviceMetrics>,
     health: Arc<Health>,
     mut control: tokio::sync::mpsc::Receiver<DeviceControl>,
+    creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
 ) {
     let backend: Box<dyn DeviceBackend> = match cfg.adapter.as_str() {
         // The in-process simulator — `cargo run` works with no PLC / no OpENer (the runnable configs
         // select this; it stands in for both poll reads and class-1 push frames).
         "sim" => Box::new(SimBackend),
         // The real EtherNet/IP backend over the owned `enip` stack (poll + push). Selected against a
-        // live cpppo / ControlLogix / OpENer target; the on-container validation is slice S7.
-        "ethernet-ip" => Box::new(crate::eip::EipBackend::new(global.timeouts.clone())),
+        // live cpppo / ControlLogix / OpENer target; the on-container validation is slice S7. The
+        // credentials vault (when present) sources TLS material for `mode: tls` connections.
+        "ethernet-ip" => {
+            Box::new(crate::eip::EipBackend::new(global.timeouts.clone()).credentials(creds))
+        }
         other => {
             tracing::error!(instance = %cfg.id, adapter = %other, "unknown adapter");
             return;
@@ -210,6 +220,12 @@ async fn run_device(
     let backoff = Backoff::from_timeouts(&global.timeouts);
     let connect_timeout = Duration::from_millis(global.timeouts.connect_ms.max(1));
     let keepalive_ms = global.health_thresholds.keepalive_probe_interval_ms;
+    // Whether this instance runs over TLS (CIP Security Phase 1) — drives the handshake-failure
+    // metric/event on the connect path.
+    let tls_instance = crate::eip::tls::SecurityConfig::from_connection(&cfg.connection)
+        .ok()
+        .flatten()
+        .is_some_and(|s| s.is_tls());
 
     // Push (class-1 implicit I/O) has its own connect → consume → reconnect loop over the
     // `PushSession` seam; it never enters the poll loop (a push device has no poll groups).
@@ -246,15 +262,40 @@ async fn run_device(
                 attempt = 0;
                 let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 dm.on_connected(latency_ms, Instant::now());
+                // Capture the negotiated security posture for the sb/status/state surface (§3.4), and
+                // clear any prior handshake-failing state.
+                let security = session.security();
+                health.set_security(security.clone());
+                health
+                    .tls_handshake_failing
+                    .store(false, Ordering::Relaxed);
                 health.set_link(LinkState::Online);
                 // A transition: flush southbound_health + connection immediately (§8.7).
                 dm.emit_now().await;
+                let mut connected_ctx = json!({ "instance": cfg.id, "adapter": backend.kind() });
+                if let Some(sec) = &security {
+                    connected_ctx["security"] = json!(if sec.tls { "tls" } else { "plaintext" });
+                    if !sec.peer_verified && sec.tls {
+                        // A no-verify TLS session is a loud, commissioning/debug posture (§3.3).
+                        events
+                            .emit(
+                                Severity::Warning,
+                                "tls-peer-unverified",
+                                Some(format!(
+                                    "connected to {} over TLS WITHOUT peer verification (verifyPeer:false)",
+                                    cfg.connection.endpoint
+                                )),
+                                Some(json!({ "instance": cfg.id })),
+                            )
+                            .await;
+                    }
+                }
                 events
                     .emit(
                         Severity::Info,
                         "device-connected",
                         Some(format!("connected to {}", cfg.connection.endpoint)),
-                        Some(json!({ "instance": cfg.id, "adapter": backend.kind() })),
+                        Some(connected_ctx),
                     )
                     .await;
                 // A raised alarm is cleared by the SAME wire type, so the pair rides one channel.
@@ -281,6 +322,7 @@ async fn run_device(
                 .await;
 
                 dm.on_connection_dropped(Instant::now());
+                health.set_security(None);
                 match exit {
                     crate::poll_driver::PollExit::LinkLost => {
                         health.set_link(LinkState::Backoff);
@@ -322,6 +364,23 @@ async fn run_device(
                     let _ = reply.send(Err(reason.clone()));
                 }
                 let permanent = matches!(&other, Ok(Err(e)) if !e.is_transient());
+                // A permanent connect failure on a TLS instance is a cert/suite/protocol handshake
+                // failure (a transient TCP hiccup or pre-handshake IO is not) — count it and fire the
+                // `tls-handshake-failed` event on the transition into failing (§3.4).
+                if tls_instance && permanent {
+                    dm.on_tls_handshake_failure();
+                    dm.emit_now().await;
+                    if !health.tls_handshake_failing.swap(true, Ordering::Relaxed) {
+                        events
+                            .emit(
+                                Severity::Warning,
+                                "tls-handshake-failed",
+                                Some(format!("TLS handshake to {} failed: {reason}", cfg.connection.endpoint)),
+                                Some(json!({ "instance": cfg.id, "security": "tls" })),
+                            )
+                            .await;
+                    }
+                }
                 let wait = if permanent {
                     Duration::from_millis(backoff.max_ms)
                 } else {

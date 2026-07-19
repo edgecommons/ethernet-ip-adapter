@@ -201,6 +201,60 @@ omitted.
 
 ---
 
+## Connect to a CIP Security device
+
+Run a poll instance's explicit-messaging session over TLS (EtherNet/IP over TLS, TCP port `2221`) with
+mutual X.509 authentication. Add a `security` block to the device's `connection`.
+
+**With certificates from the credentials vault** (a `credentials` section is configured, so
+`gg.credentials()` is available):
+
+```jsonc
+{
+  "id": "filler-plc",
+  "adapter": "ethernet-ip",
+  "connection": {
+    "endpoint": "10.0.0.60",              // no port ⇒ the TLS default 2221
+    "security": {
+      "mode": "tls",
+      "client": { "certSecret": "ot-pki/eip-originator" },  // a {certPem,keyPem[,caPem]} vault bundle
+      "ca":     { "secret":     "ot-pki/plant-root" },       // CA PEM (one or more roots)
+      "verifyPeer": true
+    }
+  },
+  "pollGroups": [ /* … */ ]
+}
+```
+
+**With certificates from files** (no vault):
+
+```jsonc
+"security": {
+  "mode": "tls",
+  "client": { "certFile": "/etc/eip/originator.pem", "keyFile": "/etc/eip/originator.key" },
+  "ca":     { "file":     "/etc/eip/plant-root.pem" }
+}
+```
+
+Notes:
+
+- `mode: tls` requires a client identity; with `verifyPeer: true` it also requires trust anchors
+  (`ca.*`, or a `certSecret` bundle carrying `caPem`).
+- The device is dialed by IP by default, so its certificate must carry the endpoint IP as a
+  Subject Alternative Name. Set `serverName` to override the verified name.
+- Only GCM-based and TLS 1.3 cipher suites are supported. A device that offers only CBC-based suites
+  fails with a "no cipher overlap" error — enable GCM-based suites on the device.
+- TLS applies to poll instances. A push (`mode: push`) instance configured with TLS is rejected at
+  startup (class-1 implicit I/O runs over plaintext UDP `2222`).
+- `sb/status` returns a `security` object (`mode`, `tlsVersion`, `cipherSuite`, `peerVerified`,
+  `peer`, `clientCertNotAfter`, `handshakeFailures`); a `tls-handshake-failed` event fires on a
+  handshake failure.
+
+For `verifyPeer: false` (commissioning/debug, accepts any device certificate), the adapter connects
+without verifying the device and raises a `tls-peer-unverified` event.
+
+---
+
 ## Deploy to a platform
 
 **HOST** (standalone process/container, MQTT transport):
@@ -236,6 +290,9 @@ With `--platform auto` the library detects the platform and needs no CLI args.
 - **State keepalive** — `ecv1/{device}/ethernet-ip-adapter/state` every ~5 s; the RUNNING keepalive
   carries an `instances[]` array with each device's live `connected` flag and `connectionMode`.
 - **Events** — `evt/{info|critical}/device-connected|device-unreachable` (a stateful link alarm),
-  `evt/{warning|info}/adapter-paused|adapter-resumed`, and `evt/{info|warning}/write-audit`.
+  `evt/{warning|info}/adapter-paused|adapter-resumed`, `evt/{info|warning}/write-audit`, and — for
+  TLS instances — `evt/warning/tls-handshake-failed` and `evt/warning/tls-peer-unverified`.
+- **Security posture** — `sb/status` returns a `security` object per instance, and the `state`
+  keepalive carries `attributes.security` (`"tls"`|`"plaintext"`).
 - **Status verb** `sb/status` → connection state, paused, a counter snapshot (and an `io` block on push).
   **Signals verb** `sb/signals` → the resolved signal list with addresses and writable flags.

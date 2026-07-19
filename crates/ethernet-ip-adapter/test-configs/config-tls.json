@@ -1,0 +1,71 @@
+{
+  "logging": {
+    "level": "DEBUG",
+    "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}"
+  },
+  "hierarchy": { "levels": ["site", "device"] },
+  "identity": { "site": "factory-1" },
+  "heartbeat": {
+    "enabled": true,
+    "intervalSecs": 5,
+    "measures": { "cpu": true, "memory": true },
+    "destination": "local"
+  },
+  "metricEmission": { "target": "log", "namespace": "edgecommons" },
+  "tags": { "site": "factory-1" },
+  "component": {
+    "token": "ethernet-ip-adapter",
+    "global": {
+      "defaults": { "pollIntervalMs": 1000, "publishMode": "onChange", "batchMs": 0 },
+      "timeouts": {
+        "connectMs": 5000,
+        "requestTimeoutMs": 2000,
+        "reconnectBackoffMinMs": 1000,
+        "reconnectBackoffMaxMs": 60000
+      },
+      "healthThresholds": { "staleSignalSecs": 60, "keepaliveProbeIntervalMs": 60000 },
+      "metricsIntervalSecs": 60
+    },
+    "instances": [
+      {
+        "id": "filler-plc-tls",
+        "adapter": "ethernet-ip",
+        "connection": {
+          "endpoint": "enip-tls",
+          "connected": false,
+          "security": {
+            "mode": "tls",
+            "client": { "certSecret": "ot-pki/eip-originator" },
+            "ca": { "secret": "ot-pki/plant-root" },
+            "verifyPeer": true,
+            "serverName": "enip-tls",
+            "checkExpiration": true
+          }
+        },
+        "pollGroups": [
+          {
+            "id": "fast",
+            "pollIntervalMs": 500,
+            "signals": [
+              { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real",
+                "deadband": { "type": "absolute", "value": 0.5 } },
+              { "name": "fill-temp", "tagPath": "FILL_TEMP", "type": "real" },
+              { "name": "tank-level", "tagPath": "TANK_LEVEL", "type": "real",
+                "scale": 0.1, "offset": 0.0 }
+            ]
+          },
+          {
+            "id": "slow",
+            "pollIntervalMs": 2000,
+            "publishMode": "always",
+            "signals": [
+              { "name": "product-count", "tagPath": "PRODUCT_COUNT", "type": "dint" },
+              { "name": "fill-setpoint", "tagPath": "FILL_SETPOINT", "type": "real" }
+            ]
+          }
+        ],
+        "writes": { "allow": ["FILL_SETPOINT"] }
+      }
+    ]
+  }
+}

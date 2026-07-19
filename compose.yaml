@@ -86,6 +86,39 @@ services:
     ports: ["44821:44818"]
     restart: unless-stopped
 
+  # stunnel TLS terminator fronting cpppo — the CIP Security Phase-1 (TLS-on-explicit) live target
+  # (DESIGN-cip-security.md §5.2). EtherNet/IP-over-TLS is byte-identical EtherNet/IP inside a standard
+  # TLS tunnel on TCP 2221, so OpenSSL's stunnel in front of the already-validated cpppo poll target is
+  # a faithful peer at the exact layer Phase 1 changes — an INDEPENDENT TLS impl (OpenSSL) carrying an
+  # INDEPENDENT EtherNet/IP impl (cpppo). Mutual TLS (verify=2) against the test PKI.
+  #
+  # First: generate the throwaway test PKI (gitignored) so the container + crates/enip/tests/live_tls.rs
+  # share the same certs:   ./test-infra/enip-tls/gen-certs.sh
+  # Then bring it up:        docker compose up --build enip-sim enip-tls enip-tls-cbc
+  # Then run the live suite: cargo test -p ec-enip --features tls --test live_tls -- --nocapture
+  enip-tls:
+    build: ./test-infra/enip-tls
+    container_name: ethernet-ip-adapter-enip-tls
+    command: ["stunnel", "/etc/stunnel/stunnel.conf"]
+    depends_on: [enip-sim]
+    ports: ["2221:2221"]
+    volumes:
+      - ./test-infra/enip-tls/certs:/etc/stunnel/certs:ro
+    restart: unless-stopped
+
+  # A DELIBERATELY LEGACY CBC-only TLS 1.2 terminator (no GCM/TLS1.3) on :2223 — models pre-1.13 CIP
+  # Security firmware (DESIGN-cip-security.md §2.4). A GCM-only rustls client fails to negotiate with
+  # it, so live_tls.rs proves the typed `NoCipherOverlap` failure. Fronts the same cpppo server.
+  enip-tls-cbc:
+    build: ./test-infra/enip-tls
+    container_name: ethernet-ip-adapter-enip-tls-cbc
+    command: ["stunnel", "/etc/stunnel/stunnel-cbc.conf"]
+    depends_on: [enip-sim]
+    ports: ["2223:2223"]
+    volumes:
+      - ./test-infra/enip-tls/certs:/etc/stunnel/certs:ro
+    restart: unless-stopped
+
   ethernet-ip-adapter:
     build:
       context: .

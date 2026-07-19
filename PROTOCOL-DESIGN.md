@@ -64,10 +64,23 @@ Grounding artifacts (verified 2026-07-18, do not work from memory):
 - Allen-Bradley **Logix tag services** (symbolic read/write, fragmented transfers, tag
   enumeration) plus **generic CIP** attribute services and device discovery.
 
+**TLS on the explicit path (in scope, feature `tls`).** CIP Security Phase 1 (ODVA Vol 8) is
+supported behind the off-by-default `tls` cargo feature: `EipClient::connect_tls` wraps the
+encapsulation TCP session in a `rustls` `TlsStream` via the transport-generic session-actor seam
+(§5.7, §11.1 — the actor is generic over `AsyncRead + AsyncWrite + Unpin`, so the whole session
+machinery rides inside TLS unchanged). The crate takes a prepared `rustls::ClientConfig` and stays
+EdgeCommons-free; cert material/vault sourcing is the adapter's job (**D-ENIP-15**, the dependency
+decision below; DESIGN-cip-security.md). `rustls` speaks the GCM + TLS 1.3 suites Vol 8 ≥ 1.13
+mandates; legacy CBC/NULL/PSK-only firmware is the documented interop boundary, surfaced as the typed
+`EnipError::Tls { NoCipherOverlap }`.
+
 **Non-goals (v1).** UDT/structure *value* decoding (struct tags are detected and reported, not
-decoded); Logix STRING values; CIP Multiple Service Packet batching; CIP Security/TLS
-(EtherNet/IP here is plaintext); CIP Sync/Motion; acting as a full *target* (the crate ships a
-minimal test-target for validation only, §12.5); DeviceNet/ControlNet adaptations of CIP.
+decoded); Logix STRING values; CIP Multiple Service Packet batching; **DTLS on the implicit (class-1)
+I/O path** — CIP Security for class-1 needs DTLS, which `rustls` does not provide and which has no OSS
+validation peer, so implicit I/O remains plaintext UDP 2222 and a TLS-configured push instance is
+refused; the device-side certificate/security-object *commissioning* model and EST enrollment (Phase 2
+of DESIGN-cip-security.md); CIP Sync/Motion; acting as a full *target* (the crate ships a minimal
+test-target for validation only, §12.5); DeviceNet/ControlNet adaptations of CIP.
 
 **The isolation contract.** The protocol crate is pure protocol. It deliberately knows **nothing**
 about: EdgeCommons (no `edgecommons` dependency), the UNS, message envelopes, `SouthboundSignalUpdate`,
@@ -81,6 +94,13 @@ Dependency budget (normative — additions need a decision): `tokio` (net, time,
 `tokio-util` (codec), `bytes`, `thiserror`, `tracing`, `rand` (connection serials/ids). Dev/test
 extras: `arbitrary`, `cargo-fuzz` harness, `serde`/`serde_json` for vector manifests only. No
 `unsafe`, no C dependencies, builds on stable Windows/MSVC + Linux.
+
+**D-ENIP-15 (TLS dependency decision).** The off-by-default `tls` feature adds `tokio-rustls` +
+`rustls` (pinned to the `ring` crypto provider, `default-features = false` — so no `aws-lc-rs`/NASM C
+toolchain) to the crate; default features stay TLS-free and dependency-lean. `ring` is pure-Rust and
+already in the workspace lock (via the edgecommons MQTT stack), so the zero-C-deps /
+builds-on-Windows-and-Linux property is preserved. Dev-only: `rcgen` + `rustls-pemfile` mint/parse
+throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.rs` suite.
 
 ---
 

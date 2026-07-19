@@ -55,7 +55,8 @@ Connection lifecycle and liveness. Dimensions: `instance`, `connectionMode`.
 | `connectFailures` | Count | counter | Failed connect attempts. |
 | `connectionDrops` | Count | counter | Live links marked down. |
 | `reconnects` | Count | counter | Reconnects performed. |
-| `connectLatencyMs` | Milliseconds | gauge | Connect latency. |
+| `tlsHandshakeFailures` | Count | counter | TLS handshake failures on a `security.mode: tls` connection (bad certificate, no cipher overlap, protocol mismatch). |
+| `connectLatencyMs` | Milliseconds | gauge | Connect latency (includes the TLS handshake for a TLS connection). |
 | `connectedDurationMs` | Milliseconds | gauge | Time spent connected since the previous emission. |
 
 ## `EtherNetIpInventory`

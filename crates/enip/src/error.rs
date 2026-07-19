@@ -131,6 +131,58 @@ pub enum EnipError {
         /// The cap that was exceeded.
         limit: usize,
     },
+    /// A TLS transport failure — the CIP Security explicit path (feature `tls`, DESIGN-cip-security.md
+    /// §3.1). Carries a [`TlsErrorKind`] classification and a fixed-plus-diagnostic detail string.
+    #[cfg(feature = "tls")]
+    #[error("tls error ({kind}): {detail}")]
+    Tls {
+        /// The failure class (handshake / peer-unverified / no-cipher-overlap / pre-handshake I/O).
+        kind: TlsErrorKind,
+        /// A human diagnostic (the underlying rustls/IO message, plus the legacy-CBC hint for
+        /// [`TlsErrorKind::NoCipherOverlap`]). Never carries key material.
+        detail: String,
+    },
+}
+
+/// The class of a TLS transport failure (feature `tls`, DESIGN-cip-security.md §3.1). Cert and
+/// verification failures are non-transient (a bad cert stays bad — surface loudly, back off at the
+/// ceiling); pre-handshake socket I/O is transient.
+#[cfg(feature = "tls")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TlsErrorKind {
+    /// The TLS handshake failed for a reason other than the specific classes below.
+    HandshakeFailed,
+    /// The peer's certificate did not verify against the configured trust anchors (bad chain, wrong
+    /// name/SAN, expired when `checkExpiration` is on).
+    PeerUnverified,
+    /// No cipher suite (or signature scheme) in common — the predictable failure against pre-1.13
+    /// CIP Security firmware that offers only CBC/NULL/PSK suites `rustls` cannot negotiate (§2.4).
+    NoCipherOverlap,
+    /// A pre-handshake socket error (connection refused/reset, DNS): transient.
+    Io,
+}
+
+#[cfg(feature = "tls")]
+impl TlsErrorKind {
+    /// The reconnect classification: only pre-handshake I/O is transient (§3.1).
+    #[must_use]
+    pub fn is_transient(self) -> bool {
+        matches!(self, TlsErrorKind::Io)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl core::fmt::Display for TlsErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            TlsErrorKind::HandshakeFailed => "handshake failed",
+            TlsErrorKind::PeerUnverified => "peer certificate unverified",
+            TlsErrorKind::NoCipherOverlap => "no cipher overlap",
+            TlsErrorKind::Io => "pre-handshake io",
+        };
+        f.write_str(s)
+    }
 }
 
 impl EnipError {
@@ -145,6 +197,8 @@ impl EnipError {
             Self::Cip(status) | Self::ForwardOpenRejected { status, .. } => {
                 status.is_routing_error() || status.is_resource_error()
             }
+            #[cfg(feature = "tls")]
+            Self::Tls { kind, .. } => kind.is_transient(),
             Self::Malformed(_)
             | Self::ProtocolViolation { .. }
             | Self::Unsupported { .. }

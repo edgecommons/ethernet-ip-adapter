@@ -151,6 +151,7 @@ pub fn family_defs() -> Vec<FamilyDef> {
     conn.extend(pair("connectFailures"));
     conn.extend(pair("connectionDrops"));
     conn.extend(pair("reconnects"));
+    conn.extend(pair("tlsHandshakeFailures"));
     conn.push(m("connectLatencyMs", UNIT_MS, 60));
     conn.push(m("connectedDurationMs", UNIT_MS, 60));
     out.push(FamilyDef { name: CONNECTION.to_string(), dimensions: dims(&["instance", "connectionMode"]), measures: conn });
@@ -266,6 +267,8 @@ struct ConnCounters {
     connect_failures: Pair,
     connection_drops: Pair,
     reconnects: Pair,
+    /// TLS handshake failures on a `mode: tls` connection (CIP Security Phase 1, §3.4).
+    tls_handshake_failures: Pair,
     connect_latency_ms: f64,
     connected_accrued_ms: f64,
     connected_since: Option<Instant>,
@@ -287,6 +290,7 @@ impl ConnCounters {
         self.connect_failures.drain_into(&mut v, "connectFailures");
         self.connection_drops.drain_into(&mut v, "connectionDrops");
         self.reconnects.drain_into(&mut v, "reconnects");
+        self.tls_handshake_failures.drain_into(&mut v, "tlsHandshakeFailures");
         v.insert("connectLatencyMs".to_string(), self.connect_latency_ms);
         v.insert("connectedDurationMs".to_string(), self.connected_accrued_ms);
         self.connected_accrued_ms = 0.0;
@@ -606,6 +610,12 @@ impl DeviceMetrics {
         self.inner.lock().unwrap().conn.connect_failures.add(1.0);
     }
 
+    /// A TLS handshake failed on a `mode: tls` connection (CIP Security Phase 1, §3.4). Distinct from
+    /// `on_connect_failure` (which also fires) so a fleet view can single out cert/suite failures.
+    pub fn on_tls_handshake_failure(&self) {
+        self.inner.lock().unwrap().conn.tls_handshake_failures.add(1.0);
+    }
+
     /// An established session was lost (poll loop exited / push `Lost`).
     pub fn on_connection_dropped(&self, now: Instant) {
         let mut inner = self.inner.lock().unwrap();
@@ -744,6 +754,40 @@ impl DeviceMetrics {
             writes.interval += c.write_signals.interval;
         }
         serde_json::json!({ "read": read, "write": pair(&writes), "readErrors": read_errors })
+    }
+
+    /// The `sb/status` `security` object (CIP Security Phase 1, DESIGN-cip-security.md §3.4). A
+    /// plaintext instance reports `{ "mode": "plaintext" }` (so a console can render the posture
+    /// column unconditionally); a `mode: tls` instance reports the negotiated TLS facts (when the
+    /// session is up) plus the `handshakeFailures` counter pair.
+    #[must_use]
+    pub fn security_view(&self) -> serde_json::Value {
+        let hs = {
+            let inner = self.inner.lock().unwrap();
+            let p = &inner.conn.tls_handshake_failures;
+            serde_json::json!({ "interval": p.interval, "total": p.total })
+        };
+        let is_tls = crate::eip::tls::SecurityConfig::from_connection(&self.device.connection)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.is_tls());
+        if !is_tls {
+            return serde_json::json!({ "mode": "plaintext" });
+        }
+        let mut out = serde_json::Map::new();
+        out.insert("mode".into(), serde_json::json!("tls"));
+        if let Some(st) = self.health.security() {
+            out.insert("tlsVersion".into(), serde_json::json!(st.tls_version));
+            out.insert("cipherSuite".into(), serde_json::json!(st.cipher_suite));
+            out.insert("peerVerified".into(), serde_json::json!(st.peer_verified));
+            out.insert("peer".into(), serde_json::json!(st.peer));
+            out.insert(
+                "clientCertNotAfter".into(),
+                serde_json::json!(st.client_cert_not_after),
+            );
+        }
+        out.insert("handshakeFailures".into(), hs);
+        serde_json::Value::Object(out)
     }
 
     /// The push `sb/status` `io` object (§7.1): negotiated APIs, run/peerRun, and the §8.8 counters.
@@ -1111,7 +1155,7 @@ mod tests {
         ]));
 
         let mut conn = vec![g("sessionConnected", "Count", 1)];
-        for p in ["connectAttempts", "connectFailures", "connectionDrops", "reconnects"] { conn.extend(cp(p)); }
+        for p in ["connectAttempts", "connectFailures", "connectionDrops", "reconnects", "tlsHandshakeFailures"] { conn.extend(cp(p)); }
         conn.push(g("connectLatencyMs", "Milliseconds", 60));
         conn.push(g("connectedDurationMs", "Milliseconds", 60));
         expected.push((CONNECTION, vec!["instance", "connectionMode"], conn));

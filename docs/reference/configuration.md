@@ -96,9 +96,33 @@ targets need different keys; everything else in the schema is strict.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `endpoint` | string | **required** | `<host>` or `<host>:<port>` (default CIP port `44818`). Published in `device.endpoint`. |
+| `endpoint` | string | **required** | `<host>` or `<host>:<port>` (default CIP port `44818`, or `2221` when `security.mode` is `tls`). Published in `device.endpoint`. |
 | `slot` | integer 0–255 | — | ControlLogix CPU slot ⇒ backplane connection path (`1,<slot>`). Absent ⇒ no routing path (correct for cpppo / CompactLogix-direct). |
 | `connected` | boolean | `false` | `true` ⇒ CIP connected messaging (ForwardOpen); `false` ⇒ unconnected explicit messaging. |
+| `security` | object | — | TLS (CIP Security) on the explicit-messaging path (below). Absent ⇒ plaintext. |
+
+#### `connection.security` (CIP Security / TLS)
+
+Runs a poll instance's explicit-messaging session over **TLS** (EtherNet/IP over TLS, TCP port `2221`)
+with mutual X.509 authentication. TLS applies to poll instances only; a push (`mode: push`) instance
+configured with `security.mode: tls` is rejected at startup.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `mode` | `plaintext` \| `tls` | `plaintext` | `tls` wraps the session in mutual TLS on TCP `2221` (the default port when the endpoint has no explicit port). |
+| `client.certSecret` | string | — | A credentials-vault secret holding a `{certPem, keyPem[, caPem]}` TLS bundle — the adapter's client identity. |
+| `client.certFile` / `client.keyFile` | string | — | A PEM client certificate + private-key file pair, as an alternative to `certSecret`. |
+| `ca.secret` | string | — | A credentials-vault secret holding CA certificate PEM (one or more roots) for verifying the device. |
+| `ca.file` | string | — | A CA-certificate PEM file path, as an alternative to `ca.secret`. |
+| `verifyPeer` | boolean | `true` | `true` verifies the device certificate against the trust anchors; `false` accepts any device certificate (a commissioning/debug posture that raises a `tls-peer-unverified` event). |
+| `serverName` | string | endpoint host | The verification / SNI name. An IP literal is verified against the device certificate's IP SAN. |
+| `checkExpiration` | boolean | `true` | `false` tolerates an expired / not-yet-valid device certificate (for devices without a real-time clock). |
+| `cipherSuites` | string[] | GCM + TLS 1.3 | An optional cipher-suite allow-list (IANA / rustls names). Only GCM-based and TLS 1.3 suites are supported. |
+
+`mode: tls` requires a client identity (`client.certSecret`, or `client.certFile` + `client.keyFile`);
+with `verifyPeer: true` it also requires trust anchors (`ca.secret`/`ca.file`, or a `certSecret` bundle
+that carries `caPem`). Devices that offer only CBC-based cipher suites are not supported — enable
+GCM-based suites on the device. See the how-to guide "Connect to a CIP Security device."
 
 ### `pollGroups[]` (poll mode)
 
@@ -221,5 +245,9 @@ after `ecv1` on a multi-site broker.
 - **Value types** — CIP elementary scalars and 1-D arrays thereof (see [data-types](data-types.md)).
   Structures/UDTs, Logix `STRING`, and multi-dimensional arrays are rejected at config-parse time.
 - **One mode per instance** — a device needing both poll and push telemetry is two instances.
-- **No CIP Security / TLS** — EtherNet/IP here is plaintext (TCP `44818`, class-1 UDP `2222`); deploy on
-  an isolated OT network segment.
+- **TLS (CIP Security)** — poll (explicit-messaging) instances can run over TLS with mutual X.509
+  (`connection.security`, above). Only GCM-based and TLS 1.3 cipher suites are supported; devices that
+  offer only CBC-based suites are not. Class-1 implicit I/O (`mode: push`) runs over plaintext UDP
+  `2222` — a push instance configured with TLS is rejected at startup. Certificate commissioning
+  (enrollment/rotation of the adapter's own certificate) is not part of this adapter; provision the
+  client certificate and trust anchors through the credentials vault or files.
