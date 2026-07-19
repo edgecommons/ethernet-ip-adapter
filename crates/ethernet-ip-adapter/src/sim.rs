@@ -9,14 +9,19 @@
 //! per type, including a live array and a writable setpoint that reflects the last write), answers
 //! `browse` with the cpppo tag set, and answers `probe`.
 
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use crate::config::{EipType, SignalSpec};
+use crate::config::{EipType, IoConfig, IoFieldSpec, SignalSpec};
 use crate::device::{
-    BrowsePage, BrowsedTag, ConnectionConfig, DeviceBackend, DeviceError, DeviceSession, Quality,
-    Reading, Result,
+    BrowsePage, BrowsedTag, ConnectionConfig, DeviceBackend, DeviceError, DeviceSession, IoUpdate,
+    PushSession, Quality, Reading, Result,
 };
+use crate::eip::push::assembly_to_readings;
 
 /// The cpppo tag layout (§11.1): `(name, type_name, array_dim)`. `RECIPE=SSTRING` is present
 /// precisely to prove the browse/validation story for an unsupported type — its `type_name` maps to
@@ -50,6 +55,133 @@ impl DeviceBackend for SimBackend {
             )));
         }
         Ok(Box::new(SimSession::default()))
+    }
+
+    async fn open_push(
+        &self,
+        cfg: &ConnectionConfig,
+        io: &IoConfig,
+    ) -> Result<Box<dyn PushSession>> {
+        if cfg.endpoint.is_empty() {
+            return Err(DeviceError::Permanent(anyhow::anyhow!(
+                "no endpoint configured"
+            )));
+        }
+        Ok(Box::new(SimPushSession::open(io)?))
+    }
+}
+
+/// The in-process push (class-1 I/O) simulator: it emits **scripted [`IoUpdate`] frames** from a
+/// moving assembly buffer through the *same* [`assembly_to_readings`] extraction path the real
+/// backend uses, so `cargo run` on a push config works with no OpENer — mirroring how [`SimSession`]
+/// stands in for a PLC. It announces `Up` once, then produces one `Data` frame per tick.
+pub struct SimPushSession {
+    updates: mpsc::Receiver<IoUpdate>,
+    task: JoinHandle<()>,
+    /// The output (O→T) layout + fields, so `set_output` validates + stages exactly like the real
+    /// backend (the sim just holds the staged buffer; there is no wire).
+    out_layout: Option<enip::AssemblyLayout>,
+    out_fields: Vec<IoFieldSpec>,
+    out_buf: Vec<u8>,
+}
+
+impl SimPushSession {
+    /// Build the sim push session from the validated `io` block and spawn its frame producer.
+    fn open(io: &IoConfig) -> Result<Self> {
+        let in_layout = io
+            .input_layout()
+            .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?;
+        let out_layout = io
+            .output_layout()
+            .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?;
+        let in_fields = io.input.signals.clone();
+        let in_inst = io.assemblies.input;
+        let size = io.input.size_bytes;
+        let out_fields = io
+            .output
+            .as_ref()
+            .map(|o| o.signals.clone())
+            .unwrap_or_default();
+        let out_size = io.output.as_ref().map_or(0, |o| o.size_bytes);
+        let o2t_api_ms = u32::try_from(io.effective_o2t_rpi_ms()).unwrap_or(u32::MAX);
+        let t2o_api_ms = u32::try_from(io.rpi_ms).unwrap_or(u32::MAX);
+        // Produce faster than 200 ms so `cargo run` shows frames quickly; never busier than 20 ms.
+        let period = Duration::from_millis(io.rpi_ms.clamp(20, 200));
+
+        let (tx, rx) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            if tx
+                .send(IoUpdate::Up { o2t_api_ms, t2o_api_ms })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut tick: u64 = 0;
+            loop {
+                tokio::time::sleep(period).await;
+                tick = tick.wrapping_add(1);
+                // A moving assembly buffer: a rolling byte pattern so decoded values change over time.
+                let mut buf = vec![0u8; size];
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = tick.wrapping_add(i as u64) as u8;
+                }
+                let readings = assembly_to_readings(&in_layout, &in_fields, in_inst, &buf, true);
+                let update = IoUpdate::Data {
+                    readings,
+                    sequence: tick as u16,
+                    run_mode: true,
+                    received_at: Instant::now(),
+                };
+                if tx.send(update).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Self {
+            updates: rx,
+            task,
+            out_layout,
+            out_fields,
+            out_buf: vec![0u8; out_size],
+        })
+    }
+}
+
+#[async_trait]
+impl PushSession for SimPushSession {
+    fn updates(&mut self) -> &mut mpsc::Receiver<IoUpdate> {
+        &mut self.updates
+    }
+
+    async fn set_output(&mut self, field: &IoFieldSpec, value: &Value) -> Result<()> {
+        let layout = self
+            .out_layout
+            .as_ref()
+            .ok_or(DeviceError::Unsupported("device has no output assembly"))?;
+        let key = self
+            .out_fields
+            .iter()
+            .position(|f| f.offset == field.offset && f.eip_type == field.eip_type && f.bit == field.bit)
+            .ok_or_else(|| DeviceError::Permanent(anyhow::anyhow!("unknown output field")))?;
+        let cip = crate::eip::types::encode_write(
+            value,
+            field.eip_type,
+            field.scale,
+            field.value_offset,
+            field.array_count,
+        )
+        .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e.to_string())))?;
+        layout
+            .encode_into(&[(key, cip)], &mut self.out_buf)
+            .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e.to_string())))?;
+        tracing::info!(name = %field.name, ?value, "sim push: output staged");
+        Ok(())
+    }
+
+    async fn close(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -268,5 +400,58 @@ mod tests {
         let a = s.read_signals(&sp).await.unwrap()[0].value.clone();
         let b = s.read_signals(&sp).await.unwrap()[0].value.clone();
         assert_ne!(a, b);
+    }
+
+    fn push_io() -> IoConfig {
+        serde_json::from_value(json!({
+            "rpiMs": 20,
+            "assemblies": { "output": 150, "input": 100 },
+            "input": {
+                "sizeBytes": 8,
+                "signals": [
+                    { "name": "din-word", "offset": 0, "type": "udint" },
+                    { "name": "line-speed", "offset": 4, "type": "real" }
+                ]
+            },
+            "output": {
+                "sizeBytes": 8,
+                "signals": [ { "name": "dout-word", "offset": 0, "type": "udint" } ]
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sim_push_session_announces_up_then_produces_data_frames() {
+        let io = push_io();
+        let mut session = SimBackend.open_push(&conn("opener"), &io).await.unwrap();
+
+        // First: the connection comes up with the negotiated intervals.
+        match session.updates().recv().await.expect("an update") {
+            IoUpdate::Up { t2o_api_ms, .. } => assert_eq!(t2o_api_ms, 20),
+            other => panic!("expected Up, got {other:?}"),
+        }
+        // Then: scripted data frames, each carrying one Reading per input field.
+        match session.updates().recv().await.expect("a data frame") {
+            IoUpdate::Data { readings, .. } => {
+                assert_eq!(readings.len(), 2);
+                assert_eq!(readings[0].name.as_deref(), Some("din-word"));
+                assert_eq!(readings[0].signal_id, "a100/0/udint");
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+        session.close().await;
+    }
+
+    #[tokio::test]
+    async fn sim_push_set_output_validates_and_stages() {
+        let io = push_io();
+        let mut session = SimBackend.open_push(&conn("opener"), &io).await.unwrap();
+        let field = io.output.as_ref().unwrap().signals[0].clone();
+        session.set_output(&field, &json!(42)).await.unwrap();
+        // A value out of range for the field type is a typed failure, not a clamp.
+        let bad = session.set_output(&field, &json!(-1)).await;
+        assert!(bad.is_err(), "udint cannot hold -1");
+        session.close().await;
     }
 }

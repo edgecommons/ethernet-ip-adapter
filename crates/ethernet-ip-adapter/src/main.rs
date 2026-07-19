@@ -18,6 +18,7 @@
 mod app;
 mod config;
 mod device;
+mod eip;
 mod sim;
 
 use edgecommons::prelude::*;

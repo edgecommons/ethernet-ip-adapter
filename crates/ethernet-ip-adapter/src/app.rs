@@ -31,7 +31,7 @@ use edgecommons::prelude::*;
 use serde_json::json;
 
 use crate::config::{DeviceConfig, GlobalConfig, SignalSpec};
-use crate::device::{DeviceBackend, Quality, Reading};
+use crate::device::{DeviceBackend, IoUpdate, PushSession, Quality, Reading};
 use crate::sim::SimBackend;
 
 /// The metric every southbound adapter emits (SOUTHBOUND.md §5). The full `EtherNetIp*` families
@@ -386,24 +386,13 @@ async fn run_device(
     health: Arc<Health>,
     mut writes: tokio::sync::mpsc::Receiver<WriteRequest>,
 ) {
-    // S3: the class-1 push engine (the `enip` IoManager consuming the input assembly at the RPI)
-    // lands in slice S3. The push config is fully parsed + validated (§4.6, its AssemblyLayout is
-    // built at startup), but there is no wire backend yet — stand in with a log rather than entering
-    // the poll loop (which has no poll groups for a push device).
-    if matches!(cfg.mode, crate::config::DeviceMode::Push) {
-        tracing::info!(
-            instance = %cfg.id, endpoint = %cfg.connection.endpoint,
-            "push mode: class-1 I/O backend lands in S3"
-        );
-        return;
-    }
-
     let backend: Box<dyn DeviceBackend> = match cfg.adapter.as_str() {
+        // The in-process simulator — `cargo run` works with no PLC / no OpENer (the runnable configs
+        // select this; it stands in for both poll reads and class-1 push frames).
         "sim" => Box::new(SimBackend),
-        // SLICE S3: the real `EipBackend` (built on the owned `enip` protocol crate) lands in slice
-        // S3. Until then the simulator stands in for `ethernet-ip` so a bare deploy runs end-to-end
-        // without a PLC.
-        "ethernet-ip" => Box::new(SimBackend),
+        // The real EtherNet/IP backend over the owned `enip` stack (poll + push). Selected against a
+        // live cpppo / ControlLogix / OpENer target; the on-container validation is slice S7.
+        "ethernet-ip" => Box::new(crate::eip::EipBackend::new(global.timeouts.clone())),
         other => {
             tracing::error!(instance = %cfg.id, adapter = %other, "unknown adapter");
             return;
@@ -411,6 +400,24 @@ async fn run_device(
     };
     let backoff = Backoff::from_timeouts(&global.timeouts);
     let connect_timeout = Duration::from_millis(global.timeouts.connect_ms.max(1));
+
+    // Push (class-1 implicit I/O) has its own connect → consume → reconnect loop over the
+    // `PushSession` seam; it never enters the poll loop (a push device has no poll groups).
+    if matches!(cfg.mode, crate::config::DeviceMode::Push) {
+        run_push(
+            &cfg,
+            backend.as_ref(),
+            &data,
+            &events,
+            &metrics,
+            &health,
+            backoff,
+            connect_timeout,
+        )
+        .await;
+        return;
+    }
+
     let mut attempt: u32 = 0;
 
     loop {
@@ -573,6 +580,131 @@ async fn poll_until_disconnected(
         if since_health.elapsed() >= Duration::from_secs(60) {
             emit_health(metrics, health).await;
             since_health = Instant::now();
+        }
+    }
+}
+
+/// One push device's lifecycle: open the class-1 connection, consume the [`IoUpdate`] stream, and
+/// reconnect on loss with the same backoff ladder as poll (§10.2). The full deadband/batch/publish
+/// engine is slice S4; this keeps the connectivity/health surface truthful and consumes every frame.
+#[allow(clippy::too_many_arguments)]
+async fn run_push(
+    cfg: &DeviceConfig,
+    backend: &dyn DeviceBackend,
+    data: &DataFacade,
+    events: &EventsFacade,
+    metrics: &Arc<dyn MetricService>,
+    health: &Arc<Health>,
+    backoff: Backoff,
+    connect_timeout: Duration,
+) {
+    // SLICE S4: the push publish engine binds the data facade here (deadband/batch/publish).
+    let _ = data;
+    let Some(io) = cfg.io.clone() else {
+        tracing::error!(instance = %cfg.id, "push device has no io block");
+        return;
+    };
+    let mut attempt: u32 = 0;
+
+    loop {
+        health.set_link(LinkState::Connecting);
+        let outcome =
+            tokio::time::timeout(connect_timeout, backend.open_push(&cfg.connection, &io)).await;
+        match outcome {
+            Ok(Ok(mut session)) => {
+                attempt = 0;
+                consume_push(cfg, session.as_mut(), events, metrics, health, backend.kind()).await;
+                session.close().await;
+
+                health.set_link(LinkState::Backoff);
+                health.reconnects.fetch_add(1, Ordering::Relaxed);
+                emit_health(metrics, health).await;
+                let _ = events
+                    .raise_alarm(
+                        Severity::Critical,
+                        "device-unreachable",
+                        Some(format!("lost the class-1 link to {}", cfg.connection.endpoint)),
+                        Some(json!({ "instance": cfg.id })),
+                    )
+                    .await;
+            }
+            other => {
+                health.set_link(LinkState::Backoff);
+                let permanent = matches!(&other, Ok(Err(e)) if !e.is_transient());
+                let wait = if permanent {
+                    Duration::from_millis(backoff.max_ms)
+                } else {
+                    backoff.delay(attempt, rand01())
+                };
+                let reason = match &other {
+                    Ok(Err(e)) => e.to_string(),
+                    _ => format!("open_push timed out after {} ms", connect_timeout.as_millis()),
+                };
+                tracing::warn!(
+                    instance = %cfg.id, error = %reason, permanent,
+                    wait_ms = wait.as_millis() as u64, "push open failed"
+                );
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// Consume one push session's update stream until the link is lost (returns on `Lost`/end-of-stream).
+async fn consume_push(
+    cfg: &DeviceConfig,
+    session: &mut dyn PushSession,
+    events: &EventsFacade,
+    metrics: &Arc<dyn MetricService>,
+    health: &Arc<Health>,
+    adapter: &str,
+) {
+    let mut since_health = Instant::now();
+    loop {
+        match session.updates().recv().await {
+            Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms }) => {
+                health.set_link(LinkState::Online);
+                emit_health(metrics, health).await;
+                let _ = events
+                    .emit(
+                        Severity::Info,
+                        "device-connected",
+                        Some(format!("class-1 connection up to {}", cfg.connection.endpoint)),
+                        Some(json!({
+                            "instance": cfg.id, "adapter": adapter,
+                            "o2tApiMs": o2t_api_ms, "t2oApiMs": t2o_api_ms
+                        })),
+                    )
+                    .await;
+                let _ = events
+                    .clear_alarm(Severity::Critical, "device-unreachable", None)
+                    .await;
+            }
+            Some(IoUpdate::Data { readings, sequence, run_mode, .. }) => {
+                // SLICE S4: deadband/change gating, batchMs coalescing, and the SouthboundSignalUpdate
+                // publish plug in here. This slice keeps the frame observable + the counters moving.
+                health
+                    .signals_published
+                    .fetch_add(readings.len() as u64, Ordering::Relaxed);
+                tracing::debug!(
+                    instance = %cfg.id, sequence, run_mode, fields = readings.len(),
+                    "push frame received"
+                );
+                if since_health.elapsed() >= Duration::from_secs(60) {
+                    emit_health(metrics, health).await;
+                    since_health = Instant::now();
+                }
+            }
+            Some(IoUpdate::Lost { error }) => {
+                tracing::warn!(instance = %cfg.id, error = %error, "class-1 connection lost; reconnecting");
+                health.read_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            None => {
+                tracing::warn!(instance = %cfg.id, "push session ended; reconnecting");
+                return;
+            }
         }
     }
 }

@@ -44,7 +44,7 @@
     "instances": [
       {
         "id": "filler-plc",
-        "adapter": "ethernet-ip",
+        "adapter": "sim",
         "connection": { "endpoint": "127.0.0.1:44818", "connected": false },
         "pollGroups": [
           {

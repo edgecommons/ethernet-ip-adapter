@@ -32,7 +32,7 @@ edgecommons = { workspace = true }
 # `enip::AssemblyLayout` at config-parse time; the eip/ backend consumes the rest of its surface
 # through the device.rs seam in slice S3.
 ec-enip = { path = "../enip" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "sync"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -42,6 +42,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The eip poll-backend unit tests drive `enip::EipClient::connect_over` over a `tokio::io::duplex`
+# fixture and hand-craft CIP reply frames (Bytes) — no socket, no PLC (S3, §12.3).
+bytes = { workspace = true }
 # Validates the worked test-configs against config.schema.json in a unit test (the schema is a
 # published contract; a drift between it and the parser is a defect). Already in the workspace lock.
 jsonschema = "0.46"

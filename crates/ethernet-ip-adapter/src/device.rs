@@ -24,10 +24,12 @@
 //! swallowed. A signal that silently stops updating is indistinguishable from one that is simply
 //! not changing.
 
+use std::time::Instant;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::config::SignalSpec;
+use crate::config::{IoConfig, IoFieldSpec, SignalSpec};
 
 /// One reading from the device.
 #[derive(Debug, Clone, PartialEq)]
@@ -165,13 +167,96 @@ pub trait DeviceBackend: Send + Sync {
     /// The protocol's name, as it appears in config and in the published `device.adapter` field.
     fn kind(&self) -> &'static str;
 
-    /// Connect to one device.
+    /// Connect to one device for **poll** mode (explicit messaging). Push instances never call this.
     ///
     /// # Errors
     ///
     /// If the device is unreachable ([`DeviceError::Transient`]) or the configuration is wrong
     /// ([`DeviceError::Permanent`]).
     async fn connect(&self, cfg: &ConnectionConfig) -> Result<Box<dyn DeviceSession>>;
+
+    /// Open a **push** (class-1 implicit I/O) session against the device: ForwardOpen the connection
+    /// from the `io` block and start consuming the input assembly at the RPI (§3.3, §4.6). Poll
+    /// instances never call this; a backend that does not implement push returns
+    /// [`DeviceError::Unsupported`] (the default).
+    ///
+    /// # Errors
+    ///
+    /// [`DeviceError::Transient`] if the device is unreachable / the ForwardOpen is refused for a
+    /// transient reason; [`DeviceError::Permanent`] for a misconfiguration; [`DeviceError::Unsupported`]
+    /// if the backend has no push implementation.
+    async fn open_push(
+        &self,
+        _conn: &ConnectionConfig,
+        _io: &IoConfig,
+    ) -> Result<Box<dyn PushSession>> {
+        Err(DeviceError::Unsupported(
+            "this backend does not implement push (class-1 I/O) mode",
+        ))
+    }
+}
+
+/// One event on a **push** session's stream (§3.3) — the push analog of a poll `read_signals` result.
+///
+/// The seam speaks [`Reading`]s and connection lifecycle transitions, **never** the UNS (the boundary
+/// rule): the backend has already decoded the input assembly's byte-offset fields into signals per §5,
+/// applied scale/offset, and mapped quality (fresh frame ⇒ GOOD; Idle run/idle bit ⇒ UNCERTAIN;
+/// non-finite scale ⇒ UNCERTAIN). The engine above the seam publishes them without seeing the `enip`
+/// crate.
+#[derive(Debug)]
+pub enum IoUpdate {
+    /// The class-1 connection came up on the first accepted frame; the negotiated actual packet
+    /// intervals (milliseconds), from the ForwardOpen reply.
+    Up {
+        /// Actual O→T packet interval, ms.
+        o2t_api_ms: u32,
+        /// Actual T→O packet interval, ms.
+        t2o_api_ms: u32,
+    },
+    /// One accepted input-assembly frame, decoded to one [`Reading`] per configured input field (§5).
+    Data {
+        /// One reading per input field, in declaration order.
+        readings: Vec<Reading>,
+        /// The class-1 sequence count of the frame.
+        sequence: u16,
+        /// Run (`true`) / Idle (`false`) from the frame's run/idle header (Idle ⇒ UNCERTAIN, §5.4).
+        run_mode: bool,
+        /// When the frame was accepted (monotonic) — the push `serverTs` (§5.4).
+        // SLICE S4: consumed by the push publish engine as the sample's `serverTs`.
+        #[allow(dead_code)]
+        received_at: Instant,
+    },
+    /// The connection was lost (class-1 watchdog timeout / peer close / socket error). The push
+    /// engine leaves its loop and reconnects (§10.1). Terminal.
+    Lost {
+        /// Why the link ended — always a [`DeviceError::Transient`] (§10.1 row 7).
+        error: DeviceError,
+    },
+}
+
+/// A live **push** (class-1 implicit I/O) session to one device. **This is the trait a push backend
+/// implements** (§3.3). The engine owns the update receiver; the session owns translation from the
+/// transport into seam types.
+#[async_trait]
+pub trait PushSession: Send + Sync {
+    /// The consumed-I/O stream: decoded field updates + connection lifecycle. The engine drives this
+    /// receiver; a `None` means the session's translator task ended (treat as a lost link).
+    fn updates(&mut self) -> &mut tokio::sync::mpsc::Receiver<IoUpdate>;
+
+    /// Set one output-assembly field (already coerced/validated by the codec) into the producer
+    /// buffer; it rides the next O→T frame. `Ok(())` means the field is staged (§7.3 honesty note).
+    /// The full write path drives this in slice S6; it is exposed now.
+    ///
+    /// # Errors
+    ///
+    /// [`DeviceError::Unsupported`] when the device has no output assembly; [`DeviceError::Permanent`]
+    /// when the value does not fit the field (a coercion/range error).
+    // SLICE S6: dispatched by the `sb/write` command handler for push instances.
+    #[allow(dead_code)]
+    async fn set_output(&mut self, field: &IoFieldSpec, value: &serde_json::Value) -> Result<()>;
+
+    /// Close the connection (ForwardClose + socket teardown). Must be safe to call twice.
+    async fn close(&mut self);
 }
 
 /// How to reach one device. Deliberately open (`additionalProperties: true` in the schema): every

@@ -44,7 +44,7 @@
     "instances": [
       {
         "id": "palletizer-io",
-        "adapter": "ethernet-ip",
+        "adapter": "sim",
         "mode": "push",
         "connection": { "endpoint": "opener-sim:44818" },
         "io": {
