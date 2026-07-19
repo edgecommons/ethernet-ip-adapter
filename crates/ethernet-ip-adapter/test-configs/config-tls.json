@@ -35,11 +35,12 @@
           "connected": false,
           "security": {
             "mode": "tls",
-            "client": { "certSecret": "ot-pki/eip-originator" },
+            "client": { "certSecret": "ot-pki/eip-originator", "renewBeforeDays": 30 },
             "ca": { "secret": "ot-pki/plant-root" },
             "verifyPeer": true,
             "serverName": "enip-tls",
-            "checkExpiration": true
+            "checkExpiration": true,
+            "reloadIntervalSecs": 60
           }
         },
         "pollGroups": [
@@ -81,6 +82,32 @@
             "ca": { "cert": { "$secret": "tls/plant-root" } },
             "verifyPeer": true,
             "serverName": "enip-tls"
+          }
+        },
+        "pollGroups": [
+          {
+            "id": "fast",
+            "pollIntervalMs": 500,
+            "signals": [
+              { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" }
+            ]
+          }
+        ],
+        "writes": { "allow": [] }
+      },
+      {
+        "id": "filler-plc-tls-truststore",
+        "adapter": "ethernet-ip",
+        "connection": {
+          "endpoint": "enip-tls",
+          "connected": false,
+          "security": {
+            "mode": "tls",
+            "client": { "certSecret": "ot-pki/eip-originator", "renewBeforeDays": 45 },
+            "ca": { "trustStore": "ot-pki/plant-trust-store" },
+            "verifyPeer": true,
+            "serverName": "enip-tls",
+            "reloadIntervalSecs": 30
           }
         },
         "pollGroups": [

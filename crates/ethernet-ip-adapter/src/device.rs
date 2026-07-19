@@ -133,10 +133,34 @@ pub struct SecurityStatus {
     /// The adapter's own client-certificate `notAfter`, RFC-3339 (drives Phase-2 rotation; surfaced
     /// now for operators). `None` when no client cert / not parseable.
     pub client_cert_not_after: Option<String>,
+    /// The adapter's own client-certificate serial number, hex (Phase 2b — surfaced so an operator
+    /// can correlate a rotation against the issuing CA's records). `None` when no client cert.
+    pub client_cert_serial: Option<String>,
+    /// Whole days until the adapter's client certificate expires (Phase 2b cert-expiry monitoring,
+    /// DESIGN-cip-security.md §4.2). Negative ⇒ already expired. `None` when no client cert / not
+    /// parseable.
+    pub client_cert_expiry_days: Option<i64>,
+    /// A summary of the managed trust store the session verified the device against (Phase 2b,
+    /// DESIGN-cip-security.md §4.2): one entry per trust anchor (CA root) sourced from the vault or
+    /// files, including any old+new roots live during a CA-rollover grace window. Empty for a
+    /// no-verify session.
+    pub trust_anchors: Vec<TrustAnchorSummary>,
     /// The **target's** decoded CIP Security posture (Phase 2a, DESIGN-cip-security.md §4.1), read
     /// once per connect. `None` when the device implements none of the 0x5D/0x5E/0x5F objects (a
     /// generic CIP device) — surfaced as `targetSupportsCipSecurity: false`, never an error.
     pub target: Option<TargetSecurityPosture>,
+}
+
+/// One trust anchor (CA root certificate) in the adapter's managed trust store (Phase 2b,
+/// DESIGN-cip-security.md §4.2) — the protocol-agnostic view surfaced on `sb/status.security.trustStore`.
+/// Multiple anchors are normal: a plant trust domain may carry several roots, and a CA rollover keeps
+/// the old and new roots both live during the vault's version-grace window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustAnchorSummary {
+    /// The CA certificate subject (e.g. `CN=Plant Root CA`).
+    pub subject: Option<String>,
+    /// The CA certificate's `notAfter`, RFC-3339.
+    pub not_after: Option<String>,
 }
 
 /// The **target device's** decoded CIP Security posture (Phase 2a, DESIGN-cip-security.md §4.1) — the

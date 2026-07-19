@@ -114,16 +114,26 @@ configured with `security.mode: tls` is rejected at startup.
 | `ca` | object | — | Trust anchors for verifying the device certificate. Sourced by exactly one style (below). |
 | `verifyPeer` | boolean | `true` | `true` verifies the device certificate against the trust anchors; `false` accepts any device certificate (a commissioning/debug posture that raises a `tls-peer-unverified` event). |
 | `serverName` | string | endpoint host | The verification / SNI name. An IP literal is verified against the device certificate's IP SAN. |
-| `checkExpiration` | boolean | `true` | `false` tolerates an expired / not-yet-valid device certificate (for devices without a real-time clock). |
+| `checkExpiration` | boolean | `true` | `false` tolerates an expired / not-yet-valid device certificate (for devices without a real-time clock). With `true`, an already-expired **client** certificate is refused at connect rather than attempted. |
 | `cipherSuites` | string[] | GCM + TLS 1.3 | An optional cipher-suite allow-list (IANA / rustls names). Only GCM-based and TLS 1.3 suites are supported. |
+| `client.renewBeforeDays` | integer | `30` | Fire a `cert-expiring` event this many days before the client certificate's `notAfter`. |
+| `reloadIntervalSecs` | integer | `300` | How often (seconds) to re-read the vault for a rotated client certificate / trust store. A detected change reconnects so the new material takes effect without a restart. `0` disables the re-read (material is then reloaded only on a natural reconnect). |
 
 Each credential — the client certificate, the client key, and the CA — is sourced by exactly **one**
-of three styles; mixing styles on one credential is a startup error.
+style; mixing styles on one credential is a startup error.
 
 | Credential | Vault ref (typed) | File path | Inline `$secret` content |
 |------------|-------------------|-----------|--------------------------|
 | Client identity | `client.certSecret` — a `{certPem, keyPem[, caPem]}` vault bundle (cert + key together) | `client.certFile` + `client.keyFile` | `client.cert` + `client.key`, each `{"$secret": "<name>"}` |
 | CA trust anchors | `ca.secret` — a vault PEM secret | `ca.file` | `ca.cert` — `{"$secret": "<name>"}` |
+
+The CA trust anchors form a **managed trust store** — a set of trusted roots, not just one. Two more
+`ca` styles build the set:
+
+| `ca` style | What it is |
+|------------|------------|
+| `ca.trustStore` | A vault secret holding a bundle of trusted CAs. The trust store is built from **all retained versions** of the secret, so during a CA rollover the old and new roots are trusted at the same time. |
+| `ca.list` | An explicit array of `{"$secret": "<name>"}` refs, each a CA PEM, assembled into one trust store. |
 
 An inline reference is `{"$secret": "<vault-name>"}` (the ecosystem-wide `$secret` convention): the
 PEM content is resolved from the credentials vault at connect time and never lands in the logged
@@ -270,9 +280,15 @@ after `ecv1` on a multi-site broker.
 - **TLS (CIP Security)** — poll (explicit-messaging) instances can run over TLS with mutual X.509
   (`connection.security`, above). Only GCM-based and TLS 1.3 cipher suites are supported; devices that
   offer only CBC-based suites are not. Class-1 implicit I/O (`mode: push`) runs over plaintext UDP
-  `2222` — a push instance configured with TLS is rejected at startup. Certificate commissioning
-  (enrollment/rotation of the adapter's own certificate) is not part of this adapter; provision the
-  client certificate and trust anchors through the credentials vault or files.
+  `2222` — a push instance configured with TLS is rejected at startup.
+- **Managed trust store and certificate rotation** — the CA trust anchors are a set of roots
+  (`ca.trustStore` / `ca.list`), and a CA rollover's old and new roots are trusted together while both
+  are live. The adapter re-reads the vault on the `reloadIntervalSecs` cadence and, when the client
+  certificate or trust store rotates (for example via `ec-secrets`), reconnects so the new material
+  takes effect without a restart. It monitors the client certificate's expiry: a `cert-expiring` event
+  fires within `client.renewBeforeDays` of `notAfter`, a `cert-expired` event fires when it lapses, and
+  an already-expired client certificate is refused at connect. Direct EST enrollment of the adapter's
+  own certificate is not part of this adapter; provision the client certificate through the vault.
 - **Security posture reporting** — on connect the adapter reads the target's CIP Security objects and
   reports the device's posture (state, security profiles, allowed/available cipher suites, client-cert
   and expiration policy, and a certificate summary) on `sb/status` under `security.target`, with

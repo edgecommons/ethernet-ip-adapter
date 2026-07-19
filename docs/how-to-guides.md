@@ -264,8 +264,9 @@ Notes:
 - TLS applies to poll instances. A push (`mode: push`) instance configured with TLS is rejected at
   startup (class-1 implicit I/O runs over plaintext UDP `2222`).
 - `sb/status` returns a `security` object (`mode`, `tlsVersion`, `cipherSuite`, `peerVerified`,
-  `peer`, `clientCertNotAfter`, `handshakeFailures`); a `tls-handshake-failed` event fires on a
-  handshake failure.
+  `peer`, `clientCertNotAfter`, `clientCertSerial`, `clientCertExpiryDays`, `trustStore`,
+  `handshakeFailures`, `certReloads`); a `tls-handshake-failed` event fires on a handshake failure.
+  Certificate rotation and expiry are covered in "Rotate certificates and manage the trust store" below.
 - On connect the adapter reads the target's CIP Security objects and reports the device's posture
   under `security.target` (state, security profiles, allowed/available cipher suites, client-cert and
   expiration policy, certificate summary), with `security.targetSupportsCipSecurity` telling you
@@ -274,6 +275,52 @@ Notes:
 
 For `verifyPeer: false` (commissioning/debug, accepts any device certificate), the adapter connects
 without verifying the device and raises a `tls-peer-unverified` event.
+
+---
+
+## Rotate certificates and manage the trust store
+
+The CA trust anchors are a **managed trust store** — a set of trusted roots, not a single CA — and the
+adapter reloads its own client certificate and the trust store from the vault while it runs, so a
+rotation takes effect without a restart.
+
+**Trust a set of CA roots.** Point `ca.trustStore` at a vault secret holding a bundle of CA PEMs; the
+trust store is built from **all retained versions** of that secret, so during a CA rollover the old and
+new roots are trusted at the same time:
+
+```jsonc
+"security": {
+  "mode": "tls",
+  "client": { "certSecret": "ot-pki/eip-originator" },
+  "ca":     { "trustStore": "ot-pki/plant-trust-store" }
+}
+```
+
+Or list several independently-rotated roots explicitly:
+
+```jsonc
+"ca": { "list": [ { "$secret": "ot-pki/root-a" }, { "$secret": "ot-pki/root-b" } ] }
+```
+
+**Rotate without a restart.** The adapter re-reads the vault every `reloadIntervalSecs` (default 300).
+When you write a new client certificate or CA into the vault (for example with `ec-secrets`), the
+adapter detects the change, emits `cert-rotated`, increments the `certReloads` metric, and reconnects so
+the next handshake presents the new certificate:
+
+```jsonc
+"security": {
+  "mode": "tls",
+  "client": { "certSecret": "ot-pki/eip-originator", "renewBeforeDays": 30 },
+  "ca":     { "trustStore": "ot-pki/plant-trust-store" },
+  "reloadIntervalSecs": 300
+}
+```
+
+**Watch for expiry.** The adapter monitors its own client certificate: a `cert-expiring` event fires
+within `client.renewBeforeDays` (default 30) of `notAfter`, a `cert-expired` event fires when it lapses,
+and an already-expired certificate is refused at connect (with `checkExpiration: true`). `sb/status`
+reports `security.clientCertExpiryDays` and `security.trustStore` (the anchor count and each root's
+subject/`notAfter`), and the `certExpiryDays` metric is a gauge of the days remaining.
 
 ---
 

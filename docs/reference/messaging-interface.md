@@ -165,9 +165,14 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
   framesConsumed, staleDropped, sequenceGaps }`.
 - **`security`** — the connection's security posture. A plaintext instance reports
   `{ mode: "plaintext" }`; a TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified,
-  peer, clientCertNotAfter, handshakeFailures: {interval,total} }` — the negotiated fields are present
-  once the session is up. The `state` keepalive carries the same posture as `attributes.security`
-  (`"tls"`|`"plaintext"`).
+  peer, clientCertNotAfter, clientCertSerial, clientCertExpiryDays,
+  trustStore: { count, anchors: [{ subject, notAfter }] },
+  handshakeFailures: {interval,total}, certReloads: {interval,total} }` — the negotiated fields are
+  present once the session is up. `trustStore` summarizes the managed set of trusted CA roots (a CA
+  rollover shows both the old and new roots while both are live); `clientCertExpiryDays` is the whole
+  days until the adapter's own certificate expires (negative when expired); `certReloads` counts client
+  cert / trust-store rotations picked up from the vault without a restart. The `state` keepalive carries
+  the same posture as `attributes.security` (`"tls"`|`"plaintext"`).
 
   While a session is up, `security` also carries **`targetSupportsCipSecurity`** (boolean) and, when
   the device implements the CIP Security objects, a **`target`** object with the device's decoded
@@ -213,6 +218,9 @@ Published through the library's `events()` facade: severity **derives** the chan
 | `evt/warning/write-audit` | Warning | An `sb/write` entry failed or was refused. `context` adds `error`. |
 | `evt/warning/tls-handshake-failed` | Warning | A TLS instance's handshake failed (bad certificate, no cipher overlap, protocol mismatch) — fired on the transition into failing. `context` carries `{instance, security:"tls"}`. |
 | `evt/warning/tls-peer-unverified` | Warning | A TLS instance connected with `verifyPeer:false` (the device certificate was not verified). |
+| `evt/info/cert-rotated` | Info | The adapter's client certificate or trust store rotated in the vault; the adapter reconnected to apply it. `context` carries `{instance, security:"tls", serial, notAfter}`. |
+| `evt/warning/cert-expiring` | Warning | The adapter's client certificate is within `renewBeforeDays` of expiry. `context` carries `{instance, security:"tls", daysRemaining, notAfter}`. |
+| `evt/warning/cert-expired` | Warning | The adapter's client certificate has expired; TLS connects fail until it is rotated. `context` carries `{instance, security:"tls", notAfter}`. |
 
 On a TLS instance, `device-connected` carries `context.security: "tls"`.
 

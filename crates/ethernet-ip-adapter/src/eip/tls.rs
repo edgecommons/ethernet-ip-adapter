@@ -25,6 +25,7 @@ use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, Error as Tls
 
 use crate::device::{
     ConnectionConfig, SecurityStatus, TargetCertificateSummary, TargetSecurityPosture,
+    TrustAnchorSummary,
 };
 
 /// The `connection.security` block (DESIGN-cip-security.md §3.3) — a strict typed island inside the
@@ -54,7 +55,18 @@ pub struct SecurityConfig {
     /// GCM + TLS 1.3 suites Vol 8 ≥ 1.13 mandates).
     #[serde(default)]
     pub cipher_suites: Option<Vec<String>>,
+    /// How often (seconds) the per-instance cert-lifecycle task re-reads the vault to pick up a
+    /// rotated client certificate / trust store and cert-expiry threshold crossings (Phase 2b,
+    /// DESIGN-cip-security.md §4.2). Default 300; `0` disables the lifecycle task (the material is
+    /// then only re-read on a natural reconnect). Ignored for a non-vault (file-only) deployment.
+    #[serde(default)]
+    pub reload_interval_secs: Option<u64>,
 }
+
+/// The default cert-lifecycle re-read cadence (seconds) when `reloadIntervalSecs` is unset.
+pub const DEFAULT_RELOAD_INTERVAL_SECS: u64 = 300;
+/// The default `renewBeforeDays` threshold: fire `cert-expiring` this many days before `notAfter`.
+pub const DEFAULT_RENEW_BEFORE_DAYS: i64 = 30;
 
 /// `plaintext` | `tls` (DESIGN-cip-security.md §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -149,6 +161,10 @@ pub struct ClientIdentity {
     /// Style 3: an inline `{"$secret": …}` yielding the client private-key PEM.
     #[serde(default)]
     pub key: Option<SecretRef>,
+    /// Fire a `cert-expiring` event this many days before the client certificate's `notAfter`
+    /// (Phase 2b cert-expiry monitoring, DESIGN-cip-security.md §4.2). Default 30.
+    #[serde(default)]
+    pub renew_before_days: Option<u32>,
 }
 
 impl ClientIdentity {
@@ -166,10 +182,20 @@ impl ClientIdentity {
     }
 }
 
-/// The trust anchors for verifying the device certificate. Exactly one of three sourcing styles:
-/// a vault secret name (`secret`), a PEM file path (`file`), or an inline `{"$secret": …}` (`cert`)
-/// — the `client`-identity styles' CA analog (§3.3/§4.1).
-#[derive(Debug, Clone, Deserialize)]
+/// The trust anchors for verifying the device certificate — a **managed trust store** (Phase 2b,
+/// DESIGN-cip-security.md §4.2), sourced by exactly one style:
+///
+/// * `secret` — a single vault secret holding CA PEM (one or more roots);
+/// * `file` — a CA PEM file path;
+/// * `cert` — an inline `{"$secret": …}` yielding CA PEM;
+/// * `trustStore` — a vault secret name holding a **bundle** of trusted CAs (a set of roots). Unlike
+///   `secret`, the store is built from **all retained versions** of the secret, so a CA rollover's
+///   old+new roots are both trusted during the vault's version-grace window;
+/// * `list` — an explicit list of inline `{"$secret": …}` refs, each yielding one or more roots (a
+///   trust store assembled from several independently-rotated vault secrets).
+///
+/// A single root is just a one-entry store; the single-CA styles above are unchanged from Phase 1.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CaSource {
     /// A vault secret name holding CA certificate PEM.
@@ -181,6 +207,13 @@ pub struct CaSource {
     /// An inline `{"$secret": …}` yielding the CA certificate PEM (one or more roots).
     #[serde(default)]
     pub cert: Option<SecretRef>,
+    /// A vault secret name holding a bundle of trusted CAs — the managed trust store. Built from all
+    /// retained versions of the secret (CA-rollover grace).
+    #[serde(default)]
+    pub trust_store: Option<String>,
+    /// An explicit list of inline `{"$secret": …}` CA refs assembled into one trust store.
+    #[serde(default)]
+    pub list: Option<Vec<SecretRef>>,
 }
 
 impl CaSource {
@@ -189,6 +222,8 @@ impl CaSource {
         usize::from(self.secret.is_some())
             + usize::from(self.file.is_some())
             + usize::from(self.cert.is_some())
+            + usize::from(self.trust_store.is_some())
+            + usize::from(self.list.as_ref().is_some_and(|l| !l.is_empty()))
     }
     /// Whether any CA source is configured at all.
     fn is_configured(&self) -> bool {
@@ -201,11 +236,18 @@ fn d_true() -> bool {
 }
 
 /// The out-of-band material the adapter carries alongside the built `TlsOptions` for the status
-/// surface (things the `enip` crate cannot know: our own cert's expiry + the verify policy).
+/// surface (things the `enip` crate cannot know: our own cert's expiry + the verify policy + the
+/// managed trust store's contents).
 #[derive(Debug, Clone, Default)]
 pub struct TlsMeta {
     /// The adapter client certificate's `notAfter`, RFC-3339.
     pub client_cert_not_after: Option<String>,
+    /// The adapter client certificate's serial number, hex (Phase 2b).
+    pub client_cert_serial: Option<String>,
+    /// Whole days until the client certificate expires (Phase 2b); negative ⇒ expired.
+    pub client_cert_expiry_days: Option<i64>,
+    /// A summary of the managed trust store (Phase 2b): one entry per sourced CA root.
+    pub trust_anchors: Vec<TrustAnchorSummary>,
     /// The configured `verifyPeer` policy (a no-verify session reports `peerVerified: false`).
     pub verify_peer: bool,
 }
@@ -323,7 +365,7 @@ fn read_pem_file(path: &str, what: &str) -> std::result::Result<String, String> 
 }
 
 /// Parse a PEM blob into a DER certificate chain.
-fn certs_from_pem(pem: &str, what: &str) -> std::result::Result<Vec<CertificateDer<'static>>, String> {
+pub(super) fn certs_from_pem(pem: &str, what: &str) -> std::result::Result<Vec<CertificateDer<'static>>, String> {
     let mut rd = std::io::Cursor::new(pem.as_bytes());
     rustls_pemfile::certs(&mut rd)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -405,58 +447,29 @@ pub fn build_client_config(
     creds: Option<&Arc<dyn CredentialService>>,
 ) -> std::result::Result<(enip::TlsOptions, TlsMeta), String> {
     let mut root_pems: Vec<String> = Vec::new();
-    let mut client_cert_pem: Option<String> = None;
-    let mut client_key_pem: Option<String> = None;
 
     // ---- client identity (exactly one style, per validate()) ----
-    if let Some(c) = &sec.client {
-        if let Some(name) = &c.cert_secret {
-            // Style 1: a vault TLS bundle (cert + key + optional CA together).
-            let creds = creds.ok_or_else(|| {
-                format!("client.certSecret `{name}` is set but no credentials vault is configured")
-            })?;
-            let bundle = creds
-                .get_tls_bundle(name)
-                .map_err(|e| format!("vault get_tls_bundle(`{name}`): {e}"))?
-                .ok_or_else(|| format!("vault TLS bundle `{name}` not found"))?;
-            client_cert_pem = Some(bundle.cert_pem);
-            client_key_pem = Some(bundle.key_pem);
-            if let Some(ca) = bundle.ca_pem {
-                root_pems.push(ca);
-            }
-        } else if let (Some(cert), Some(key)) = (&c.cert, &c.key) {
-            // Style 3: inline {"$secret": …} refs, each resolved to one PEM.
-            client_cert_pem = Some(cert.resolve(creds, "client.cert")?);
-            client_key_pem = Some(key.resolve(creds, "client.key")?);
-        } else if let (Some(cf), Some(kf)) = (&c.cert_file, &c.key_file) {
-            // Style 2: file paths.
-            client_cert_pem = Some(read_pem_file(cf, "client certificate")?);
-            client_key_pem = Some(read_pem_file(kf, "client key")?);
-        }
+    let (client_cert_pem, client_key_pem, bundle_ca) = source_client_material(sec, creds)?;
+    if let Some(ca) = bundle_ca {
+        root_pems.push(ca);
     }
 
-    // ---- trust anchors (exactly one style, per validate()) ----
+    // ---- trust anchors: the managed trust store (Phase 2b, §4.2) ----
+    // All configured CA styles feed one set of root PEMs (a certSecret bundle's caPem is already in
+    // `root_pems`); `trustStore` pulls every retained version so a CA rollover's old+new roots overlap.
     if let Some(ca) = &sec.ca {
-        if let Some(name) = &ca.secret {
-            let creds = creds.ok_or_else(|| {
-                format!("ca.secret `{name}` is set but no credentials vault is configured")
-            })?;
-            let pem = creds
-                .get_string(name)
-                .map_err(|e| format!("vault get_string(`{name}`): {e}"))?
-                .ok_or_else(|| format!("vault CA secret `{name}` not found"))?;
-            root_pems.push(pem);
-        } else if let Some(cert) = &ca.cert {
-            // Inline {"$secret": …} CA content.
-            root_pems.push(cert.resolve(creds, "ca.cert")?);
-        } else if let Some(f) = &ca.file {
-            root_pems.push(read_pem_file(f, "CA certificate")?);
-        }
+        root_pems.extend(source_ca_pems(ca, creds)?);
     }
 
+    // Build the rustls root store AND the operator-facing trust-store summary from the same PEMs.
     let mut roots = RootCertStore::empty();
+    let mut trust_anchors: Vec<TrustAnchorSummary> = Vec::new();
     for pem in &root_pems {
         for cert in certs_from_pem(pem, "CA")? {
+            trust_anchors.push(TrustAnchorSummary {
+                subject: cert_subject(cert.as_ref()),
+                not_after: cert_not_after(cert.as_ref()),
+            });
             roots
                 .add(cert)
                 .map_err(|e| format!("adding CA certificate to the trust store: {e}"))?;
@@ -474,10 +487,33 @@ pub fn build_client_config(
         }
         _ => None,
     };
-    let client_cert_not_after = client_identity
+    let leaf = client_identity
         .as_ref()
         .and_then(|(chain, _)| chain.first())
-        .and_then(|c| cert_not_after(c.as_ref()));
+        .map(|c| c.as_ref().to_vec());
+    let client_cert_not_after = leaf.as_deref().and_then(cert_not_after);
+    let client_cert_serial = leaf.as_deref().and_then(cert_serial);
+    let client_cert_expiry_days = leaf
+        .as_deref()
+        .and_then(cert_not_after_time)
+        .map(|na| days_until(na, time::OffsetDateTime::now_utc()));
+    // Refuse to connect on an already-expired client certificate when expiration is being enforced
+    // (Phase 2b, DESIGN-cip-security.md §4.3): a doomed handshake would fail confusingly at the peer;
+    // fail fast and loud instead, so it surfaces as a `tls-handshake-failed` transition with a cause
+    // the `cert-expiring`/`cert-expired` events have already been narrating. `checkExpiration: false`
+    // tolerates it (RTC-less deployments).
+    if sec.check_expiration {
+        if let Some(days) = client_cert_expiry_days {
+            if days < 0 {
+                return Err(format!(
+                    "client certificate expired {} day(s) ago (notAfter {}) — rotate it in the vault \
+                     (e.g. ec-secrets) before connecting; refusing to connect with an expired cert",
+                    -days,
+                    client_cert_not_after.as_deref().unwrap_or("?")
+                ));
+            }
+        }
+    }
 
     // ---- provider + verifier ----
     let provider = Arc::new(provider_for(sec)?);
@@ -523,6 +559,9 @@ pub fn build_client_config(
         },
         TlsMeta {
             client_cert_not_after,
+            client_cert_serial,
+            client_cert_expiry_days,
+            trust_anchors,
             verify_peer: sec.verify_peer,
         },
     ))
@@ -547,6 +586,9 @@ pub fn security_status(
         peer_verified: meta.verify_peer,
         peer,
         client_cert_not_after: meta.client_cert_not_after.clone(),
+        client_cert_serial: meta.client_cert_serial.clone(),
+        client_cert_expiry_days: meta.client_cert_expiry_days,
+        trust_anchors: meta.trust_anchors.clone(),
         target: None,
     }
 }
@@ -605,8 +647,8 @@ pub fn map_target_posture(p: &enip::SecurityPosture) -> Option<TargetSecurityPos
     Some(out)
 }
 
-/// Extract a certificate's `notAfter` as an RFC-3339 string (best-effort; `None` on any parse error).
-fn cert_not_after(der: &[u8]) -> Option<String> {
+/// Extract a certificate's `notAfter` as an [`time::OffsetDateTime`] (best-effort).
+pub(super) fn cert_not_after_time(der: &[u8]) -> Option<time::OffsetDateTime> {
     use x509_cert::der::Decode;
     let cert = x509_cert::Certificate::from_der(der).ok()?;
     let secs = cert
@@ -615,8 +657,142 @@ fn cert_not_after(der: &[u8]) -> Option<String> {
         .not_after
         .to_unix_duration()
         .as_secs();
-    let dt = time::OffsetDateTime::from_unix_timestamp(i64::try_from(secs).ok()?).ok()?;
-    dt.format(&time::format_description::well_known::Rfc3339).ok()
+    time::OffsetDateTime::from_unix_timestamp(i64::try_from(secs).ok()?).ok()
+}
+
+/// Extract a certificate's `notAfter` as an RFC-3339 string (best-effort; `None` on any parse error).
+pub(super) fn cert_not_after(der: &[u8]) -> Option<String> {
+    cert_not_after_time(der)?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
+/// Whole days from `now` until `not_after` (Phase 2b cert-expiry monitoring). Negative ⇒ expired.
+#[must_use]
+pub fn days_until(not_after: time::OffsetDateTime, now: time::OffsetDateTime) -> i64 {
+    (not_after - now).whole_days()
+}
+
+/// Extract a certificate's serial number as an uppercase hex string (best-effort).
+pub(super) fn cert_serial(der: &[u8]) -> Option<String> {
+    use x509_cert::der::Decode;
+    let cert = x509_cert::Certificate::from_der(der).ok()?;
+    let bytes = cert.tbs_certificate.serial_number.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02X}");
+    }
+    Some(s)
+}
+
+/// The client identity PEMs sourced from the vault/files: `(cert_pem, key_pem, bundle_ca_pem)`.
+pub(super) type ClientMaterial = (Option<String>, Option<String>, Option<String>);
+
+/// Source the client identity PEMs (cert, key, and — for the bundle style — an optional CA) from the
+/// configured [`ClientIdentity`] style. Returns `(None, None, None)` when no client identity is set
+/// (a `verifyPeer: false` anonymous connection). Shared by [`build_client_config`] and the Phase-2b
+/// cert-lifecycle reader ([`super::rotation::read_reload_state`]).
+///
+/// # Errors
+///
+/// A config-legible message for a missing vault, a missing secret, or an inline-ref resolution error.
+pub(super) fn source_client_material(
+    sec: &SecurityConfig,
+    creds: Option<&Arc<dyn CredentialService>>,
+) -> std::result::Result<ClientMaterial, String> {
+    let Some(c) = &sec.client else {
+        return Ok((None, None, None));
+    };
+    if let Some(name) = &c.cert_secret {
+        // Style 1: a vault TLS bundle (cert + key + optional CA together).
+        let creds = creds.ok_or_else(|| {
+            format!("client.certSecret `{name}` is set but no credentials vault is configured")
+        })?;
+        let bundle = creds
+            .get_tls_bundle(name)
+            .map_err(|e| format!("vault get_tls_bundle(`{name}`): {e}"))?
+            .ok_or_else(|| format!("vault TLS bundle `{name}` not found"))?;
+        Ok((Some(bundle.cert_pem), Some(bundle.key_pem), bundle.ca_pem))
+    } else if let (Some(cert), Some(key)) = (&c.cert, &c.key) {
+        // Style 3: inline {"$secret": …} refs, each resolved to one PEM.
+        Ok((
+            Some(cert.resolve(creds, "client.cert")?),
+            Some(key.resolve(creds, "client.key")?),
+            None,
+        ))
+    } else if let (Some(cf), Some(kf)) = (&c.cert_file, &c.key_file) {
+        // Style 2: file paths.
+        Ok((
+            Some(read_pem_file(cf, "client certificate")?),
+            Some(read_pem_file(kf, "client key")?),
+            None,
+        ))
+    } else {
+        Ok((None, None, None))
+    }
+}
+
+/// Source the managed trust store's CA PEMs from every configured [`CaSource`] style (Phase 2b,
+/// DESIGN-cip-security.md §4.2). `secret`/`file`/`cert` yield one PEM (possibly several roots);
+/// `trustStore` yields **all retained versions** of a vault bundle (CA-rollover grace — the old and
+/// new roots overlap during the vault's version window); `list` yields several independently-sourced
+/// refs. Exactly one style is set (enforced by [`SecurityConfig::validate`]).
+///
+/// # Errors
+///
+/// A config-legible message when a vault is required but absent, a secret/version is missing, or a
+/// value is not UTF-8 PEM.
+pub(super) fn source_ca_pems(
+    ca: &CaSource,
+    creds: Option<&Arc<dyn CredentialService>>,
+) -> std::result::Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if let Some(name) = &ca.secret {
+        let creds = creds.ok_or_else(|| {
+            format!("ca.secret `{name}` is set but no credentials vault is configured")
+        })?;
+        let pem = creds
+            .get_string(name)
+            .map_err(|e| format!("vault get_string(`{name}`): {e}"))?
+            .ok_or_else(|| format!("vault CA secret `{name}` not found"))?;
+        out.push(pem);
+    } else if let Some(cert) = &ca.cert {
+        out.push(cert.resolve(creds, "ca.cert")?);
+    } else if let Some(f) = &ca.file {
+        out.push(read_pem_file(f, "CA certificate")?);
+    } else if let Some(name) = &ca.trust_store {
+        let creds = creds.ok_or_else(|| {
+            format!("ca.trustStore `{name}` is set but no credentials vault is configured")
+        })?;
+        let versions = creds
+            .versions(name)
+            .map_err(|e| format!("vault versions(`{name}`) for ca.trustStore: {e}"))?;
+        if versions.is_empty() {
+            return Err(format!("vault trust-store secret `{name}` (ca.trustStore) not found"));
+        }
+        // All retained versions — a CA rollover keeps old+new roots live during the grace window.
+        for v in &versions {
+            if let Some(secret) = creds
+                .get_version(name, v)
+                .map_err(|e| format!("vault get_version(`{name}`, `{v}`): {e}"))?
+            {
+                let pem = secret
+                    .as_str()
+                    .map_err(|e| format!("trust-store `{name}` version `{v}`: {e}"))?
+                    .to_string();
+                out.push(pem);
+            }
+        }
+    } else if let Some(list) = &ca.list {
+        for (i, r) in list.iter().enumerate() {
+            out.push(r.resolve(creds, &format!("ca.list[{i}]"))?);
+        }
+    }
+    Ok(out)
 }
 
 /// Extract a certificate's subject as a string (best-effort).
@@ -982,6 +1158,314 @@ mod tests {
         }
     }
 
+    /// Mint a client cert with an explicit validity window (`days_from_now` days until `notAfter`;
+    /// negative ⇒ already expired), signed by a fresh CA — for the Phase-2b expiry tests.
+    fn mint_expiring(days_from_now: i64) -> Fx {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use time::Duration as TD;
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let mut cp = CertificateParams::new(vec!["eip-originator".to_string()]).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        cp.not_before = now - TD::days(2);
+        cp.not_after = now + TD::days(days_from_now);
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = cp.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+        Fx {
+            ca_pem: ca_cert.pem(),
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
+    }
+
+    /// A second, unrelated CA root (for the multi-root trust-store tests).
+    fn mint_ca() -> String {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let mut p = CertificateParams::new(vec![]).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let k = KeyPair::generate().unwrap();
+        p.self_signed(&k).unwrap().pem()
+    }
+
+    fn empty_vault(seed: u8) -> Arc<dyn CredentialService> {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FileKeyProvider::from_bytes([seed; 32])) as Arc<dyn KeyProvider>;
+        let vault = LocalVault::open(dir.path().join("vault"), provider, 3).unwrap();
+        std::mem::forget(dir);
+        Arc::new(DefaultCredentialService::new(vault))
+    }
+
+    // ---- Phase 2b: managed trust store (multi-CA / multi-version / list) ----
+
+    #[test]
+    fn trust_store_builds_from_all_retained_versions() {
+        // A CA rollover: two versions of one trust-store secret ⇒ both roots trusted (grace window).
+        let fx = mint();
+        let creds = empty_vault(21);
+        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/trust", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        // Roll the trust store: add a new root as a second version.
+        let new_root = mint_ca();
+        creds.put("ot/trust", new_root.as_bytes(), PutOptions::default()).unwrap();
+
+        let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
+            "ca": { "trustStore": "ot/trust" } }));
+        let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
+        assert_eq!(meta.trust_anchors.len(), 2, "old + new root both live during grace");
+        assert!(meta.trust_anchors.iter().all(|a| a.subject.is_some()));
+    }
+
+    #[test]
+    fn trust_store_missing_secret_errors() {
+        let fx = mint();
+        let creds = empty_vault(22);
+        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        let c = conn(json!({ "endpoint": "h" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
+            "ca": { "trustStore": "absent" } }));
+        let err = build_client_config(&s, &c, Some(&creds)).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn ca_list_builds_a_multi_root_store() {
+        let fx = mint();
+        let root2 = mint_ca();
+        let creds = empty_vault(23);
+        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/root-a", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/root-b", root2.as_bytes(), PutOptions::default()).unwrap();
+        let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
+            "ca": { "list": [ { "$secret": "ot/root-a" }, { "$secret": "ot/root-b" } ] } }));
+        let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
+        assert_eq!(meta.trust_anchors.len(), 2, "both listed roots in the trust store");
+    }
+
+    #[test]
+    fn ca_mixing_truststore_and_secret_is_rejected() {
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "certFile": "c.pem", "keyFile": "k.pem" },
+            "ca": { "secret": "root", "trustStore": "store" } }));
+        let err = s.validate("plc", false).unwrap_err();
+        assert!(err.contains("mixes sourcing styles"), "{err}");
+    }
+
+    #[test]
+    fn ca_truststore_and_list_satisfy_verify_peer_validation() {
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "certFile": "c.pem", "keyFile": "k.pem" },
+            "ca": { "trustStore": "store" } }));
+        assert!(s.validate("plc", false).is_ok());
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "certFile": "c.pem", "keyFile": "k.pem" },
+            "ca": { "list": [ { "$secret": "root" } ] } }));
+        assert!(s.validate("plc", false).is_ok());
+    }
+
+    // ---- Phase 2b: client-cert expiry + serial ----
+
+    #[test]
+    fn client_cert_serial_and_expiry_days_are_surfaced() {
+        let fx = mint_expiring(400);
+        let creds = empty_vault(24);
+        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
+            "ca": { "cert": { "$secret": "ot/root" } } }));
+        let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
+        assert!(meta.client_cert_serial.is_some(), "serial parsed");
+        let days = meta.client_cert_expiry_days.expect("expiry days");
+        assert!((398..=401).contains(&days), "~400 days: {days}");
+    }
+
+    #[test]
+    fn expired_client_cert_is_refused_when_check_expiration() {
+        let fx = mint_expiring(-5);
+        let creds = empty_vault(25);
+        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
+            "ca": { "cert": { "$secret": "ot/root" } } }));
+        let err = build_client_config(&s, &c, Some(&creds)).unwrap_err();
+        assert!(err.contains("expired") && err.contains("refusing to connect"), "{err}");
+    }
+
+    #[test]
+    fn expired_client_cert_is_tolerated_when_check_expiration_false() {
+        let fx = mint_expiring(-5);
+        let creds = empty_vault(26);
+        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
+            "verifyPeer": false, "checkExpiration": false }));
+        let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
+        assert!(meta.client_cert_expiry_days.unwrap() < 0, "expired cert accepted (RTC-less tolerance)");
+    }
+
+    #[test]
+    fn renew_before_days_and_reload_interval_parse() {
+        let s = sec_of(json!({ "mode": "tls",
+            "client": { "certSecret": "x", "renewBeforeDays": 45 },
+            "reloadIntervalSecs": 120 }));
+        assert_eq!(s.client.unwrap().renew_before_days, Some(45));
+        assert_eq!(s.reload_interval_secs, Some(120));
+    }
+
+    #[test]
+    fn days_until_is_signed() {
+        let now = time::OffsetDateTime::now_utc();
+        assert!(days_until(now + time::Duration::days(10), now) >= 9);
+        assert!(days_until(now - time::Duration::days(10), now) <= -9);
+    }
+
+    // ---- Phase 2b LIVE: client-cert rotation end-to-end over the stunnel/cpppo TLS peer ----
+    //
+    // Self-skipping on a `:2221` probe (the §11.3 live pattern): brings the real originator certs from
+    // `test-infra/enip-tls/certs/`, connects over TLS to the stunnel terminator (independent OpenSSL +
+    // cpppo), then ROTATES the vault to `client2.pem` (a fresh cert signed by the same CA) and proves
+    // the cert-lifecycle detects it and the next `connect_tls` presents the NEW cert (accepted by the
+    // `verify=2` peer). It runs only when the harness is up:
+    //   docker compose up --build enip-sim enip-tls
+    // and is silently skipped otherwise, so the normal suite stays green with no live infra.
+
+    const CERT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-infra/enip-tls/certs");
+
+    fn read_cert(name: &str) -> Option<String> {
+        std::fs::read_to_string(format!("{CERT_DIR}/{name}")).ok()
+    }
+
+    async fn stunnel_up() -> bool {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            tokio::net::TcpStream::connect("127.0.0.1:2221"),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+    }
+
+    fn live_vault(cert: &str, key: &str, ca: &str) -> Arc<dyn CredentialService> {
+        let creds = empty_vault(90);
+        creds.put("ot/cert", cert.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", key.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/ca", ca.as_bytes(), PutOptions::default()).unwrap();
+        creds
+    }
+
+    fn tls_sec() -> SecurityConfig {
+        sec_of(json!({ "mode": "tls",
+            "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
+            "ca": { "cert": { "$secret": "ot/ca" } },
+            "serverName": "127.0.0.1" }))
+    }
+
+    async fn connect_once(sec: &SecurityConfig, creds: &Arc<dyn CredentialService>) -> Option<String> {
+        let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
+        let (tls_opts, meta) = build_client_config(sec, &c, Some(creds)).expect("build ClientConfig");
+        let opts = enip::ClientOptions {
+            connect_timeout: std::time::Duration::from_secs(5),
+            request_timeout: std::time::Duration::from_secs(2),
+            ..Default::default()
+        };
+        let client = enip::EipClient::connect_tls("127.0.0.1:2221", opts, tls_opts)
+            .await
+            .expect("TLS connect + RegisterSession");
+        client.close().await;
+        meta.client_cert_serial
+    }
+
+    #[tokio::test]
+    async fn live_client_cert_rotation_presents_the_new_cert() {
+        if !stunnel_up().await {
+            eprintln!("SKIP live_client_cert_rotation: no stunnel on 127.0.0.1:2221 (run `docker compose up --build enip-sim enip-tls`)");
+            return;
+        }
+        let (Some(ca), Some(c1), Some(k1), Some(c2), Some(k2)) = (
+            read_cert("ca.pem"),
+            read_cert("client.pem"),
+            read_cert("client.key"),
+            read_cert("client2.pem"),
+            read_cert("client2.key"),
+        ) else {
+            eprintln!("SKIP live_client_cert_rotation: test certs missing (run gen-certs.sh)");
+            return;
+        };
+
+        let creds = live_vault(&c1, &k1, &ca);
+        let sec = tls_sec();
+
+        // Baseline connect with cert A.
+        let serial_a = connect_once(&sec, &creds).await.expect("client A serial");
+        let state_a = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
+
+        // Rotate the vault to cert B (fresh cert, same CA) — the ec-secrets rotation shape.
+        creds.put("ot/cert", c2.as_bytes(), PutOptions::default()).unwrap();
+        creds.put("ot/key", k2.as_bytes(), PutOptions::default()).unwrap();
+
+        // The lifecycle watcher detects the rotation from the vault re-read.
+        let state_b = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
+        assert_ne!(state_a.fingerprint, state_b.fingerprint, "rotation changed the material fingerprint");
+        let mut watcher = crate::eip::rotation::CertWatcher::default();
+        watcher.observe(&state_a, 30);
+        let out = watcher.observe(&state_b, 30);
+        assert!(
+            out.actions.iter().any(|a| matches!(a, crate::eip::rotation::WatchAction::Rotated { .. })),
+            "watcher reports the rotation"
+        );
+
+        // The NEXT connect presents cert B and the peer accepts it (same CA).
+        let serial_b = connect_once(&sec, &creds).await.expect("client B serial");
+        assert_ne!(serial_a, serial_b, "the reconnect used the rotated cert");
+        eprintln!("LIVE rotation OK: {serial_a} -> {serial_b} over stunnel :2221");
+    }
+
+    #[tokio::test]
+    async fn live_near_expiry_cert_fires_expiring() {
+        if !stunnel_up().await {
+            eprintln!("SKIP live_near_expiry_cert: no stunnel on :2221");
+            return;
+        }
+        let (Some(ca), Some(ce), Some(ke)) = (
+            read_cert("ca.pem"),
+            read_cert("client-expiring.pem"),
+            read_cert("client-expiring.key"),
+        ) else {
+            eprintln!("SKIP live_near_expiry_cert: certs missing");
+            return;
+        };
+        let creds = live_vault(&ce, &ke, &ca);
+        let sec = tls_sec();
+        // The near-expiry cert (20 days) still connects (valid), but crosses the 30-day threshold.
+        let _ = connect_once(&sec, &creds).await.expect("near-expiry cert still connects");
+        let state = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
+        let mut watcher = crate::eip::rotation::CertWatcher::default();
+        let out = watcher.observe(&state, 30);
+        assert!(
+            out.actions.iter().any(|a| matches!(a, crate::eip::rotation::WatchAction::Expiring { .. })),
+            "a ~20-day cert fires cert-expiring at the 30-day threshold: {:?}",
+            out.actions
+        );
+        eprintln!("LIVE near-expiry OK: {:?}", out.expiry_days);
+    }
+
     fn vault_with(bundle_name: &str, ca_name: &str, fx: &Fx) -> Arc<dyn CredentialService> {
         let dir = tempfile::tempdir().unwrap();
         let provider = Arc::new(FileKeyProvider::from_bytes([7u8; 32])) as Arc<dyn KeyProvider>;
@@ -1225,7 +1709,7 @@ mod tests {
             cipher_suite: Some("TLS13_AES_128_GCM_SHA256".to_string()),
             peer_cert_der: None,
         };
-        let meta = TlsMeta { client_cert_not_after: Some("2027-01-01T00:00:00Z".to_string()), verify_peer: true };
+        let meta = TlsMeta { client_cert_not_after: Some("2027-01-01T00:00:00Z".to_string()), verify_peer: true, ..TlsMeta::default() };
         let c = conn(json!({ "endpoint": "192.168.10.60:2221" }));
         let st = security_status(Some(&info), &meta, &c);
         assert!(st.tls);

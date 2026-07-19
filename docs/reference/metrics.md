@@ -56,6 +56,8 @@ Connection lifecycle and liveness. Dimensions: `instance`, `connectionMode`.
 | `connectionDrops` | Count | counter | Live links marked down. |
 | `reconnects` | Count | counter | Reconnects performed. |
 | `tlsHandshakeFailures` | Count | counter | TLS handshake failures on a `security.mode: tls` connection (bad certificate, no cipher overlap, protocol mismatch). |
+| `certReloads` | Count | counter | Client-certificate / trust-store rotations picked up from the vault without a restart (`security.mode: tls`). |
+| `certExpiryDays` | Count | gauge | Whole days until the adapter's client certificate expires (negative when expired). |
 | `connectLatencyMs` | Milliseconds | gauge | Connect latency (includes the TLS handshake for a TLS connection). |
 | `connectedDurationMs` | Milliseconds | gauge | Time spent connected since the previous emission. |
 

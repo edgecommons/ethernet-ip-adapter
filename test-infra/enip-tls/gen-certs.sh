@@ -42,6 +42,23 @@ openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/C
 openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out client.pem \
   -days "$DAYS" -extfile client.ext
 
-rm -f server.csr client.csr server.ext client.ext ca.srl other-ca.key
+# --- a ROTATED originator leaf (Phase 2b): a fresh cert signed by the SAME CA, so the stunnel peer
+#     (verify=2, CAfile=ca.pem) still accepts it. Distinct key + serial ⇒ the rotation is observable. ---
+openssl req -newkey rsa:2048 -nodes -keyout client2.key -out client2.csr -subj "/CN=eip-originator-rotated"
+openssl x509 -req -in client2.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out client2.pem \
+  -days "$DAYS" -extfile client.ext
+
+# --- a NEAR-EXPIRY originator leaf (Phase 2b): valid, but only 20 days from notAfter, so the
+#     cert-expiry monitor fires `cert-expiring` at the default 30-day threshold. ---
+openssl req -newkey rsa:2048 -nodes -keyout client-expiring.key -out client-expiring.csr \
+  -subj "/CN=eip-originator-expiring"
+openssl x509 -req -in client-expiring.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -out client-expiring.pem -days 20 -extfile client.ext
+
+# --- a managed TRUST STORE bundle (Phase 2b): the plant root PLUS a second (rollover) root, both
+#     trusted at once — the ca.trustStore / rollover-grace shape. ---
+cat ca.pem other-ca.pem > trust-store.pem
+
+rm -f server.csr client.csr client2.csr client-expiring.csr server.ext client.ext ca.srl other-ca.key
 echo "wrote test PKI into $(pwd):"
 ls -1 *.pem *.key

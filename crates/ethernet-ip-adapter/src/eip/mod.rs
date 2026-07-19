@@ -28,6 +28,7 @@ use crate::device::{ConnectionConfig, DeviceError};
 
 pub mod live;
 pub mod push;
+pub mod rotation;
 pub mod session;
 pub mod tls;
 pub mod types;

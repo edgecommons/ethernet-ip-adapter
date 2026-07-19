@@ -152,6 +152,10 @@ pub fn family_defs() -> Vec<FamilyDef> {
     conn.extend(pair("connectionDrops"));
     conn.extend(pair("reconnects"));
     conn.extend(pair("tlsHandshakeFailures"));
+    // CIP Security Phase 2b (§8.2): client-cert rotations picked up without a restart, and a gauge of
+    // days until the adapter's own client certificate expires (negative ⇒ expired).
+    conn.extend(pair("certReloads"));
+    conn.push(m("certExpiryDays", UNIT_COUNT, 60));
     conn.push(m("connectLatencyMs", UNIT_MS, 60));
     conn.push(m("connectedDurationMs", UNIT_MS, 60));
     out.push(FamilyDef { name: CONNECTION.to_string(), dimensions: dims(&["instance", "connectionMode"]), measures: conn });
@@ -269,6 +273,10 @@ struct ConnCounters {
     reconnects: Pair,
     /// TLS handshake failures on a `mode: tls` connection (CIP Security Phase 1, §3.4).
     tls_handshake_failures: Pair,
+    /// Client-cert / trust-store rotations picked up from the vault without a restart (Phase 2b, §4.2).
+    cert_reloads: Pair,
+    /// Days until the adapter's client certificate expires (Phase 2b gauge, §4.2); `None` until read.
+    cert_expiry_days: Option<f64>,
     connect_latency_ms: f64,
     connected_accrued_ms: f64,
     connected_since: Option<Instant>,
@@ -291,6 +299,11 @@ impl ConnCounters {
         self.connection_drops.drain_into(&mut v, "connectionDrops");
         self.reconnects.drain_into(&mut v, "reconnects");
         self.tls_handshake_failures.drain_into(&mut v, "tlsHandshakeFailures");
+        self.cert_reloads.drain_into(&mut v, "certReloads");
+        // A gauge — emitted only once the lifecycle task (or a connect) has read the client cert.
+        if let Some(days) = self.cert_expiry_days {
+            v.insert("certExpiryDays".to_string(), days);
+        }
         v.insert("connectLatencyMs".to_string(), self.connect_latency_ms);
         v.insert("connectedDurationMs".to_string(), self.connected_accrued_ms);
         self.connected_accrued_ms = 0.0;
@@ -616,6 +629,19 @@ impl DeviceMetrics {
         self.inner.lock().unwrap().conn.tls_handshake_failures.add(1.0);
     }
 
+    /// The cert-lifecycle task picked up a rotated client cert / trust store from the vault (Phase 2b,
+    /// §4.2) — `certReloads`. The reconnect it triggers rebuilds the `ClientConfig` from the fresh
+    /// material.
+    pub fn on_cert_reload(&self) {
+        self.inner.lock().unwrap().conn.cert_reloads.add(1.0);
+    }
+
+    /// Update the `certExpiryDays` gauge (Phase 2b, §4.2): whole days until the adapter's client
+    /// certificate expires (negative ⇒ expired). Set on connect and on each lifecycle re-read.
+    pub fn set_cert_expiry_days(&self, days: i64) {
+        self.inner.lock().unwrap().conn.cert_expiry_days = Some(days as f64);
+    }
+
     /// An established session was lost (poll loop exited / push `Lost`).
     pub fn on_connection_dropped(&self, now: Instant) {
         let mut inner = self.inner.lock().unwrap();
@@ -762,10 +788,15 @@ impl DeviceMetrics {
     /// session is up) plus the `handshakeFailures` counter pair.
     #[must_use]
     pub fn security_view(&self) -> serde_json::Value {
-        let hs = {
+        let (hs, reloads, gauge_expiry_days) = {
             let inner = self.inner.lock().unwrap();
             let p = &inner.conn.tls_handshake_failures;
-            serde_json::json!({ "interval": p.interval, "total": p.total })
+            let r = &inner.conn.cert_reloads;
+            (
+                serde_json::json!({ "interval": p.interval, "total": p.total }),
+                serde_json::json!({ "interval": r.interval, "total": r.total }),
+                inner.conn.cert_expiry_days,
+            )
         };
         let is_tls = crate::eip::tls::SecurityConfig::from_connection(&self.device.connection)
             .ok()
@@ -787,8 +818,22 @@ impl DeviceMetrics {
                     "clientCertNotAfter".into(),
                     serde_json::json!(st.client_cert_not_after),
                 );
+                // Phase 2b: the client cert's serial + days-to-expiry, and the managed trust store's
+                // contents (one entry per sourced CA root, incl. an old+new pair during a rollover).
+                out.insert("clientCertSerial".into(), serde_json::json!(st.client_cert_serial));
+                out.insert(
+                    "clientCertExpiryDays".into(),
+                    serde_json::json!(st.client_cert_expiry_days),
+                );
+                out.insert("trustStore".into(), trust_store_view(&st.trust_anchors));
             }
             out.insert("handshakeFailures".into(), hs);
+            // Phase 2b: rotations picked up without a restart + the current expiry-days gauge.
+            out.insert("certReloads".into(), reloads);
+            if let Some(days) = gauge_expiry_days {
+                out.entry("clientCertExpiryDays".to_string())
+                    .or_insert_with(|| serde_json::json!(days as i64));
+            }
         }
         // Phase 2a: the target's decoded CIP Security posture (both modes), when it was read on
         // connect. `targetSupportsCipSecurity` is present whenever a posture read was attempted (i.e.
@@ -1037,6 +1082,18 @@ impl DeviceMetrics {
     }
 }
 
+/// Render the managed trust store (Phase 2b, DESIGN-cip-security.md §4.2) into the
+/// `sb/status.security.trustStore` JSON: an anchor `count` plus one summary entry per CA root
+/// (`subject` + `notAfter`). A CA rollover shows both the old and new roots while both are live.
+#[must_use]
+fn trust_store_view(anchors: &[crate::device::TrustAnchorSummary]) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = anchors
+        .iter()
+        .map(|a| serde_json::json!({ "subject": a.subject, "notAfter": a.not_after }))
+        .collect();
+    serde_json::json!({ "count": anchors.len(), "anchors": list })
+}
+
 /// Render a target CIP Security posture (Phase 2a, DESIGN-cip-security.md §4.1) into the
 /// `sb/status.security.target` JSON. Arrays are always present (possibly empty); scalar fields are
 /// included only when decoded (a device need not expose every attribute). `pullModel` mirrors the
@@ -1224,7 +1281,8 @@ mod tests {
         ]));
 
         let mut conn = vec![g("sessionConnected", "Count", 1)];
-        for p in ["connectAttempts", "connectFailures", "connectionDrops", "reconnects", "tlsHandshakeFailures"] { conn.extend(cp(p)); }
+        for p in ["connectAttempts", "connectFailures", "connectionDrops", "reconnects", "tlsHandshakeFailures", "certReloads"] { conn.extend(cp(p)); }
+        conn.push(g("certExpiryDays", "Count", 60));
         conn.push(g("connectLatencyMs", "Milliseconds", 60));
         conn.push(g("connectedDurationMs", "Milliseconds", 60));
         expected.push((CONNECTION, vec!["instance", "connectionMode"], conn));
@@ -1697,5 +1755,75 @@ mod tests {
         assert!(v["availableCipherSuites"].is_array());
         assert!(v.get("state").is_none());
         assert!(v.get("certificate").is_none());
+    }
+
+    // --- Phase 2b: trust-store summary + cert expiry/serial + reloads on sb/status.security ---
+
+    fn tls_device() -> DeviceConfig {
+        DeviceConfig::from_value(&json!({
+            "id": "filler-plc-tls",
+            "adapter": "ethernet-ip",
+            "connection": { "endpoint": "10.0.0.60", "security": {
+                "mode": "tls",
+                "client": { "certSecret": "ot/eip", "renewBeforeDays": 30 },
+                "ca": { "trustStore": "ot/trust" }
+            } },
+            "pollGroups": [ { "id": "fast", "signals": [
+                { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" } ] } ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn security_view_renders_trust_store_serial_and_expiry() {
+        use crate::device::{SecurityStatus, TrustAnchorSummary};
+        let sec = SecurityStatus {
+            tls: true,
+            tls_version: Some("1.3".to_string()),
+            cipher_suite: Some("TLS13_AES_128_GCM_SHA256".to_string()),
+            peer_verified: true,
+            peer: Some("10.0.0.60".to_string()),
+            client_cert_not_after: Some("2027-03-01T00:00:00Z".to_string()),
+            client_cert_serial: Some("0A1B2C".to_string()),
+            client_cert_expiry_days: Some(400),
+            trust_anchors: vec![
+                TrustAnchorSummary { subject: Some("CN=Old Root".to_string()), not_after: Some("2026-01-01T00:00:00Z".to_string()) },
+                TrustAnchorSummary { subject: Some("CN=New Root".to_string()), not_after: Some("2030-01-01T00:00:00Z".to_string()) },
+            ],
+            target: None,
+        };
+        let m = dm_with_security(tls_device(), Some(sec));
+        // A rotation was picked up + the expiry gauge set.
+        m.on_cert_reload();
+        m.set_cert_expiry_days(400);
+
+        let v = m.security_view();
+        assert_eq!(v["mode"], "tls");
+        assert_eq!(v["clientCertSerial"], "0A1B2C");
+        assert_eq!(v["clientCertExpiryDays"], 400);
+        assert_eq!(v["trustStore"]["count"], 2, "old + new root");
+        assert_eq!(v["trustStore"]["anchors"][0]["subject"], "CN=Old Root");
+        assert_eq!(v["certReloads"]["total"], 1.0, "one rotation picked up");
+    }
+
+    #[test]
+    fn cert_expiry_days_gauge_emits_on_the_connection_family() {
+        let (svc, m) = dm(tls_device());
+        m.set_cert_expiry_days(-2); // expired
+        m.on_cert_reload();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(m.emit_periodic());
+        let conn = svc.last(CONNECTION).unwrap();
+        assert_eq!(conn["certExpiryDays"], -2.0, "negative gauge = expired");
+        assert_eq!(conn["certReloadsTotal"], 1.0);
+    }
+
+    #[test]
+    fn trust_store_view_empty_is_zero_count() {
+        let v = trust_store_view(&[]);
+        assert_eq!(v["count"], 0);
+        assert!(v["anchors"].as_array().unwrap().is_empty());
     }
 }

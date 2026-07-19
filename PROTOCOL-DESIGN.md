@@ -81,6 +81,14 @@ the shipped generic `Get_Attribute_Single` service (§7.5, §7.7). This is pure 
 transport, no new dependency, always available); the crate reads the *originator's* view of the target
 and never acts as a CIP Security *target* or writes the commissioning objects (that stays a non-goal).
 
+**Cert lifecycle / rotation (Phase 2b) is adapter-side — no crate change.** The vault-native managed
+trust store, the client-cert rotation-without-restart, and cert-expiry monitoring (DESIGN §D-EIP-23,
+DESIGN-cip-security.md §4.2/§4.3) live entirely in the **adapter**: it re-sources the cert/key/CA
+material and rebuilds the opaque `rustls::ClientConfig` it already hands to `connect_tls`. The crate's
+TLS surface (`connect_tls`, `TlsOptions`, `TlsSessionInfo`) is unchanged — it takes a fresh
+`ClientConfig` on the next connect and neither knows nor cares that the material rotated. This keeps the
+isolation contract intact (the crate never reads a vault or a key byte's provenance).
+
 **Non-goals (v1).** UDT/structure *value* decoding (struct tags are detected and reported, not
 decoded); Logix STRING values; CIP Multiple Service Packet batching; **DTLS on the implicit (class-1)
 I/O path** — CIP Security for class-1 needs DTLS, which `rustls` does not provide and which has no OSS

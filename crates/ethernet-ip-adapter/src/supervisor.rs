@@ -126,11 +126,29 @@ impl App {
 
             handles.push(crate::commands::DeviceHandle {
                 cfg: device.clone(),
-                control: control_tx,
+                control: control_tx.clone(),
                 health: Arc::clone(&health),
                 dm: Arc::clone(&dm),
                 events: Arc::clone(&events),
             });
+
+            // CIP Security Phase 2b: a per-instance cert-lifecycle task for a TLS poll device watches
+            // the vault for a rotated client cert / trust store and cert-expiry threshold crossings,
+            // reconnecting so the fresh material takes effect without a restart (§4.2).
+            let tls_poll = !matches!(device.mode, DeviceMode::Push)
+                && crate::eip::tls::SecurityConfig::from_connection(&device.connection)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.is_tls());
+            if tls_poll {
+                tokio::spawn(security_lifecycle(
+                    device.clone(),
+                    self.creds.clone(),
+                    control_tx,
+                    Arc::clone(&events),
+                    Arc::clone(&dm),
+                ));
+            }
 
             tokio::spawn(run_device(
                 device.clone(),
@@ -266,6 +284,11 @@ async fn run_device(
                 // clear any prior handshake-failing state.
                 let security = session.security();
                 health.set_security(security.clone());
+                // Phase 2b: surface the connected cert's days-to-expiry as a gauge immediately, even
+                // before the lifecycle task's first re-read (§4.2).
+                if let Some(days) = security.as_ref().and_then(|s| s.client_cert_expiry_days) {
+                    dm.set_cert_expiry_days(days);
+                }
                 health
                     .tls_handshake_failing
                     .store(false, Ordering::Relaxed);
@@ -395,6 +418,133 @@ async fn run_device(
                     serve_control_disconnected(&mut control, &cfg, &health, &dm, events.as_ref(), wait).await
                 {
                     pending_reconnect = Some(reply);
+                }
+            }
+        }
+    }
+}
+
+/// The CIP Security Phase-2b cert-lifecycle driver (§4.2/§4.3) — the thin live-infra seam over the
+/// pure [`crate::eip::rotation`] logic. On the `reloadIntervalSecs` cadence it re-reads the vault's
+/// current TLS material, and:
+///
+/// * on a **rotation** (the client cert and/or a trust-store CA changed) it bumps `certReloads`, emits
+///   `cert-rotated`, and sends a `reconnect` so the next handshake uses the fresh material (the connect
+///   path always rebuilds the `ClientConfig` from the latest vault contents);
+/// * on the transition into **near-expiry** (`renewBeforeDays`) it emits `cert-expiring`, and into
+///   **expired** it emits `cert-expired`;
+/// * every tick it refreshes the `certExpiryDays` gauge.
+///
+/// It never blocks polling: a vault-read error is logged and the loop continues on the current
+/// material (offline-first). All decisions are made by [`crate::eip::rotation::CertWatcher`]; this
+/// driver only performs the I/O.
+async fn security_lifecycle(
+    cfg: DeviceConfig,
+    creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
+    control: tokio::sync::mpsc::Sender<crate::app::DeviceControl>,
+    events: Arc<dyn EventSink>,
+    dm: Arc<crate::metrics::DeviceMetrics>,
+) {
+    use crate::eip::rotation::{read_reload_state, CertWatcher, WatchAction};
+    use crate::eip::tls::{SecurityConfig, DEFAULT_RELOAD_INTERVAL_SECS, DEFAULT_RENEW_BEFORE_DAYS};
+
+    let Some(sec) = SecurityConfig::from_connection(&cfg.connection)
+        .ok()
+        .flatten()
+        .filter(SecurityConfig::is_tls)
+    else {
+        return;
+    };
+    let interval_secs = sec.reload_interval_secs.unwrap_or(DEFAULT_RELOAD_INTERVAL_SECS);
+    if interval_secs == 0 {
+        // Rotation is then picked up only on a natural reconnect (the connect path rebuilds anyway).
+        return;
+    }
+    let renew_before_days = sec
+        .client
+        .as_ref()
+        .and_then(|c| c.renew_before_days)
+        .map_or(DEFAULT_RENEW_BEFORE_DAYS, i64::from);
+
+    let mut watcher = CertWatcher::default();
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        let now = time::OffsetDateTime::now_utc();
+        let state = match read_reload_state(&sec, creds.as_ref(), now) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(instance = %cfg.id, error = %e, "cert-lifecycle re-read failed (ignored)");
+                continue;
+            }
+        };
+        let outcome = watcher.observe(&state, renew_before_days);
+        if let Some(days) = outcome.expiry_days {
+            dm.set_cert_expiry_days(days);
+        }
+        for action in outcome.actions {
+            match action {
+                WatchAction::Rotated { serial, not_after } => {
+                    dm.on_cert_reload();
+                    events
+                        .emit(
+                            Severity::Info,
+                            "cert-rotated",
+                            Some(format!(
+                                "client certificate / trust store rotated for {} — reconnecting to \
+                                 apply the new material",
+                                cfg.connection.endpoint
+                            )),
+                            Some(json!({
+                                "instance": cfg.id, "security": "tls",
+                                "serial": serial, "notAfter": not_after
+                            })),
+                        )
+                        .await;
+                    // Trigger a graceful reconnect (the reply is not needed here).
+                    let (reply, _rx) = tokio::sync::oneshot::channel();
+                    if control
+                        .send(crate::app::DeviceControl::Reconnect { reply })
+                        .await
+                        .is_err()
+                    {
+                        // The device task ended — nothing left to serve.
+                        return;
+                    }
+                }
+                WatchAction::Expiring { days, not_after } => {
+                    events
+                        .emit(
+                            Severity::Warning,
+                            "cert-expiring",
+                            Some(format!(
+                                "adapter client certificate expires in {days} day(s) — rotate it \
+                                 (e.g. ec-secrets) before it lapses"
+                            )),
+                            Some(json!({
+                                "instance": cfg.id, "security": "tls",
+                                "daysRemaining": days, "notAfter": not_after
+                            })),
+                        )
+                        .await;
+                }
+                WatchAction::Expired { days, not_after } => {
+                    events
+                        .emit(
+                            Severity::Warning,
+                            "cert-expired",
+                            Some(format!(
+                                "adapter client certificate EXPIRED {} day(s) ago — TLS connects will \
+                                 fail until it is rotated",
+                                -days
+                            )),
+                            Some(json!({
+                                "instance": cfg.id, "security": "tls", "notAfter": not_after
+                            })),
+                        )
+                        .await;
                 }
             }
         }

@@ -33,7 +33,7 @@ Grounding artifacts (re-read them, do not work from memory):
 ## Table of contents
 
 1. [Overview & scope](#1-overview--scope)
-2. [Decisions register (D-EIP-1…D-EIP-22)](#2-decisions-register)
+2. [Decisions register (D-EIP-1…D-EIP-23)](#2-decisions-register)
 3. [Module architecture](#3-module-architecture)
 4. [Configuration schema](#4-configuration-schema)
 5. [Signal & data-type model](#5-signal--data-type-model)
@@ -148,6 +148,7 @@ performed, by this work).
 | **D-EIP-20** | **Pause in push mode keeps the I/O connection OPEN**: O→T production continues (heartbeat/outputs, run/idle unchanged), consumed frames still update the last-value snapshot and drive connectivity — but nothing is published to `data`. | Per-instance pause suspends *telemetry production* whichever mode the instance runs (user clarification). Closing the connection would conflate "operator muted the data flow" with "link is down" (same rationale as D-EIP-14), and stopping O→T production would make the *target* time the connection out (PROTOCOL-DESIGN D-ENIP-9). Push needs no keepalive probe: T→O reception itself is the liveness signal. |
 | **D-EIP-21** | **CIP Security Phase 1 — TLS on the explicit (poll) path.** A poll instance's `connection.security` block (`mode: plaintext\|tls`, client identity, CA, `verifyPeer`, `serverName`, `checkExpiration`, `cipherSuites`) wraps the explicit-messaging session in mutual X.509 TLS on TCP 2221 via `enip::connect_tls` (crate `tls` feature). The adapter builds the `rustls::ClientConfig`; the crate stays EdgeCommons-free. Cert/key/CA material is sourced by exactly one style per credential — a vault bundle/secret (`certSecret`/`ca.secret`), files (`certFile`/`keyFile`/`ca.file`), or an inline `{"$secret": …}` content ref (`client.cert`+`key`/`ca.cert`); mixing styles is a startup error. `tls` on a push instance is refused (no DTLS, no silent downgrade). | Poll mode is the security-sensitive path (writes) and TLS-on-TCP maps 1:1 onto the transport-generic session-actor seam (PROTOCOL-DESIGN §11.1). Only GCM + TLS 1.3 suites (`rustls`); CBC-only legacy firmware is a documented interop boundary (typed `NoCipherOverlap`). The three sourcing styles honor the ecosystem `$secret` convention while keeping file/vault/inline unambiguous. DESIGN-cip-security.md §3. |
 | **D-EIP-22** | **CIP Security Phase 2a — security-posture reads (originator).** On connect the adapter reads the target's CIP Security (0x5D), EtherNet/IP Security (0x5E), and Certificate Management (0x5F) objects and surfaces the decoded posture on `sb/status.security.target` (+ `targetSupportsCipSecurity`) and the session's `SecurityStatus`. The `enip` crate carries typed, bounds-checked (`WireReader`) decoders (`cip/security.rs`) over the shipped `get_attribute_single` service — no new transport, no feature gate, fuzzed by `fuzz_security_attrs`. A device implementing none of the objects reports `targetSupportsCipSecurity: false`, never an error. | Reading the target's posture makes Phase-1 TLS *operable* (an operator sees whether the device requires client certs, which suites it allows, its cert state) and is cheap: pure decoding over the existing generic services (the objects are reachable over plaintext or TLS). The typed-refusal pattern (unavailable ≠ error) mirrors `sb/browse`. Validated against the OpENer `CIPSecurity` branch (independent implementation of 0x5D/0x5E/0x5F). DESIGN-cip-security.md §4.1. |
+| **D-EIP-23** | **CIP Security Phase 2b — vault-native managed trust store + client-cert lifecycle / rotation.** `connection.security.ca` gains a **managed trust store**: `trustStore` (a vault secret whose *all retained versions* form the root set — CA-rollover grace) and `list` (several inline `{"$secret": …}` roots), alongside the Phase-1 single-CA styles. A per-instance cert-lifecycle task re-reads the vault every `reloadIntervalSecs` (default 300): on a **rotation** (the client cert and/or a trust-store CA changed) it bumps `certReloads`, emits `cert-rotated`, and reconnects so the next handshake presents the fresh material (the connect path always rebuilds the `ClientConfig` from the current vault) — **no restart**; on the transition into near-expiry (`client.renewBeforeDays`, default 30) it emits `cert-expiring`, into expired `cert-expired`; and it keeps the `certExpiryDays` gauge current. An already-expired client cert is refused at connect (a loud, typed permanent failure) when `checkExpiration` is on. `sb/status.security` gains `trustStore` (anchor summaries), `clientCertSerial`, `clientCertExpiryDays`, and `certReloads`. | Trust and cert lifecycle is what makes hand-provisioned Phase-1 TLS *operable in a real plant PKI*: a CA rollover needs the old+new roots to overlap (the vault's version grace), and a rotated originator cert must take effect without bouncing the component. The pure decisions (rotation detection, expiry thresholds) live in `eip/rotation.rs` and are unit-tested; the driver is the supervisor. Validated end-to-end over the stunnel/cpppo TLS peer (rotate the vault → next `connect_tls` presents the new serial; a ~20-day cert fires `cert-expiring`). EST enrollment (Phase 2c) remains deferred. DESIGN-cip-security.md §4.2/§4.3. |
 
 ---
 
@@ -405,7 +406,7 @@ token override rides the canonical top-level config (`component.token`), not thi
 | `connection.endpoint` | string, required | `"<host>"` or `"<host>:<port>"` (default port 44818, or 2221 when `security.mode: tls`). Published as `device.endpoint`. |
 | `connection.slot` | int 0–255, optional | ControlLogix CPU slot ⇒ backplane routing path (`1,<slot>`, `RoutePath::backplane_slot`). Absent ⇒ no routing — correct for cpppo/CompactLogix-direct/OpENer. Applies to both modes (explicit requests and the I/O connection path). |
 | `connection.connected` | bool, **false** | Poll mode only: `true` ⇒ class-3 connected messaging (ForwardOpen); `false` ⇒ unconnected (D-EIP-8). Ignored (warned) for push. |
-| `connection.security` | object, optional (typed island) | CIP Security TLS (D-EIP-21): `mode` (`plaintext`\|`tls`), `client.{certSecret\|certFile+keyFile}`, `ca.{secret\|file}`, `verifyPeer`, `serverName`, `checkExpiration`, `cipherSuites`. Poll-only — `tls` on a push instance is a startup error. Parsed strictly (`deny_unknown_fields`) though it rides in the open `connection` object. Material sourced from `gg.credentials()` or files at connect time; keys never enter the logged snapshot. |
+| `connection.security` | object, optional (typed island) | CIP Security TLS (D-EIP-21): `mode` (`plaintext`\|`tls`), `client.{certSecret\|certFile+keyFile\|cert+key}`, `ca.{secret\|file\|cert\|trustStore\|list}`, `verifyPeer`, `serverName`, `checkExpiration`, `cipherSuites`. **Phase 2b (D-EIP-23):** the CA styles `trustStore` (a vault bundle whose all retained versions form the root set — CA-rollover grace) and `list` (several inline `{"$secret": …}` roots) build a **managed trust store**; `client.renewBeforeDays` (default 30) is the `cert-expiring` threshold; `reloadIntervalSecs` (default 300, `0` disables) is the vault re-read cadence that picks up a rotated cert / trust store without a restart. Poll-only — `tls` on a push instance is a startup error. Parsed strictly (`deny_unknown_fields`) though it rides in the open `connection` object. Material sourced from `gg.credentials()` or files at connect time; keys never enter the logged snapshot. |
 | `connection.*` | open (`additionalProperties: true`) | The one deliberately open object (template rule kept). |
 | `defaults.{pollIntervalMs,publishMode,batchMs}` | as §4.1 | Per-device overrides (`pollIntervalMs` poll-only). |
 | `pollGroups[]` | array, min 1 — required iff `mode: "poll"` | See §4.3. |
@@ -700,6 +701,11 @@ Via the `events()` facade only (verified signatures: `emit`, `raise_alarm`, `cle
 | `adapter-paused` | emit, Warning | `sb/pause` took effect | `{instance, by: <requester identity path if present>}` |
 | `adapter-resumed` | emit, Info | `sb/resume` took effect | `{instance}` |
 | `write-audit` | emit, Info (success) / Warning (failure or refusal) | every `sb/write` entry, INCLUDING allow-list refusals | `{instance, signalId, ok, value, error?}` |
+| `tls-handshake-failed` | emit, Warning | a `mode: tls` connect handshake failed (bad cert / no cipher overlap / protocol mismatch), fired on the transition into failing (D-EIP-21) | `{instance, security: "tls"}` |
+| `tls-peer-unverified` | emit, Warning | a TLS session connected with `verifyPeer: false` (device cert not verified) | `{instance}` |
+| `cert-rotated` | emit, Info | Phase 2b (D-EIP-23): the vault's client cert / trust store changed and the adapter reconnected to apply it | `{instance, security: "tls", serial, notAfter}` |
+| `cert-expiring` | emit, Warning | Phase 2b: the client cert is within `renewBeforeDays` of `notAfter` (fired once on the transition) | `{instance, security: "tls", daysRemaining, notAfter}` |
+| `cert-expired` | emit, Warning | Phase 2b: the client cert has expired (fired once) | `{instance, security: "tls", notAfter}` |
 
 Raise/clear ride the same severity so they share one channel (facade rule, template behavior
 kept).
@@ -744,6 +750,15 @@ the posture column unconditionally. A TLS instance reports the negotiated facts:
 "handshakeFailures": { "interval": 0, "total": 0 } }`. The `state` keepalive carries the same posture
 as `attributes.security` (`"tls"`|`"plaintext"`), and `EtherNetIpConnection.tlsHandshakeFailures`
 (§8.2) counts handshake failures.
+
+**Managed trust store + cert lifecycle (Phase 2b, D-EIP-23).** A TLS instance additionally carries the
+adapter's own client-cert lifecycle facts and the managed trust store:
+`"clientCertSerial": "0A1B2C", "clientCertExpiryDays": 400,
+"trustStore": { "count": 2, "anchors": [ { "subject": "CN=Plant Root CA", "notAfter": "…" }, … ] },
+"certReloads": { "interval": 0, "total": 1 } }`. `trustStore.count` is the number of trust anchors
+sourced (a CA rollover shows both the old and new roots while both are live); `certReloads` counts
+rotations picked up from the vault without a restart; `clientCertExpiryDays` mirrors the
+`EtherNetIpConnection.certExpiryDays` gauge (§8.2).
 
 **Target posture (Phase 2a, D-EIP-22).** Whenever a session is up (either mode), `security` also
 carries `targetSupportsCipSecurity` (bool) and, when the device implements the CIP Security objects, a
@@ -933,6 +948,8 @@ Dimensions: `instance`, `connectionMode`.
 | `connectionDropsTotal` / `connectionDropsInterval` | Count | 60 (established session lost) |
 | `reconnectsTotal` / `reconnectsInterval` | Count | 60 (successful re-establishments) |
 | `tlsHandshakeFailuresTotal` / `tlsHandshakeFailuresInterval` | Count | 60 (TLS handshake failures on a `security.mode: tls` connection — bad cert / no cipher overlap / protocol mismatch; D-EIP-21) |
+| `certReloadsTotal` / `certReloadsInterval` | Count | 60 (client-cert / trust-store rotations picked up from the vault without a restart; Phase 2b, D-EIP-23) |
+| `certExpiryDays` | Count | 60 (gauge: whole days until the adapter's client certificate expires; negative ⇒ expired; Phase 2b) |
 | `connectLatencyMs` | Milliseconds | 60 (last successful connect duration; includes the TLS handshake for a TLS connection) |
 | `connectedDurationMs` | Milliseconds | 60 (connected time accrued this interval — Modbus semantics) |
 
@@ -1158,6 +1175,17 @@ is stalled (Dec 2023) and its Certificate Management object depends on the separ
 project; the Dockerfile carries the vendoring/link/init patches to stand it up (never patching `enip`),
 per the ab_server precedent. Real-device posture semantics (a commissioned Vol 8 PLC's populated suite
 lists / `Configured` state) remain the declared lab-hardware gap (§14.6).
+
+**CIP Security Phase-2b validation (managed trust store + cert rotation).** The pure lifecycle logic —
+managed trust-store building from multiple/multi-version CAs, the client-cert expiry parse + threshold,
+the rotation-detection fingerprint, and the connect-time refuse-on-expired — is unit-tested in
+`eip/tls.rs` + `eip/rotation.rs`. The **rotation is proven end-to-end over the same stunnel/cpppo TLS
+peer** by two self-skipping (`:2221` probe) tests in `eip/tls.rs`: `live_client_cert_rotation_…`
+connects over TLS with the originator cert, rotates the vault to a fresh cert (signed by the same CA —
+the `ec-secrets` shape), confirms the lifecycle watcher reports the rotation, and asserts the next
+`connect_tls` presents the **new serial** (accepted by the `verify=2` peer); `live_near_expiry_cert_…`
+proves a ~20-day cert fires `cert-expiring` at the 30-day threshold. Certified-Vol-8-device rotation
+semantics remain the declared lab-hardware gap (§14.6). EST enrollment (Phase 2c) is not built.
 
 **Browse-gap status: CLOSED (sim-grade).** The tag-list service (Get Instance Attribute List `0x55`
 on the Symbol class `0x6B`) — which cpppo and ab_server both refuse — is served by EthernetIPSharp,
@@ -1611,9 +1639,16 @@ language) in the user-facing docs where relevant.
    (`WireReader`) decoders for these objects over the shipped `get_attribute_single` service (no new
    transport, no feature gate). A device that implements none of them reports
    `targetSupportsCipSecurity: false`, never an error (the generic-CIP-device path, validated against
-   cpppo and the OpENer `CIPSecurity` branch). **Roadmap (Phase 2b/2c, not built):** vault-native
-   trust/cert rotation; EST enrollment of the adapter's own certificate (D-EIP-23); and DTLS on the
-   implicit path. See DESIGN-cip-security.md §4/§6 for the phase gates.
+   cpppo and the OpENer `CIPSecurity` branch). **Phase 2b (vault-native managed trust store + client-cert
+   lifecycle/rotation) shipped (D-EIP-23):** the `ca.trustStore`/`ca.list` styles build a managed trust
+   store (CA-rollover grace via the vault's version window), and a per-instance cert-lifecycle task
+   picks up a rotated client cert / trust store from the vault and reconnects so it takes effect without
+   a restart, monitors client-cert expiry (`certExpiryDays` gauge; `cert-expiring`/`cert-expired`
+   events; refuse-connect on an expired cert), and reflects it all on `sb/status.security`
+   (`trustStore`, `clientCertSerial`, `clientCertExpiryDays`, `certReloads`). Validated end-to-end over
+   the stunnel/cpppo TLS peer (rotate the vault → next connect presents the new serial; a near-expiry
+   cert fires the event). **Roadmap (Phase 2c, not built):** EST enrollment of the adapter's own
+   certificate; and DTLS on the implicit path. See DESIGN-cip-security.md §4/§6 for the phase gates.
 6. **Lab-hardware-only validation paths, declared:** the `slot`/backplane routing path,
    connected class-3 messaging, **multicast T→O consume**, push against a real PLC/remote-I/O
    device, and **CIP Security against a certified Vol 8 device** (port policy with 44818 closed,
