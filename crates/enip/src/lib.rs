@@ -72,6 +72,13 @@ pub mod client;
 
 pub mod discovery;
 
+// The shared fuzz/decode-exercise harness (§12.3): one panic-free entry per hostile decode surface,
+// the single source of truth driven by both the `crates/enip/fuzz` libFuzzer targets and the
+// cross-platform `tests/fuzz_corpus.rs` regression sweep. `#[doc(hidden)]` — internal test scaffolding,
+// not part of the consumed API surface.
+#[doc(hidden)]
+pub mod harness;
+
 // ---- P1 public re-exports (the surface `DESIGN.md` §3.3 consumes from this slice) ----
 
 pub use error::{EnipError, Result, WireError};
@@ -107,7 +114,7 @@ pub use cm::{
     TRANSPORT_CLASS1_TRIGGER,
 };
 
-pub use logix::{Scope, SymbolInfo, SymbolType, TagReadResult};
+pub use logix::{parse_tag_list, Scope, SymbolInfo, SymbolType, TagReadResult};
 
 // ---- P3 public re-exports: class-1 implicit I/O + assembly mapping (§8–§9, §11.2) ----
 

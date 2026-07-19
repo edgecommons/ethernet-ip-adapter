@@ -1,0 +1,103 @@
+# cargo-fuzz / libFuzzer harness for the owned EtherNet/IP + CIP protocol crate (PROTOCOL-DESIGN
+# §12.3). One `[[bin]]` per hostile decode surface; each target is a three-line shim delegating to
+# `enip::harness::<surface>` so the fuzz body and the cross-platform `tests/fuzz_corpus.rs` regression
+# run the identical code (a decoder can never be fuzzed by one and skipped by the other).
+#
+# This is a SEPARATE workspace (the empty `[workspace]` table below): cargo-fuzz builds it with a
+# nightly toolchain + sanitizers on Linux/WSL, and it is excluded from the crate's normal
+# build/test/coverage (DESIGN.md §12.2 — `fuzz/` is not product code, it exercises product code).
+[package]
+name = "ec-enip-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.ec-enip]
+path = ".."
+
+# libFuzzer targets are release-optimized with debug assertions on (catch overflow/asserts) and
+# overflow checks on (arithmetic invariants are part of the no-panic claim, §4 invariant 2).
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+# Each target: no test/doc/bench harness — they are libFuzzer entry points only.
+[[bin]]
+name = "fuzz_encap_frame"
+path = "fuzz_targets/fuzz_encap_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cpf"
+path = "fuzz_targets/fuzz_cpf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_message_reply"
+path = "fuzz_targets/fuzz_message_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cip_value"
+path = "fuzz_targets/fuzz_cip_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_forward_open_reply"
+path = "fuzz_targets/fuzz_forward_open_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tag_list"
+path = "fuzz_targets/fuzz_tag_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_io_frame"
+path = "fuzz_targets/fuzz_io_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_assembly_decode"
+path = "fuzz_targets/fuzz_assembly_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tag_path"
+path = "fuzz_targets/fuzz_tag_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_discovery"
+path = "fuzz_targets/fuzz_discovery.rs"
+test = false
+doc = false
+bench = false

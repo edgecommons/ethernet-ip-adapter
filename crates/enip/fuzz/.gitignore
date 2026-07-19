@@ -1,0 +1,5 @@
+# cargo-fuzz build output and crash artifacts — never source. The SEED corpus under `corpus/` IS
+# checked in (it is part of the §12.3 deliverable), so it is deliberately NOT ignored here.
+target/
+artifacts/
+Cargo.lock

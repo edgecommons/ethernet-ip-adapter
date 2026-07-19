@@ -145,6 +145,22 @@ impl SymbolInfo {
     }
 }
 
+/// Decode one page of Get-Instance-Attribute-List (`0x55`) records from the reply service data
+/// (§7.3): a back-to-back stream of `{ u32 instance_id, u16 name_length, name bytes (checked UTF-8),
+/// u16 symbol_type }`. Every field is read through the checked cursor — a name-length lie, a bad
+/// UTF-8 name, or a truncated record is a typed [`WireError`], never a panic (the `fuzz_tag_list`
+/// hostile surface, §12.3). A record that fails mid-stream fails the whole page rather than yielding
+/// a silent partial. Paging policy (deriving the next start instance) stays with the caller in
+/// [`EipClient::list_tags`].
+pub fn parse_tag_list(data: &[u8]) -> core::result::Result<Vec<SymbolInfo>, WireError> {
+    let mut r = WireReader::with_context(data, CONTEXT);
+    let mut records = Vec::new();
+    while r.remaining() > 0 {
+        records.push(SymbolInfo::decode(&mut r)?);
+    }
+    Ok(records)
+}
+
 /// The scope a tag enumeration runs in (§7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -359,12 +375,7 @@ impl EipClient {
             return Err(EnipError::Cip(reply.status));
         }
 
-        let mut r = WireReader::with_context(&reply.data, CONTEXT);
-        let mut records = Vec::new();
-        while r.remaining() > 0 {
-            // A record that fails to decode fails the whole page (never a silent partial, §7.3).
-            records.push(SymbolInfo::decode(&mut r)?);
-        }
+        let records = parse_tag_list(&reply.data)?;
 
         let next = if more {
             records

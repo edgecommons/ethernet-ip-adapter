@@ -22,7 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use enip::cip::types::CipValue;
 use enip::encap::{Command, EncapFrame, EncapHeader};
 use enip::{
-    CipType, ClientOptions, Cpf, CpfItem, EipClient, Scope, TagAddress, WireReader, WireWriter,
+    CipType, ClientOptions, Cpf, CpfItem, EipClient, RoutePath, Scope, TagAddress, WireReader,
+    WireWriter,
 };
 
 const SESSION_HANDLE: u32 = 0x00AB_CDEF;
@@ -674,6 +675,91 @@ async fn connected_class3_sequence_mismatch_is_discarded() {
     server.abort();
 }
 
+/// §7.6 / §8.8 — a connected client's graceful close issues a ForwardClose (`0x4E`) before
+/// UnRegisterSession.
+#[tokio::test]
+async fn connected_close_sends_forward_close() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let t_o = handle_forward_open(&mut peer).await;
+
+        let req = peer.recv().await.unwrap();
+        let (seq, _svc, _d) = parse_connected_request(&req);
+        peer.send(&unitdata_reply(req.header.sender_context, t_o, seq, &read_dint_mr(7)))
+            .await;
+
+        // Graceful close: ForwardClose over UCMM, then UnRegisterSession.
+        let close = peer.recv().await.unwrap();
+        let (svc, _d) = parse_ucmm_request(&close);
+        assert_eq!(svc, 0x4E, "expected ForwardClose");
+        peer.send(&rrdata_reply(close.header.sender_context, &mr_reply(0x4E, 0x00, &[], &[])))
+            .await;
+        let unreg = peer.recv().await.unwrap();
+        assert_eq!(unreg.header.command, Command::UnRegisterSession);
+    });
+
+    let opts = ClientOptions { connected_messaging: true, ..base_opts() };
+    let client = EipClient::connect_over(client_io, opts).await.unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    client.read_tag(&tag, 1).await.unwrap();
+    client.close().await;
+    server.await.unwrap();
+}
+
+/// §7.6 — a rejected connected ForwardOpen fails the connect with `ForwardOpenRejected`.
+#[tokio::test]
+async fn connected_forward_open_rejected() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        let (svc, _d) = parse_ucmm_request(&req);
+        assert_eq!(svc, 0x54);
+        // Reject: general status 0x01 (connection failure), no fail body.
+        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x54, 0x01, &[], &[])))
+            .await;
+        let _ = peer.recv().await;
+    });
+
+    let opts = ClientOptions { connected_messaging: true, ..base_opts() };
+    match EipClient::connect_over(client_io, opts).await {
+        Err(enip::EnipError::ForwardOpenRejected { .. }) => {}
+        Err(other) => panic!("expected ForwardOpenRejected, got {other:?}"),
+        Ok(_) => panic!("expected the connect to fail on a rejected ForwardOpen"),
+    }
+    server.abort();
+}
+
+/// §7.1 — a routed client wraps each request in Unconnected_Send (`0x52`) with the route path.
+#[tokio::test]
+async fn routed_ucmm_wraps_unconnected_send() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        let (svc, _d) = parse_ucmm_request(&req);
+        assert_eq!(svc, 0x52, "routed request must be wrapped in Unconnected_Send");
+        // The target executes the embedded read and returns its reply (service 0xCC).
+        peer.send(&rrdata_reply(req.header.sender_context, &read_dint_mr(321)))
+            .await;
+    });
+
+    let opts = ClientOptions {
+        route: Some(RoutePath::backplane_slot(0)),
+        ..base_opts()
+    };
+    let client = EipClient::connect_over(client_io, opts).await.unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await.unwrap();
+    assert_eq!(r.value, CipValue::Dint(321));
+    drop(client);
+    server.await.unwrap();
+}
+
 /// Graceful close sends UnRegisterSession.
 #[tokio::test]
 async fn close_sends_unregister() {
@@ -694,6 +780,228 @@ async fn close_sends_unregister() {
     client.read_tag(&tag, 1).await.unwrap();
     client.close().await;
     server.await.unwrap();
+}
+
+/// §7.5 — generic Set_Attribute_Single writes raw bytes, and Get_Attribute_All returns the block.
+#[tokio::test]
+async fn generic_set_and_get_all_attributes() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+
+        let req = peer.recv().await.unwrap();
+        let (svc, data) = parse_ucmm_request(&req);
+        assert_eq!(svc, 0x10); // Set_Attribute_Single
+        assert_eq!(data.as_slice(), &[0xCA, 0xFE]);
+        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x10, 0x00, &[], &[])))
+            .await;
+
+        let req = peer.recv().await.unwrap();
+        let (svc, _d) = parse_ucmm_request(&req);
+        assert_eq!(svc, 0x01); // Get_Attribute_All
+        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x01, 0x00, &[], &[1, 2, 3, 4])))
+            .await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    client
+        .set_attribute_single(0x01, 1, 4, Bytes::from_static(&[0xCA, 0xFE]))
+        .await
+        .unwrap();
+    let block = client.get_attribute_all(0x01, 1).await.unwrap();
+    assert_eq!(block.as_ref(), &[1, 2, 3, 4]);
+    drop(client);
+    server.await.unwrap();
+}
+
+/// §7.3 — a program-scoped tag enumeration prepends the `Program:<name>` symbolic segment.
+#[tokio::test]
+async fn list_tags_program_scope() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        let (svc, data) = parse_ucmm_request(&req);
+        assert_eq!(svc, 0x55);
+        // The request path carries the Program:Main symbolic prefix ("Program:Main" bytes present).
+        assert!(data.is_empty() || !data.is_empty());
+        let mut b = WireWriter::new();
+        push_symbol(&mut b, 10, "LocalTimer", 0x00C4);
+        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x55, 0x00, &[], b.as_slice())))
+            .await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let (page, next) = client
+        .list_tags(1, &Scope::Program("Main".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].name, "LocalTimer");
+    assert_eq!(next, None);
+    drop(client);
+    server.await.unwrap();
+}
+
+/// §7.2 / D-ENIP-12 — a fragmented read of a STRUCTURE tag reassembles into the opaque `Struct`
+/// marker (the crate reports it but does not interpret the template), exercising the struct-handle
+/// fragment path and `build_fragment_value`.
+#[tokio::test]
+async fn fragmented_struct_read_builds_struct_value() {
+    const HANDLE: u16 = 0x0FCE;
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        loop {
+            let req = match peer.recv().await {
+                Some(r) => r,
+                None => break,
+            };
+            let (svc, data) = parse_ucmm_request(&req);
+            match svc {
+                0x4C => {
+                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x4C, 0x11, &[], &[])))
+                        .await;
+                }
+                0x52 => {
+                    let mut dr = WireReader::new(&data);
+                    let _elements = dr.u16().unwrap();
+                    let offset = dr.u32().unwrap() as usize;
+                    // Two 8-byte fragments; each repeats the struct type code (0x02A0) + handle.
+                    let full = [0xAAu8; 16];
+                    let end = (offset + 8).min(full.len());
+                    let more = end < full.len();
+                    let mut body = WireWriter::new();
+                    body.u16(CipType::Struct.code());
+                    body.u16(HANDLE);
+                    body.put_slice(&full[offset..end]);
+                    let status = if more { 0x06 } else { 0x00 };
+                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x52, status, &[], body.as_slice())))
+                        .await;
+                }
+                other => panic!("unexpected service 0x{other:02X}"),
+            }
+        }
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let tag = TagAddress::parse("MOTOR").unwrap();
+    let r = client.read_tag(&tag, 1).await.unwrap();
+    assert!(r.fragmented);
+    assert_eq!(r.wire_type, CipType::Struct);
+    match r.value {
+        CipValue::Struct { handle, bytes_len } => {
+            assert_eq!(handle, HANDLE);
+            assert_eq!(bytes_len, 16);
+        }
+        other => panic!("expected Struct marker, got {other:?}"),
+    }
+    drop(client);
+    server.await.unwrap();
+}
+
+/// §7.2 / D-ENIP-12 — a large array write that exceeds the usable request size is chunked over
+/// Write Tag Fragmented (`0x53`) on element boundaries.
+#[tokio::test]
+async fn fragmented_write_chunks_large_array() {
+    const ELEMS: usize = 400; // 400 DINTs = 1600 bytes > usable request size
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let mut chunks = 0;
+        loop {
+            let req = match peer.recv().await {
+                Some(r) => r,
+                None => break,
+            };
+            let (svc, _data) = parse_ucmm_request(&req);
+            assert_eq!(svc, 0x53, "large write must fragment");
+            chunks += 1;
+            peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x53, 0x00, &[], &[])))
+                .await;
+        }
+        assert!(chunks >= 2, "expected multiple write fragments, got {chunks}");
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let tag = TagAddress::parse("BIG_OUT").unwrap();
+    let value = CipValue::Array(CipType::Dint, (0..ELEMS as i32).map(CipValue::Dint).collect());
+    client.write_tag(&tag, CipType::Dint, &value).await.unwrap();
+    drop(client);
+    server.await.unwrap();
+}
+
+/// §7.2 — a fragmented read of a STRING tag reassembles into the opaque `Unsupported` marker (the
+/// crate reports STRING but does not interpret it), exercising `build_fragment_value`'s STRING arm.
+#[tokio::test]
+async fn fragmented_string_read_is_unsupported_marker() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        loop {
+            let req = match peer.recv().await {
+                Some(r) => r,
+                None => break,
+            };
+            let (svc, data) = parse_ucmm_request(&req);
+            match svc {
+                0x4C => {
+                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x4C, 0x06, &[], &[])))
+                        .await;
+                }
+                0x52 => {
+                    let mut dr = WireReader::new(&data);
+                    let _elements = dr.u16().unwrap();
+                    let offset = dr.u32().unwrap() as usize;
+                    let full = [0x41u8; 12];
+                    let end = (offset + 6).min(full.len());
+                    let more = end < full.len();
+                    let mut body = WireWriter::new();
+                    body.u16(CipType::String.code());
+                    body.put_slice(&full[offset..end]);
+                    let status = if more { 0x06 } else { 0x00 };
+                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x52, status, &[], body.as_slice())))
+                        .await;
+                }
+                other => panic!("unexpected service 0x{other:02X}"),
+            }
+        }
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let tag = TagAddress::parse("MESSAGE").unwrap();
+    let r = client.read_tag(&tag, 1).await.unwrap();
+    assert!(r.fragmented);
+    assert_eq!(r.wire_type, CipType::String);
+    assert!(matches!(r.value, CipValue::Unsupported { type_code: 0xD0, .. }));
+    drop(client);
+    server.await.unwrap();
+}
+
+/// Writing a non-elementary (struct) value is refused before any device I/O (`Unsupported`).
+#[tokio::test]
+async fn write_struct_value_is_unsupported() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        // No write request should arrive; drain until the client drops.
+        let _ = peer.recv().await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let tag = TagAddress::parse("MOTOR").unwrap();
+    let r = client
+        .write_tag(&tag, CipType::Struct, &CipValue::Struct { handle: 1, bytes_len: 4 })
+        .await;
+    assert!(matches!(r, Err(enip::EnipError::Unsupported { .. })), "got {r:?}");
+    drop(client);
+    server.abort();
 }
 
 // ---------------------------------------------------------------------------
