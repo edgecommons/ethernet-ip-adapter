@@ -174,6 +174,11 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
   cert / trust-store rotations picked up from the vault without a restart. The `state` keepalive carries
   the same posture as `attributes.security` (`"tls"`|`"plaintext"`).
 
+  When automatic enrollment is enabled, `security` also carries an **`est`** object with the EST
+  lifecycle state: `{ enabled, server, lastEnroll, nextRenew, lastError, enrollments, failures }`.
+  `nextRenew` is the certificate's `notAfter` minus the renew window; `enrollments` / `failures` count
+  successful and failed enrollment attempts.
+
   While a session is up, `security` also carries **`targetSupportsCipSecurity`** (boolean) and, when
   the device implements the CIP Security objects, a **`target`** object with the device's decoded
   posture: `{ state, profiles: [...], allowedCipherSuites: [...], availableCipherSuites: [...],

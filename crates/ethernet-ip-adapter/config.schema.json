@@ -160,6 +160,49 @@
           "minimum": 0,
           "default": 300,
           "description": "How often (seconds) to re-read the vault for a rotated client certificate / trust store and cert-expiry threshold crossings (CIP Security Phase 2b). A detected rotation reconnects so the fresh material takes effect without a restart. Default 300; `0` disables the lifecycle task (material is then re-read only on a natural reconnect)."
+        },
+        "est": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Automatic certificate enrollment/renewal via EST (Enrollment over Secure Transport, RFC 7030), CIP Security Phase 2c. OFF unless `enabled`. The adapter enrolls/renews its own client certificate from a plant EST server and writes it back into the vault, where the reload watcher picks it up.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false, "description": "Enable automatic EST enrollment/renewal for this instance. Default false (severable)." },
+            "server": { "type": "string", "minLength": 1, "description": "The EST server base URL, e.g. `https://est.plant.example:8443/.well-known/est`. Must be `https://`. Required when `enabled`." },
+            "label": { "type": "string", "minLength": 1, "description": "Optional EST label path segment, inserted before the operation (`.../est/<label>/simpleenroll`)." },
+            "trust": { "$ref": "#/$defs/security/properties/ca", "description": "Trust anchors for verifying the EST server's TLS certificate (a `ca`-style block). Defaults to the connection's `ca`." },
+            "auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "How the adapter authenticates to the EST server. Use `bootstrap` (a client identity for the initial enroll) OR `basic` (HTTP Basic), or neither (reuse the current client certificate for a mutual-TLS renewal).",
+              "properties": {
+                "bootstrap": { "$ref": "#/$defs/security/properties/client", "description": "A bootstrap client identity for the initial enrollment (sourced like `security.client`)." },
+                "basic": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["$secret"],
+                  "description": "HTTP Basic credentials — an inline reference to a vault `{username, password}` secret.",
+                  "properties": {
+                    "$secret": { "type": "string", "minLength": 1 },
+                    "field": { "type": "string", "minLength": 1 }
+                  }
+                }
+              }
+            },
+            "into": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Where the enrolled material is written back into the vault. Use `certSecret` (a `{certPem, keyPem}` bundle secret) OR `cert`+`key` (a secret pair). Defaults to the `security.client` secret(s), so the reload watcher reloads it.",
+              "properties": {
+                "certSecret": { "type": "string", "minLength": 1 },
+                "cert": { "type": "string", "minLength": 1 },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            },
+            "subject": { "type": "string", "minLength": 1, "default": "eip-originator", "description": "The CSR subject CommonName. Default `eip-originator`." },
+            "renewBeforeDays": { "type": "integer", "minimum": 0, "description": "Renew the certificate this many days before its `notAfter`. Default = `client.renewBeforeDays` or 30." },
+            "retryBackoffMins": { "type": "integer", "minimum": 0, "default": 60, "description": "Minimum minutes between failed enrollment attempts. Default 60." },
+            "fetchCaCerts": { "type": "boolean", "default": false, "description": "Fetch the EST server's CA bag (`GET /cacerts`) before enrolling, to confirm trust. Default false." }
+          }
         }
       }
     },

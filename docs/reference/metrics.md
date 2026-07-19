@@ -58,6 +58,8 @@ Connection lifecycle and liveness. Dimensions: `instance`, `connectionMode`.
 | `tlsHandshakeFailures` | Count | counter | TLS handshake failures on a `security.mode: tls` connection (bad certificate, no cipher overlap, protocol mismatch). |
 | `certReloads` | Count | counter | Client-certificate / trust-store rotations picked up from the vault without a restart (`security.mode: tls`). |
 | `certExpiryDays` | Count | gauge | Whole days until the adapter's client certificate expires (negative when expired). |
+| `estEnrollments` | Count | counter | Successful EST certificate enrollments/renewals (`security.est.enabled`). |
+| `estFailures` | Count | counter | Failed EST enrollment attempts (`security.est.enabled`). |
 | `connectLatencyMs` | Milliseconds | gauge | Connect latency (includes the TLS handshake for a TLS connection). |
 | `connectedDurationMs` | Milliseconds | gauge | Time spent connected since the previous emission. |
 

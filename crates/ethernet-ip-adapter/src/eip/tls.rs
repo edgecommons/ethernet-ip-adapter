@@ -61,6 +61,12 @@ pub struct SecurityConfig {
     /// then only re-read on a natural reconnect). Ignored for a non-vault (file-only) deployment.
     #[serde(default)]
     pub reload_interval_secs: Option<u64>,
+    /// Automatic certificate enrollment/renewal via EST (RFC 7030), CIP Security Phase 2c
+    /// (DESIGN-cip-security.md §4.3, D-EIP-24). OFF by default; when `est.enabled` the per-instance
+    /// lifecycle task enrolls/renews the adapter's own client certificate from a plant EST server and
+    /// writes it back into the vault (Phase 2b then reloads it). Absent ⇒ no EST.
+    #[serde(default)]
+    pub est: Option<super::est::EstConfig>,
 }
 
 /// The default cert-lifecycle re-read cadence (seconds) when `reloadIntervalSecs` is unset.
@@ -180,6 +186,14 @@ impl ClientIdentity {
     fn has_inline(&self) -> bool {
         self.cert.is_some() || self.key.is_some()
     }
+    /// Whether the identity is a complete, usable sourcing of exactly one style (bundle, both files,
+    /// or both inline refs). Used by the EST bootstrap-identity validation (Phase 2c).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.has_bundle()
+            || (self.cert_file.is_some() && self.key_file.is_some())
+            || (self.cert.is_some() && self.key.is_some())
+    }
 }
 
 /// The trust anchors for verifying the device certificate — a **managed trust store** (Phase 2b,
@@ -274,6 +288,29 @@ impl SecurityConfig {
         self.mode == SecurityMode::Tls
     }
 
+    /// A minimal `tls`-mode config carrying only a client identity — used to reuse
+    /// [`source_client_material`] for the EST bootstrap identity (Phase 2c). No CA/verify policy.
+    #[must_use]
+    pub fn with_client(client: ClientIdentity) -> Self {
+        Self {
+            mode: SecurityMode::Tls,
+            client: Some(client),
+            ca: None,
+            verify_peer: true,
+            server_name: None,
+            check_expiration: true,
+            cipher_suites: None,
+            reload_interval_secs: None,
+            est: None,
+        }
+    }
+
+    /// The EST config, if present and enabled (Phase 2c).
+    #[must_use]
+    pub fn est_enabled(&self) -> Option<&super::est::EstConfig> {
+        self.est.as_ref().filter(|e| e.enabled)
+    }
+
     /// Fail-fast startup validation (DESIGN-cip-security.md §3.3): TLS is refused on a push instance,
     /// requires a client identity, and (with `verifyPeer`) a CA source.
     ///
@@ -355,6 +392,10 @@ impl SecurityConfig {
                 ));
             }
         }
+        // CIP Security Phase 2c: validate the EST block (a no-op unless `est.enabled`).
+        if let Some(est) = &self.est {
+            est.validate(device_id, self)?;
+        }
         Ok(())
     }
 }
@@ -373,7 +414,7 @@ pub(super) fn certs_from_pem(pem: &str, what: &str) -> std::result::Result<Vec<C
 }
 
 /// Parse the first private key out of a PEM blob (PKCS#8 / RSA / SEC1).
-fn key_from_pem(pem: &str) -> std::result::Result<PrivateKeyDer<'static>, String> {
+pub(super) fn key_from_pem(pem: &str) -> std::result::Result<PrivateKeyDer<'static>, String> {
     let mut rd = std::io::Cursor::new(pem.as_bytes());
     rustls_pemfile::private_key(&mut rd)
         .map_err(|e| format!("parsing private key PEM: {e}"))?

@@ -324,6 +324,43 @@ subject/`notAfter`), and the `certExpiryDays` metric is a gauge of the days rema
 
 ---
 
+## Enroll and renew certificates automatically with EST
+
+The adapter obtains and renews its own client certificate from an EST server (Enrollment over Secure
+Transport, RFC 7030), so the certificate lifecycle runs without operator intervention. Add an `est`
+block to `connection.security`:
+
+```jsonc
+"security": {
+  "mode": "tls",
+  "client": { "certSecret": "ot-pki/eip-originator" },
+  "ca":     { "secret": "ot-pki/plant-root" },
+  "est": {
+    "enabled": true,
+    "server": "https://est.plant.example:8443/.well-known/est",
+    "label": "eip",
+    "trust":  { "secret": "ot-pki/est-root" },            // verifies the EST server (defaults to the connection ca)
+    "auth":   { "bootstrap": { "certSecret": "ot-pki/eip-bootstrap" } },
+    "into":   { "certSecret": "ot-pki/eip-originator" },  // writes the enrolled cert where the client reads it
+    "renewBeforeDays": 30,
+    "fetchCaCerts": true
+  }
+}
+```
+
+The adapter enrolls when it has no usable certificate (`POST /simpleenroll`) and renews within
+`renewBeforeDays` of expiry (`POST /simplereenroll`), authenticating with the bootstrap identity, an
+HTTP Basic credential (`auth.basic`), or — for a renewal — the current client certificate. It writes the
+enrolled key and certificate into the vault destination (`into`, defaulting to the `client` secret), and
+the reload watcher then applies it and reconnects — the same path as a manual rotation above.
+
+An unreachable EST server never blocks polling: the current certificate is kept and the attempt is
+retried after `retryBackoffMins`. Enrollment reports through the `cert-enrolled` / `cert-enroll-failed`
+events, the `estEnrollments` / `estFailures` metrics, and `sb/status` `security.est` (`enabled`,
+`lastEnroll`, `nextRenew`, `enrollments`, `failures`).
+
+---
+
 ## Deploy to a platform
 
 **HOST** (standalone process/container, MQTT transport):

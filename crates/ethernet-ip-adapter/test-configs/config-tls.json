@@ -120,6 +120,43 @@
           }
         ],
         "writes": { "allow": [] }
+      },
+      {
+        "id": "filler-plc-tls-est",
+        "adapter": "ethernet-ip",
+        "connection": {
+          "endpoint": "enip-tls",
+          "connected": false,
+          "security": {
+            "mode": "tls",
+            "client": { "certSecret": "ot-pki/eip-originator", "renewBeforeDays": 30 },
+            "ca": { "secret": "ot-pki/plant-root" },
+            "verifyPeer": true,
+            "serverName": "enip-tls",
+            "reloadIntervalSecs": 60,
+            "est": {
+              "enabled": true,
+              "server": "https://est.plant.example:8443/.well-known/est",
+              "label": "eip",
+              "trust": { "secret": "ot-pki/est-root" },
+              "auth": { "bootstrap": { "certSecret": "ot-pki/eip-bootstrap" } },
+              "into": { "certSecret": "ot-pki/eip-originator" },
+              "renewBeforeDays": 30,
+              "retryBackoffMins": 60,
+              "fetchCaCerts": true
+            }
+          }
+        },
+        "pollGroups": [
+          {
+            "id": "fast",
+            "pollIntervalMs": 500,
+            "signals": [
+              { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" }
+            ]
+          }
+        ],
+        "writes": { "allow": [] }
       }
     ]
   }

@@ -155,6 +155,9 @@ pub fn family_defs() -> Vec<FamilyDef> {
     // CIP Security Phase 2b (§8.2): client-cert rotations picked up without a restart, and a gauge of
     // days until the adapter's own client certificate expires (negative ⇒ expired).
     conn.extend(pair("certReloads"));
+    // CIP Security Phase 2c (§8.2): EST enrollments/renewals succeeded, and enrollment attempts failed.
+    conn.extend(pair("estEnrollments"));
+    conn.extend(pair("estFailures"));
     conn.push(m("certExpiryDays", UNIT_COUNT, 60));
     conn.push(m("connectLatencyMs", UNIT_MS, 60));
     conn.push(m("connectedDurationMs", UNIT_MS, 60));
@@ -275,6 +278,10 @@ struct ConnCounters {
     tls_handshake_failures: Pair,
     /// Client-cert / trust-store rotations picked up from the vault without a restart (Phase 2b, §4.2).
     cert_reloads: Pair,
+    /// Successful EST enrollments/renewals (Phase 2c, §4.3).
+    est_enrollments: Pair,
+    /// Failed EST enrollment attempts (Phase 2c, §4.3).
+    est_failures: Pair,
     /// Days until the adapter's client certificate expires (Phase 2b gauge, §4.2); `None` until read.
     cert_expiry_days: Option<f64>,
     connect_latency_ms: f64,
@@ -300,6 +307,8 @@ impl ConnCounters {
         self.reconnects.drain_into(&mut v, "reconnects");
         self.tls_handshake_failures.drain_into(&mut v, "tlsHandshakeFailures");
         self.cert_reloads.drain_into(&mut v, "certReloads");
+        self.est_enrollments.drain_into(&mut v, "estEnrollments");
+        self.est_failures.drain_into(&mut v, "estFailures");
         // A gauge — emitted only once the lifecycle task (or a connect) has read the client cert.
         if let Some(days) = self.cert_expiry_days {
             v.insert("certExpiryDays".to_string(), days);
@@ -642,6 +651,17 @@ impl DeviceMetrics {
         self.inner.lock().unwrap().conn.cert_expiry_days = Some(days as f64);
     }
 
+    /// Record an EST enrollment/renewal outcome (Phase 2c, §4.3): `estEnrollments` on success,
+    /// `estFailures` on a failed attempt.
+    pub fn on_est_enrollment(&self, success: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if success {
+            inner.conn.est_enrollments.add(1.0);
+        } else {
+            inner.conn.est_failures.add(1.0);
+        }
+    }
+
     /// An established session was lost (poll loop exited / push `Lost`).
     pub fn on_connection_dropped(&self, now: Instant) {
         let mut inner = self.inner.lock().unwrap();
@@ -833,6 +853,10 @@ impl DeviceMetrics {
             if let Some(days) = gauge_expiry_days {
                 out.entry("clientCertExpiryDays".to_string())
                     .or_insert_with(|| serde_json::json!(days as i64));
+            }
+            // Phase 2c: the EST enrollment state (enabled, last-enroll, next-renew, counters).
+            if let Some(est) = self.health.est() {
+                out.insert("est".into(), est.to_json());
             }
         }
         // Phase 2a: the target's decoded CIP Security posture (both modes), when it was read on
@@ -1281,7 +1305,7 @@ mod tests {
         ]));
 
         let mut conn = vec![g("sessionConnected", "Count", 1)];
-        for p in ["connectAttempts", "connectFailures", "connectionDrops", "reconnects", "tlsHandshakeFailures", "certReloads"] { conn.extend(cp(p)); }
+        for p in ["connectAttempts", "connectFailures", "connectionDrops", "reconnects", "tlsHandshakeFailures", "certReloads", "estEnrollments", "estFailures"] { conn.extend(cp(p)); }
         conn.push(g("certExpiryDays", "Count", 60));
         conn.push(g("connectLatencyMs", "Milliseconds", 60));
         conn.push(g("connectedDurationMs", "Milliseconds", 60));

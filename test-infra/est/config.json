@@ -1,0 +1,23 @@
+{
+    "mock_ca": {
+        "certificates": "/est/ca.pem",
+        "private_key": "/est/ca.key"
+    },
+    "tls": {
+        "listen_address": "0.0.0.0:8443",
+        "certificates": "/est/server-chain.pem",
+        "private_key": "/est/server.key",
+        "client_cas": [
+            "/est/ca.pem"
+        ]
+    },
+    "allowed_hosts": [
+        "localhost",
+        "127.0.0.1",
+        "est-server",
+        "[::1]"
+    ],
+    "healthcheck_password": "xyzzy",
+    "rate_limit": 150,
+    "timeout": 30
+}

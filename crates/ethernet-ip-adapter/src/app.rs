@@ -136,6 +136,10 @@ pub struct Health {
     /// 1 = the instance is currently in a TLS-handshake-failing state (§3.4). Drives the transition
     /// edge for the `tls-handshake-failed` event (fired on the transition into failing, not per retry).
     pub tls_handshake_failing: std::sync::atomic::AtomicBool,
+    /// The EST enrollment lifecycle state (CIP Security Phase 2c, DESIGN-cip-security.md §4.3), or
+    /// `None` when EST is not enabled for this instance. Updated by the `security_lifecycle` driver;
+    /// read by the `sb/status` `security.est` object. One source for the status surface.
+    pub est: std::sync::Mutex<Option<crate::eip::est::EstStatus>>,
 
     // ---- engine counters (consumed by the S5 metric families; §8) ----
     /// Publish latency of the last `data.publish().await`, ms (§6.2).
@@ -203,6 +207,17 @@ impl Health {
     #[must_use]
     pub fn security(&self) -> Option<crate::device::SecurityStatus> {
         self.security.lock().unwrap().clone()
+    }
+
+    /// Store the EST enrollment state (CIP Security Phase 2c §4.3), read by `sb/status.security.est`.
+    pub fn set_est(&self, est: Option<crate::eip::est::EstStatus>) {
+        *self.est.lock().unwrap() = est;
+    }
+
+    /// The current EST enrollment state, if EST is enabled for this instance.
+    #[must_use]
+    pub fn est(&self) -> Option<crate::eip::est::EstStatus> {
+        self.est.lock().unwrap().clone()
     }
 }
 

@@ -43,6 +43,18 @@ rustls-pemfile = "2"
 # Read the client leaf certificate's notAfter + peer subject for the `sb/status` security surface
 # (pure-Rust X.509 decode; no C).
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+# CIP Security Phase 2c — EST (RFC 7030) client for automatic originator-cert enrollment/renewal
+# (DESIGN-cip-security.md §4.3, D-EIP-24). All pure Rust, no C — severable and OFF unless
+# `connection.security.est.enabled` is set:
+#   rcgen        — generate the adapter's client keypair + PKCS#10 CSR (ring backend, no C).
+#   tokio-rustls — async TLS to the EST server (same rustls 0.23 / ring the rest of the adapter uses).
+#   cms + der    — parse the `application/pkcs7-mime` (certs-only degenerate SignedData) enroll reply.
+#   base64       — the `application/pkcs10` CSR body + the PKCS#7 reply are base64 on the wire (RFC 7030).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+cms = { version = "0.2", default-features = false, features = ["std"] }
+der = { version = "0.7", default-features = false, features = ["std"] }
+base64 = "0.22"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "sync"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }

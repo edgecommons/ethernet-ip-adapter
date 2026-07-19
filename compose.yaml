@@ -135,6 +135,20 @@ services:
     ports: ["44822:44818"]
     restart: unless-stopped
 
+  # EST (RFC 7030) server — the CIP Security Phase-2c enrollment peer (DESIGN-cip-security.md §4.3/§5.2
+  # Target C). Built from test-infra/est/Dockerfile (the independent Go `globalsign/est` reference
+  # `estserver` + mock CA), serving /.well-known/est over mutual TLS on :8443 with the committed test
+  # PKI. The self-skipping live_est test (inline in eip::est::tests, probing :8443) enrolls a real
+  # originator certificate against it and asserts it lands in the vault.
+  #
+  #   docker compose up --build est-server
+  #   cargo test -p ethernet-ip-adapter eip::est::tests::live_est_enroll -- --nocapture
+  est-server:
+    build: ./test-infra/est
+    container_name: ethernet-ip-adapter-est-server
+    ports: ["8443:8443"]
+    restart: unless-stopped
+
   ethernet-ip-adapter:
     build:
       context: .

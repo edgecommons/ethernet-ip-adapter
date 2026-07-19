@@ -141,12 +141,13 @@ impl App {
                     .flatten()
                     .is_some_and(|s| s.is_tls());
             if tls_poll {
-                tokio::spawn(security_lifecycle(
+                tokio::spawn(security_lifecycle_inner(
                     device.clone(),
                     self.creds.clone(),
                     control_tx,
                     Arc::clone(&events),
                     Arc::clone(&dm),
+                    Some(Arc::clone(&health)),
                 ));
             }
 
@@ -438,13 +439,18 @@ async fn run_device(
 /// It never blocks polling: a vault-read error is logged and the loop continues on the current
 /// material (offline-first). All decisions are made by [`crate::eip::rotation::CertWatcher`]; this
 /// driver only performs the I/O.
-async fn security_lifecycle(
+/// The lifecycle body (Phase 2b rotation/expiry + Phase 2c EST enroll/renew), parameterized on an
+/// optional shared [`crate::app::Health`] so the EST state can be surfaced on `sb/status.security.est`.
+#[allow(clippy::too_many_lines)]
+async fn security_lifecycle_inner(
     cfg: DeviceConfig,
     creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
     control: tokio::sync::mpsc::Sender<crate::app::DeviceControl>,
     events: Arc<dyn EventSink>,
     dm: Arc<crate::metrics::DeviceMetrics>,
+    health: Option<Arc<crate::app::Health>>,
 ) {
+    use crate::eip::est::{enroll_once, next_renew_rfc3339, EstDecision, EstScheduler, EstStatus};
     use crate::eip::rotation::{read_reload_state, CertWatcher, WatchAction};
     use crate::eip::tls::{SecurityConfig, DEFAULT_RELOAD_INTERVAL_SECS, DEFAULT_RENEW_BEFORE_DAYS};
 
@@ -456,10 +462,30 @@ async fn security_lifecycle(
         return;
     };
     let interval_secs = sec.reload_interval_secs.unwrap_or(DEFAULT_RELOAD_INTERVAL_SECS);
-    if interval_secs == 0 {
+
+    // CIP Security Phase 2c: EST enrollment/renewal (off unless `est.enabled`).
+    let est = sec.est_enabled().cloned();
+    let est_renew_days = est.as_ref().map_or(DEFAULT_RENEW_BEFORE_DAYS, |e| e.renew_before_days(&sec));
+    let est_backoff = est.as_ref().map_or(Duration::from_secs(3600), |e| e.retry_backoff());
+    // A generous fixed deadline for the whole EST exchange (connect + handshake + request/reply); EST
+    // is a background provisioning step, never on the polling hot path.
+    let connect_timeout = Duration::from_secs(20);
+    let mut est_last_attempt: Option<Instant> = None;
+    if let (Some(e), Some(h)) = (&est, &health) {
+        h.set_est(Some(EstStatus {
+            enabled: true,
+            server: e.server.clone(),
+            ..EstStatus::default()
+        }));
+    }
+
+    // With EST disabled and rotation-watching disabled, there is nothing to do.
+    if interval_secs == 0 && est.is_none() {
         // Rotation is then picked up only on a natural reconnect (the connect path rebuilds anyway).
         return;
     }
+    // When only EST is on but the reload watcher is disabled, still tick (default cadence) to enroll.
+    let tick_secs = if interval_secs == 0 { DEFAULT_RELOAD_INTERVAL_SECS } else { interval_secs };
     let renew_before_days = sec
         .client
         .as_ref()
@@ -467,12 +493,95 @@ async fn security_lifecycle(
         .map_or(DEFAULT_RENEW_BEFORE_DAYS, i64::from);
 
     let mut watcher = CertWatcher::default();
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut ticker = tokio::time::interval(Duration::from_secs(tick_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;
         let now = time::OffsetDateTime::now_utc();
+
+        // ---- Phase 2c: EST enrollment/renewal, BEFORE the rotation re-read so a fresh enrollment's
+        // vault write is observed by the watcher this same tick (⇒ Rotated ⇒ reconnect). ----
+        if let Some(e) = &est {
+            // The current cert's days-to-expiry drives the enroll decision (None ⇒ initial enroll).
+            let current_days = read_reload_state(&sec, creds.as_ref(), now)
+                .ok()
+                .and_then(|s| s.client.map(|c| c.expiry_days))
+                .filter(|d| *d != i64::MAX);
+            let since = est_last_attempt.map(|t| t.elapsed());
+            if let EstDecision::Enroll { reenroll } =
+                EstScheduler::decide(current_days, est_renew_days, since, est_backoff)
+            {
+                est_last_attempt = Some(Instant::now());
+                match enroll_once(e, &sec, creds.as_ref(), reenroll, connect_timeout).await {
+                    Ok(out) => {
+                        dm.on_est_enrollment(true);
+                        let next_renew =
+                            next_renew_rfc3339(out.not_after.as_deref(), est_renew_days);
+                        if let Some(h) = &health {
+                            let prev = h.est().unwrap_or_default();
+                            h.set_est(Some(EstStatus {
+                                enabled: true,
+                                server: e.server.clone(),
+                                last_enroll: now
+                                    .format(&time::format_description::well_known::Rfc3339)
+                                    .ok(),
+                                next_renew,
+                                last_error: None,
+                                enrollments: prev.enrollments + 1,
+                                failures: prev.failures,
+                            }));
+                        }
+                        events
+                            .emit(
+                                Severity::Info,
+                                "cert-enrolled",
+                                Some(format!(
+                                    "EST {} succeeded for {} — wrote the new certificate to `{}`",
+                                    if reenroll { "re-enrollment" } else { "enrollment" },
+                                    cfg.connection.endpoint,
+                                    out.written_to
+                                )),
+                                Some(json!({
+                                    "instance": cfg.id, "security": "tls",
+                                    "serial": out.serial, "notAfter": out.not_after,
+                                    "reenroll": reenroll
+                                })),
+                            )
+                            .await;
+                    }
+                    Err(err) => {
+                        dm.on_est_enrollment(false);
+                        if let Some(h) = &health {
+                            let prev = h.est().unwrap_or_default();
+                            h.set_est(Some(EstStatus {
+                                enabled: true,
+                                server: e.server.clone(),
+                                last_enroll: prev.last_enroll,
+                                next_renew: prev.next_renew,
+                                last_error: Some(err.clone()),
+                                enrollments: prev.enrollments,
+                                failures: prev.failures + 1,
+                            }));
+                        }
+                        events
+                            .emit(
+                                Severity::Warning,
+                                "cert-enroll-failed",
+                                Some(format!(
+                                    "EST enrollment for {} failed: {err} — keeping the current \
+                                     certificate; will retry",
+                                    cfg.connection.endpoint
+                                )),
+                                Some(json!({ "instance": cfg.id, "security": "tls" })),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // ---- Phase 2b: rotation / expiry watch (also picks up a fresh EST enrollment's vault write). ----
         let state = match read_reload_state(&sec, creds.as_ref(), now) {
             Ok(s) => s,
             Err(e) => {

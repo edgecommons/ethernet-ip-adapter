@@ -156,6 +156,33 @@ anchors (any one `ca` style, or a `certSecret` bundle that carries `caPem`). Dev
 CBC-based cipher suites are not supported — enable GCM-based suites on the device. See the how-to guide
 "Connect to a CIP Security device."
 
+##### `connection.security.est` (automatic enrollment / renewal)
+
+The adapter obtains and renews its own client certificate automatically from an EST server
+(Enrollment over Secure Transport, RFC 7030). The enrolled key and certificate are written into the
+credentials vault, where the reload watcher (`reloadIntervalSecs`) picks them up and reconnects — so a
+certificate lifecycle runs without operator intervention or a restart. EST is off unless
+`est.enabled` is set.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `enabled` | boolean | `false` | Enable automatic EST enrollment/renewal for this instance. |
+| `server` | string | — | The EST server base URL, e.g. `https://est.plant.example:8443/.well-known/est`. Must be `https://`. Required when `enabled`. |
+| `label` | string | — | An optional EST label path segment, inserted before the operation (`.../est/<label>/simpleenroll`). |
+| `trust` | object | connection `ca` | Trust anchors for verifying the EST server's TLS certificate (a `ca`-style block: `secret` / `file` / `cert` / `trustStore` / `list`). Defaults to the connection's `ca` trust store. |
+| `auth` | object | reuse client cert | How the adapter authenticates to the EST server. `auth.bootstrap` — a client identity (`certSecret` / `certFile`+`keyFile` / `cert`+`key`) used for the initial enrollment; `auth.basic` — `{"$secret": "<name>"}` for a vault `{username, password}` secret sent as HTTP Basic. With neither, the current client certificate is reused (a mutual-TLS renewal). |
+| `into` | object | derived from `client` | Where the enrolled material is written: `into.certSecret` (a `{certPem, keyPem}` bundle secret) or `into.cert` + `into.key` (a secret pair). Defaults to the `security.client` secret(s), so the reload watcher reloads it. |
+| `subject` | string | `eip-originator` | The CSR subject CommonName. |
+| `renewBeforeDays` | integer | `client.renewBeforeDays` or `30` | Renew the certificate this many days before its `notAfter`. |
+| `retryBackoffMins` | integer | `60` | Minimum minutes between failed enrollment attempts. |
+| `fetchCaCerts` | boolean | `false` | Fetch the EST server's CA bag (`GET /cacerts`) before enrolling, to confirm trust. |
+
+The adapter enrolls (`simpleenroll`) when it has no usable certificate, and renews (`simplereenroll`)
+within `renewBeforeDays` of expiry. An unreachable EST server never blocks polling — the current
+certificate is kept and the attempt is retried. Enrollment outcomes are reported as `cert-enrolled` /
+`cert-enroll-failed` events, the `estEnrollments` / `estFailures` metrics, and the `security.est`
+object in `sb/status`.
+
 ### `pollGroups[]` (poll mode)
 
 A set of signals read together on one cadence.

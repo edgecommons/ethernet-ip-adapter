@@ -26,6 +26,7 @@ use edgecommons::credentials::CredentialService;
 use crate::config::Timeouts;
 use crate::device::{ConnectionConfig, DeviceError};
 
+pub mod est;
 pub mod live;
 pub mod push;
 pub mod rotation;

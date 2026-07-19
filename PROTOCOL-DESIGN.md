@@ -81,20 +81,24 @@ the shipped generic `Get_Attribute_Single` service (§7.5, §7.7). This is pure 
 transport, no new dependency, always available); the crate reads the *originator's* view of the target
 and never acts as a CIP Security *target* or writes the commissioning objects (that stays a non-goal).
 
-**Cert lifecycle / rotation (Phase 2b) is adapter-side — no crate change.** The vault-native managed
-trust store, the client-cert rotation-without-restart, and cert-expiry monitoring (DESIGN §D-EIP-23,
+**Cert lifecycle / rotation (Phase 2b) and EST enrollment (Phase 2c) are adapter-side — no crate
+change.** The vault-native managed trust store, the client-cert rotation-without-restart, cert-expiry
+monitoring (DESIGN §D-EIP-23), and the **EST (RFC 7030) enrollment/renewal client** (DESIGN §D-EIP-24,
 DESIGN-cip-security.md §4.2/§4.3) live entirely in the **adapter**: it re-sources the cert/key/CA
-material and rebuilds the opaque `rustls::ClientConfig` it already hands to `connect_tls`. The crate's
-TLS surface (`connect_tls`, `TlsOptions`, `TlsSessionInfo`) is unchanged — it takes a fresh
-`ClientConfig` on the next connect and neither knows nor cares that the material rotated. This keeps the
-isolation contract intact (the crate never reads a vault or a key byte's provenance).
+material — now optionally *obtaining* it from a plant EST server and writing it back to the vault — and
+rebuilds the opaque `rustls::ClientConfig` it already hands to `connect_tls`. The crate's TLS surface
+(`connect_tls`, `TlsOptions`, `TlsSessionInfo`) is unchanged — it takes a fresh `ClientConfig` on the
+next connect and neither knows nor cares that the material rotated or where it came from. EST is HTTPS
+credential provisioning, not EtherNet/IP, so it is not in this crate. This keeps the isolation contract
+intact (the crate never reads a vault, a key byte's provenance, or an EST server).
 
 **Non-goals (v1).** UDT/structure *value* decoding (struct tags are detected and reported, not
 decoded); Logix STRING values; CIP Multiple Service Packet batching; **DTLS on the implicit (class-1)
 I/O path** — CIP Security for class-1 needs DTLS, which `rustls` does not provide and which has no OSS
 validation peer, so implicit I/O remains plaintext UDP 2222 and a TLS-configured push instance is
-refused; the device-side certificate/security-object *commissioning* model and EST enrollment (Phase 2
-of DESIGN-cip-security.md); CIP Sync/Motion; acting as a full *target* (the crate ships a minimal
+refused; the device-side certificate/security-object *commissioning* model (writing a target's security
+objects — the adapter's own EST enrollment (Phase 2c) is adapter-side, above); CIP Sync/Motion; acting
+as a full *target* (the crate ships a minimal
 test-target for validation only, §12.5); DeviceNet/ControlNet adaptations of CIP.
 
 **The isolation contract.** The protocol crate is pure protocol. It deliberately knows **nothing**

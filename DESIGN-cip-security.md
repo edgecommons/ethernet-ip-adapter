@@ -621,11 +621,16 @@ cert → non-transient loud failure).
   of exactly the changed layer. The one honest asterisk — no certified device in the loop — is
   a declared, precedented gap, not a reason to hold the capability.
 - **Phase 2 — SPLIT GO.** **GO on 2(a) posture reads and 2(b) lifecycle/rotation** (cheap,
-  validatable, and they make Phase 1 operable). **CONDITIONAL GO on 2(c) EST**: build it behind
-  config (off by default) with libest-container validation *if* the EST capability is wanted
-  this cycle; otherwise defer 2(c) intact — it is severable, and nothing in 1/2(a)/2(b) depends
-  on it. The condition to state to the user: 2(c) ships validated against an OSS EST server
-  only; real plant-PKI enrollment joins the lab-hardware gap list.
+  validatable, and they make Phase 1 operable). **2(c) EST — SHIPPED** (D-EIP-24): the owned
+  RFC 7030 client is built behind config (`connection.security.est`, off by default) and severable —
+  nothing in 1/2(a)/2(b) depends on it. It is validated against an OSS EST server (the independent Go
+  `globalsign/est` `estserver` + mock CA in `test-infra/est/`, not the intractable libest C build —
+  see the note below) plus an OpenSSL-produced golden PKCS#7 vector and an in-process rustls EST
+  responder. As stated at go/no-go: **real plant/device pull-model PKI enrollment joins the lab-hardware
+  gap list** (§5.2, DESIGN.md §14.6). *EST-server-implementation note: the spike named Cisco `libest`
+  (C, awkward to build); the shipped harness uses the Go `globalsign/est` reference server instead — an
+  equally independent RFC 7030 implementation that builds cleanly in a container, so the live gate ran
+  green without falling back to golden-vector-only.*
 - **DTLS / push — NO (unchanged).** Documented future (§3.6); revisit only with a lab PLC and
   an explicit C-dependency decision.
 - **Lab-PLC purchase** — the single go/no-go input that upgrades every gap above from
