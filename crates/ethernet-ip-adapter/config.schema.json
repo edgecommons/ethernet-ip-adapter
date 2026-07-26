@@ -88,6 +88,7 @@
     }
   },
   "$defs": {
+    "instance": { "$ref": "#/$defs/device" },
     "secretRef": {
       "type": "object",
       "additionalProperties": false,

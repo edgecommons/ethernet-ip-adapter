@@ -10,7 +10,8 @@
 //!
 //! Every **counter** is a measure PAIR: `<name>Total` (monotonic since component start) and
 //! `<name>Interval` (since the previous emit of that family; **reset on emit**). **Gauges**
-//! (`connectionState`, `sessionConnected`, `paused`, `batchSize`, latencies, inventory sizes) and
+//! (`connectionState`, `sessionConnected`, `signalsSubscribed`, `batchSize`, latencies, inventory
+//! sizes) and
 //! interval **sums** (`pollDurationMs`, `publishLatencyMs`, `commandLatencyMs`, `connectedDurationMs`)
 //! are single measures. See [`Pair`].
 //!
@@ -40,8 +41,7 @@ use edgecommons::prelude::{Config, MetricBuilder, MetricService};
 use crate::app::Health;
 use crate::config::{DeviceConfig, DeviceMode, GlobalConfig, PublishMode};
 
-/// The mandatory shared southbound metric (SOUTHBOUND §5 + the §8.1 `paused`/`publishLatencyMs`/
-/// `staleSignals` extensions).
+/// The mandatory shared southbound metric — exactly the eight SOUTHBOUND §5 measures (§8.1).
 pub const HEALTH: &str = "southbound_health";
 /// §8.2 — the CIP session / connect lifecycle.
 pub const CONNECTION: &str = "EtherNetIpConnection";
@@ -130,12 +130,14 @@ pub fn family_defs() -> Vec<FamilyDef> {
     let mut out = Vec::new();
 
     // §8.1 southbound_health — dims: instance. All single measures (no Total/Interval pairs).
+    // Exactly the eight SOUTHBOUND §5 measures — no extras (pause state rides sb/status, the
+    // keepalive token, and the adapter-paused/resumed events instead of a gauge).
     out.push(FamilyDef {
         name: HEALTH.to_string(),
         dimensions: dims(&["instance"]),
         measures: vec![
             m("connectionState", UNIT_COUNT, 1),
-            m("paused", UNIT_COUNT, 1),
+            m("signalsSubscribed", UNIT_COUNT, 1),
             m("pollLatencyMs", UNIT_MS, 1),
             m("publishLatencyMs", UNIT_MS, 1),
             m("readErrors", UNIT_COUNT, 60),
@@ -492,6 +494,10 @@ pub struct DeviceMetrics {
     publish_modes: Vec<&'static str>,
     inventory: Vec<InventoryRow>,
     health: Arc<Health>,
+    /// The device's whole configured signal inventory (poll: every poll-group signal; push: every
+    /// declared input+output field) — the `southbound_health.signalsSubscribed` gauge value while
+    /// the session is up (§8.1).
+    signals_total: f64,
     /// The O→T run/idle we produce (push output.run, default true) — the `run` field of the status
     /// `io` view (§7.1). `false`/irrelevant for poll devices.
     produced_run: bool,
@@ -585,6 +591,16 @@ impl DeviceMetrics {
             .and_then(|io| io.output.as_ref())
             .is_none_or(|o| o.run);
 
+        // §8.1 signalsSubscribed: the configured inventory this device's session serves — the same
+        // set `sb/signals` lists (poll groups, or the declared input+output fields).
+        let signals_total = if is_push {
+            device.io.as_ref().map_or(0, |io| {
+                io.input.signals.len() + io.output.as_ref().map_or(0, |o| o.signals.len())
+            }) as f64
+        } else {
+            device.signals().count() as f64
+        };
+
         Self {
             svc,
             config,
@@ -593,6 +609,7 @@ impl DeviceMetrics {
             publish_modes,
             inventory,
             health,
+            signals_total,
             produced_run,
             inner: Mutex::new(inner),
         }
@@ -1032,8 +1049,14 @@ impl DeviceMetrics {
     async fn emit_health(&self, now: bool) {
         // Gauges from the shared Health; interval counters swap-reset here (§8.1).
         let mut v = HashMap::new();
-        v.insert("connectionState".to_string(), self.health.connection_state.load(Ordering::Relaxed) as f64);
-        v.insert("paused".to_string(), f64::from(u8::from(self.health.paused.load(Ordering::Relaxed))));
+        let connected = self.health.connection_state.load(Ordering::Relaxed);
+        v.insert("connectionState".to_string(), connected as f64);
+        // The configured/served signal inventory while the session is up; 0 while disconnected
+        // (SOUTHBOUND §5 `signalsSubscribed` — the polling-adapter reading of "currently serves").
+        v.insert(
+            "signalsSubscribed".to_string(),
+            if connected == 1 { self.signals_total } else { 0.0 },
+        );
         v.insert("pollLatencyMs".to_string(), self.health.poll_latency_ms.load(Ordering::Relaxed) as f64);
         v.insert("publishLatencyMs".to_string(), self.health.publish_latency_ms.load(Ordering::Relaxed) as f64);
         v.insert("readErrors".to_string(), self.health.read_errors.swap(0, Ordering::Relaxed) as f64);
@@ -1298,7 +1321,7 @@ mod tests {
         let mut expected: Vec<ExpectedFamily> = Vec::new();
 
         expected.push((HEALTH, vec!["instance"], vec![
-            g("connectionState", "Count", 1), g("paused", "Count", 1),
+            g("connectionState", "Count", 1), g("signalsSubscribed", "Count", 1),
             g("pollLatencyMs", "Milliseconds", 1), g("publishLatencyMs", "Milliseconds", 1),
             g("readErrors", "Count", 60), g("writeErrors", "Count", 60),
             g("staleSignals", "Count", 60), g("reconnects", "Count", 60),
@@ -1389,9 +1412,14 @@ mod tests {
         }
         assert!(!names.contains(IO), "poll device does not define EtherNetIpIo");
 
-        // southbound_health carries the `paused` gauge (§8.1 extension).
+        // southbound_health carries the `signalsSubscribed` gauge (SOUTHBOUND §5) and no extras
+        // beyond the eight shared measures.
         let health = defined.iter().find(|x| x.get_name() == HEALTH).unwrap();
-        assert!(health.get_measure("paused").is_some(), "southbound_health has the paused gauge");
+        assert!(
+            health.get_measure("signalsSubscribed").is_some(),
+            "southbound_health has the signalsSubscribed gauge"
+        );
+        assert!(health.get_measure("paused").is_none(), "no paused extension measure");
     }
 
     #[test]
@@ -1532,20 +1560,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_emit_includes_the_paused_gauge_and_reads_health() {
+    async fn health_emit_includes_signals_subscribed_and_reads_health() {
         let (svc, m) = dm(poll_device());
         m.health.connection_state.store(1, Ordering::Relaxed);
         m.health.read_errors.store(4, Ordering::Relaxed);
         m.emit_health(false).await;
 
-        let emitted = svc.emitted.lock().unwrap();
-        let (_, v) = emitted.iter().find(|(n, _)| n == HEALTH).expect("health emitted");
-        assert_eq!(v["connectionState"], 1.0);
-        assert_eq!(v["readErrors"], 4.0);
-        assert_eq!(v["paused"], 0.0, "paused reads false until S6 sets it");
-        assert!(v.contains_key("publishLatencyMs") && v.contains_key("staleSignals"));
+        {
+            let emitted = svc.emitted.lock().unwrap();
+            let (_, v) = emitted.iter().find(|(n, _)| n == HEALTH).expect("health emitted");
+            assert_eq!(v["connectionState"], 1.0);
+            assert_eq!(v["readErrors"], 4.0);
+            // signalsSubscribed = the configured inventory while the session is up (§8.1); the
+            // poll_device fixture declares 3 signals across its two groups.
+            assert_eq!(v["signalsSubscribed"], 3.0, "the sb/signals inventory size while connected");
+            assert!(v.contains_key("publishLatencyMs") && v.contains_key("staleSignals"));
+        }
         // readErrors is an interval counter: it swap-resets, so a re-read is 0.
         assert_eq!(m.health.read_errors.load(Ordering::Relaxed), 0);
+
+        // Disconnected ⇒ the gauge reads 0 (the session serves nothing).
+        m.health.connection_state.store(0, Ordering::Relaxed);
+        m.emit_health(false).await;
+        let emitted = svc.emitted.lock().unwrap();
+        let (_, v) = emitted.iter().rev().find(|(n, _)| n == HEALTH).expect("health emitted");
+        assert_eq!(v["signalsSubscribed"], 0.0, "0 while disconnected");
     }
 
     /// The connection lifecycle counters (§8.2): a first connect sets `sessionConnected` and does NOT

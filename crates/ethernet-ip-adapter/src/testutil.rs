@@ -16,7 +16,7 @@ use crate::config::{DeviceConfig, GlobalConfig};
 use crate::metrics::DeviceMetrics;
 
 /// A [`MetricService`] that records every emit, so a test can read the last `southbound_health`
-/// (e.g. the `paused` gauge).
+/// (e.g. the `signalsSubscribed` gauge).
 #[derive(Default)]
 pub struct RecordingMetrics {
     pub emitted: Mutex<Vec<(String, HashMap<String, f64>)>>,

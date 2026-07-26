@@ -124,9 +124,9 @@ pub struct Health {
     pub write_errors: AtomicU64,
     pub reconnects: AtomicU64,
     pub signals_published: AtomicU64,
-    /// 1 = this instance is paused (§7.4 / §8.1 `paused` gauge). Owned here so the connectivity
-    /// token, the `paused` attribute, and the gauge all derive from one source (§9.2). S6 sets it;
-    /// it reads `false` until then.
+    /// 1 = this instance is paused (§7.4). Owned here so the connectivity token, the `paused`
+    /// attribute, and the `sb/status` reply all derive from one source (§9.2). S6 sets it; it
+    /// reads `false` until then.
     pub paused: std::sync::atomic::AtomicBool,
     /// The negotiated TLS security posture of the current session (CIP Security Phase 1,
     /// DESIGN-cip-security.md §3.4), or `None` when down / plaintext. Set on connect, cleared on drop;
@@ -367,14 +367,15 @@ pub trait EventSink: Send + Sync {
     async fn clear_alarm(&self, severity: Severity, event_type: &str, context: Option<Value>);
 }
 
-/// Move **all three** pause-reflection surfaces together, in one place (§9, §8.1, §6.3) — so the
-/// connectivity token/attribute, the `southbound_health.paused` gauge, and the `adapter-paused/resumed`
-/// event can never disagree:
+/// Move **both** pause-reflection surfaces together, in one place (§9, §6.3) — so the
+/// connectivity token/attribute and the `adapter-paused/resumed` event can never disagree:
 ///
 /// 1. the shared [`Health::paused`] flag (which the connectivity provider reads for the `PAUSED` token
 ///    + `paused` attribute — pull-based, so flipping it is enough);
-/// 2. the `southbound_health.paused` gauge — flushed immediately via `emit_metric_now`;
-/// 3. the `adapter-paused` (Warning) / `adapter-resumed` (Info) `evt`.
+/// 2. the `adapter-paused` (Warning) / `adapter-resumed` (Info) `evt`.
+///
+/// The transition also flushes `southbound_health` immediately (`emit_metric_now`, §8.7) so the
+/// gauges are current at the pause boundary.
 ///
 /// Idempotent: pausing an already-paused instance changes nothing and returns `false` (never an error).
 pub async fn apply_pause(
@@ -389,7 +390,7 @@ pub async fn apply_pause(
     if was == paused {
         return false;
     }
-    // The gauge derives from the same flag; flush the transition now (§8.1/§8.7).
+    // Flush the health gauges at the transition boundary (§8.7).
     dm.emit_now().await;
     if paused {
         let mut ctx = serde_json::Map::new();
@@ -640,9 +641,9 @@ mod tests {
         assert!(!c.connected);
     }
 
-    /// The three pause-reflection surfaces move together, in ONE test (§9, §8.1, §6.3): the
-    /// connectivity token + `paused` attribute, the `southbound_health.paused` gauge, and the
-    /// `adapter-paused` event — and resume flips all three back. Idempotent (`changed: false`).
+    /// The pause-reflection surfaces move together, in ONE test (§9, §6.3): the connectivity
+    /// token + `paused` attribute and the `adapter-paused` event — with `southbound_health`
+    /// flushed at the transition — and resume flips them back. Idempotent (`changed: false`).
     async fn pause_reflection_case(cfg: DeviceConfig) {
         let health = Arc::new(Health::default());
         health.set_link(LinkState::Online);
@@ -660,9 +661,10 @@ mod tests {
         assert_eq!(c.state.as_deref(), Some("PAUSED"));
         assert_eq!(c.attributes["paused"], json!(true));
         assert!(c.connected, "connected stays truthful while paused");
-        // 2. the gauge.
+        // 2. the transition flushes southbound_health immediately (no paused measure — the eight
+        // SOUTHBOUND §5 measures only).
         let h = metrics.last("southbound_health").expect("health emitted on the pause transition");
-        assert_eq!(h["paused"], 1.0, "southbound_health.paused gauge = 1");
+        assert!(!h.contains_key("paused"), "southbound_health carries no paused extension measure");
         // 3. the event (with the requester identity path).
         assert!(events.has("adapter-paused"));
         assert_eq!(events.last_ctx("adapter-paused").unwrap()["by"], json!("site/op"));
@@ -671,21 +673,20 @@ mod tests {
         assert!(!apply_pause(&cfg, &health, &dm, &events, true, None).await);
         assert_eq!(events.count("adapter-paused"), 1, "idempotent pause emits no second event");
 
-        // Resume flips all three back.
+        // Resume flips the surfaces back.
         assert!(apply_pause(&cfg, &health, &dm, &events, false, None).await);
         assert_eq!(connectivity_of(&cfg, &health).state.as_deref(), Some("ONLINE"));
         assert_eq!(connectivity_of(&cfg, &health).attributes["paused"], json!(false));
-        assert_eq!(metrics.last("southbound_health").unwrap()["paused"], 0.0);
         assert!(events.has("adapter-resumed"));
     }
 
     #[tokio::test]
-    async fn pause_reflection_moves_all_three_surfaces_poll() {
+    async fn pause_reflection_moves_the_surfaces_poll() {
         pause_reflection_case(a_device()).await;
     }
 
     #[tokio::test]
-    async fn pause_reflection_moves_all_three_surfaces_push() {
+    async fn pause_reflection_moves_the_surfaces_push() {
         pause_reflection_case(a_push_device()).await;
     }
 

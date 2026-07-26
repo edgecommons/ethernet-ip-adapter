@@ -36,13 +36,16 @@ Total/Interval pair).
 | Measure | Unit | Meaning |
 |---|---|---|
 | `connectionState` | Count | `1` connected, `0` down. Drives simple health alarms. |
-| `paused` | Count | `1` when the instance is paused, else `0`. |
+| `signalsSubscribed` | Count | The configured signal inventory the instance's session serves while connected (poll: every poll-group signal; push: every declared input+output field); `0` while disconnected. |
 | `pollLatencyMs` | Milliseconds | Most recent poll-cycle latency. |
 | `publishLatencyMs` | Milliseconds | Most recent publish latency. |
-| `readErrors` | Count | Read errors observed in the interval. |
-| `writeErrors` | Count | Write errors observed in the interval. |
+| `readErrors` | Count | Read errors observed in the interval; the counter drains on each emit. |
+| `writeErrors` | Count | Writes that failed at the device in the interval — the entry passed validation and the allow-list and was then rejected by the device or aborted by an unavailable session. Allow-list refusals and malformed entries do not count. Drains on each emit like `readErrors`. |
 | `staleSignals` | Count | Signals with no GOOD read within `staleSignalSecs` (suspended while paused). |
 | `reconnects` | Count | Reconnects in the interval. |
+
+Pause state does not appear here: it is reported by `sb/status` (`paused`), the `state` keepalive
+(`PAUSED` token), and the `adapter-paused`/`adapter-resumed` events.
 
 ## `EtherNetIpConnection`
 

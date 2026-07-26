@@ -122,7 +122,7 @@ verbs answer, I/O verbs report the device unavailable.
 polling/publishing (or, for push, suppresses publishing) while keeping the connection alive and truthful
 with a slow real CIP round-trip every `keepaliveProbeIntervalMs`. A paused instance reports `state:
 "PAUSED"` while `connected` stays truthful, stale-signal health is suspended, and `repoll` is refused
-until you resume. Pause is in-memory and does not survive a restart. `sb/resume` reverses it. Both are
+(error code `PAUSED`) until you resume. Pause is in-memory and does not survive a restart. `sb/resume` reverses it. Both are
 idempotent — the reply's `changed` tells you whether the call actually changed state.
 
 ## Two planes
