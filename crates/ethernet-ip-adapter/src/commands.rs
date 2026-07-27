@@ -4,7 +4,8 @@
 //! `sb/signals`, `sb/browse`, `sb/pause`, `sb/resume`, `reconnect`, `repoll` — mode-aware (poll vs
 //! push), with **instance routing** (D-EIP-13: `body.instance` optional iff exactly one device) and
 //! the §7.1 error codes (`BAD_ARGS`, `NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`,
-//! `DEVICE_UNAVAILABLE`, `READ_FAILED`, `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`).
+//! `DEVICE_UNAVAILABLE`, `READ_FAILED`, `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`,
+//! `PAUSED`).
 //!
 //! The inbox handlers never touch the (non-`Sync`) session directly: every session-touching verb is
 //! sent to the device's own task as a [`DeviceControl`] and *confirmed* through the reply that rides
@@ -97,26 +98,64 @@ pub fn register_all(
 
 /// The three edge-console panel descriptors (§7.6). Core validates `id`/`title`/uniqueness; the rest
 /// is console-interpreted (the PHASE3-DESCRIPTOR-PANELS contract), so the widget kinds and bound
-/// verbs ride verbatim. `order` 10/20/30 and `scope: "instance"` per the spec.
+/// verbs ride verbatim. `order` 10/20/30 and `scope: "instance"` per the spec — repeated on each
+/// command-backed widget, which the console renderer requires. No widget names a `writeVerb`:
+/// writes stay on the command surface behind the allow-list.
 #[must_use]
 pub fn panels() -> Vec<Value> {
     vec![
         json!({
             "id": "overview", "title": "Overview", "order": 10, "scope": "instance",
             "widgets": [
-                { "kind": "summary", "fields": ["connected", "state", "paused", "endpoint"] },
-                { "kind": "commandSummary", "actions": ["sb/pause", "sb/resume", "reconnect"] }
+                {
+                    "kind": "summary", "id": "overview-summary", "title": "Adapter overview",
+                    "rows": [
+                        { "label": "Status", "value": "Connected / state / paused / endpoint via cmd/sb/status" },
+                        { "label": "Lifecycle", "value": "Pause, resume, reconnect, and repoll the instance" },
+                        { "label": "Writes", "value": "Allow-listed via writes.allow[]; checked before device I/O" }
+                    ]
+                },
+                {
+                    "kind": "commandSummary", "id": "overview-lifecycle", "title": "Lifecycle bindings",
+                    "verbs": ["sb/status", "sb/pause", "sb/resume", "reconnect"]
+                }
             ],
             "verbs": ["sb/status", "sb/pause", "sb/resume", "reconnect"]
         }),
+        // Descriptor-compat hint: the shipped edge-console signalGrid reads `subscriptionsVerb`
+        // (falling back to the removed `sb/subscriptions`). Point that key at the `sb/signals` verb
+        // too, so the current console binds correctly until it reads `signalsVerb`. This is a
+        // descriptor field alias, NOT a wire-verb alias — no `sb/subscriptions` verb exists.
         json!({
             "id": "signals", "title": "Signals", "order": 20, "scope": "instance",
-            "widgets": [ { "kind": "signalGrid" } ],
+            "widgets": [
+                {
+                    "kind": "signalGrid", "id": "configured-signals", "title": "Configured signals",
+                    "scope": "instance",
+                    "signalsVerb": "sb/signals",
+                    "subscriptionsVerb": "sb/signals",
+                    "readVerb": "sb/read"
+                }
+            ],
             "verbs": ["sb/signals", "sb/read", "sb/write", "repoll"]
         }),
         json!({
             "id": "diagnostics", "title": "Diagnostics", "order": 30, "scope": "instance",
-            "widgets": [ { "kind": "treeBrowser" }, { "kind": "keyValueList" } ],
+            "widgets": [
+                {
+                    "kind": "treeBrowser", "id": "tag-space", "title": "Device tag space",
+                    "scope": "instance", "mode": "hierarchical", "rootRef": "root",
+                    "depth": 1, "maxRefs": 200,
+                    "browseVerb": "sb/browse", "readVerb": "sb/read"
+                },
+                {
+                    "kind": "keyValueList", "id": "diagnostic-counters", "title": "Diagnostics",
+                    "rows": [
+                        { "label": "Counters", "value": "Read/write/error tallies via cmd/sb/status `metrics`" },
+                        { "label": "Security", "value": "Session posture via cmd/sb/status `security`" }
+                    ]
+                }
+            ],
             "verbs": ["sb/browse", "sb/status"]
         }),
     ]
@@ -557,11 +596,45 @@ impl Commander {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // sb/browse (§7.5) — poll = paged list_tags; push = the configured assembly layout
+    // sb/browse (§7.5) — poll = paged list_tags; push = the configured assembly layout. `ref`
+    // additionally selects the hierarchical `treeBrowser` panel mode over the same inventory.
     // ---------------------------------------------------------------------------------------------
     async fn browse(&self, body: &Value) -> Reply {
         let h = self.resolve(body)?;
         let started = Instant::now();
+        // The two request forms are mutually exclusive: `ref`/`depth`/`maxRefs` select the
+        // hierarchical panel mode, `cursor`/`max` the paged one — and the hierarchical-only
+        // arguments are meaningless without a `ref`.
+        let hierarchical_keys = ["ref", "depth", "maxRefs"].iter().any(|k| body.get(*k).is_some());
+        let paged_keys = ["cursor", "max"].iter().any(|k| body.get(*k).is_some());
+        if hierarchical_keys && paged_keys {
+            h.dm.record_command("sb/browse", false, ms(started), CommandTally::default());
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                "`ref`/`depth`/`maxRefs` (hierarchical) and `cursor`/`max` (paged) are mutually exclusive",
+            ));
+        }
+        if hierarchical_keys && body.get("ref").is_none() {
+            h.dm.record_command("sb/browse", false, ms(started), CommandTally::default());
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                "`depth`/`maxRefs` are hierarchical-mode arguments and require `ref`",
+            ));
+        }
+        if body.get("ref").is_some() {
+            let result = self.browse_hierarchical(h, body).await;
+            let (ok, browsed) = match &result {
+                Ok(Some(v)) => (true, v.get("refCount").and_then(Value::as_u64).unwrap_or(0)),
+                _ => (false, 0),
+            };
+            h.dm.record_command(
+                "sb/browse",
+                ok,
+                ms(started),
+                CommandTally { browsed_tags: browsed, ..CommandTally::default() },
+            );
+            return result;
+        }
         let cursor = body.get("cursor").and_then(|v| v.as_str()).map(str::to_string);
         let max = body.get("max").and_then(|v| v.as_u64()).unwrap_or(200).clamp(1, 1000) as usize;
 
@@ -594,6 +667,121 @@ impl Commander {
             CommandTally { browsed_tags: browsed, ..CommandTally::default() },
         );
         result.map(Some)
+    }
+
+    /// The `treeBrowser` panel mode of `sb/browse` (§7.5): `ref` names a node in the **same**
+    /// inventory the paged mode serves — the device tag list (poll) or the configured assembly
+    /// layout (push). `"root"` is the device node, whose `contains` refs are the inventory (bounded
+    /// by `maxRefs`); a tag/field id is a known leaf (`"refs": []`); an unknown ref is `BAD_ARGS`.
+    /// `depth` and `maxRefs` are clamped to 1..4 / 1..1000 (the same convention as the paged `max`);
+    /// the tag inventory is flat, so a deeper `depth` finds no grandchildren — it is still validated
+    /// and echoed.
+    async fn browse_hierarchical(&self, h: &DeviceHandle, body: &Value) -> Reply {
+        let Some(ref_id) = body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()) else {
+            return Err(CommandError::new("BAD_ARGS", "`ref` must be a non-empty string"));
+        };
+        let depth = body.get("depth").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4);
+        let max_refs = body.get("maxRefs").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
+
+        // One inventory source per mode — the same one the paged form serves. Each entry:
+        // (nodeId, name, dataType, extra fields).
+        let entries: Vec<(String, String, Value, serde_json::Map<String, Value>)> =
+            if matches!(h.cfg.mode, DeviceMode::Push) {
+                let mut out = Vec::new();
+                if let Some(io) = h.cfg.io.as_ref() {
+                    for f in &io.input.signals {
+                        out.push(hier_entry(f, io.assemblies.input, "input"));
+                    }
+                    if let Some(o) = io.output.as_ref() {
+                        for f in &o.signals {
+                            out.push(hier_entry(f, io.assemblies.output, "output"));
+                        }
+                    }
+                }
+                out
+            } else {
+                // Collect the whole tag list through the same control channel the paged mode uses,
+                // following its cursors — one source, both browse modes.
+                let configured: std::collections::HashSet<String> =
+                    h.cfg.signals().map(|s| s.tag_path.clone()).collect();
+                let mut out = Vec::new();
+                let mut cursor: Option<String> = None;
+                loop {
+                    let (tx, rx) = oneshot::channel();
+                    h.control
+                        .send(DeviceControl::Browse { cursor: cursor.clone(), max: 1000, reply: tx })
+                        .await
+                        .map_err(|_| device_unavailable())?;
+                    let page = match rx.await {
+                        Ok(Ok(page)) => page,
+                        Ok(Err(BrowseError::Unsupported)) => {
+                            return Err(CommandError::new("BROWSE_UNSUPPORTED", "device has no tag-list service"));
+                        }
+                        Ok(Err(BrowseError::Failed(e))) => return Err(CommandError::new("BROWSE_FAILED", e)),
+                        Err(_) => return Err(device_unavailable()),
+                    };
+                    for t in &page.tags {
+                        let mut extra = serde_json::Map::new();
+                        extra.insert("configured".into(), json!(configured.contains(&t.name)));
+                        extra.insert("supported".into(), json!(type_supported(&t.type_name)));
+                        if let Some(dim) = t.array_dim {
+                            extra.insert("arrayDim".into(), json!(dim));
+                        }
+                        out.push((t.name.clone(), t.name.clone(), json!(t.type_name), extra));
+                    }
+                    match page.next_cursor {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+                out
+            };
+
+        if ref_id == "root" {
+            let truncated = entries.len() > max_refs;
+            let refs: Vec<Value> = entries
+                .into_iter()
+                .take(max_refs)
+                .map(|(id, name, data_type, extra)| {
+                    let mut target = serde_json::Map::new();
+                    target.insert("nodeId".into(), json!(id));
+                    target.insert("name".into(), json!(name));
+                    target.insert("nodeClass".into(), json!("signal"));
+                    target.insert("dataType".into(), data_type);
+                    target.extend(extra);
+                    json!({ "referenceType": "contains", "target": Value::Object(target) })
+                })
+                .collect();
+            let ref_count = refs.len();
+            return Ok(Some(json!({
+                "id": h.cfg.id,
+                "mode": "hierarchical",
+                "root": { "nodeId": "root", "name": h.cfg.id, "nodeClass": "device",
+                          "dataType": Value::Null, "refs": refs },
+                "refCount": ref_count,
+                "depth": depth,
+                "truncated": truncated
+            })));
+        }
+
+        let Some((id, name, data_type, extra)) = entries.into_iter().find(|(id, _, _, _)| id == ref_id) else {
+            return Err(CommandError::new("BAD_ARGS", format!("unknown browse ref `{ref_id}`")));
+        };
+        let mut root = serde_json::Map::new();
+        root.insert("nodeId".into(), json!(id));
+        root.insert("name".into(), json!(name));
+        root.insert("nodeClass".into(), json!("signal"));
+        root.insert("dataType".into(), data_type);
+        root.extend(extra);
+        root.insert("refs".into(), json!([]));
+        Ok(Some(json!({
+            "id": h.cfg.id,
+            "mode": "hierarchical",
+            "root": Value::Object(root),
+            "refCount": 0,
+            "depth": depth,
+            "truncated": false
+        })))
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -650,7 +838,7 @@ impl Commander {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // repoll (§7.5) — poll only, refused on push and while paused
+    // repoll (§7.5) — poll only, refused on push (BAD_ARGS) and while paused (PAUSED)
     // ---------------------------------------------------------------------------------------------
     async fn repoll(&self, body: &Value) -> Reply {
         let h = self.resolve(body)?;
@@ -661,7 +849,7 @@ impl Commander {
         }
         if h.health.paused.load(Ordering::Relaxed) {
             h.dm.record_command("repoll", false, ms(started), CommandTally::default());
-            return Err(CommandError::new("BAD_ARGS", "instance is paused - resume first"));
+            return Err(CommandError::new("PAUSED", "instance is paused - resume first"));
         }
         let (tx, rx) = oneshot::channel();
         h.control
@@ -675,7 +863,7 @@ impl Commander {
             }
             Err(e) if e.contains("paused") => {
                 h.dm.record_command("repoll", false, ms(started), CommandTally::default());
-                Err(CommandError::new("BAD_ARGS", e))
+                Err(CommandError::new("PAUSED", e))
             }
             Err(e) => {
                 h.dm.record_command("repoll", false, ms(started), CommandTally::default());
@@ -899,6 +1087,19 @@ fn browse_push_layout(h: &DeviceHandle) -> Value {
         }
     }
     json!({ "id": h.cfg.id, "tags": tags })
+}
+
+/// A hierarchical-browse inventory entry for one configured push I/O field (§7.5):
+/// `(nodeId, name, dataType, extra)`.
+fn hier_entry(
+    f: &IoFieldSpec,
+    assembly: u16,
+    direction: &str,
+) -> (String, String, Value, serde_json::Map<String, Value>) {
+    let mut extra = serde_json::Map::new();
+    extra.insert("direction".into(), json!(direction));
+    extra.insert("configured".into(), json!(true));
+    (f.signal_id(assembly), f.name.clone(), json!(f.eip_type.wire()), extra)
 }
 
 fn layout_tag(f: &IoFieldSpec, assembly: u16, direction: &str) -> Value {
@@ -1327,6 +1528,62 @@ mod tests {
         assert!(!out["tags"].as_array().unwrap().is_empty());
     }
 
+    // --- sb/browse hierarchical (the treeBrowser panel mode) --------------------------------------
+
+    #[tokio::test]
+    async fn browse_ref_serves_the_hierarchical_panel_mode_over_the_same_inventory() {
+        let opts = MockOpts { browse: BrowseKind::Tags(vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING")]), ..MockOpts::default() };
+        let h = harness(poll_device(), opts);
+
+        // "root" answers the device node with one `contains` ref per browsed tag.
+        let out = ok(h.commander.browse(&json!({ "ref": "root" })).await);
+        assert_eq!(out["mode"], json!("hierarchical"));
+        assert_eq!(out["root"]["nodeId"], json!("root"));
+        assert_eq!(out["root"]["nodeClass"], json!("device"));
+        let refs = out["root"]["refs"].as_array().unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0]["referenceType"], json!("contains"));
+        assert_eq!(refs[0]["target"]["nodeId"], json!("LINE_SPEED"));
+        assert_eq!(refs[0]["target"]["configured"], json!(true), "LINE_SPEED is in config");
+        assert_eq!(refs[1]["target"]["supported"], json!(false), "SSTRING is undecodable");
+        assert_eq!(out["refCount"], json!(2));
+        assert_eq!(out["truncated"], json!(false));
+
+        // A known tag ref is a leaf; an unknown ref is BAD_ARGS.
+        let out = ok(h.commander.browse(&json!({ "ref": "LINE_SPEED" })).await);
+        assert_eq!(out["root"]["nodeClass"], json!("signal"));
+        assert_eq!(out["root"]["refs"], json!([]));
+        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "nope" })).await), "BAD_ARGS");
+
+        // `depth` clamps to 1..4 and `maxRefs` to 1..1000 (`truncated` reports the cut).
+        let out = ok(h.commander.browse(&json!({ "ref": "root", "depth": 99, "maxRefs": 1 })).await);
+        assert_eq!(out["depth"], json!(4));
+        assert_eq!(out["root"]["refs"].as_array().unwrap().len(), 1);
+        assert_eq!(out["truncated"], json!(true));
+
+        // Push: the hierarchical inventory is the configured assembly layout, no round-trip.
+        let hp = harness(push_device(), MockOpts::default());
+        let out = ok(hp.commander.browse(&json!({ "ref": "root" })).await);
+        let refs = out["root"]["refs"].as_array().unwrap();
+        assert_eq!(refs.len(), 2, "one input + one output field");
+        assert_eq!(refs[0]["target"]["direction"], json!("input"));
+        let out = ok(hp.commander.browse(&json!({ "ref": "a150/0/real" })).await);
+        assert_eq!(out["root"]["nodeClass"], json!("signal"));
+    }
+
+    #[tokio::test]
+    async fn browse_rejects_mixed_modes_and_hierarchical_args_without_ref() {
+        let h = harness(poll_device(), MockOpts::default());
+        // Mixing the paged and hierarchical arg families is BAD_ARGS.
+        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "root", "cursor": "1" })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "root", "max": 10 })).await), "BAD_ARGS");
+        // `depth`/`maxRefs` without `ref` is BAD_ARGS.
+        assert_eq!(err_code(h.commander.browse(&json!({ "depth": 2 })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(&json!({ "maxRefs": 10 })).await), "BAD_ARGS");
+        // A non-string / empty `ref` is BAD_ARGS.
+        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "" })).await), "BAD_ARGS");
+    }
+
     // --- sb/pause / sb/resume + reflection through the mock task -----------------------------------
 
     #[tokio::test]
@@ -1373,10 +1630,10 @@ mod tests {
         let hp = harness(push_device(), MockOpts::default());
         assert_eq!(err_code(hp.commander.repoll(&json!({})).await), "BAD_ARGS");
 
-        // Paused poll instance ⇒ BAD_ARGS (resume first, §7.4.7).
+        // Paused poll instance ⇒ the dedicated PAUSED code (resume first, §7.4.7).
         let h = harness(poll_device(), MockOpts::default());
         let _ = h.commander.pause(&json!({}), None).await;
-        assert_eq!(err_code(h.commander.repoll(&json!({})).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.repoll(&json!({})).await), "PAUSED");
     }
 
     // --- the describe catalog: 9 verbs + 3 panels -------------------------------------------------
@@ -1393,6 +1650,32 @@ mod tests {
             assert_eq!(p["scope"], json!("instance"));
         }
         assert_eq!(panels[1]["verbs"], json!(["sb/signals", "sb/read", "sb/write", "repoll"]));
+
+        // The renderable-descriptor floor: `summary.rows`, `commandSummary.verbs`, a `signalGrid`
+        // naming BOTH `signalsVerb` and `subscriptionsVerb` (→ sb/signals) plus `readVerb`, a
+        // hierarchical `treeBrowser` with `browseVerb`/`rootRef`, widget-level `scope: "instance"`
+        // on the command-backed widgets — and NO widget advertises a `writeVerb` (the guarded-write
+        // console flow does not exist).
+        let overview = &panels[0]["widgets"];
+        assert!(overview[0]["rows"].as_array().is_some_and(|r| !r.is_empty()), "summary carries rows");
+        assert!(overview[1]["verbs"].as_array().is_some_and(|v| !v.is_empty()), "commandSummary carries verbs");
+        let grid = &panels[1]["widgets"][0];
+        assert_eq!(grid["kind"], json!("signalGrid"));
+        assert_eq!(grid["scope"], json!("instance"));
+        assert_eq!(grid["signalsVerb"], json!("sb/signals"));
+        assert_eq!(grid["subscriptionsVerb"], json!("sb/signals"));
+        assert_eq!(grid["readVerb"], json!("sb/read"));
+        let tree = &panels[2]["widgets"][0];
+        assert_eq!(tree["kind"], json!("treeBrowser"));
+        assert_eq!(tree["scope"], json!("instance"));
+        assert_eq!(tree["mode"], json!("hierarchical"));
+        assert_eq!(tree["rootRef"], json!("root"));
+        assert_eq!(tree["browseVerb"], json!("sb/browse"));
+        for p in &panels {
+            for w in p["widgets"].as_array().unwrap() {
+                assert!(w.get("writeVerb").is_none(), "no widget advertises writeVerb");
+            }
+        }
 
         // The nine verbs `register_all` registers == the `EtherNetIpCommand` verb set (§7, §8.6).
         let expected = [

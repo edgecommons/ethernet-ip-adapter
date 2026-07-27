@@ -1829,6 +1829,28 @@ mod tests {
     }
 
     #[test]
+    fn schema_aliases_instance_onto_device() {
+        // The SOUTHBOUND §4 tooling convention: `#/$defs/instance` is one `component.instances[]`
+        // entry, aliased onto this adapter's own `#/$defs/device` shape so `component validate`
+        // and the deployment compatibility guard find the instance shape without knowing the
+        // adapter's vocabulary.
+        let schema: Value =
+            serde_json::from_str(include_str!("../config.schema.json")).expect("schema is JSON");
+        assert_eq!(schema["$defs"]["instance"], json!({ "$ref": "#/$defs/device" }));
+        let inst_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": "#/$defs/instance"
+        });
+        let v = jsonschema::validator_for(&inst_schema).expect("instance alias compiles");
+        let cfg: Value =
+            serde_json::from_str(include_str!("../test-configs/config.json")).expect("config is JSON");
+        for inst in cfg["component"]["instances"].as_array().unwrap() {
+            assert!(v.is_valid(inst), "instance {} validates via the alias", inst["id"]);
+        }
+    }
+
+    #[test]
     fn schema_rejects_push_without_io_and_poll_with_io() {
         let schema: Value =
             serde_json::from_str(include_str!("../config.schema.json")).expect("schema is JSON");

@@ -157,7 +157,8 @@ publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/resume
 ```
 
 While paused, the instance reports `state: "PAUSED"` (with `connected` still truthful), stale-signal
-health is suspended, a slow liveness probe keeps `connected` honest, and `repoll` is refused. Both verbs
+health is suspended, a slow liveness probe keeps `connected` honest, and `repoll` is refused with the
+`PAUSED` error code. Both verbs
 are idempotent — `changed` tells you whether the call moved the state. Pause is in-memory and resets to
 running on restart.
 
@@ -181,6 +182,27 @@ publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/browse
 Pass the returned `cursor` back to page. The tag-list service is a Logix-family capability; a generic CIP
 device (e.g. a plain I/O adapter) answers `BROWSE_UNSUPPORTED`. On a **push** instance `sb/browse`
 returns the configured assembly layout (input + output fields) with no device round-trip.
+
+A body carrying `ref` selects the **hierarchical** form over the same inventory — the shape the
+edge-console tree browser drives. `ref: "root"` answers the device node with one `contains` ref per
+tag (or per configured push field); a tag id answers that leaf:
+
+```
+publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/browse
+          { "header": { "name": "sb/browse", ... },
+            "body": { "instance": "filler-plc", "ref": "root", "depth": 1, "maxRefs": 200 } }
+   → { "ok": true, "result": { "id": "filler-plc", "mode": "hierarchical",
+       "root": { "nodeId": "root", "name": "filler-plc", "nodeClass": "device", "dataType": null,
+                 "refs": [ { "referenceType": "contains",
+                             "target": { "nodeId": "LINE_SPEED", "name": "LINE_SPEED",
+                                         "nodeClass": "signal", "dataType": "REAL",
+                                         "configured": true, "supported": true } } ] },
+       "refCount": 1, "depth": 1, "truncated": false } }
+```
+
+`depth` clamps to 1..4 and `maxRefs` to 1..1000. The two argument families are exclusive: mixing
+`ref`/`depth`/`maxRefs` with `cursor`/`max` — or passing `depth`/`maxRefs` without `ref` — is
+`BAD_ARGS`.
 
 ---
 
@@ -385,9 +407,9 @@ With `--platform auto` the library detects the platform and needs no CLI args.
 
 ## Observe health and status
 
-- **Metric** `southbound_health` (`connectionState`, `paused`, `readErrors`, `writeErrors`,
-  `staleSignals`, `reconnects`, latencies) — with `metricEmission.target: messaging` it auto-publishes
-  on the UNS `metric` class; `log`/`cloudwatch`/`prometheus` also work.
+- **Metric** `southbound_health` (`connectionState`, `signalsSubscribed`, `readErrors`,
+  `writeErrors`, `staleSignals`, `reconnects`, latencies) — with `metricEmission.target: messaging`
+  it auto-publishes on the UNS `metric` class; `log`/`cloudwatch`/`prometheus` also work.
 - **Operational metrics** `EtherNetIpConnection`, `EtherNetIpInventory`, `EtherNetIpPoll`,
   `EtherNetIpPublish`, `EtherNetIpCommand`, and (push only) `EtherNetIpIo`. Use `EtherNetIpPoll` for poll
   health, `EtherNetIpIo` for class-1 frame health (`framesConsumed`, `staleFramesDropped`,

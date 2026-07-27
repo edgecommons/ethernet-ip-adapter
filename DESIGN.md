@@ -140,7 +140,7 @@ performed, by this work).
 | **D-EIP-9** | **`signal.id` = the configured `tagPath`, verbatim (case-sensitive).** | One instance = one device, so the tag path is unique within the instance and stable across restarts — no synthetic prefix needed (`u<unit>/…` exists in Modbus because unit id is real addressing there; slot is connection routing, not identity, so it stays out of the id and inside `signal.address`). The UNS topic channel comes from the config `name` (lower-kebab), NOT from the id — §5.3/§6.1. |
 | **D-EIP-10** | **Quality: per-signal read failure ⇒ published `BAD` sample with the CIP status in `qualityRaw`; connection-level failure ⇒ leave the poll loop and reconnect; `UNCERTAIN` for scale/coercion anomalies.** | Keeps the template's "a failed read is published, not swallowed" rule and the §3 normalization table (§5.4). |
 | **D-EIP-11** | **Timestamps: `serverTs` = adapter read time (facade default "now"); `sourceTs` is NEVER emitted.** | CIP explicit read replies carry no device timestamp. The facade never synthesizes `sourceTs`, honoring `SOUTHBOUND.md` §2 ("at least one SHOULD be present" — `serverTs` is). |
-| **D-EIP-12** | **Metric families: mandatory `southbound_health` (+ a `paused` gauge) PLUS `EtherNetIpConnection` / `EtherNetIpInventory` / `EtherNetIpPoll` / `EtherNetIpPublish` / `EtherNetIpCommand` / `EtherNetIpIo` (push), every counter as a `(…Total, …Interval)` measure pair.** | Family structure and dimensions mirror Modbus (`Modbus*` families, dims `instance`/`pollGroup`/`result`/`verb`/`publishMode`); the explicit Total/Interval measure-pair spelling mirrors OPC UA (`ReadRequestTotal`/`ReadRequestInterval`). `EtherNetIpIo` is the push-mode addition (frames, sequence gaps, stale drops, watchdog timeouts — §8.8), surfacing the validation counters the protocol stack keeps (PROTOCOL-DESIGN §8.6). This is the parity superset — full tables in §8. Dimensions are low-cardinality ONLY; tag names/addresses/endpoints are never dimensions. |
+| **D-EIP-12** | **Metric families: mandatory `southbound_health` (exactly the eight SOUTHBOUND §5 measures, incl. `signalsSubscribed`) PLUS `EtherNetIpConnection` / `EtherNetIpInventory` / `EtherNetIpPoll` / `EtherNetIpPublish` / `EtherNetIpCommand` / `EtherNetIpIo` (push), every counter as a `(…Total, …Interval)` measure pair.** | Family structure and dimensions mirror Modbus (`Modbus*` families, dims `instance`/`pollGroup`/`result`/`verb`/`publishMode`); the explicit Total/Interval measure-pair spelling mirrors OPC UA (`ReadRequestTotal`/`ReadRequestInterval`). `EtherNetIpIo` is the push-mode addition (frames, sequence gaps, stale drops, watchdog timeouts — §8.8), surfacing the validation counters the protocol stack keeps (PROTOCOL-DESIGN §8.6). This is the parity superset — full tables in §8. Dimensions are low-cardinality ONLY; tag names/addresses/endpoints are never dimensions. |
 | **D-EIP-13** | **Command routing: all verbs registered ONCE on the component-scope inbox; the target device rides `body.instance`, optional when exactly one device is configured.** | Exactly the Modbus pattern (`main.py` registers each verb once and resolves by the body's `instance` selector) and the template's `sb/write`. One inbox serves every device this adapter owns (D-U28). |
 | **D-EIP-14** | **Pause semantics (poll mode): pause suspends the *scheduled poll/publish* only. The session stays open, on-demand `sb/read`/`sb/write` still work, and a slow keepalive probe keeps `connected` driven by real CIP I/O.** (Push-mode counterpart: D-EIP-20; the mode-uniform contract — pause suspends the instance's telemetry production — is normative in §7.4.) | The alternative (tear the session down) conflates "operator muted the data flow" with "link is down" and would make `connected` a lie in both directions. Full semantics in §7.4/§9.3. Pause state is **in-memory** — a component restart resumes production (documented; a persistent disable would be config, not a command). |
 | **D-EIP-15** | **One CIP request per signal per poll cycle (no Multiple Service Packet batching) in v1.** | MSP batching is a performance optimization with real encoding complexity; with the owned stack it is now *feasible* (a natural `enip` crate v2 feature) but still deliberately deferred. Stated as a limitation (§14.3) with the `EtherNetIpInventory.requestsPerCycle` measure making the cost visible. Push mode does not have this cost (one frame carries the whole assembly). |
@@ -733,8 +733,9 @@ a missing/unknown instance is `NO_SUCH_INSTANCE`. Replies always include the res
 **Error codes** (reply `{"ok":false,"error":{"code","message"}}` via `CommandError`):
 `BAD_ARGS`, `NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`, `DEVICE_UNAVAILABLE`
 (device task gone / channel closed), `READ_FAILED` (connection-level failure during an on-demand
-read), `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`. Per-entry problems inside
-batch read/write are reported inline in the result, not as command errors.
+read), `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`, `PAUSED` (a whole operation the
+paused state prohibits — `repoll`, §7.4.7). Per-entry problems inside batch read/write are
+reported inline in the result, not as command errors.
 
 ### 7.1 `sb/status` — instance status
 
@@ -864,14 +865,15 @@ clarification; D-EIP-14 + D-EIP-20):
    cadence `healthThresholds.keepaliveProbeIntervalMs`) since no polls flow; a probe failure
    drives the normal reconnect path (still paused after reconnecting). Push: **no probe needed**
    — T→O reception and the watchdog already are the liveness signal.
-4. Reflection — all three surfaces move together: (a) `state` keepalive `instances[]`: `state`
+4. Reflection — the surfaces move together: (a) `state` keepalive `instances[]`: `state`
    token becomes **`"PAUSED"`**, `attributes.paused: true` (`connected` stays truthful);
-   (b) metric: `southbound_health.paused` gauge = 1 (§8.1); (c) events: `adapter-paused` /
-   `adapter-resumed` (§6.3).
+   (b) events: `adapter-paused` / `adapter-resumed` (§6.3); (c) `sb/status` reports
+   `paused: true`. The transition also flushes `southbound_health` immediately (§8.7); there is
+   no `paused` measure — the metric carries exactly the eight SOUTHBOUND §5 measures (§8.1).
 5. Staleness accounting is **suspended** while paused (§9.3) — a paused signal is paused, not
    stale.
 6. Pause state is in-memory; restart ⇒ production resumes (documented in `docs/`).
-7. `repoll` against a paused instance is refused with `BAD_ARGS`
+7. `repoll` against a paused instance is refused with the dedicated top-level code **`PAUSED`**
    (`"instance is paused - resume first"`) — an explicit one-shot read is what `sb/read` is for.
 8. On resume, push change-detection state is **re-based to the current snapshot** so the paused
    span's accumulated drift is not published as one giant "change" burst; poll behaves likewise
@@ -887,25 +889,28 @@ clarification; D-EIP-14 + D-EIP-20):
 | Verb | Request | Reply / behavior |
 |---|---|---|
 | `sb/signals` | `{ "instance"? }` | `{ "id", "mode", "signals": [ { "name", "id", "address", "pollGroup"?, "pollIntervalMs"?, "direction"?, "publishMode", "writable": bool, "deadband"? } ] }` — the resolved config view, `writable` = allow-list membership. Poll entries carry `pollGroup`/`pollIntervalMs`; push entries carry `direction: "input"\|"output"` instead. No device I/O. |
-| `sb/browse` | `{ "instance"?, "cursor"?, "max"? (default 200, cap 1000) }` | Paged CIP tag discovery via Get Instance Attribute List (`EipClient::list_tags`): `{ "id", "tags": [ { "name", "type", "arrayDim"?, "configured": bool, "supported": bool } ], "cursor"? }` (`cursor` absent on the last page; `configured` marks tags already in config; `supported` = decodable per §5.1 — structs/strings/multi-dim report `false` via the typed SymbolType). Works for push instances too when the device is a Logix family (a short-lived explicit session); devices without the tag service ⇒ `BROWSE_UNSUPPORTED`; mid-browse failures ⇒ `BROWSE_FAILED`. |
+| `sb/browse` | `{ "instance"?, "cursor"?, "max"? (default 200, cap 1000) }` | Paged CIP tag discovery via Get Instance Attribute List (`EipClient::list_tags`): `{ "id", "tags": [ { "name", "type", "arrayDim"?, "configured": bool, "supported": bool } ], "cursor"? }` (`cursor` absent on the last page; `configured` marks tags already in config; `supported` = decodable per §5.1 — structs/strings/multi-dim report `false` via the typed SymbolType). Works for push instances too when the device is a Logix family (a short-lived explicit session); devices without the tag service ⇒ `BROWSE_UNSUPPORTED`; mid-browse failures ⇒ `BROWSE_FAILED`. **Hierarchical panel mode:** presence of `"ref"` selects the `treeBrowser` form over the SAME inventory (poll: the device tag list; push: the configured assembly layout) — `{ "ref", "depth"? (clamp 1..4), "maxRefs"? (clamp 1..1000) }` → `{ "id", "mode": "hierarchical", "root": { nodeId, name, nodeClass, dataType, refs[] }, "refCount", "depth", "truncated" }`; `"root"` is the device node whose `contains` refs are the inventory, a tag/field id is a leaf, an unknown ref is `BAD_ARGS`. Mixing `ref`/`depth`/`maxRefs` with `cursor`/`max`, or `depth`/`maxRefs` without `ref`, is `BAD_ARGS`. |
 | `reconnect` | `{ "instance"? }` | Drop + re-establish, one bounded attempt (control message to the device task): poll = session re-register; push = ForwardClose + ForwardOpen. `{ "id", "connected": bool }`; failure ⇒ `RECONNECT_FAILED` (the task then continues normal backoff). Works while paused (does not resume). |
-| `repoll` | `{ "instance"? }` | Poll instances only: force an immediate poll of ALL groups now: `{ "id", "polled": <signals read> }`. Refused while paused (§7.4.7); refused for push instances with `BAD_ARGS` (`"push instance - data arrives cyclically"`). |
+| `repoll` | `{ "instance"? }` | Poll instances only: force an immediate poll of ALL groups now: `{ "id", "polled": <signals read> }`. Refused while paused with `PAUSED` (§7.4.7); refused for push instances with `BAD_ARGS` (`"push instance - data arrives cyclically"`). |
 
 ### 7.6 Edge-console panels (parity requirement)
 
 Registered via `commands.register_panel(json!({...}))` (core validates `id`/`title`/uniqueness;
 everything else is console-interpreted — PHASE3-DESCRIPTOR-PANELS contract). Three panels,
-mirroring the sibling adapters' descriptor set:
+mirroring the sibling adapters' descriptor set, at the **renderable-descriptor floor** the
+shipped console requires:
 
 | Panel `id` | `title` | Widgets (console-owned kinds) | Bound verbs |
 |---|---|---|---|
-| `overview` | Overview | `summary` (connected/state/paused/endpoint per instance), `commandSummary` (pause/resume/reconnect actions) | `sb/status`, `sb/pause`, `sb/resume`, `reconnect` |
-| `signals` | Signals | `signalGrid` over configured signals with live values + on-demand read + write affordance on writable rows | `sb/signals`, `sb/read`, `sb/write`, `repoll` |
-| `diagnostics` | Diagnostics | `treeBrowser` over the device tag space, `keyValueList` of counters | `sb/browse`, `sb/status` |
+| `overview` | Overview | `summary` with `rows[]` (status/lifecycle/writes orientation), `commandSummary` with `verbs[]` (status/pause/resume/reconnect) | `sb/status`, `sb/pause`, `sb/resume`, `reconnect` |
+| `signals` | Signals | `signalGrid` naming BOTH `signalsVerb` and `subscriptionsVerb` → `sb/signals` (descriptor-compat alias for the shipped console) plus `readVerb` → `sb/read` | `sb/signals`, `sb/read`, `sb/write`, `repoll` |
+| `diagnostics` | Diagnostics | `treeBrowser` with `browseVerb` → `sb/browse`, `mode: "hierarchical"`, `rootRef: "root"`, `depth`/`maxRefs` defaults; `keyValueList` with `rows[]` pointing at the `sb/status` counters | `sb/browse`, `sb/status` |
 
-Descriptors carry `order` (10/20/30) and `scope: "instance"`. The console renders verbs it finds
-in `describe`; absent verbs render unavailable — so panels degrade gracefully if a slice lands
-before browse does.
+Descriptors carry `order` (10/20/30) and `scope: "instance"` — repeated at widget level on the
+command-backed widgets, which the console renderer requires. **No widget advertises a
+`writeVerb`** (the guarded-write console flow does not exist; writes stay on the command surface
+behind the allow-list). The console renders verbs it finds in `describe`; absent verbs render
+unavailable — so panels degrade gracefully if a slice lands before browse does.
 
 ---
 
@@ -920,7 +925,7 @@ config-driven (`metricEmission.target`), no adapter code per target. Units are `
 - Every **counter** is a measure PAIR: `<name>Total` (monotonic since component start) and
   `<name>Interval` (since the previous emit of that family; reset on emit). The OPC UA pair
   spelling over the Modbus family/dimension structure — D-EIP-12.
-- **Gauges** (`connectionState`, `sessionConnected`, `paused`, `batchSize`, latencies,
+- **Gauges** (`connectionState`, `sessionConnected`, `signalsSubscribed`, `batchSize`, latencies,
   inventory sizes) are single measures.
 - Dimensions are **low-cardinality only**: `instance`, `pollGroup`, `result`
   (`success`|`error`), `verb` (closed set §8.6), `publishMode` (`onChange`|`always`),
@@ -929,18 +934,19 @@ config-driven (`metricEmission.target`), no adapter code per target. Units are `
 - One metric definition per (family × dimension combination), defined at startup like Modbus
   (`_define_*`), values accumulated in atomics/mutexed counters, emitted on the cadence (§8.7).
 
-### 8.1 `southbound_health` — the mandatory shared metric (SOUTHBOUND §5 + pause)
+### 8.1 `southbound_health` — the mandatory shared metric (exactly the eight SOUTHBOUND §5 measures)
 
-Dimensions: `instance`.
+Dimensions: `instance`. No extension measures: pause state rides `sb/status`, the keepalive
+`PAUSED` token, and the `adapter-paused`/`adapter-resumed` events instead of a gauge.
 
 | Measure | Unit | Res | Meaning |
 |---|---|---|---|
 | `connectionState` | Count | 1 | 1 = session up (driven with `LinkState`, template `Health::set_link` kept) |
-| `paused` | Count | 1 | 1 = instance paused (the §7.4 reflection gauge) — **extension measure** |
+| `signalsSubscribed` | Count | 1 | the configured/served signal inventory the session serves while up (poll: every poll-group signal; push: every declared input+output field — the `sb/signals` set); 0 while disconnected |
 | `pollLatencyMs` | Milliseconds | 1 | last poll cycle's read round-trip (whole cycle) |
 | `publishLatencyMs` | Milliseconds | 1 | last `data` publish await duration |
-| `readErrors` | Count | 60 | signal-read failures over the interval (BAD samples + link-breaking read errors) |
-| `writeErrors` | Count | 60 | failed confirmed writes over the interval |
+| `readErrors` | Count | 60 | signal-read failures over the interval (BAD samples + link-breaking read errors), drained on emit |
+| `writeErrors` | Count | 60 | DEVICE-PATH write failures over the interval (the entry passed validation + the allow-list and was then rejected by the device or aborted by an unavailable session; policy refusals / unresolved refs / missing values do NOT count), drained on emit like `readErrors` |
 | `staleSignals` | Count | 60 | signals with no GOOD read for > `staleSignalSecs` (0 while paused, §9.3) |
 | `reconnects` | Count | 60 | poll-loop exits into reconnect over the interval |
 
@@ -1100,8 +1106,8 @@ from the link state (an `AtomicBool` beside `Health`) so a link break while paus
 The reported `state` token is `PAUSED` whenever the instance is paused AND the session is up;
 `connected` always tells the truth independently. The template invariant is preserved and
 extended: `connected`, `southbound_health.connectionState`, and the state token all derive from
-the same `Health` object — and `paused` (attribute, gauge, token) derives from the same
-`AtomicBool` — so no two surfaces can disagree.
+the same `Health` object — and `paused` (attribute, token, `sb/status` field) derives from the
+same `AtomicBool` — so no two surfaces can disagree.
 
 ### 9.3 Connectivity is driven by real CIP I/O
 
@@ -1363,9 +1369,9 @@ via request/reply:
    increment. Push — `dout-word` write `ok:true` with `applied: "next-frame"`, and the O→T
    frame observably changes; a write to an input field refused inline.
 6. **sb/pause / sb/resume (both modes)**: pause each instance → its `data` traffic stops; state
-   token `PAUSED`; `southbound_health.paused`=1; `adapter-paused` event; `sb/read` still
+   token `PAUSED`; `sb/status` `paused: true`; `adapter-paused` event; `sb/read` still
    answers; **push: `framesConsumed`/`framesProduced` keep counting while paused** (the
-   connection lives, D-EIP-20); resume → traffic returns, all three surfaces flip back, no
+   connection lives, D-EIP-20); resume → traffic returns, the surfaces flip back, no
    burst of stale "changes" (§7.4.8).
 7. **Metrics**: with `metricEmission.target: messaging`, the `metric` class shows all seven
    families (§8.1–§8.8) with the §8 measure names; Total counters monotonic, Interval counters
@@ -1565,7 +1571,7 @@ a ship blocker.
 | `push.rs` | field-change gating (deadband + `sampleMs` floor under `start_paused` time control); idle-frame ⇒ UNCERTAIN samples; pause = consume-but-don't-publish (snapshot advances, zero publishes); resume re-basing (§7.4.8 — no stale-change burst); Lost ⇒ reconnect path; output-write serialization |
 | `sim.rs` + session behavior | per-signal BAD not swallowed; probe; browse paging incl. unsupported marker; scripted push frames (values, idle, stop-producing) |
 | `app.rs` supervisor | backoff math (template tests kept); connectivity tokens incl. PAUSED and break-while-paused, for both modes; provider/metric/token single-source invariants |
-| `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default; write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused and repoll-on-push refusals; browse error mapping; push sb/read snapshot incl. `NO_FRAME` |
+| `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default; write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused (`PAUSED`) and repoll-on-push (`BAD_ARGS`) refusals; browse error mapping; push sb/read snapshot incl. `NO_FRAME` |
 | `metrics.rs` | Total/Interval pair semantics (interval resets, total doesn't); per-dimension definition set matches §8 exactly incl. `EtherNetIpIo` (this test IS the parity contract's executable form) |
 | wire shape | `DataFacade::build_body` output for a §4.5 signal AND a §4.6 push field asserted field-by-field against §5.2 (id/address/device/quality/serverTs-present/sourceTs-absent) |
 
@@ -1723,7 +1729,7 @@ Section references are the acceptance spec. **P-slices build the protocol crate*
 | **S2 — Config model & schema** | `config.rs` per §4 incl. `mode` + the §4.6 `io` block (all keys, precedence, validations, layout construction via `AssemblyLayout`); rewrite `config.schema.json` to the §4 shape; `test-configs/` = §4.5 poll + §4.6 push. | Every §4 table key parses with its default; every §4.4/§4.6-listed validation has a rejecting test; schema validates both worked examples; `deny_unknown_fields` everywhere except `connection`. |
 | **S3 — EIP backend (both modes)** | `eip/{mod,session,push,types}.rs` per §3.3–§3.4 and §5 over the enip crate; extend `device.rs` traits (read subset, write w/ spec, browse, probe, `Unsupported`, **`PushSession`/`IoUpdate`**); update `sim.rs` to the new traits + §11.1 layout + scripted push frames. | Codec unit tests cover every §5.1 row + arrays + scale/offset both modes; `EnipError`→`DeviceError` mapping matches §10.1's table (test per row); backend unit-tested against `duplex` fixtures / a mock `DeviceSession`. |
 | **S4 — Poll & push engines + publish** | `poll.rs` + `push.rs` + `publish.rs` per §3.2, §6.2: per-group tickers / IoUpdate consumption, deadband+`sampleMs` gates, batch windows, stale tracking, BAD-passes-gate, snapshot + re-basing, publish latency; wire both into `run_device` by `mode`. | §12.3 poll- and push-row tests green under `tokio::time` control; wire-shape test asserts the exact §5.2 body for both id forms; sim-backed `cargo run` publishes per-group cadences AND gated push updates. |
-| **S5 — Metrics** | `metrics.rs` per §8 in full: health set (incl. `paused`), **six** families incl. `EtherNetIpIo`, Total/Interval pairs, dimension pre-definition, cadence + `emit_metric_now` transitions (incl. push up/lost). | The §12.3 "definition set matches §8 exactly" test enumerates every family/measure/dimension from this doc and passes — this test is the executable parity contract. |
+| **S5 — Metrics** | `metrics.rs` per §8 in full: health set (the eight SOUTHBOUND §5 measures incl. `signalsSubscribed`), **six** families incl. `EtherNetIpIo`, Total/Interval pairs, dimension pre-definition, cadence + `emit_metric_now` transitions (incl. push up/lost). | The §12.3 "definition set matches §8 exactly" test enumerates every family/measure/dimension from this doc and passes — this test is the executable parity contract. |
 | **S6 — Command surface + pause/resume + panels** | `commands.rs` per §7: all 9 verbs with mode-aware behaviors (§7.2 snapshot reads, §7.3 `applied: next-frame`, §7.5 refusals), instance routing, gate order, control channel into the device task, pause semantics §7.4 both modes (probe poll-only, D-EIP-20 push), events §6.3, panels §7.6. | Every §7 verb has request/reply/error tests per §12.3 incl. the push-specific rows; pause flips all three reflection surfaces in one test per mode; `describe` lists all 9 verbs + 3 panels; allow-list refusal is proven to happen before any device I/O. |
 | **S7 — Simulators, live tests, CI & coverage** | `compose.yaml` both sim services §11.2 + the OpENer `test-infra/opener/Dockerfile` §11.5; `tests/live_cpppo.rs` + `tests/live_opener.rs` §11.3; `.github/workflows/ci.yml` (org reusable + §12.1 workspace gate + P4 fuzz smoke); coverage regex §12.2. | `cargo llvm-cov --workspace … --fail-under-lines 90` passes locally (Linux/WSL, 93.5%) with the §12.2 regex excluding only the thin live-infra seam files (`supervisor`/`poll_driver`/`push_driver`/`publish_sink`/`eip/live`) + live suites + fuzz + test doubles; both live suites pass with their sim up and self-skip with it down. |
 | **S8 — Docs** | Diátaxis `docs/{tutorial,how-to-guides,explanation,sample-configurations}.md` + `docs/reference/{configuration,messaging-interface,metrics,data-types}.md`; rewrite `README.md` for the real adapter — **covering both modes as equal citizens**. User-docs rules apply: current behavior only, present tense, no roadmap/status; limitations §14 stated as plain facts (incl. the push-write §14.1 honesty note). | Reference pages enumerate exactly the §4 config keys (incl. §4.6), §7 verbs/error codes, §8 measures (incl. §8.8), §5.1 types — no drift from this doc; docs-site sync compatibility (front-matter per sibling adapters). |

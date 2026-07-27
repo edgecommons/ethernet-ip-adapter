@@ -59,7 +59,7 @@ on success, or `{"ok": false, "error": {"code", "message"}}` on failure.
 | `sb/read` | poll, push | `{instance?, signals:[ref…]}` | `{id, reads:[…]}` |
 | `sb/write` | poll, push | `{instance?, writes:[{ref…, value}]}` (or a single `{ref…, value}`) | `{id, written, results:[…]}` |
 | `sb/signals` | poll, push | `{instance?}` | `{id, mode, signals:[…]}` |
-| `sb/browse` | poll, push | `{instance?, cursor?, max?}` | `{id, tags:[…], cursor?}` |
+| `sb/browse` | poll, push | `{instance?, cursor?, max?}` or `{instance?, ref, depth?, maxRefs?}` | `{id, tags:[…], cursor?}` (paged) or `{id, mode:"hierarchical", root, refCount, depth, truncated}` |
 | `sb/pause` | poll, push | `{instance?}` | `{id, paused:true, changed}` |
 | `sb/resume` | poll, push | `{instance?}` | `{id, paused:false, changed}` |
 | `reconnect` | poll, push | `{instance?}` | `{id, connected:true}` |
@@ -71,7 +71,8 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 
 | Code | When |
 |------|------|
-| `BAD_ARGS` | Malformed body; `instance` required with ≥ 2 devices; `repoll` on a push instance or a paused instance. |
+| `BAD_ARGS` | Malformed body; `instance` required with ≥ 2 devices; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
+| `PAUSED` | `repoll` on a paused instance — resume first. |
 | `NO_SUCH_INSTANCE` | `instance` names no configured device. |
 | `WRITE_NOT_ALLOWED` | Every `sb/write` entry was refused by the allow-list. |
 | `WRITE_FAILED` | A write reached the device but the device rejected it (per-entry failures are also reported inline). |
@@ -194,12 +195,19 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
 - **`sb/browse`** → poll: `{ id, tags:[{ name, type, configured, supported, arrayDim? }], cursor? }` —
   page with the returned `cursor`. Push: `{ id, tags:[{ name, id, type, direction, configured:true,
   supported:true }] }` (the configured layout, no round-trip).
+  **Hierarchical form:** a body with `ref` selects the tree mode over the same inventory —
+  `{ instance?, ref, depth? (clamped 1..4), maxRefs? (clamped 1..1000) }` →
+  `{ id, mode:"hierarchical", root:{ nodeId, name, nodeClass, dataType, refs:[{ referenceType:
+  "contains", target:{ nodeId, name, nodeClass, dataType, … } }] }, refCount, depth, truncated }`.
+  `ref:"root"` answers the device node whose refs are the inventory; a tag or field id answers that
+  leaf. Mixing `ref`/`depth`/`maxRefs` with `cursor`/`max`, using `depth`/`maxRefs` without `ref`,
+  or naming an unknown `ref` is `BAD_ARGS`.
 - **`sb/pause`** / **`sb/resume`** → `{ id, paused, changed }` — idempotent; `changed` is whether the
   call moved the state.
 - **`reconnect`** → drops and re-establishes the link (one bounded attempt); `{ id, connected:true }` or
   a `RECONNECT_FAILED` error.
 - **`repoll`** (poll only) → forces one immediate poll cycle; `{ id, polled:<groups> }`. Refused on push
-  or while paused (`BAD_ARGS`).
+  (`BAD_ARGS`) and while paused (`PAUSED`).
 
 ## Events (`evt` class)
 
@@ -266,9 +274,12 @@ The adapter registers three descriptor panels (surfaced by the built-in `describ
 
 | Panel | Order | Widgets | Verbs |
 |-------|-------|---------|-------|
-| `overview` | 10 | summary (`connected`/`state`/`paused`/`endpoint`), command summary | `sb/status`, `sb/pause`, `sb/resume`, `reconnect` |
-| `signals` | 20 | signal grid | `sb/signals`, `sb/read`, `sb/write`, `repoll` |
-| `diagnostics` | 30 | tree browser, key/value list | `sb/browse`, `sb/status` |
+| `overview` | 10 | summary (orientation rows), command summary (`sb/status`/`sb/pause`/`sb/resume`/`reconnect`) | `sb/status`, `sb/pause`, `sb/resume`, `reconnect` |
+| `signals` | 20 | signal grid (`signalsVerb`/`subscriptionsVerb` → `sb/signals`, `readVerb` → `sb/read`) | `sb/signals`, `sb/read`, `sb/write`, `repoll` |
+| `diagnostics` | 30 | tree browser (hierarchical `sb/browse` from `rootRef:"root"`, `readVerb` → `sb/read`), key/value list | `sb/browse`, `sb/status` |
+
+Command-backed widgets repeat `scope: "instance"` at widget level. No widget advertises a
+`writeVerb`; writes go through `cmd/sb/write` behind the allow-list.
 
 ## CLI
 
