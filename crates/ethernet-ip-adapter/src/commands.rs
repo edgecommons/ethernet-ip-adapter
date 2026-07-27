@@ -287,6 +287,7 @@ impl Commander {
             }
         };
 
+        // Capture time (four-slot timestamp model): stamped at read completion, before reply assembly.
         let ts = crate::publish::now_iso();
         let mut reads = Vec::with_capacity(plan.len());
         let mut served = 0u64;
@@ -328,9 +329,10 @@ impl Commander {
             .as_ref()
             .map(|s| s.readings.iter().map(|r| (r.signal_id.as_str(), r)).collect())
             .unwrap_or_default();
+        // Capture time (four-slot timestamp model): the snapshot frame's receipt instant.
         let ts = snapshot
             .as_ref()
-            .map(|s| iso_ago(s.received_at))
+            .map(|s| crate::publish::iso_at(s.received_at))
             .unwrap_or_else(crate::publish::now_iso);
 
         let mut reads = Vec::with_capacity(refs.len());
@@ -1122,12 +1124,6 @@ fn type_supported(type_name: &str) -> bool {
     )
 }
 
-/// An RFC-3339 timestamp for a snapshot accepted `ago` before now — the push read `serverTs` (§7.2).
-fn iso_ago(received: Instant) -> String {
-    let ago = Instant::now().saturating_duration_since(received);
-    let dt = time::OffsetDateTime::now_utc() - time::Duration::try_from(ago).unwrap_or(time::Duration::ZERO);
-    dt.format(&time::format_description::well_known::Rfc3339).unwrap_or_default()
-}
 
 /// Normalize an `sb/write` body to a list of `{ref…, value}` entries: a `writes` array, or a single
 /// object carrying `value` (§2.2). `Err(BAD_ARGS)` when neither form is present.

@@ -128,7 +128,10 @@ those, not the topic channel).
 Published when a polled/consumed value changes (`publishMode: onChange`, gated by the signal's
 `deadband`) or every sample (`always`). A non-GOOD sample always publishes. One message carries one
 signal's `samples` (one, or many when `batchMs > 0`). `sourceTs` is never emitted (EtherNet/IP carries
-no device timestamp); `serverTs` is the adapter's read/receive time, ISO-8601 UTC.
+no device timestamp); `serverTs` is the adapter's read/receive time, ISO-8601 UTC. Per the southbound
+four-slot timestamp model, `serverTs` is the capture time — stamped at read completion (poll) or
+class-1 frame receipt (push), so a `batchMs` flush carries each sample's capture-time stamp — and
+`receivedTs` is not emitted (a direct-client adapter's receipt and capture coincide).
 
 ### `sb/read` (command, request/reply)
 

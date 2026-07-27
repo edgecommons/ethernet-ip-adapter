@@ -27,7 +27,8 @@ use crate::publish::{self, Engine, Publish};
 /// Gate + count + batch one consumed frame's readings (§4.6, §6.2). The **`sampleMs` floor** throttles
 /// GOOD samples to at most one per window per field; a non-GOOD sample (BAD / IDLE) bypasses both the
 /// floor and the deadband — a failure/idle is information. Returns the samples to publish now
-/// (batchMs == 0); buffered ones flush via [`Engine::take_due`].
+/// (batchMs == 0); buffered ones flush via [`Engine::take_due`]. `server_ts` is the capture-time
+/// stamp of the frame's receipt (the four-slot timestamp model) — every sample carries it explicitly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_frame(
     engine: &mut Engine,
@@ -37,6 +38,7 @@ pub(crate) fn process_frame(
     sample_ms: u64,
     batch_ms: u64,
     now: Instant,
+    server_ts: &str,
     health: &Health,
 ) -> Vec<Publish> {
     let default_db = DeadbandSpec::default();
@@ -82,12 +84,13 @@ pub(crate) fn process_frame(
             st.baseline = Some(reading.value.clone());
         }
 
-        let server_ts = (batch_ms > 0).then(publish::now_iso);
+        // Every sample carries the explicit capture-time serverTs (frame receipt, §6.2) — never the
+        // facade's at-publish default, which would drift under batchMs coalescing.
         let sample = publish::sample_of(
             reading.value.clone(),
             reading.quality,
             reading.quality_raw.as_deref(),
-            server_ts,
+            Some(server_ts.to_string()),
         );
         if let Some(samples) = st.batcher.add(sample, now, batch_ms) {
             out.push(Publish {
@@ -109,6 +112,9 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use tokio::sync::mpsc;
+
+    /// The injected capture-time stamp (frame receipt) every test passes to [`process_frame`].
+    const TS: &str = "2026-07-18T12:00:00Z";
 
     fn reading(id: &str, value: Value, quality: Quality) -> Reading {
         let raw = match quality {
@@ -171,7 +177,7 @@ mod tests {
         let mut e = Engine::new(t0);
 
         let go = |e: &mut Engine, now: Instant, v: i64, h: &Health| {
-            process_frame(e, &[reading("a100/0/udint", json!(v), Quality::Good)], &dbs, PublishMode::Always, 100, 0, now, h).len()
+            process_frame(e, &[reading("a100/0/udint", json!(v), Quality::Good)], &dbs, PublishMode::Always, 100, 0, now, TS, h).len()
         };
         assert_eq!(go(&mut e, t0, 1, &h), 1, "first frame publishes");
         assert_eq!(go(&mut e, t0 + Duration::from_millis(50), 2, &h), 0, "within 100ms ⇒ throttled");
@@ -186,7 +192,7 @@ mod tests {
         let now = Instant::now();
         let mut e = Engine::new(now);
         let go = |e: &mut Engine, v: f64, h: &Health| {
-            process_frame(e, &[reading("a100/4/real", json!(v), Quality::Good)], &dbs, PublishMode::OnChange, 0, 0, now, h).len()
+            process_frame(e, &[reading("a100/4/real", json!(v), Quality::Good)], &dbs, PublishMode::OnChange, 0, 0, now, TS, h).len()
         };
         assert_eq!(go(&mut e, 10.0, &h), 1, "first publishes");
         assert_eq!(go(&mut e, 10.2, &h), 0, "0.2 < 0.5 suppressed");
@@ -201,20 +207,38 @@ mod tests {
         let mut e = Engine::new(now);
         // IDLE (UNCERTAIN) frame: publishes despite onChange + a sampleMs floor + no value change.
         assert_eq!(
-            process_frame(&mut e, &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)], &dbs, PublishMode::OnChange, 500, 0, now, &h).len(),
+            process_frame(&mut e, &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)], &dbs, PublishMode::OnChange, 500, 0, now, TS, &h).len(),
             1
         );
         assert_eq!(
-            process_frame(&mut e, &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)], &dbs, PublishMode::OnChange, 500, 0, now, &h).len(),
+            process_frame(&mut e, &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)], &dbs, PublishMode::OnChange, 500, 0, now, TS, &h).len(),
             1
         );
         // A BAD frame publishes too.
         assert_eq!(
-            process_frame(&mut e, &[reading("a100/0/bool.1", Value::Null, Quality::Bad)], &dbs, PublishMode::OnChange, 500, 0, now, &h).len(),
+            process_frame(&mut e, &[reading("a100/0/bool.1", Value::Null, Quality::Bad)], &dbs, PublishMode::OnChange, 500, 0, now, TS, &h).len(),
             1
         );
         assert_eq!(h.samples_bad.load(Ordering::Relaxed), 1);
         assert_eq!(h.samples_suppressed.load(Ordering::Relaxed), 0);
+    }
+
+    /// Four-slot timestamp model (edgecommons/edgecommons#79): a batched push field keeps the
+    /// frame-receipt serverTs through a delayed flush (simulated batching latency) instead of being
+    /// re-stamped at publish time.
+    #[test]
+    fn a_delayed_batch_flush_carries_the_frame_receipt_server_ts() {
+        let dbs = deadbands(&[("a100/0/udint", none_db())]);
+        let h = Health::default();
+        let t0 = Instant::now();
+        let mut e = Engine::new(t0);
+        // batchMs=100 buffers the frame's sample, stamped with the injected receipt-time TS.
+        assert!(process_frame(&mut e, &[reading("a100/0/udint", json!(1), Quality::Good)], &dbs, PublishMode::Always, 0, 100, t0, TS, &h).is_empty());
+        // Flush far later than the receipt: the capture stamp survives the batching latency.
+        let flush = e.take_due(100, t0 + Duration::from_secs(30));
+        assert_eq!(flush.len(), 1);
+        assert_eq!(flush[0].samples[0].server_ts.as_deref(), Some(TS),
+            "the frame-receipt capture stamp survives the delay");
     }
 
     #[tokio::test]
@@ -246,7 +270,7 @@ mod tests {
             match session.updates().recv().await {
                 Some(IoUpdate::Up { .. }) => up_seen = true,
                 Some(IoUpdate::Data { readings, .. }) => {
-                    published += process_frame(&mut e, &readings, &dbs, PublishMode::OnChange, 0, 0, Instant::now(), &h).len();
+                    published += process_frame(&mut e, &readings, &dbs, PublishMode::OnChange, 0, 0, Instant::now(), TS, &h).len();
                 }
                 Some(IoUpdate::Lost { .. }) | None => break,
             }

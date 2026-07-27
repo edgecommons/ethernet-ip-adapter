@@ -293,13 +293,16 @@ pub(crate) async fn poll_until_disconnected(
                         return PollExit::LinkLost;
                     }
                 };
+                // Capture time (four-slot timestamp model): serverTs is stamped the moment the
+                // group's read completed, so a batchMs flush carries the read-time stamp.
+                let server_ts = publish::now_iso();
                 let elapsed = started.elapsed();
                 let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
                 health.poll_latency_ms.store(elapsed_ms, Ordering::Relaxed);
                 record_cycle(elapsed, intervals[idx], health);
 
                 let now2 = Instant::now();
-                for p in process_group(&mut engine, group, modes[idx], batch_ms, &readings, now2, health) {
+                for p in process_group(&mut engine, group, modes[idx], batch_ms, &readings, now2, &server_ts, health) {
                     let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| modes[idx].as_str());
                     publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
                 }
@@ -358,9 +361,11 @@ async fn repoll_all_groups(
             .read_signals(&group.signals)
             .await
             .map_err(|e| e.to_string())?;
+        // Capture time (four-slot timestamp model): stamped at read completion, as on the timer.
+        let server_ts = publish::now_iso();
         polled += group.signals.len() as u64;
         let now = Instant::now();
-        for p in process_group(engine, group, modes[idx], batch_ms, &readings, now, health) {
+        for p in process_group(engine, group, modes[idx], batch_ms, &readings, now, &server_ts, health) {
             let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| modes[idx].as_str());
             publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
         }

@@ -211,8 +211,11 @@ pub(crate) async fn consume_push(
                         "push frame received"
                     );
                     if !paused {
+                        // Capture time (four-slot timestamp model): serverTs is the frame's
+                        // receipt instant, so a batchMs flush carries the receipt-time stamp.
+                        let server_ts = publish::iso_at(received_at);
                         let now = Instant::now();
-                        for p in process_frame(&mut engine, &readings, &deadbands, mode, sample_ms, batch_ms, now, health) {
+                        for p in process_frame(&mut engine, &readings, &deadbands, mode, sample_ms, batch_ms, now, &server_ts, health) {
                             publish_field(data, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, false).await;
                         }
                     }
