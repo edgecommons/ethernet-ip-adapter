@@ -2,10 +2,11 @@
 //!
 //! This module owns the whole `gg.commands()` registration: `sb/status`, `sb/read`, `sb/write`,
 //! `sb/signals`, `sb/browse`, `sb/pause`, `sb/resume`, `reconnect`, `repoll` — mode-aware (poll vs
-//! push), with **instance routing** (D-EIP-13: `body.instance` optional iff exactly one device) and
-//! the §7.1 error codes (`BAD_ARGS`, `NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`,
-//! `DEVICE_UNAVAILABLE`, `READ_FAILED`, `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`,
-//! `PAUSED`).
+//! push), with **instance routing** (D-EIP-13: `body.instance` optional iff exactly one device;
+//! D-EIP-25 / SOUTHBOUND §2.2: every verb is registered via `register_scoped`, the delivery
+//! topic's addressed instance is authoritative — [`scope_body`]) and the §7.1 error codes
+//! (`BAD_ARGS`, `NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`, `DEVICE_UNAVAILABLE`,
+//! `READ_FAILED`, `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`, `PAUSED`).
 //!
 //! The inbox handlers never touch the (non-`Sync`) session directly: every session-touching verb is
 //! sent to the device's own task as a [`DeviceControl`] and *confirmed* through the reply that rides
@@ -20,7 +21,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use edgecommons::prelude::{command_handler, CommandError, CommandInbox, Severity};
+use edgecommons::commands::{scoped_command_handler, AVAILABILITY_UNSUPPORTED};
+use edgecommons::prelude::{CommandError, CommandInbox, Severity};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -42,24 +44,37 @@ pub struct DeviceHandle {
 
 /// Register all nine `sb/*` verbs (§7) + the three edge-console panels (§7.6) on the inbox.
 ///
+/// Every verb is registered through the **scoped** registration (`register_scoped`, D-U28 /
+/// SOUTHBOUND §2.2): the handler receives the delivery topic's addressed instance and
+/// [`scope_body`] reconciles it with `body.instance` before the commander routes.
+///
+/// When every configured device runs push mode, `repoll` is marked `unsupported` in `describe`
+/// via `set_command_availability` (D-EIP-25): the verb is mode-conditional and no instance can
+/// service it in an all-push configuration. The verb stays registered — an addressed request
+/// still gets its per-instance `BAD_ARGS` refusal (§7.5).
+///
 /// # Errors
-/// Propagates [`CommandInbox::register`] / [`CommandInbox::register_panel`] failures (a verb/panel
-/// name clash or an invalid token).
+/// Propagates [`CommandInbox::register_scoped`] / [`CommandInbox::register_panel`] failures
+/// (a verb/panel name clash or an invalid token).
 pub fn register_all(
     commands: &CommandInbox,
     handles: Vec<DeviceHandle>,
     global: Arc<GlobalConfig>,
 ) -> anyhow::Result<()> {
+    let all_push = repoll_unsupported(&handles);
     let commander = Arc::new(Commander::new(handles, global));
 
     macro_rules! verb {
         ($name:expr, $method:ident) => {{
             let c = Arc::clone(&commander);
-            commands.register(
+            commands.register_scoped(
                 $name,
-                command_handler(move |req| {
+                scoped_command_handler(move |req, addressed| {
                     let c = Arc::clone(&c);
-                    async move { c.$method(&req.body).await }
+                    async move {
+                        let body = scope_body(req.body, addressed.as_deref())?;
+                        c.$method(&body).await
+                    }
                 }),
             )?;
         }};
@@ -78,15 +93,24 @@ pub fn register_all(
     // `adapter-paused` event, §6.3).
     {
         let c = Arc::clone(&commander);
-        commands.register(
+        commands.register_scoped(
             "sb/pause",
-            command_handler(move |req| {
+            scoped_command_handler(move |req, addressed| {
                 let c = Arc::clone(&c);
                 async move {
                     let by = req.identity.as_ref().map(|i| i.path().to_string());
-                    c.pause(&req.body, by).await
+                    let body = scope_body(req.body, addressed.as_deref())?;
+                    c.pause(&body, by).await
                 }
             }),
+        )?;
+    }
+
+    if all_push {
+        commands.set_command_availability(
+            "repoll",
+            AVAILABILITY_UNSUPPORTED,
+            Some("all configured instances are push-mode (class-1 cyclic I/O); repoll applies to poll instances"),
         )?;
     }
 
@@ -94,6 +118,51 @@ pub fn register_all(
         commands.register_panel(panel)?;
     }
     Ok(())
+}
+
+/// SOUTHBOUND §2.2 addressed-instance routing (D-U28, D-EIP-25): reconcile the delivery topic's
+/// `{instance}` token with `body.instance` before the commander routes (D-EIP-13).
+///
+/// - **Topic instance is authoritative**: when both are present and disagree, the request is
+///   refused with `BAD_ARGS`.
+/// - **Topic-only**: the topic token is injected as the routing selector, so the command routes
+///   by it (an unknown token then yields `NO_SUCH_INSTANCE` from the commander).
+/// - **Component scope** (`addressed` = `None`): the body passes through unchanged — the
+///   existing `body.instance` routing applies, including the single-instance default.
+fn scope_body(
+    body: Value,
+    addressed: Option<&str>,
+) -> std::result::Result<Value, CommandError> {
+    let Some(topic) = addressed else { return Ok(body) };
+    if let Some(in_body) = body.get("instance").and_then(Value::as_str) {
+        if in_body != topic {
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                format!(
+                    "body `instance` (`{in_body}`) conflicts with the topic-addressed instance (`{topic}`)"
+                ),
+            ));
+        }
+        return Ok(body);
+    }
+    let mut map = match body {
+        Value::Object(map) => map,
+        Value::Null => serde_json::Map::new(),
+        _ => {
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                "an instance-addressed command body must be a JSON object",
+            ));
+        }
+    };
+    map.insert("instance".to_string(), Value::String(topic.to_string()));
+    Ok(Value::Object(map))
+}
+
+/// True when `repoll` is unserviceable in this configuration (D-EIP-25): every configured device
+/// runs push mode, so `register_all` marks the verb `unsupported` in `describe`.
+fn repoll_unsupported(handles: &[DeviceHandle]) -> bool {
+    !handles.is_empty() && handles.iter().all(|h| matches!(h.cfg.mode, DeviceMode::Push))
 }
 
 /// The three edge-console panel descriptors (§7.6). Core validates `id`/`title`/uniqueness; the rest
@@ -1361,6 +1430,77 @@ mod tests {
         b.id = "second".into();
         let multi = Commander::new(vec![mk(poll_device()), mk(b)], Arc::new(GlobalConfig::default()));
         assert_eq!(err_code(multi.status(&json!({})).await), "BAD_ARGS");
+    }
+
+    // --- SOUTHBOUND §2.2 addressed-instance routing (D-U28 / D-EIP-25) ---------------------------
+
+    /// A device handle with no live device task — enough for routing/`sb/status` assertions.
+    fn bare_handle(cfg: DeviceConfig) -> DeviceHandle {
+        let (tx, _rx) = mpsc::channel(1);
+        let health = Arc::new(Health::default());
+        let (_m, dm) = device_metrics(cfg.clone(), Arc::clone(&health));
+        let events: Arc<dyn EventSink> = Arc::new(RecordingEvents::default());
+        DeviceHandle { cfg, control: tx, health, dm, events }
+    }
+
+    /// Two poll devices: `filler-plc` + `second`.
+    fn two_device_commander() -> Commander {
+        let mut b = poll_device();
+        b.id = "second".into();
+        Commander::new(vec![bare_handle(poll_device()), bare_handle(b)], Arc::new(GlobalConfig::default()))
+    }
+
+    #[tokio::test]
+    async fn topic_addressed_instance_routes_the_command() {
+        let multi = two_device_commander();
+        // Topic-only (§2.2): the delivery topic's instance token routes the command — no
+        // `body.instance` needed even with two devices configured.
+        let body = scope_body(json!({}), Some("second")).unwrap();
+        assert_eq!(ok(multi.status(&body).await)["id"], json!("second"));
+        // A `null` body is promoted to an object carrying the topic instance.
+        assert_eq!(scope_body(Value::Null, Some("second")).unwrap(), json!({ "instance": "second" }));
+        // An unknown topic token still routes by the token and is refused by the commander.
+        let body = scope_body(json!({}), Some("ghost")).unwrap();
+        assert_eq!(err_code(multi.status(&body).await), "NO_SUCH_INSTANCE");
+        // A non-object body cannot carry the routing selector.
+        assert_eq!(scope_body(json!("junk"), Some("second")).unwrap_err().code, "BAD_ARGS");
+    }
+
+    #[tokio::test]
+    async fn conflicting_body_instance_is_refused_bad_args() {
+        let multi = two_device_commander();
+        // Topic instance is authoritative: a disagreeing `body.instance` is BAD_ARGS (§2.2).
+        let err = scope_body(json!({ "instance": "filler-plc" }), Some("second")).unwrap_err();
+        assert_eq!(err.code, "BAD_ARGS");
+        // An agreeing `body.instance` passes through and routes normally.
+        let body = scope_body(json!({ "instance": "second" }), Some("second")).unwrap();
+        assert_eq!(ok(multi.status(&body).await)["id"], json!("second"));
+    }
+
+    #[tokio::test]
+    async fn component_scope_keeps_body_instance_routing() {
+        let multi = two_device_commander();
+        // Component-scoped delivery (no topic instance): the body passes through unchanged and
+        // `body.instance` routes exactly as before (D-EIP-13).
+        let body = scope_body(json!({ "instance": "filler-plc" }), None).unwrap();
+        assert_eq!(body, json!({ "instance": "filler-plc" }));
+        assert_eq!(ok(multi.status(&body).await)["id"], json!("filler-plc"));
+        // …including the ≥ 2-devices missing-instance refusal…
+        assert_eq!(err_code(multi.status(&scope_body(json!({}), None).unwrap()).await), "BAD_ARGS");
+        // …and the single-instance default.
+        let single = harness(poll_device(), MockOpts::default());
+        let body = scope_body(json!({}), None).unwrap();
+        assert_eq!(ok(single.commander.status(&body).await)["id"], json!("filler-plc"));
+    }
+
+    #[tokio::test]
+    async fn repoll_is_unsupported_only_when_every_device_is_push() {
+        // The predicate `register_all` feeds into `set_command_availability` (D-EIP-25): true
+        // only when every configured device runs push mode.
+        assert!(repoll_unsupported(&[bare_handle(push_device())]));
+        assert!(!repoll_unsupported(&[bare_handle(poll_device())]));
+        assert!(!repoll_unsupported(&[bare_handle(poll_device()), bare_handle(push_device())]));
+        assert!(!repoll_unsupported(&[]));
     }
 
     // --- sb/status ---------------------------------------------------------------------------------

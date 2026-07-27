@@ -7,8 +7,10 @@ data/control plane model see [explanation.md](../explanation.md); for client rec
 
 - `{device}` — the resolved Thing name (the last `hierarchy` level).
 - `{component}` — the component UNS token, `ethernet-ip-adapter`.
-- `{instance}` — a device instance id (`filler-plc`, …) for `data`/`evt`; the shared command inbox, the
-  `state` keepalive, and `metric` are component-scope.
+- `{instance}` — a device instance id (`filler-plc`, …) for `data`/`evt`; the `state` keepalive and
+  `metric` are component-scope. `cmd` accepts both scopes: component-scope
+  (`…/ethernet-ip-adapter/cmd/{verb}`) and instance-addressed
+  (`…/ethernet-ip-adapter/{instance}/cmd/{verb}`).
 
 ## Envelope
 
@@ -30,7 +32,7 @@ reply is published to `reply_to` with the same `correlation_id`.
 |-------|---------|-----------|-------|-------|
 | `data` | `SouthboundSignalUpdate` | adapter → bus | `ecv1/{device}/ethernet-ip-adapter/{instance}/data/{signal}` | — |
 | `evt` | `evt` | adapter → bus | `ecv1/{device}/ethernet-ip-adapter/{instance}/evt/{severity}/{type}` | — |
-| `cmd` | the nine verbs (below) | bus → adapter | `ecv1/{device}/ethernet-ip-adapter/cmd/{verb}` | `{ok,result}` |
+| `cmd` | the nine verbs (below) | bus → adapter | `ecv1/{device}/ethernet-ip-adapter[/{instance}]/cmd/{verb}` | `{ok,result}` |
 | `metric` | `southbound_health`, `EtherNetIpConnection`, `EtherNetIpInventory`, `EtherNetIpPoll`, `EtherNetIpPublish`, `EtherNetIpCommand`, `EtherNetIpIo` | adapter → bus (auto) | `ecv1/{device}/ethernet-ip-adapter/metric/{metricName}` | — |
 | `state` | keepalive | adapter → bus (auto) | `ecv1/{device}/ethernet-ip-adapter/state` | — |
 
@@ -41,15 +43,22 @@ facades and `cmd` replies via the command inbox — never a hand-assembled topic
 
 ## The command inbox
 
-The read/write/control surface is served through the library's **command inbox** — a single
-component-scope subscription `ecv1/{device}/ethernet-ip-adapter/cmd/#`. A request's **verb** is the topic
-channel after `cmd/` and must equal `header.name`. Built-in verbs (`ping`, `reload-config`,
+The read/write/control surface is served through the library's **command inbox**, which subscribes
+both command scopes: the component scope `ecv1/{device}/ethernet-ip-adapter/cmd/#` and the instance
+scope `ecv1/{device}/ethernet-ip-adapter/{instance}/cmd/#`. A request's **verb** is the topic channel
+after `cmd/` and must equal `header.name`. Built-in verbs (`ping`, `reload-config`,
 `get-configuration`, `describe`) ship with every component; the adapter adds the nine `sb/*`/`reconnect`/
 `repoll` verbs below.
 
-A multi-instance adapter selects the target device with an **`instance`** field in the request body
-(optional when only one device is configured). The reply body is `{"ok": true, "result": <verb result>}`
-on success, or `{"ok": false, "error": {"code", "message"}}` on failure.
+**Instance routing.** On an instance-scoped topic the topic's `{instance}` token is authoritative:
+it routes the command to that device. A request body that also carries an `instance` field must
+agree with the topic token — a disagreement is refused with `BAD_ARGS`. On the component-scoped
+topic the target device is selected by the **`instance`** field in the request body (optional when
+only one device is configured). The reply body is `{"ok": true, "result": <verb result>}` on
+success, or `{"ok": false, "error": {"code", "message"}}` on failure.
+
+When every configured device runs push mode, `describe` reports `repoll` as `unsupported` (the verb
+applies to poll instances); a `repoll` request is still answered with its per-instance refusal.
 
 ### The nine verbs
 
@@ -71,7 +80,7 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 
 | Code | When |
 |------|------|
-| `BAD_ARGS` | Malformed body; `instance` required with ≥ 2 devices; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
+| `BAD_ARGS` | Malformed body; `instance` required with ≥ 2 devices on a component-scoped request; a body `instance` that disagrees with the topic-addressed instance; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
 | `PAUSED` | `repoll` on a paused instance — resume first. |
 | `NO_SUCH_INSTANCE` | `instance` names no configured device. |
 | `WRITE_NOT_ALLOWED` | Every `sb/write` entry was refused by the allow-list. |
