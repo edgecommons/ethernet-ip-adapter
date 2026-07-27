@@ -19,7 +19,8 @@ Addressing follows the UNS: every topic is `ecv1/{device}/{component}/{instance}
 built and validated by the library — never a hand-assembled string. Telemetry rides the `data` class
 (`ecv1/{device}/ethernet-ip-adapter/{instance}/data/{signal}`); discrete events ride `evt`; the
 on-demand command surface rides the library's `cmd` inbox; and the library owns `state` (a keepalive
-whose RUNNING body also carries each configured device's live connectivity in an `instances[]` array),
+whose RUNNING body also carries each configured device's live connectivity and state in an
+`instances[]` array),
 `metric`, `cfg`, and `log` automatically. Every message carries a top-level **`identity`** element
 (`{hier, path, component, instance}`) placing the reading in the enterprise tree — routing and
 partitioning never parse the body or the topic. A fleet consumer needs one wildcard per class
