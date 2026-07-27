@@ -3,8 +3,11 @@
 //! Both engines — poll ([`crate::poll`]) and push ([`crate::push`]) — feed the *same* publish path
 //! here: [`publish`] assembles a `SouthboundSignalUpdate` through the `data()` facade builder and
 //! measures the publish latency. Neither engine ever hand-builds a topic or a body — the facade mints
-//! the topic (channel = the config `name`, §5.3), stamps identity, and defaults `serverTs` to now
-//! when a sample leaves it unset (§6.2).
+//! the topic (channel = the config `name`, §5.3) and stamps identity. `serverTs` is the **capture**
+//! time (the four-slot timestamp model): each engine captures the UTC timestamp at read completion
+//! (poll) / frame receipt (push) and stamps every sample explicitly, so the facade's
+//! `serverTs`-defaults-to-publish-time rule never fires — under `batchMs` coalescing a publish-time
+//! stamp would drift by up to the whole batch window (§6.2).
 //!
 //! This module also owns the **mode-agnostic gate primitives** both engines share:
 //!
@@ -47,10 +50,10 @@ pub(crate) fn facade_quality(q: Quality) -> edgecommons::facades::Quality {
     }
 }
 
-/// Build one [`Sample`] from a seam reading's parts. `server_ts` is set explicitly for the older
-/// samples of a coalesced batch (so a batch preserves per-read arrival times, §6.2) and left `None`
-/// for the immediate/newest case (the facade then stamps "now"). `sourceTs` is never emitted
-/// (D-EIP-11).
+/// Build one [`Sample`] from a seam reading's parts. `server_ts` is the capture-time stamp (read
+/// completion / frame receipt, §6.2) — the engines always pass it explicitly so a coalesced batch
+/// preserves per-read capture times instead of drifting to the facade's at-publish default.
+/// `sourceTs` is never emitted (D-EIP-11).
 #[must_use]
 pub(crate) fn sample_of(
     value: Value,
@@ -344,13 +347,23 @@ pub(crate) fn cycle_overran(elapsed: Duration, interval: Duration) -> bool {
     elapsed > interval
 }
 
-/// The current wall-clock time as an RFC-3339 string — the explicit `serverTs` stamped on the older
-/// samples of a coalesced batch so the batch preserves per-read arrival times (§6.2).
+/// The current wall-clock time as an RFC-3339 string — the capture-time `serverTs` taken at read
+/// completion (§6.2, the four-slot timestamp model).
 #[must_use]
 pub(crate) fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
+}
+
+/// The RFC-3339 wall-clock time corresponding to a monotonic capture instant (frame receipt /
+/// snapshot acceptance) — the push-side `serverTs` (§6.2, §7.2). Anchors the monotonic `Instant`
+/// to the wall clock by its distance from now.
+#[must_use]
+pub(crate) fn iso_at(captured: Instant) -> String {
+    let ago = Instant::now().saturating_duration_since(captured);
+    let dt = time::OffsetDateTime::now_utc() - time::Duration::try_from(ago).unwrap_or(time::Duration::ZERO);
+    dt.format(&time::format_description::well_known::Rfc3339).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -518,6 +531,23 @@ mod tests {
     fn overrun_is_a_cycle_longer_than_its_interval() {
         assert!(cycle_overran(Duration::from_millis(600), Duration::from_millis(500)));
         assert!(!cycle_overran(Duration::from_millis(400), Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn iso_at_anchors_a_past_capture_instant_before_now() {
+        // A capture instant ~30s ago converts to a wall-clock stamp ~30s before now — the
+        // frame-receipt serverTs is the receipt time, not the conversion/publish time.
+        let Some(captured) = Instant::now().checked_sub(Duration::from_secs(30)) else {
+            return; // platform Instant epoch too close — nothing to anchor against
+        };
+        let ts = iso_at(captured);
+        let parsed =
+            time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339).unwrap();
+        let delta = time::OffsetDateTime::now_utc() - parsed;
+        assert!(
+            delta >= time::Duration::seconds(29) && delta <= time::Duration::seconds(31),
+            "anchored ~30s before now, got {delta}"
+        );
     }
 
     #[test]
