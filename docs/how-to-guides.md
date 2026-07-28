@@ -416,7 +416,9 @@ With `--platform auto` the library detects the platform and needs no CLI args.
   `sequenceGaps`), `EtherNetIpConnection` for link/reconnect pressure, and `EtherNetIpCommand` for
   control-plane volume. See [reference/metrics.md](reference/metrics.md).
 - **State keepalive** — `ecv1/{device}/ethernet-ip-adapter/state` every ~5 s; the RUNNING keepalive
-  carries an `instances[]` array with each device's live `connected` flag and `connectionMode`.
+  carries an `instances[]` array with each device's live `connected` flag, its `state` token
+  (`CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` — the same one `sb/status` returns), and its
+  `connectionMode`.
 - **Events** — `evt/{info|critical}/device-connected|device-unreachable` (a stateful link alarm),
   `evt/{warning|info}/adapter-paused|adapter-resumed`, `evt/{info|warning}/write-audit`, and — for
   TLS instances — `evt/warning/tls-handshake-failed` and `evt/warning/tls-peer-unverified`.

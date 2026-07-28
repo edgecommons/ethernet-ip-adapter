@@ -47,6 +47,15 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
   matched on the stable `signal.id` (D-EIP-5).
 - **`sb/pause`/`sb/resume` are a deliberate southbound-contract extension** (D-EIP-3), a candidate
   for core promotion — this repo does NOT edit core `SOUTHBOUND.md`.
+- **Every verb declares its command scope** (D-EIP-26): all nine register at
+  `CommandScope::Instance`, so the library owns addressing — the topic's instance token, a body
+  `instance`, and the `BAD_ARGS` refusal when the two conflict — and hands the handler the resolved
+  instance. The adapter keeps only what needs its own configuration: the sole-device default and
+  `NO_SUCH_INSTANCE`. Never re-add topic parsing or a `body.instance` read.
+- **One state model, two surfaces** (D-SC-7, §9.2): `connectivity_of` derives the
+  `CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` token and the `paused` attribute from the same `Health`
+  object that answers `sb/status`, and the `state` keepalive's `instances[]` publishes it — a paused
+  instance is never indistinguishable from a stale one.
 - **The seam** (`src/device.rs`): `DeviceBackend`/`DeviceSession` traits know protocols and never
   import the UNS/topics/envelopes/metrics. The in-process `SimBackend`/`SimSession` (`src/sim.rs`)
   models the cpppo tag layout so `cargo run` and the unit tests need no PLC or network.

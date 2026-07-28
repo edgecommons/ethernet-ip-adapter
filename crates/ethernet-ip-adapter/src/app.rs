@@ -571,6 +571,27 @@ mod tests {
         assert!(!connectivity_of(&cfg, &health).connected);
     }
 
+    /// D-SC-7: the state token reaches the **published** keepalive element, not just the struct —
+    /// `ONLINE` while polling and `PAUSED` while deliberately quiet, beside the normalized flag.
+    #[test]
+    fn the_published_keepalive_element_carries_the_state_token() {
+        let cfg = a_device();
+        let health = Health::default();
+        health.set_link(LinkState::Online);
+
+        let element = connectivity_of(&cfg, &health).to_json();
+        assert_eq!(element["instance"], json!("plc-1"));
+        assert_eq!(element["connected"], json!(true));
+        assert_eq!(element["state"], json!("ONLINE"));
+        assert_eq!(element["detail"], json!("127.0.0.1:44818"));
+
+        health.paused.store(true, Ordering::Relaxed);
+        let element = connectivity_of(&cfg, &health).to_json();
+        assert_eq!(element["state"], json!("PAUSED"), "a paused instance is not silently stale");
+        assert_eq!(element["connected"], json!(true), "connectivity stays truthful beside it");
+        assert_eq!(element["attributes"]["paused"], json!(true));
+    }
+
     #[test]
     fn state_attributes_reflect_target_cip_security_posture() {
         let cfg = a_device();

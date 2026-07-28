@@ -2,9 +2,11 @@
 //!
 //! This module owns the whole `gg.commands()` registration: `sb/status`, `sb/read`, `sb/write`,
 //! `sb/signals`, `sb/browse`, `sb/pause`, `sb/resume`, `reconnect`, `repoll` — mode-aware (poll vs
-//! push), with **instance routing** (D-EIP-13: `body.instance` optional iff exactly one device;
-//! D-EIP-25 / SOUTHBOUND §2.2: every verb is registered via `register_scoped`, the delivery
-//! topic's addressed instance is authoritative — [`scope_body`]) and the §7.1 error codes
+//! push), each declaring [`CommandScope::Instance`] (D-EIP-26 / SOUTHBOUND §2.2: the library owns
+//! addressing — the topic token, `body.instance`, and the conflict refusal — and hands the handler
+//! the resolved instance; [`Commander::resolve`] then applies only the adapter-side policies of
+//! D-EIP-13: the sole configured device when none is addressed, `NO_SUCH_INSTANCE` when unknown)
+//! and the §7.1 error codes
 //! (`BAD_ARGS`, `NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`, `DEVICE_UNAVAILABLE`,
 //! `READ_FAILED`, `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`, `PAUSED`).
 //!
@@ -21,8 +23,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use edgecommons::commands::{scoped_command_handler, AVAILABILITY_UNSUPPORTED};
-use edgecommons::prelude::{CommandError, CommandInbox, Severity};
+use edgecommons::commands::{command_handler, AVAILABILITY_UNSUPPORTED};
+use edgecommons::prelude::{CommandError, CommandInbox, CommandScope, Severity};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
@@ -44,9 +46,10 @@ pub struct DeviceHandle {
 
 /// Register all nine `sb/*` verbs (§7) + the three edge-console panels (§7.6) on the inbox.
 ///
-/// Every verb is registered through the **scoped** registration (`register_scoped`, D-U28 /
-/// SOUTHBOUND §2.2): the handler receives the delivery topic's addressed instance and
-/// [`scope_body`] reconciles it with `body.instance` before the commander routes.
+/// Every verb declares [`CommandScope::Instance`] (D-SC-2 / D-EIP-26): each acts on exactly one
+/// device, so the inbox enforces the addressing before dispatch — refusing a `body.instance` that
+/// conflicts with the topic's instance token with `BAD_ARGS` — and hands the handler the resolved
+/// instance (the topic token, else the body-named one, else `None`).
 ///
 /// When every configured device runs push mode, `repoll` is marked `unsupported` in `describe`
 /// via `set_command_availability` (D-EIP-25): the verb is mode-conditional and no instance can
@@ -54,7 +57,7 @@ pub struct DeviceHandle {
 /// still gets its per-instance `BAD_ARGS` refusal (§7.5).
 ///
 /// # Errors
-/// Propagates [`CommandInbox::register_scoped`] / [`CommandInbox::register_panel`] failures
+/// Propagates [`CommandInbox::register`] / [`CommandInbox::register_panel`] failures
 /// (a verb/panel name clash or an invalid token).
 pub fn register_all(
     commands: &CommandInbox,
@@ -67,14 +70,12 @@ pub fn register_all(
     macro_rules! verb {
         ($name:expr, $method:ident) => {{
             let c = Arc::clone(&commander);
-            commands.register_scoped(
+            commands.register(
                 $name,
-                scoped_command_handler(move |req, addressed| {
+                CommandScope::Instance,
+                command_handler(move |req, addressed| {
                     let c = Arc::clone(&c);
-                    async move {
-                        let body = scope_body(req.body, addressed.as_deref())?;
-                        c.$method(&body).await
-                    }
+                    async move { c.$method(addressed.as_deref(), &req.body).await }
                 }),
             )?;
         }};
@@ -93,14 +94,14 @@ pub fn register_all(
     // `adapter-paused` event, §6.3).
     {
         let c = Arc::clone(&commander);
-        commands.register_scoped(
+        commands.register(
             "sb/pause",
-            scoped_command_handler(move |req, addressed| {
+            CommandScope::Instance,
+            command_handler(move |req, addressed| {
                 let c = Arc::clone(&c);
                 async move {
                     let by = req.identity.as_ref().map(|i| i.path().to_string());
-                    let body = scope_body(req.body, addressed.as_deref())?;
-                    c.pause(&body, by).await
+                    c.pause(addressed.as_deref(), &req.body, by).await
                 }
             }),
         )?;
@@ -118,45 +119,6 @@ pub fn register_all(
         commands.register_panel(panel)?;
     }
     Ok(())
-}
-
-/// SOUTHBOUND §2.2 addressed-instance routing (D-U28, D-EIP-25): reconcile the delivery topic's
-/// `{instance}` token with `body.instance` before the commander routes (D-EIP-13).
-///
-/// - **Topic instance is authoritative**: when both are present and disagree, the request is
-///   refused with `BAD_ARGS`.
-/// - **Topic-only**: the topic token is injected as the routing selector, so the command routes
-///   by it (an unknown token then yields `NO_SUCH_INSTANCE` from the commander).
-/// - **Component scope** (`addressed` = `None`): the body passes through unchanged — the
-///   existing `body.instance` routing applies, including the single-instance default.
-fn scope_body(
-    body: Value,
-    addressed: Option<&str>,
-) -> std::result::Result<Value, CommandError> {
-    let Some(topic) = addressed else { return Ok(body) };
-    if let Some(in_body) = body.get("instance").and_then(Value::as_str) {
-        if in_body != topic {
-            return Err(CommandError::new(
-                "BAD_ARGS",
-                format!(
-                    "body `instance` (`{in_body}`) conflicts with the topic-addressed instance (`{topic}`)"
-                ),
-            ));
-        }
-        return Ok(body);
-    }
-    let mut map = match body {
-        Value::Object(map) => map,
-        Value::Null => serde_json::Map::new(),
-        _ => {
-            return Err(CommandError::new(
-                "BAD_ARGS",
-                "an instance-addressed command body must be a JSON object",
-            ));
-        }
-    };
-    map.insert("instance".to_string(), Value::String(topic.to_string()));
-    Ok(Value::Object(map))
 }
 
 /// True when `repoll` is unserviceable in this configuration (D-EIP-25): every configured device
@@ -247,10 +209,15 @@ impl Commander {
         Self { devices, ids, global }
     }
 
-    /// Route to the addressed device (D-EIP-13): `body.instance` optional iff exactly one device is
-    /// configured; with ≥ 2 a missing/unknown id is `BAD_ARGS`/`NO_SUCH_INSTANCE`.
-    fn resolve(&self, body: &Value) -> std::result::Result<&DeviceHandle, CommandError> {
-        match body.get("instance").and_then(|v| v.as_str()) {
+    /// Route to the addressed device — the adapter-side half of the resolution (D-SC-4, D-EIP-13).
+    ///
+    /// The library has already resolved the addressing (the delivery topic's instance token, else
+    /// the body's `instance` field) and refused any conflict between the two; what needs this
+    /// adapter's configuration stays here: an unaddressed request routes to the sole configured
+    /// device (`BAD_ARGS` with ≥ 2), and an addressed instance that is not configured is
+    /// `NO_SUCH_INSTANCE`.
+    fn resolve(&self, addressed: Option<&str>) -> std::result::Result<&DeviceHandle, CommandError> {
+        match addressed {
             Some(id) => self
                 .devices
                 .get(id)
@@ -261,7 +228,7 @@ impl Commander {
                 } else {
                     Err(CommandError::new(
                         "BAD_ARGS",
-                        "field `instance` is required when multiple devices are configured",
+                        "the request must address an instance when multiple devices are configured",
                     ))
                 }
             }
@@ -271,8 +238,8 @@ impl Commander {
     // ---------------------------------------------------------------------------------------------
     // sb/status (§7.1)
     // ---------------------------------------------------------------------------------------------
-    async fn status(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn status(&self, addressed: Option<&str>, _body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         let link = h.health.link();
         let connected = link == LinkState::Online;
@@ -300,8 +267,8 @@ impl Commander {
     // ---------------------------------------------------------------------------------------------
     // sb/read (§7.2) — poll = live read via ReadNow; push = the last input snapshot
     // ---------------------------------------------------------------------------------------------
-    async fn read(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn read(&self, addressed: Option<&str>, body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         let refs = body
             .get("signals")
@@ -435,8 +402,8 @@ impl Commander {
     // ---------------------------------------------------------------------------------------------
     // sb/write (§7.3) — allow-list BEFORE any device I/O; confirmed; every entry audited on evt
     // ---------------------------------------------------------------------------------------------
-    async fn write(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn write(&self, addressed: Option<&str>, body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         let entries = write_entries(body)?;
         let result = if matches!(h.cfg.mode, DeviceMode::Push) {
@@ -608,8 +575,8 @@ impl Commander {
     // ---------------------------------------------------------------------------------------------
     // sb/signals (§7.5) — the resolved config view, no device I/O
     // ---------------------------------------------------------------------------------------------
-    async fn signals(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn signals(&self, addressed: Option<&str>, _body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         let out = if matches!(h.cfg.mode, DeviceMode::Push) {
             self.signals_push(h)
@@ -670,8 +637,8 @@ impl Commander {
     // sb/browse (§7.5) — poll = paged list_tags; push = the configured assembly layout. `ref`
     // additionally selects the hierarchical `treeBrowser` panel mode over the same inventory.
     // ---------------------------------------------------------------------------------------------
-    async fn browse(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn browse(&self, addressed: Option<&str>, body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         // The two request forms are mutually exclusive: `ref`/`depth`/`maxRefs` select the
         // hierarchical panel mode, `cursor`/`max` the paged one — and the hierarchical-only
@@ -858,8 +825,8 @@ impl Commander {
     // ---------------------------------------------------------------------------------------------
     // sb/pause + sb/resume (§7.4) — idempotent {paused, changed}, both modes
     // ---------------------------------------------------------------------------------------------
-    async fn pause(&self, body: &Value, by: Option<String>) -> Reply {
-        let h = self.resolve(body)?;
+    async fn pause(&self, addressed: Option<&str>, _body: &Value, by: Option<String>) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         let (tx, rx) = oneshot::channel();
         h.control
@@ -871,8 +838,8 @@ impl Commander {
         Ok(Some(json!({ "id": h.cfg.id, "paused": true, "changed": changed })))
     }
 
-    async fn resume(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn resume(&self, addressed: Option<&str>, _body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         let (tx, rx) = oneshot::channel();
         h.control
@@ -887,8 +854,8 @@ impl Commander {
     // ---------------------------------------------------------------------------------------------
     // reconnect (§7.5)
     // ---------------------------------------------------------------------------------------------
-    async fn reconnect(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn reconnect(&self, addressed: Option<&str>, _body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         let (tx, rx) = oneshot::channel();
         h.control
@@ -911,8 +878,8 @@ impl Commander {
     // ---------------------------------------------------------------------------------------------
     // repoll (§7.5) — poll only, refused on push (BAD_ARGS) and while paused (PAUSED)
     // ---------------------------------------------------------------------------------------------
-    async fn repoll(&self, body: &Value) -> Reply {
-        let h = self.resolve(body)?;
+    async fn repoll(&self, addressed: Option<&str>, _body: &Value) -> Reply {
+        let h = self.resolve(addressed)?;
         let started = Instant::now();
         if matches!(h.cfg.mode, DeviceMode::Push) {
             h.dm.record_command("repoll", false, ms(started), CommandTally::default());
@@ -1411,14 +1378,14 @@ mod tests {
 
     #[tokio::test]
     async fn instance_defaults_to_the_sole_device_and_unknown_or_missing_ids_error() {
-        // Single device: `instance` may be omitted.
+        // Single device: the request need not address an instance.
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.status(&json!({})).await);
+        let out = ok(h.commander.status(None, &json!({})).await);
         assert_eq!(out["id"], json!("filler-plc"));
-        // An unknown id is NO_SUCH_INSTANCE.
-        assert_eq!(err_code(h.commander.status(&json!({ "instance": "nope" })).await), "NO_SUCH_INSTANCE");
+        // An unknown addressed instance is NO_SUCH_INSTANCE.
+        assert_eq!(err_code(h.commander.status(Some("nope"), &json!({})).await), "NO_SUCH_INSTANCE");
 
-        // Two devices: a missing `instance` is BAD_ARGS.
+        // Two devices: an unaddressed request is BAD_ARGS.
         let mk = |cfg: DeviceConfig| {
             let (tx, _rx) = mpsc::channel(1);
             let health = Arc::new(Health::default());
@@ -1429,10 +1396,10 @@ mod tests {
         let mut b = poll_device();
         b.id = "second".into();
         let multi = Commander::new(vec![mk(poll_device()), mk(b)], Arc::new(GlobalConfig::default()));
-        assert_eq!(err_code(multi.status(&json!({})).await), "BAD_ARGS");
+        assert_eq!(err_code(multi.status(None, &json!({})).await), "BAD_ARGS");
     }
 
-    // --- SOUTHBOUND §2.2 addressed-instance routing (D-U28 / D-EIP-25) ---------------------------
+    // --- SOUTHBOUND §2.2 addressed-instance routing (D-U28 / D-SC-4 / D-EIP-26) ------------------
 
     /// A device handle with no live device task — enough for routing/`sb/status` assertions.
     fn bare_handle(cfg: DeviceConfig) -> DeviceHandle {
@@ -1451,46 +1418,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topic_addressed_instance_routes_the_command() {
+    async fn the_addressed_instance_routes_the_command() {
         let multi = two_device_commander();
-        // Topic-only (§2.2): the delivery topic's instance token routes the command — no
-        // `body.instance` needed even with two devices configured.
-        let body = scope_body(json!({}), Some("second")).unwrap();
-        assert_eq!(ok(multi.status(&body).await)["id"], json!("second"));
-        // A `null` body is promoted to an object carrying the topic instance.
-        assert_eq!(scope_body(Value::Null, Some("second")).unwrap(), json!({ "instance": "second" }));
-        // An unknown topic token still routes by the token and is refused by the commander.
-        let body = scope_body(json!({}), Some("ghost")).unwrap();
-        assert_eq!(err_code(multi.status(&body).await), "NO_SUCH_INSTANCE");
-        // A non-object body cannot carry the routing selector.
-        assert_eq!(scope_body(json!("junk"), Some("second")).unwrap_err().code, "BAD_ARGS");
-    }
-
-    #[tokio::test]
-    async fn conflicting_body_instance_is_refused_bad_args() {
-        let multi = two_device_commander();
-        // Topic instance is authoritative: a disagreeing `body.instance` is BAD_ARGS (§2.2).
-        let err = scope_body(json!({ "instance": "filler-plc" }), Some("second")).unwrap_err();
-        assert_eq!(err.code, "BAD_ARGS");
-        // An agreeing `body.instance` passes through and routes normally.
-        let body = scope_body(json!({ "instance": "second" }), Some("second")).unwrap();
-        assert_eq!(ok(multi.status(&body).await)["id"], json!("second"));
-    }
-
-    #[tokio::test]
-    async fn component_scope_keeps_body_instance_routing() {
-        let multi = two_device_commander();
-        // Component-scoped delivery (no topic instance): the body passes through unchanged and
-        // `body.instance` routes exactly as before (D-EIP-13).
-        let body = scope_body(json!({ "instance": "filler-plc" }), None).unwrap();
-        assert_eq!(body, json!({ "instance": "filler-plc" }));
-        assert_eq!(ok(multi.status(&body).await)["id"], json!("filler-plc"));
-        // …including the ≥ 2-devices missing-instance refusal…
-        assert_eq!(err_code(multi.status(&scope_body(json!({}), None).unwrap()).await), "BAD_ARGS");
-        // …and the single-instance default.
+        // The library resolves the addressing (topic token, else `body.instance`) and hands it to
+        // the handler; it routes even with two devices configured and an empty body.
+        assert_eq!(ok(multi.status(Some("second"), &json!({})).await)["id"], json!("second"));
+        // An addressed instance this adapter does not serve is NO_SUCH_INSTANCE.
+        assert_eq!(err_code(multi.status(Some("ghost"), &json!({})).await), "NO_SUCH_INSTANCE");
+        // An addressed instance never falls back to "the only device".
         let single = harness(poll_device(), MockOpts::default());
-        let body = scope_body(json!({}), None).unwrap();
-        assert_eq!(ok(single.commander.status(&body).await)["id"], json!("filler-plc"));
+        assert_eq!(err_code(single.commander.status(Some("ghost"), &json!({})).await), "NO_SUCH_INSTANCE");
+    }
+
+    #[tokio::test]
+    async fn an_unaddressed_request_takes_the_configured_default() {
+        // ≥ 2 devices: the request must address one (D-EIP-13).
+        let multi = two_device_commander();
+        assert_eq!(err_code(multi.status(None, &json!({})).await), "BAD_ARGS");
+        // Exactly one device: the sole configured device answers.
+        let single = harness(poll_device(), MockOpts::default());
+        assert_eq!(ok(single.commander.status(None, &json!({})).await)["id"], json!("filler-plc"));
     }
 
     #[tokio::test]
@@ -1508,7 +1455,7 @@ mod tests {
     #[tokio::test]
     async fn status_reports_connected_state_paused_and_a_counter_snapshot() {
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.status(&json!({})).await);
+        let out = ok(h.commander.status(None, &json!({})).await);
         assert_eq!(out["connected"], json!(true));
         assert_eq!(out["state"], json!("ONLINE"));
         assert_eq!(out["paused"], json!(false));
@@ -1517,7 +1464,7 @@ mod tests {
 
         // A push instance's status additionally carries the `io` object (§7.1).
         let hp = harness(push_device(), MockOpts::default());
-        let out = ok(hp.commander.status(&json!({})).await);
+        let out = ok(hp.commander.status(None, &json!({})).await);
         assert_eq!(out["mode"], json!("push"));
         assert!(out["io"].get("framesConsumed").is_some());
     }
@@ -1530,7 +1477,7 @@ mod tests {
         // LINE_SPEED is NOT in writes.allow — the sole entry is refused ⇒ WRITE_NOT_ALLOWED.
         let code = err_code(
             h.commander
-                .write(&json!({ "name": "line-speed", "value": 12.0 }))
+                .write(None, &json!({ "name": "line-speed", "value": 12.0 }))
                 .await,
         );
         assert_eq!(code, "WRITE_NOT_ALLOWED");
@@ -1548,7 +1495,7 @@ mod tests {
         let h = harness(poll_device(), MockOpts::default());
         let out = ok(
             h.commander
-                .write(&json!({ "writes": [ { "name": "fill-setpoint", "value": 55.5 } ] }))
+                .write(None, &json!({ "writes": [ { "name": "fill-setpoint", "value": 55.5 } ] }))
                 .await,
         );
         assert_eq!(out["written"], json!(1));
@@ -1566,7 +1513,7 @@ mod tests {
         // a150/0/real is allow-listed; the friendly name resolves to it.
         let out = ok(
             h.commander
-                .write(&json!({ "name": "fill-setpoint", "value": 55.5 }))
+                .write(None, &json!({ "name": "fill-setpoint", "value": 55.5 }))
                 .await,
         );
         assert_eq!(out["written"], json!(1));
@@ -1577,7 +1524,7 @@ mod tests {
         // An INPUT field is never writable (§7.3), even by explicit ref.
         let out = ok(
             h.commander
-                .write(&json!({ "assembly": 100, "offset": 0, "type": "udint", "value": 1 }))
+                .write(None, &json!({ "assembly": 100, "offset": 0, "type": "udint", "value": 1 }))
                 .await,
         );
         assert_eq!(out["results"][0]["ok"], json!(false));
@@ -1591,7 +1538,7 @@ mod tests {
         let h = harness(poll_device(), MockOpts::default());
         let out = ok(
             h.commander
-                .read(&json!({ "signals": [ { "name": "line-speed" }, { "name": "ghost" } ] }))
+                .read(None, &json!({ "signals": [ { "name": "line-speed" }, { "name": "ghost" } ] }))
                 .await,
         );
         let reads = out["reads"].as_array().unwrap();
@@ -1617,13 +1564,13 @@ mod tests {
             run_mode: true,
         };
         let h = harness(push_device(), MockOpts { snapshot: Some(snapshot), ..MockOpts::default() });
-        let out = ok(h.commander.read(&json!({ "signals": [ { "name": "motor-run" } ] })).await);
+        let out = ok(h.commander.read(None, &json!({ "signals": [ { "name": "motor-run" } ] })).await);
         assert_eq!(out["reads"][0]["value"], json!(7), "answered from the snapshot, no round-trip");
         assert_eq!(out["reads"][0]["quality"], json!("GOOD"));
 
         // No frame yet ⇒ BAD/NO_FRAME (§7.2).
         let h = harness(push_device(), MockOpts::default());
-        let out = ok(h.commander.read(&json!({ "signals": [ { "name": "motor-run" } ] })).await);
+        let out = ok(h.commander.read(None, &json!({ "signals": [ { "name": "motor-run" } ] })).await);
         assert_eq!(out["reads"][0]["qualityRaw"], json!("NO_FRAME"));
     }
 
@@ -1632,7 +1579,7 @@ mod tests {
     #[tokio::test]
     async fn signals_is_the_resolved_config_view_with_writable_flags() {
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.signals(&json!({})).await);
+        let out = ok(h.commander.signals(None, &json!({})).await);
         let sigs = out["signals"].as_array().unwrap();
         let setpoint = sigs.iter().find(|s| s["id"] == json!("FILL_SETPOINT")).unwrap();
         assert_eq!(setpoint["writable"], json!(true), "allow-listed ⇒ writable");
@@ -1648,7 +1595,7 @@ mod tests {
         // Poll: a page of tags, with configured/supported flags.
         let opts = MockOpts { browse: BrowseKind::Tags(vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING")]), ..MockOpts::default() };
         let h = harness(poll_device(), opts);
-        let out = ok(h.commander.browse(&json!({})).await);
+        let out = ok(h.commander.browse(None, &json!({})).await);
         let tags = out["tags"].as_array().unwrap();
         assert_eq!(tags[0]["configured"], json!(true), "LINE_SPEED is in config");
         assert_eq!(tags[0]["supported"], json!(true));
@@ -1656,11 +1603,11 @@ mod tests {
 
         // A device with no tag-list service ⇒ BROWSE_UNSUPPORTED.
         let h = harness(poll_device(), MockOpts { browse: BrowseKind::Unsupported, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.browse(&json!({})).await), "BROWSE_UNSUPPORTED");
+        assert_eq!(err_code(h.commander.browse(None, &json!({})).await), "BROWSE_UNSUPPORTED");
 
         // Push: the configured assembly layout, no round-trip.
         let h = harness(push_device(), MockOpts::default());
-        let out = ok(h.commander.browse(&json!({})).await);
+        let out = ok(h.commander.browse(None, &json!({})).await);
         assert!(!out["tags"].as_array().unwrap().is_empty());
     }
 
@@ -1672,7 +1619,7 @@ mod tests {
         let h = harness(poll_device(), opts);
 
         // "root" answers the device node with one `contains` ref per browsed tag.
-        let out = ok(h.commander.browse(&json!({ "ref": "root" })).await);
+        let out = ok(h.commander.browse(None, &json!({ "ref": "root" })).await);
         assert_eq!(out["mode"], json!("hierarchical"));
         assert_eq!(out["root"]["nodeId"], json!("root"));
         assert_eq!(out["root"]["nodeClass"], json!("device"));
@@ -1686,24 +1633,24 @@ mod tests {
         assert_eq!(out["truncated"], json!(false));
 
         // A known tag ref is a leaf; an unknown ref is BAD_ARGS.
-        let out = ok(h.commander.browse(&json!({ "ref": "LINE_SPEED" })).await);
+        let out = ok(h.commander.browse(None, &json!({ "ref": "LINE_SPEED" })).await);
         assert_eq!(out["root"]["nodeClass"], json!("signal"));
         assert_eq!(out["root"]["refs"], json!([]));
-        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "nope" })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "nope" })).await), "BAD_ARGS");
 
         // `depth` clamps to 1..4 and `maxRefs` to 1..1000 (`truncated` reports the cut).
-        let out = ok(h.commander.browse(&json!({ "ref": "root", "depth": 99, "maxRefs": 1 })).await);
+        let out = ok(h.commander.browse(None, &json!({ "ref": "root", "depth": 99, "maxRefs": 1 })).await);
         assert_eq!(out["depth"], json!(4));
         assert_eq!(out["root"]["refs"].as_array().unwrap().len(), 1);
         assert_eq!(out["truncated"], json!(true));
 
         // Push: the hierarchical inventory is the configured assembly layout, no round-trip.
         let hp = harness(push_device(), MockOpts::default());
-        let out = ok(hp.commander.browse(&json!({ "ref": "root" })).await);
+        let out = ok(hp.commander.browse(None, &json!({ "ref": "root" })).await);
         let refs = out["root"]["refs"].as_array().unwrap();
         assert_eq!(refs.len(), 2, "one input + one output field");
         assert_eq!(refs[0]["target"]["direction"], json!("input"));
-        let out = ok(hp.commander.browse(&json!({ "ref": "a150/0/real" })).await);
+        let out = ok(hp.commander.browse(None, &json!({ "ref": "a150/0/real" })).await);
         assert_eq!(out["root"]["nodeClass"], json!("signal"));
     }
 
@@ -1711,13 +1658,13 @@ mod tests {
     async fn browse_rejects_mixed_modes_and_hierarchical_args_without_ref() {
         let h = harness(poll_device(), MockOpts::default());
         // Mixing the paged and hierarchical arg families is BAD_ARGS.
-        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "root", "cursor": "1" })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "root", "max": 10 })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "root", "cursor": "1" })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "root", "max": 10 })).await), "BAD_ARGS");
         // `depth`/`maxRefs` without `ref` is BAD_ARGS.
-        assert_eq!(err_code(h.commander.browse(&json!({ "depth": 2 })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(&json!({ "maxRefs": 10 })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(None, &json!({ "depth": 2 })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(None, &json!({ "maxRefs": 10 })).await), "BAD_ARGS");
         // A non-string / empty `ref` is BAD_ARGS.
-        assert_eq!(err_code(h.commander.browse(&json!({ "ref": "" })).await), "BAD_ARGS");
+        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "" })).await), "BAD_ARGS");
     }
 
     // --- sb/pause / sb/resume + reflection through the mock task -----------------------------------
@@ -1725,17 +1672,17 @@ mod tests {
     #[tokio::test]
     async fn pause_and_resume_are_idempotent_and_reflect_through_the_task() {
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.pause(&json!({}), Some("site/op".into())).await);
+        let out = ok(h.commander.pause(None, &json!({}), Some("site/op".into())).await);
         assert_eq!(out["paused"], json!(true));
         assert_eq!(out["changed"], json!(true));
         assert!(h.health.paused.load(Ordering::Relaxed));
         assert!(h.events.has("adapter-paused"));
 
         // Idempotent: pausing again is changed:false.
-        let out = ok(h.commander.pause(&json!({}), None).await);
+        let out = ok(h.commander.pause(None, &json!({}), None).await);
         assert_eq!(out["changed"], json!(false));
 
-        let out = ok(h.commander.resume(&json!({})).await);
+        let out = ok(h.commander.resume(None, &json!({})).await);
         assert_eq!(out["paused"], json!(false));
         assert_eq!(out["changed"], json!(true));
         assert!(!h.health.paused.load(Ordering::Relaxed));
@@ -1746,11 +1693,11 @@ mod tests {
     #[tokio::test]
     async fn reconnect_reports_connected_or_maps_failure() {
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.reconnect(&json!({})).await);
+        let out = ok(h.commander.reconnect(None, &json!({})).await);
         assert_eq!(out["connected"], json!(true));
 
         let h = harness(poll_device(), MockOpts { reconnect_ok: false, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.reconnect(&json!({})).await), "RECONNECT_FAILED");
+        assert_eq!(err_code(h.commander.reconnect(None, &json!({})).await), "RECONNECT_FAILED");
     }
 
     // --- repoll: poll-only, refused on push and while paused --------------------------------------
@@ -1759,17 +1706,17 @@ mod tests {
     async fn repoll_polls_all_groups_but_is_refused_on_push_and_while_paused() {
         // Poll happy path: the mock returns a count.
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.repoll(&json!({})).await);
+        let out = ok(h.commander.repoll(None, &json!({})).await);
         assert_eq!(out["polled"], json!(7));
 
         // Push instance ⇒ BAD_ARGS.
         let hp = harness(push_device(), MockOpts::default());
-        assert_eq!(err_code(hp.commander.repoll(&json!({})).await), "BAD_ARGS");
+        assert_eq!(err_code(hp.commander.repoll(None, &json!({})).await), "BAD_ARGS");
 
         // Paused poll instance ⇒ the dedicated PAUSED code (resume first, §7.4.7).
         let h = harness(poll_device(), MockOpts::default());
-        let _ = h.commander.pause(&json!({}), None).await;
-        assert_eq!(err_code(h.commander.repoll(&json!({})).await), "PAUSED");
+        let _ = h.commander.pause(None, &json!({}), None).await;
+        assert_eq!(err_code(h.commander.repoll(None, &json!({})).await), "PAUSED");
     }
 
     // --- the describe catalog: 9 verbs + 3 panels -------------------------------------------------
@@ -1906,12 +1853,12 @@ mod tests {
     async fn read_poll_maps_a_device_read_failure_and_reads_by_explicit_tag_path() {
         // An explicit {tagPath,type} ref resolves and reads live.
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.read(&json!({ "signals": [ { "tagPath": "LINE_SPEED", "type": "real" } ] })).await);
+        let out = ok(h.commander.read(None, &json!({ "signals": [ { "tagPath": "LINE_SPEED", "type": "real" } ] })).await);
         assert_eq!(out["reads"][0]["value"], json!(42.0));
 
         // A live read that fails at the device ⇒ READ_FAILED.
         let h = harness(poll_device(), MockOpts { read_ok: false, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.read(&json!({ "signals": [ { "name": "line-speed" } ] })).await), "READ_FAILED");
+        assert_eq!(err_code(h.commander.read(None, &json!({ "signals": [ { "name": "line-speed" } ] })).await), "READ_FAILED");
     }
 
     #[tokio::test]
@@ -1919,7 +1866,7 @@ mod tests {
         // A missing value + an unresolved ref: both fail, and (since not ALL are allow-list refusals)
         // the call returns 200 with per-entry errors.
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.write(&json!({ "writes": [
+        let out = ok(h.commander.write(None, &json!({ "writes": [
             { "name": "fill-setpoint" },              // allow-listed but no value
             { "name": "ghost", "value": 1 }           // unresolved
         ] })).await);
@@ -1930,7 +1877,7 @@ mod tests {
 
         // A device-rejected write ⇒ the entry is ok:false with the device error.
         let h = harness(poll_device(), MockOpts { write_ok: false, ..MockOpts::default() });
-        let out = ok(h.commander.write(&json!({ "name": "fill-setpoint", "value": 55.5 })).await);
+        let out = ok(h.commander.write(None, &json!({ "name": "fill-setpoint", "value": 55.5 })).await);
         assert_eq!(out["results"][0]["ok"], json!(false));
         assert_eq!(out["results"][0]["error"], json!("write rejected"));
     }
@@ -1938,21 +1885,21 @@ mod tests {
     #[tokio::test]
     async fn write_push_reports_missing_value_failed_and_unresolved_entries() {
         let h = harness(push_device(), MockOpts::default());
-        let out = ok(h.commander.write(&json!({ "writes": [
+        let out = ok(h.commander.write(None, &json!({ "writes": [
             { "name": "fill-setpoint" },   // allow-listed output, no value
             { "name": "ghost", "value": 1 }
         ] })).await);
         assert_eq!(out["written"], json!(0));
 
         let h = harness(push_device(), MockOpts { write_ok: false, ..MockOpts::default() });
-        let out = ok(h.commander.write(&json!({ "name": "fill-setpoint", "value": 55.5 })).await);
+        let out = ok(h.commander.write(None, &json!({ "name": "fill-setpoint", "value": 55.5 })).await);
         assert_eq!(out["results"][0]["ok"], json!(false), "staging failure surfaces per-entry");
     }
 
     #[tokio::test]
     async fn signals_push_lists_input_and_output_fields_with_direction() {
         let h = harness(push_device(), MockOpts::default());
-        let out = ok(h.commander.signals(&json!({})).await);
+        let out = ok(h.commander.signals(None, &json!({})).await);
         assert_eq!(out["mode"], json!("push"));
         let sigs = out["signals"].as_array().unwrap();
         assert!(sigs.iter().any(|s| s["direction"] == json!("input")));
@@ -1963,11 +1910,11 @@ mod tests {
     async fn browse_maps_failed_and_pages_array_dim_and_cursor() {
         // A mid-browse failure ⇒ BROWSE_FAILED.
         let h = harness(poll_device(), MockOpts { browse: BrowseKind::Failed, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.browse(&json!({})).await), "BROWSE_FAILED");
+        assert_eq!(err_code(h.commander.browse(None, &json!({})).await), "BROWSE_FAILED");
 
         // A paged reply carries the array-dim tag and the next-cursor.
         let h = harness(poll_device(), MockOpts { browse: BrowseKind::Paged, ..MockOpts::default() });
-        let out = ok(h.commander.browse(&json!({ "cursor": "1", "max": 50 })).await);
+        let out = ok(h.commander.browse(None, &json!({ "cursor": "1", "max": 50 })).await);
         assert_eq!(out["tags"][0]["arrayDim"], json!(8));
         assert_eq!(out["cursor"], json!("42"));
     }
@@ -1975,6 +1922,6 @@ mod tests {
     #[tokio::test]
     async fn repoll_maps_a_device_failure_to_unavailable() {
         let h = harness(poll_device(), MockOpts { repoll_ok: false, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.repoll(&json!({})).await), "DEVICE_UNAVAILABLE");
+        assert_eq!(err_code(h.commander.repoll(None, &json!({})).await), "DEVICE_UNAVAILABLE");
     }
 }

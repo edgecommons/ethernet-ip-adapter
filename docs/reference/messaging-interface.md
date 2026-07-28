@@ -50,11 +50,13 @@ after `cmd/` and must equal `header.name`. Built-in verbs (`ping`, `reload-confi
 `get-configuration`, `describe`) ship with every component; the adapter adds the nine `sb/*`/`reconnect`/
 `repoll` verbs below.
 
-**Instance routing.** On an instance-scoped topic the topic's `{instance}` token is authoritative:
-it routes the command to that device. A request body that also carries an `instance` field must
-agree with the topic token — a disagreement is refused with `BAD_ARGS`. On the component-scoped
-topic the target device is selected by the **`instance`** field in the request body (optional when
-only one device is configured). The reply body is `{"ok": true, "result": <verb result>}` on
+**Instance routing.** Every verb below declares the `instance` scope — the value `describe` reports
+in `commands[].scope` — and the addressing resolves in this order: an instance-scoped topic names the
+device with its `{instance}` token; a component-scoped topic names it with the **`instance`** field in
+the request body; a body `instance` that disagrees with the topic's token is refused with `BAD_ARGS`
+before the verb runs; a request that names no instance addresses the sole configured device (with
+≥ 2 devices it is `BAD_ARGS`); and an addressed instance that names no configured device is
+`NO_SUCH_INSTANCE`. The reply body is `{"ok": true, "result": <verb result>}` on
 success, or `{"ok": false, "error": {"code", "message"}}` on failure.
 
 When every configured device runs push mode, `describe` reports `repoll` as `unsupported` (the verb
@@ -62,17 +64,17 @@ applies to poll instances); a `repoll` request is still answered with its per-in
 
 ### The nine verbs
 
-| Verb | Modes | Body | Result (on `ok:true`) |
-|------|-------|------|-----------------------|
-| `sb/status` | poll, push | `{instance?}` | `{id, mode, connected, state, paused, endpoint, adapter, metrics, security, io?}` |
-| `sb/read` | poll, push | `{instance?, signals:[ref…]}` | `{id, reads:[…]}` |
-| `sb/write` | poll, push | `{instance?, writes:[{ref…, value}]}` (or a single `{ref…, value}`) | `{id, written, results:[…]}` |
-| `sb/signals` | poll, push | `{instance?}` | `{id, mode, signals:[…]}` |
-| `sb/browse` | poll, push | `{instance?, cursor?, max?}` or `{instance?, ref, depth?, maxRefs?}` | `{id, tags:[…], cursor?}` (paged) or `{id, mode:"hierarchical", root, refCount, depth, truncated}` |
-| `sb/pause` | poll, push | `{instance?}` | `{id, paused:true, changed}` |
-| `sb/resume` | poll, push | `{instance?}` | `{id, paused:false, changed}` |
-| `reconnect` | poll, push | `{instance?}` | `{id, connected:true}` |
-| `repoll` | poll only | `{instance?}` | `{id, polled:<groups>}` |
+| Verb | Scope | Modes | Body | Result (on `ok:true`) |
+|------|-------|-------|------|-----------------------|
+| `sb/status` | `instance` | poll, push | `{instance?}` | `{id, mode, connected, state, paused, endpoint, adapter, metrics, security, io?}` |
+| `sb/read` | `instance` | poll, push | `{instance?, signals:[ref…]}` | `{id, reads:[…]}` |
+| `sb/write` | `instance` | poll, push | `{instance?, writes:[{ref…, value}]}` (or a single `{ref…, value}`) | `{id, written, results:[…]}` |
+| `sb/signals` | `instance` | poll, push | `{instance?}` | `{id, mode, signals:[…]}` |
+| `sb/browse` | `instance` | poll, push | `{instance?, cursor?, max?}` or `{instance?, ref, depth?, maxRefs?}` | `{id, tags:[…], cursor?}` (paged) or `{id, mode:"hierarchical", root, refCount, depth, truncated}` |
+| `sb/pause` | `instance` | poll, push | `{instance?}` | `{id, paused:true, changed}` |
+| `sb/resume` | `instance` | poll, push | `{instance?}` | `{id, paused:false, changed}` |
+| `reconnect` | `instance` | poll, push | `{instance?}` | `{id, connected:true}` |
+| `repoll` | `instance` | poll only | `{instance?}` | `{id, polled:<groups>}` |
 
 ### Error codes
 
@@ -80,9 +82,9 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 
 | Code | When |
 |------|------|
-| `BAD_ARGS` | Malformed body; `instance` required with ≥ 2 devices on a component-scoped request; a body `instance` that disagrees with the topic-addressed instance; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
+| `BAD_ARGS` | Malformed body; a request that addresses no instance with ≥ 2 devices configured; a body `instance` that disagrees with the topic's instance token; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
 | `PAUSED` | `repoll` on a paused instance — resume first. |
-| `NO_SUCH_INSTANCE` | `instance` names no configured device. |
+| `NO_SUCH_INSTANCE` | The addressed instance names no configured device. |
 | `WRITE_NOT_ALLOWED` | Every `sb/write` entry was refused by the allow-list. |
 | `WRITE_FAILED` | A write reached the device but the device rejected it (per-entry failures are also reported inline). |
 | `READ_FAILED` | A live `sb/read` (poll) failed at the link. |
@@ -262,22 +264,34 @@ itself. For every metric's dimensions, measures, units, and diagnostic purpose, 
 ## State keepalive (`state` class, reserved — automatic)
 
 The library's heartbeat publishes the `state` keepalive every ~5 s. The RUNNING keepalive carries an
-**`instances`** array: one entry per configured device, so a fleet consumer sees every device's up/down
-state under the one component without a separate UNS instance per device.
+**`instances`** array: one entry per configured device, so a fleet consumer sees every device's
+condition under the one component without a separate UNS instance per device.
 
 ```jsonc
 "body": {
   "status": "RUNNING", "uptimeSecs": 3600,
   "instances": [
-    { "instance": "filler-plc", "connected": true, "detail": "10.0.0.50:44818",
-      "attributes": { "connectionMode": "unconnected" } }
+    { "instance": "filler-plc", "connected": true, "state": "ONLINE", "detail": "10.0.0.50:44818",
+      "attributes": { "adapter": "ethernet-ip", "mode": "poll", "connectionMode": "unconnected",
+                      "paused": false, "security": "plaintext" } },
+    { "instance": "packer-plc", "connected": true, "state": "PAUSED", "detail": "10.0.0.51:44818",
+      "attributes": { "adapter": "ethernet-ip", "mode": "poll", "connectionMode": "unconnected",
+                      "paused": true, "security": "plaintext" } }
   ]
 }
 ```
 
 - `connected` — the normalized live-liveness flag every console reads (always present).
+- `state` — the device's condition, the same token `sb/status` returns: `CONNECTING` (first connect,
+  nothing has failed yet), `ONLINE` (session up and producing), `BACKOFF` (the link failed and is
+  being retried), `PAUSED` (`sb/pause` is latched and the session is up, so the instance is
+  deliberately quiet rather than stale). A link break while paused reports `BACKOFF` with
+  `attributes.paused: true`, so `connected` and `state` always tell the truth together.
 - `detail` — the connection endpoint.
-- `attributes.connectionMode` — `connected` (CIP connected messaging) or `unconnected`.
+- `attributes.connectionMode` — `connected` (CIP connected messaging), `unconnected`, or `class1-io`
+  (a push instance's cyclic I/O connection).
+- `attributes.paused` / `attributes.security` — the pause flag and the TLS posture
+  (`"tls"`|`"plaintext"`), from the same per-instance state the `sb/status` reply reads.
 
 ## Edge-console panels
 
