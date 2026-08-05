@@ -13,7 +13,7 @@ the **Rust reference** southbound adapter.
 | Doc | Start here when you want to… |
 |-----|------------------------------|
 | **[Tutorial](tutorial.md)** | learn by doing — bring the adapter up against a simulator, end to end |
-| **[How-to guides](how-to-guides.md)** | accomplish a task — poll a device, consume class-1 I/O, write a signal, pause an instance, deploy |
+| **[How-to guides](how-to-guides.md)** | accomplish a task — poll a device, consume class-1 I/O, write a signal, pause an instance, change the configuration while it runs, deploy |
 | **[Reference](reference/)** | look up an exact option, topic, payload, verb, metric, or type |
 | **[Explanation](explanation.md)** | understand how it works and why — poll vs push, the signal model, allow-listed writes |
 | **[Sample configurations](sample-configurations.md)** | copy a complete, annotated poll and push config |
@@ -25,6 +25,7 @@ the **Rust reference** southbound adapter.
 - **"How is a CIP tag or assembly field turned into a value?"** → [Reference — Data Types](reference/data-types.md).
 - **"What message on which topic?"** → [Reference — Messaging Interface](reference/messaging-interface.md).
 - **"What does this metric mean?"** → [Reference — Metrics](reference/metrics.md).
+- **"How do I change the configuration without restarting?"** → [How-to guides — Change the configuration without restarting the component](how-to-guides.md#change-the-configuration-without-restarting-the-component).
 - **"Poll or push — which do I use?"** → [Explanation](explanation.md).
 
 ## Audience

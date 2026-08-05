@@ -7,8 +7,9 @@ data/control plane model see [explanation.md](../explanation.md); for client rec
 
 - `{device}` — the resolved Thing name (the last `hierarchy` level).
 - `{component}` — the component UNS token, `ethernet-ip-adapter`.
-- `{instance}` — a device instance id (`filler-plc`, …) for `data`/`evt`; the `state` keepalive and
-  `metric` are component-scope. `cmd` accepts both scopes: component-scope
+- `{instance}` — a device instance id (`filler-plc`, …) for `data` and for the per-device `evt`
+  events; the `state` keepalive, `metric`, and the component-wide `config-applied` event are
+  component-scope. `cmd` accepts both scopes: component-scope
   (`…/ethernet-ip-adapter/cmd/{verb}`) and instance-addressed
   (`…/ethernet-ip-adapter/{instance}/cmd/{verb}`).
 
@@ -31,7 +32,7 @@ reply is published to `reply_to` with the same `correlation_id`.
 | Class | Message | Direction | Topic | Reply |
 |-------|---------|-----------|-------|-------|
 | `data` | `SouthboundSignalUpdate` | adapter → bus | `ecv1/{device}/ethernet-ip-adapter/{instance}/data/{signal}` | — |
-| `evt` | `evt` | adapter → bus | `ecv1/{device}/ethernet-ip-adapter/{instance}/evt/{severity}/{type}` | — |
+| `evt` | `evt` | adapter → bus | `ecv1/{device}/ethernet-ip-adapter[/{instance}]/evt/{severity}/{type}` | — |
 | `cmd` | the nine verbs (below) | bus → adapter | `ecv1/{device}/ethernet-ip-adapter[/{instance}]/cmd/{verb}` | `{ok,result}` |
 | `metric` | `southbound_health`, `EtherNetIpConnection`, `EtherNetIpInventory`, `EtherNetIpPoll`, `EtherNetIpPublish`, `EtherNetIpCommand`, `EtherNetIpIo` | adapter → bus (auto) | `ecv1/{device}/ethernet-ip-adapter/metric/{metricName}` | — |
 | `state` | keepalive | adapter → bus (auto) | `ecv1/{device}/ethernet-ip-adapter/state` | — |
@@ -48,15 +49,18 @@ both command scopes: the component scope `ecv1/{device}/ethernet-ip-adapter/cmd/
 scope `ecv1/{device}/ethernet-ip-adapter/{instance}/cmd/#`. A request's **verb** is the topic channel
 after `cmd/` and must equal `header.name`. Built-in verbs (`ping`, `reload-config`,
 `get-configuration`, `describe`) ship with every component; the adapter adds the nine `sb/*`/`reconnect`/
-`repoll` verbs below.
+`repoll` verbs below. `reload-config` re-reads the active config source and applies it as the
+instance-level transaction described in [configuration — Applying changes](configuration.md#applying-changes),
+answering `{"reloaded": true}` or a `RELOAD_FAILED` error when the candidate is rejected.
 
 **Instance routing.** Every verb below declares the `instance` scope — the value `describe` reports
 in `commands[].scope` — and the addressing resolves in this order: an instance-scoped topic names the
 device with its `{instance}` token; a component-scoped topic names it with the **`instance`** field in
 the request body; a body `instance` that disagrees with the topic's token is refused with `BAD_ARGS`
-before the verb runs; a request that names no instance addresses the sole configured device (with
-≥ 2 devices it is `BAD_ARGS`); and an addressed instance that names no configured device is
-`NO_SUCH_INSTANCE`. The reply body is `{"ok": true, "result": <verb result>}` on
+before the verb runs; a request that names no instance addresses the sole **running** device (with
+≥ 2 of them it is `BAD_ARGS`, and while none is running — the brief window in which a configuration
+change restarts every instance — it is `DEVICE_UNAVAILABLE`); and an addressed instance that names no
+running device is `NO_SUCH_INSTANCE`. The reply body is `{"ok": true, "result": <verb result>}` on
 success, or `{"ok": false, "error": {"code", "message"}}` on failure.
 
 When every configured device runs push mode, `describe` reports `repoll` as `unsupported` (the verb
@@ -82,13 +86,13 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 
 | Code | When |
 |------|------|
-| `BAD_ARGS` | Malformed body; a request that addresses no instance with ≥ 2 devices configured; a body `instance` that disagrees with the topic's instance token; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
+| `BAD_ARGS` | Malformed body; a request that addresses no instance with ≥ 2 devices running; a body `instance` that disagrees with the topic's instance token; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
 | `PAUSED` | `repoll` on a paused instance — resume first. |
-| `NO_SUCH_INSTANCE` | The addressed instance names no configured device. |
+| `NO_SUCH_INSTANCE` | The addressed instance names no running device. |
 | `WRITE_NOT_ALLOWED` | Every `sb/write` entry was refused by the allow-list. |
 | `WRITE_FAILED` | A write reached the device but the device rejected it (per-entry failures are also reported inline). |
 | `READ_FAILED` | A live `sb/read` (poll) failed at the link. |
-| `DEVICE_UNAVAILABLE` | The device task could not be reached (e.g. `repoll` mid-outage). |
+| `DEVICE_UNAVAILABLE` | The device task could not be reached (e.g. `repoll` mid-outage), or the request named no instance while none is running (a configuration change restarting every instance). |
 | `RECONNECT_FAILED` | `reconnect`'s single bounded attempt did not connect. |
 | `BROWSE_UNSUPPORTED` | The device has no CIP tag-list service (poll browse). |
 | `BROWSE_FAILED` | A mid-browse link failure. |
@@ -240,7 +244,7 @@ Published through the library's `events()` facade: severity **derives** the chan
 | Channel | Severity | When |
 |---------|----------|------|
 | `evt/info/device-connected` | Info | The link came up. Clears the `device-unreachable` alarm. |
-| `evt/critical/device-unreachable` | Critical | The link was lost — a stateful alarm (`alarm:true, active:true` on loss; cleared on reconnect via the same channel). |
+| `evt/critical/device-unreachable` | Critical | The link was lost — a stateful alarm (`alarm:true, active:true` on loss; cleared on reconnect via the same channel). A configuration change that removes the instance also clears it, so a device the configuration no longer runs leaves no latched alarm. |
 | `evt/warning/adapter-paused` | Warning | `sb/pause` moved the instance to paused. `context.by` carries the requester identity path. |
 | `evt/info/adapter-resumed` | Info | `sb/resume` moved the instance back to running. |
 | `evt/info/write-audit` | Info | An `sb/write` entry succeeded. `context` carries `{instance, signalId, ok, value}`. |
@@ -250,8 +254,25 @@ Published through the library's `events()` facade: severity **derives** the chan
 | `evt/info/cert-rotated` | Info | The adapter's client certificate or trust store rotated in the vault; the adapter reconnected to apply it. `context` carries `{instance, security:"tls", serial, notAfter}`. |
 | `evt/warning/cert-expiring` | Warning | The adapter's client certificate is within `renewBeforeDays` of expiry. `context` carries `{instance, security:"tls", daysRemaining, notAfter}`. |
 | `evt/warning/cert-expired` | Warning | The adapter's client certificate has expired; TLS connects fail until it is rotated. `context` carries `{instance, security:"tls", notAfter}`. |
+| `evt/info/config-applied` | Info | A configuration change was applied. **Component-scope** (no `{instance}` topic token) — it describes the whole transaction. `context` carries `{started, stopped, kept, skipped, restartAll}`. |
 
 On a TLS instance, `device-connected` carries `context.security: "tls"`.
+
+`config-applied`'s context lists the instance ids the change `started`, `stopped`, and `kept`, plus
+`skipped` — the `[id, reason]` pairs for every instance the change passed over, whether its entry was
+malformed or it could not be started — and
+`restartAll`, true when the change was outside `component.instances[]` and therefore restarted every
+instance:
+
+```jsonc
+"context": {
+  "started": ["palletizer-io"], "stopped": ["packer-plc"], "kept": ["filler-plc"],
+  "skipped": [ ["mixer-plc", "unknown field `pollGroup`"] ], "restartAll": false
+}
+```
+
+An instance the change restarts appears in both `stopped` and `started`. See
+[configuration — Applying changes](configuration.md#applying-changes).
 
 A fleet consumer subscribing `ecv1/+/+/+/evt/critical/#` sees only alarm-grade events without per-adapter
 knowledge of the channel shape.
