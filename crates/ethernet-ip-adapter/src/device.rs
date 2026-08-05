@@ -370,6 +370,10 @@ pub struct IoLinkStats {
     pub malformed_frames: u64,
     /// Produce ticks skipped because a prior tick had not been serviced — `produceOverruns` (§8.8).
     pub produce_overruns: u64,
+    /// O→T datagram send failures — `sendErrors` (§8.8).
+    pub send_errors: u64,
+    /// Socket-wide receive errors — `recvErrors` (§8.8).
+    pub recv_errors: u64,
 }
 
 /// A live **push** (class-1 implicit I/O) session to one device. **This is the trait a push backend

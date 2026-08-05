@@ -144,5 +144,7 @@ Class-1 implicit-I/O health (push mode only). Dimensions: `instance`.
 | `malformedFrames` | Count | counter | Malformed frames. |
 | `ioTimeouts` | Count | counter | Class-1 inactivity/timeout events. |
 | `produceOverruns` | Count | counter | O→T produce overruns. |
+| `sendErrors` | Count | counter | O→T datagrams that failed to send. |
+| `recvErrors` | Count | counter | Receive failures on the class-1 socket. |
 | `interFrameMs` | Milliseconds | gauge | Most recent T→O inter-arrival time. |
 | `runMode` | Count | gauge | The peer's run/idle bit (`1` run, `0` idle). |

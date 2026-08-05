@@ -34,7 +34,7 @@ Grounding artifacts (verified 2026-07-18, do not work from memory):
 ## Table of contents
 
 1. [Goals, non-goals & isolation contract](#1-goals-non-goals--isolation-contract)
-2. [Decisions register (D-ENIP-1…D-ENIP-14)](#2-decisions-register)
+2. [Decisions register (D-ENIP-1…D-ENIP-17)](#2-decisions-register)
 3. [Workspace & crate layout](#3-workspace--crate-layout)
 4. [Memory-safe decoding: the `WireReader` invariant](#4-memory-safe-decoding-the-wirereader-invariant)
 5. [Encapsulation layer](#5-encapsulation-layer)
@@ -142,6 +142,7 @@ throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.
 | **D-ENIP-13** | **v1 restricts routing to port numbers ≤ 14** (covers backplane port 1 + slot, the only routed path the adapter exposes). The extended-port encoding is implemented per spec but gated behind a conformance vector captured from real routed hardware before it is enabled. | The references disagree on extended-port byte order and we have no routed device to arbitrate; shipping an unverified encoding of a rarely-used path is how wire bugs are born. Declared limitation, not silent. |
 | **D-ENIP-14** | **The crate ships NO embedded test target.** Session/connection state-machine tests run over in-memory `tokio::io::duplex` byte-stream fixtures — the session actor is generic over `AsyncRead + AsyncWrite`, so a fixture deterministically injects wrong-`sender_context`, stale, fragmented, and sequence-mismatch frames a real device cannot be scripted to send. Real device behavior is validated against the EXTERNAL cpppo (poll) and OpENer (push) containers in the adapter's integration suite (§12.5). | Keeps every device simulator external to match reality (user decision) while preserving deterministic adversarial testing via raw-byte fixtures: the duplex fixture is a byte pipe, not a peer implementation, so a decoder bug can never be masked by a matching encoder bug in an in-crate double. (The earlier `testserver` in-crate target idea was dropped for this reason — there is no `testserver` module or feature.) |
 | **D-ENIP-16** | **ForwardOpen success replies are verified before use** — originator echo quad equality (T→O connection id, connection serial, vendor id, originator serial) plus, for class-1, an API range of [100 µs, 600 s]; failure ⇒ best-effort ForwardClose + typed error. | An unvalidated reply API of 0 previously livelocked the produce scheduler; an unverified echo can bind a connection to the wrong identity. The target-assigned O→T id is excluded because the request sends 0 and the choice is the target's. |
+| **D-ENIP-17** | **A ForwardOpen reply cannot steer our class-1 traffic.** (a) The O→T Sockaddr Info item retargets the **port only**: the transmit address is always the target's own. A sockaddr naming `0.0.0.0` contributes its port; one naming the target's address is honoured as written; one naming any other address — foreign unicast, broadcast, multicast, loopback — has its address **refused** (warned, naming the address) and only its port kept. With no known target address a redirect is unresolvable and the open fails. (b) The T→O multicast group is joined **only** when the ForwardOpen requested `ConnType::Multicast` for T→O; a multicast T→O sockaddr answering any other request is a `ProtocolViolation` whose detail names the type that was requested (`"multicast T→O sockaddr on a point-to-point request"`, `"multicast T→O sockaddr on a null (reconfigure) request"`) — the adapter only ever requests P2P, but the crate API accepts either, and a violation must not misreport which one it refused. A requested-multicast connection whose reply carries a unicast or absent T→O sockaddr consumes unicast. Both paths keep the D-ENIP-16 teardown invariant (best-effort ForwardClose before the typed error). Strict by default, with no opt-out knob. | Honouring a concrete foreign address let any target aim our cyclic O→T stream at a third party — a reflection/amplification primitive driven entirely by an attacker-controlled reply — and a multicast offer subscribed our socket to an arbitrary group on a connection we asked to keep point-to-point. The address is the one field the originator already knows (it opened the TCP session); the port is the only field a target legitimately needs to move, which is why the split is address-refuse/port-honour rather than reject-the-reply — real targets that relocate the port keep working. No config knob ships: a strict default needs none, and if field interop ever demands honouring a foreign redirect, that is a `ClientOptions` opt-in to be argued on evidence, not a hedge built in advance. **Phase-3 observability seam (recorded, not built):** a refused redirect is warn-only today, which leaves one narrow silent failure mode — a device that both *requires* the redirect to receive O→T **and** never enforces its own O→T inactivity watchdog keeps producing inputs while its outputs are dead, and the adapter still reports ONLINE because the local `send_to` succeeds, so `sendErrors` cannot catch it. Phase 3 closes it with a `refused_redirects` counter on `enip::IoStats` (riding the `sendErrors`/`recvErrors` plumbing) or a disposition accessor on `IoConnectionHandle`, with the adapter emitting an event off it. |
 
 ---
 
@@ -611,9 +612,19 @@ path; all LE):
 Success reply: `u32 O→T id (target-assigned), u32 T→O id (echo), u16 serial, u16 vendor,
 u32 orig serial, u32 O→T API (µs), u32 T→O API (µs), u8 app_reply_size (words), u8 reserved,
 app bytes`. **The APIs (actual packet intervals) from the reply — not the requested RPIs — drive
-the produce timer and the timeout watchdog.** The reply CPF may carry Sockaddr Info items
-(§5.4): an O→T sockaddr redirects our transmit endpoint (port, and address unless `0.0.0.0`); a
-T→O sockaddr with a multicast address is the group to join for multicast consumption.
+the produce timer and the timeout watchdog.**
+
+The reply CPF may carry Sockaddr Info items (§5.4), and **neither of them can steer our traffic**
+(D-ENIP-17). The O→T sockaddr moves our transmit **port** only: we always transmit to the target's
+own address, so a sockaddr naming `0.0.0.0` contributes its port, one naming the target's address is
+honoured as written, and one naming any other address — foreign unicast, broadcast, multicast,
+loopback — has its address refused (logged at `warn`, naming it) with only its port kept. A session
+with no known target address cannot resolve a transmit endpoint at all, redirect or not. The T→O
+sockaddr's multicast address is joined only when the ForwardOpen requested `ConnType::Multicast` for
+T→O; a multicast T→O sockaddr answering any other request is a protocol violation naming the type
+that was requested (`"multicast T→O sockaddr on a point-to-point request"` /
+`"… on a null (reconfigure) request"`), and a requested-multicast connection whose reply names a
+unicast address (or carries no T→O sockaddr) consumes unicast.
 
 The client verifies a success reply before arming anything: the echoed T→O connection id,
 connection serial, vendor id, and originator serial must equal the request's
@@ -626,8 +637,9 @@ deliberately outside the check: the request sends 0 and whatever the target pick
 error propagates. Past the target's success reply the target believes a connection is open and
 produces into it until its own watchdog expires, so every remaining failure path tears it down: a
 reply that fails echo verification, a reply whose APIs are out of range, an O→T transmit endpoint
-that cannot be resolved (no usable sockaddr and no known target address), and a manager task that has
-already exited so the connection could never be serviced. The ForwardClose is best-effort throughout
+that cannot be resolved (no known target address), a multicast T→O sockaddr on a connection that did
+not request multicast T→O, and a manager task that has already exited so the connection could never
+be serviced. The ForwardClose is best-effort throughout
 — its encode, round trip, and reply status are all discarded, because the caller is already leaving
 with a more specific error that must not be replaced.
 

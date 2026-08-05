@@ -128,6 +128,8 @@ fn map_io_stats(s: enip::IoStats) -> IoLinkStats {
         sequence_gaps: s.sequence_gaps,
         malformed_frames: s.malformed_frames,
         produce_overruns: s.produce_overruns,
+        send_errors: s.send_errors,
+        recv_errors: s.recv_errors,
     }
 }
 
@@ -443,7 +445,8 @@ impl PushSession for EipPushSession {
         if let Some(task) = self.task.take() {
             let (ack_tx, ack_rx) = oneshot::channel();
             if self.control.send(PushControl::Close(ack_tx)).await.is_ok() {
-                let _ = tokio::time::timeout(Duration::from_secs(5), ack_rx).await;
+                // The shutdown budget and this handoff share one number (§10.3, D-EIP-27).
+                let _ = tokio::time::timeout(crate::lifecycle::PUSH_CLOSE_HANDOFF_CAP, ack_rx).await;
             } else {
                 task.abort();
             }

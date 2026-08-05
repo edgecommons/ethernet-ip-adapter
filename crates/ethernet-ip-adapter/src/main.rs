@@ -20,6 +20,7 @@ mod commands;
 mod config;
 mod device;
 mod eip;
+mod lifecycle;
 mod metrics;
 mod poll;
 mod poll_driver;

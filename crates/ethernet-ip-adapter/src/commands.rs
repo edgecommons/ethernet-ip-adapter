@@ -36,6 +36,7 @@ use crate::metrics::{CommandTally, DeviceMetrics};
 /// The per-device handles the command surface needs: the config (routing, allow-list, address view),
 /// the control channel (session-touching verbs), the shared health (status/paused), the metrics
 /// emitter (command counters + status snapshot), and the event sink (`write-audit`, §6.3).
+#[derive(Clone)]
 pub struct DeviceHandle {
     pub cfg: DeviceConfig,
     pub control: tokio::sync::mpsc::Sender<DeviceControl>,

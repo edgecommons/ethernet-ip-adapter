@@ -970,8 +970,9 @@ impl IoManager {
     /// ([`best_effort_forward_close`]) before the typed error propagates. Past the target's success
     /// reply the target believes a connection is open and will produce into it until its own
     /// watchdog expires; every way this function can still fail — a reply that fails echo
-    /// verification or API validation, an unresolvable O→T transmit endpoint, a manager task that
-    /// has already exited — leaves that same stranded connection, so all of them tear it down.
+    /// verification or API validation, an unresolvable O→T transmit endpoint, a multicast T→O
+    /// sockaddr on a connection that did not request multicast T→O, a manager task that has already
+    /// exited — leaves that same stranded connection, so all of them tear it down.
     pub async fn forward_open<S: ForwardOpenService>(
         &self,
         session: &S,
@@ -1028,8 +1029,9 @@ impl IoManager {
             }
         };
 
-        // Sockaddr items (§8.2): an O→T sockaddr redirects our transmit endpoint; a multicast T→O
-        // sockaddr is the group to join.
+        // Sockaddr items (§8.2, D-ENIP-17): an O→T sockaddr may retarget our transmit **port**, never
+        // its address; a T→O multicast sockaddr is the group to join, and only on a connection whose
+        // T→O direction was requested multicast.
         let o2t_sock = reply_cpf
             .find(ItemType::SockAddrOtoT)
             .and_then(|i| SockAddrInfo::decode(&i.data).ok());
@@ -1038,17 +1040,31 @@ impl IoManager {
             .and_then(|i| SockAddrInfo::decode(&i.data).ok());
         // Same invariant as the two verification failures above: the target already answered with a
         // success, so an endpoint we cannot address still leaves a connection open on its side.
-        let tx_endpoint = match resolve_tx_endpoint(o2t_sock, session.target_ip()) {
-            Ok(ep) => ep,
+        let (tx_endpoint, disposition) = match resolve_tx_endpoint(o2t_sock, session.target_ip()) {
+            Ok(resolved) => resolved,
             Err(e) => {
                 best_effort_forward_close(session, &open).await;
                 return Err(e);
             }
         };
-        let multicast_group = t2o_sock.and_then(|s| {
-            let ip = Ipv4Addr::from(s.sin_addr);
-            ip.is_multicast().then_some(ip)
-        });
+        if let TxEndpointDisposition::RefusedForeign(refused) = disposition {
+            tracing::warn!(
+                %refused,
+                endpoint = %tx_endpoint,
+                "forward-open reply pointed the O→T stream at a foreign address; \
+                 address refused, sockaddr port honoured"
+            );
+        }
+        // A multicast T→O sockaddr on a connection that did not request multicast T→O is a protocol
+        // violation, not a group to join — same teardown invariant as every other post-success
+        // failure.
+        let multicast_group = match resolve_multicast_group(t2o_sock, spec.t2o.conn_type) {
+            Ok(group) => group,
+            Err(e) => {
+                best_effort_forward_close(session, &open).await;
+                return Err(e);
+            }
+        };
 
         let params = IoConnectionParams {
             o2t_connection_id: success.o_t_connection_id,
@@ -1247,21 +1263,74 @@ fn duration_to_micros(d: Duration) -> Result<u32> {
     u32::try_from(d.as_micros()).map_err(|_| EnipError::TooLarge { limit: u32::MAX as usize })
 }
 
-/// Resolve the O→T transmit endpoint (§8.2): the O→T sockaddr redirect if present (its address
-/// unless `0.0.0.0`, its port unless 0), else the target IP on :2222.
-fn resolve_tx_endpoint(o2t_sock: Option<SockAddrInfo>, target_ip: Option<IpAddr>) -> Result<SocketAddr> {
-    if let Some(s) = o2t_sock {
-        let sock_ip = Ipv4Addr::from(s.sin_addr);
-        let port = if s.sin_port != 0 { s.sin_port } else { IO_UDP_PORT };
-        let ip = if sock_ip.is_unspecified() {
-            target_ip.ok_or(EnipError::ProtocolViolation { detail: "no O→T transmit address available" })?
-        } else {
-            IpAddr::V4(sock_ip)
-        };
-        return Ok(SocketAddr::new(ip, port));
+/// How the O→T Sockaddr Info item of a ForwardOpen reply was treated (§8.2, D-ENIP-17). The
+/// endpoint that comes with it is always addressed at the target; this says what the reply asked
+/// for, so the caller can log a refusal without the classifier doing I/O of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxEndpointDisposition {
+    /// No O→T sockaddr in the reply — the target IP on :2222.
+    Direct,
+    /// The sockaddr named `0.0.0.0` (INADDR_ANY): its port applies, the target supplies the address.
+    PortOnly,
+    /// The sockaddr named the target's own address: honoured as written.
+    Honored,
+    /// The sockaddr named a **different** address. It is refused (the enclosed address is never
+    /// transmitted to); only the port is taken.
+    RefusedForeign(IpAddr),
+}
+
+/// Resolve the O→T transmit endpoint (§8.2, D-ENIP-17). **The address is always the target's**: a
+/// ForwardOpen reply may retarget the port, never the destination host. A sockaddr naming any other
+/// address — foreign unicast, broadcast, multicast, loopback — has its address refused and its port
+/// kept, because honouring it would let a target aim our cyclic O→T stream at a third party. With no
+/// known target address there is nothing to address and nothing to compare against, so a redirect
+/// can never be honoured on that path: it is [`EnipError::ProtocolViolation`].
+fn resolve_tx_endpoint(
+    o2t_sock: Option<SockAddrInfo>,
+    target_ip: Option<IpAddr>,
+) -> Result<(SocketAddr, TxEndpointDisposition)> {
+    let target = target_ip.ok_or(EnipError::ProtocolViolation {
+        detail: "no O→T transmit address available",
+    })?;
+    let Some(s) = o2t_sock else {
+        return Ok((SocketAddr::new(target, IO_UDP_PORT), TxEndpointDisposition::Direct));
+    };
+    let sock_ip = Ipv4Addr::from(s.sin_addr);
+    let port = if s.sin_port != 0 { s.sin_port } else { IO_UDP_PORT };
+    let disposition = if sock_ip.is_unspecified() {
+        TxEndpointDisposition::PortOnly
+    } else if IpAddr::V4(sock_ip) == target {
+        TxEndpointDisposition::Honored
+    } else {
+        TxEndpointDisposition::RefusedForeign(IpAddr::V4(sock_ip))
+    };
+    Ok((SocketAddr::new(target, port), disposition))
+}
+
+/// Resolve the T→O multicast group from the reply's T→O sockaddr (§8.2–§8.3, D-ENIP-17).
+///
+/// A group is joined **only** when the ForwardOpen requested `ConnType::Multicast` for T→O. A
+/// multicast sockaddr answering any other request is a protocol violation: the originator asked for
+/// a private stream, and joining an arbitrary group on the target's say-so subscribes the scanner to
+/// traffic it never requested. The violation names the type that *was* requested, so a null
+/// (reconfigure) request is not misreported as a point-to-point one. A requested-multicast
+/// connection whose reply carries a unicast or absent T→O sockaddr simply consumes unicast — no
+/// group, no error.
+fn resolve_multicast_group(
+    t2o_sock: Option<SockAddrInfo>,
+    requested_t2o: ConnType,
+) -> Result<Option<Ipv4Addr>> {
+    let Some(s) = t2o_sock else { return Ok(None) };
+    let ip = Ipv4Addr::from(s.sin_addr);
+    if !ip.is_multicast() {
+        return Ok(None);
     }
-    let ip = target_ip.ok_or(EnipError::ProtocolViolation { detail: "no O→T transmit address available" })?;
-    Ok(SocketAddr::new(ip, IO_UDP_PORT))
+    let detail = match requested_t2o {
+        ConnType::Multicast => return Ok(Some(ip)),
+        ConnType::P2P => "multicast T→O sockaddr on a point-to-point request",
+        ConnType::Null => "multicast T→O sockaddr on a null (reconfigure) request",
+    };
+    Err(EnipError::ProtocolViolation { detail })
 }
 
 /// The socket task (§8.6, §11.1): receive datagrams and route them; drive produce + watchdog on a
@@ -1735,21 +1804,131 @@ mod tests {
         assert_eq!(open.t_o_connection_id, 0x1122_3344);
     }
 
-    #[test]
-    fn tx_endpoint_prefers_o2t_sockaddr_then_target_ip() {
-        // O→T sockaddr with a concrete address + port wins.
+    /// **Redirect hardening (D-ENIP-17).** A reply's O→T sockaddr may move the transmit *port*,
+    /// never the transmit *address*: honouring a foreign address would let a target aim our cyclic
+    /// O→T stream at an arbitrary victim (a reflection/amplification primitive). The previous
+    /// behaviour — "a concrete address in the reply wins" — is exactly that hole.
+    #[tokio::test]
+    async fn tx_endpoint_refuses_a_foreign_o2t_redirect_port_only() {
+        let target = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        // A foreign unicast address: refused, its port kept.
         let sa = SockAddrInfo::ipv4(0xC0A8_0164, 0x08AE); // 192.168.1.100:2222
-        let ep = resolve_tx_endpoint(Some(sa), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))).unwrap();
-        assert_eq!(ep, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 2222));
-        // 0.0.0.0 sockaddr falls back to the target IP, keeping the sockaddr port.
-        let sa0 = SockAddrInfo::ipv4(0, 0x08AE);
-        let ep0 = resolve_tx_endpoint(Some(sa0), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))).unwrap();
-        assert_eq!(ep0, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 2222));
-        // No sockaddr → target IP on :2222.
-        let ep1 = resolve_tx_endpoint(None, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))).unwrap();
-        assert_eq!(ep1, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 2222));
+        let (ep, how) = resolve_tx_endpoint(Some(sa), Some(target)).unwrap();
+        assert_eq!(ep, SocketAddr::new(target, 2222), "we transmit to the target, on the named port");
+        assert_eq!(how, TxEndpointDisposition::RefusedForeign(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
+        // The port really does follow the sockaddr — the refusal is address-only.
+        let (ep_port, _) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0xC0A8_0164, 4444)), Some(target)).unwrap();
+        assert_eq!(ep_port, SocketAddr::new(target, 4444));
+        // Broadcast, multicast, and loopback redirects are refused by the same rule.
+        for addr in [0xFFFF_FFFF, 0xEFC0_0001, 0x7F00_0001] {
+            let (ep, how) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(addr, 0x08AE)), Some(target)).unwrap();
+            assert_eq!(ep.ip(), target, "{addr:#010x} must not become a transmit target");
+            assert!(matches!(how, TxEndpointDisposition::RefusedForeign(_)), "{addr:#010x}");
+        }
+        // A foreign redirect with no known target address is unresolvable, never honoured.
+        assert!(resolve_tx_endpoint(Some(sa), None).is_err());
+
+        // End to end: the refusal is not fatal — the connection still opens (no ForwardClose), it
+        // just keeps transmitting to the target.
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let fixture = FoFixture::new(None, 20_000, 20_000).with_o2t_sock(sa);
+        let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
+        assert_eq!(handle.apis(), (Duration::from_millis(20), Duration::from_millis(20)));
+        assert_eq!(fixture.requests().len(), 1, "a refused redirect does not tear the connection down");
+        mgr.shutdown().await;
+    }
+
+    /// The guard against over-tightening: the three legitimate sockaddr shapes keep working, and an
+    /// endpoint that cannot be addressed is still a typed error rather than a panic.
+    #[test]
+    fn tx_endpoint_keeps_zero_addr_and_same_addr_behavior() {
+        let target = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // 0.0.0.0 (INADDR_ANY): the target supplies the address, the sockaddr the port.
+        let (ep0, how0) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0, 0x08AE)), Some(target)).unwrap();
+        assert_eq!(ep0, SocketAddr::new(target, 2222));
+        assert_eq!(how0, TxEndpointDisposition::PortOnly);
+        // A zero port still falls back to the standard implicit-I/O port.
+        let (ep_zero_port, _) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0, 0)), Some(target)).unwrap();
+        assert_eq!(ep_zero_port, SocketAddr::new(target, IO_UDP_PORT));
+        // The target's own address: honoured as written.
+        let (ep_same, how_same) =
+            resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0x0A00_0001, 4444)), Some(target)).unwrap();
+        assert_eq!(ep_same, SocketAddr::new(target, 4444));
+        assert_eq!(how_same, TxEndpointDisposition::Honored);
+        // No sockaddr → the target IP on :2222.
+        let (ep1, how1) = resolve_tx_endpoint(None, Some(target)).unwrap();
+        assert_eq!(ep1, SocketAddr::new(target, IO_UDP_PORT));
+        assert_eq!(how1, TxEndpointDisposition::Direct);
         // No sockaddr and no target IP → a typed error, never a panic.
         assert!(resolve_tx_endpoint(None, None).is_err());
+    }
+
+    /// **Multicast-join hardening (D-ENIP-17).** A multicast T→O sockaddr answering a request that
+    /// did not ask for multicast T→O is a protocol violation: we asked for a private stream, so a
+    /// target must not be able to subscribe our socket to an arbitrary group. The connection the
+    /// target believes it opened is torn down on the way out, and the violation names the type that
+    /// was actually requested rather than assuming point-to-point.
+    #[tokio::test]
+    async fn p2p_request_refuses_a_multicast_t2o_sockaddr() {
+        // The pure decision.
+        let group = SockAddrInfo::ipv4(0xEFC0_0001, 0x08AE); // 239.192.0.1:2222
+        match resolve_multicast_group(Some(group), ConnType::P2P) {
+            Err(EnipError::ProtocolViolation { detail }) => {
+                assert_eq!(detail, "multicast T→O sockaddr on a point-to-point request");
+            }
+            other => panic!("expected a protocol violation, got {other:?}"),
+        }
+        // A null (reconfigure) request is refused by the same rule, and reported as what it is.
+        match resolve_multicast_group(Some(group), ConnType::Null) {
+            Err(EnipError::ProtocolViolation { detail }) => {
+                assert_eq!(detail, "multicast T→O sockaddr on a null (reconfigure) request");
+            }
+            other => panic!("expected a protocol violation, got {other:?}"),
+        }
+
+        // End to end: `sample_spec()` requests P2P, so the forged reply fails the open.
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let fixture = FoFixture::new(None, 20_000, 20_000).with_t2o_sock(group);
+        match mgr.forward_open(&fixture, sample_spec()).await {
+            Err(EnipError::ProtocolViolation { detail }) => {
+                assert_eq!(detail, "multicast T→O sockaddr on a point-to-point request");
+            }
+            other => panic!("expected a protocol violation, got {:?}", other.map(|h| h.apis())),
+        }
+        assert_forward_closed(&fixture.requests());
+        mgr.shutdown().await;
+    }
+
+    /// The other side of the same rule: a connection that *asked* for multicast T→O joins the group
+    /// the reply names, and a unicast or absent T→O sockaddr simply means unicast consumption — no
+    /// group, no error.
+    #[tokio::test]
+    async fn multicast_request_joins_only_a_valid_multicast_group() {
+        let group = SockAddrInfo::ipv4(0xEFC0_0001, 0x08AE); // 239.192.0.1:2222
+        let unicast = SockAddrInfo::ipv4(0xC0A8_0164, 0x08AE); // 192.168.1.100:2222
+        assert_eq!(
+            resolve_multicast_group(Some(group), ConnType::Multicast).unwrap(),
+            Some(Ipv4Addr::new(239, 192, 0, 1)),
+            "the requested-multicast connection records the group"
+        );
+        assert_eq!(resolve_multicast_group(Some(unicast), ConnType::Multicast).unwrap(), None);
+        assert_eq!(resolve_multicast_group(None, ConnType::Multicast).unwrap(), None);
+        assert_eq!(resolve_multicast_group(Some(unicast), ConnType::P2P).unwrap(), None);
+        assert_eq!(resolve_multicast_group(None, ConnType::P2P).unwrap(), None);
+
+        // End to end: a multicast-requested spec opens against either reply.
+        let spec = || IoConnectionSpec {
+            t2o: DirectionSpec { conn_type: ConnType::Multicast, ..sample_spec().t2o },
+            ..sample_spec()
+        };
+        for sock in [group, unicast] {
+            let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+            let fixture = FoFixture::new(None, 20_000, 20_000).with_t2o_sock(sock);
+            let handle = mgr.forward_open(&fixture, spec()).await.unwrap();
+            assert_eq!(handle.apis(), (Duration::from_millis(20), Duration::from_millis(20)));
+            assert_eq!(fixture.requests().len(), 1, "no ForwardClose on the happy path");
+            mgr.shutdown().await;
+        }
     }
 
     // -- produce catch-up is arithmetic, not a loop (F1 regression) ---------
@@ -2027,6 +2206,12 @@ mod tests {
         /// peer address (an injected byte stream), which leaves the O→T transmit endpoint
         /// unresolvable when the reply carries no O→T sockaddr either.
         target_ip: Option<IpAddr>,
+        /// An O→T Sockaddr Info item to attach to the ForwardOpen success reply — the transmit
+        /// redirect a hostile or misconfigured target would use (D-ENIP-17).
+        o2t_sock: Option<SockAddrInfo>,
+        /// A T→O Sockaddr Info item to attach to the ForwardOpen success reply — the multicast
+        /// group offer (D-ENIP-17).
+        t2o_sock: Option<SockAddrInfo>,
     }
 
     impl FoFixture {
@@ -2037,6 +2222,8 @@ mod tests {
                 o_t_api,
                 t_o_api,
                 target_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                o2t_sock: None,
+                t2o_sock: None,
             }
         }
 
@@ -2046,23 +2233,50 @@ mod tests {
             self
         }
 
+        /// The same fixture, answering with the given O→T sockaddr redirect.
+        fn with_o2t_sock(mut self, sock: SockAddrInfo) -> Self {
+            self.o2t_sock = Some(sock);
+            self
+        }
+
+        /// The same fixture, answering with the given T→O sockaddr.
+        fn with_t2o_sock(mut self, sock: SockAddrInfo) -> Self {
+            self.t2o_sock = Some(sock);
+            self
+        }
+
+        /// The sockaddr items this fixture attaches to a ForwardOpen success reply.
+        fn sock_items(&self) -> Vec<CpfItem> {
+            let mut items = Vec::new();
+            if let Some(s) = self.o2t_sock {
+                items.push(CpfItem::new(ItemType::SockAddrOtoT, s.encode()));
+            }
+            if let Some(s) = self.t2o_sock {
+                items.push(CpfItem::new(ItemType::SockAddrTtoO, s.encode()));
+            }
+            items
+        }
+
         /// Every `(service, service-data)` pair the fixture was asked to send, in order.
         fn requests(&self) -> Vec<(u8, Bytes)> {
             self.seen.lock().unwrap().clone()
         }
 
-        /// Wrap Message Router reply bytes in the UCMM reply CPF `forward_open` expects.
-        fn reply_cpf(service: u8, data: Bytes) -> Cpf {
+        /// Wrap Message Router reply bytes in the UCMM reply CPF `forward_open` expects, plus any
+        /// sockaddr items the reply carries.
+        fn reply_cpf(service: u8, data: Bytes, extra: Vec<CpfItem>) -> Cpf {
             let mut mr = WireWriter::new();
             mr.u8(service | 0x80);
             mr.u8(0); // reserved
             mr.u8(0); // general status: success
             mr.u8(0); // extended-status words
             mr.put_slice(&data);
-            Cpf::from_items(vec![
+            let mut items = vec![
                 CpfItem::null_address(),
                 CpfItem::unconnected_data(mr.into_bytes()),
-            ])
+            ];
+            items.extend(extra);
+            Cpf::from_items(items)
         }
     }
 
@@ -2081,7 +2295,7 @@ mod tests {
                 w.u16(r.u16()?);
                 w.u16(r.u16()?);
                 w.u32(r.u32()?);
-                return Ok(Self::reply_cpf(service, w.into_bytes()));
+                return Ok(Self::reply_cpf(service, w.into_bytes(), Vec::new()));
             }
 
             // Read the originator identity straight out of the ForwardOpen request (§8.2 fields 3–7).
@@ -2111,7 +2325,7 @@ mod tests {
             w.u32(self.t_o_api);
             w.u8(0); // application reply words
             w.u8(0); // reserved
-            Ok(Self::reply_cpf(service, w.into_bytes()))
+            Ok(Self::reply_cpf(service, w.into_bytes(), self.sock_items()))
         }
 
         fn target_ip(&self) -> Option<IpAddr> {
