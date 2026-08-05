@@ -21,6 +21,16 @@
 //!   [`IoConnection::poll_watchdog`]. It exposes [`IoConnectionHandle`] (`events`, `set_output`,
 //!   `set_run`, `stats`, `close`).
 //!
+//! **Socket errors are classified, never swallowed** (§8.6–§8.7, D-ENIP-7). Every `recv_from` /
+//! `send_to` failure increments a counter (`recv_errors` manager-wide, `send_errors` per
+//! connection). A *per-datagram* kind ([`is_per_datagram_error`] — notably Windows'
+//! `ConnectionReset` from an ICMP port-unreachable for a previously sent datagram) is a survivable
+//! drop that proves the socket still works. Three consecutive errors of any other kind declare the
+//! socket dead: [`IoEvent::Lost`] with [`LostReason::Io`] fans out to **every** registered
+//! connection and the manager task exits. `Lost` delivery is best-effort `try_send`; **the event
+//! channel closing is the authoritative terminal signal** — a consumer that sees `recv() == None`
+//! must treat the connection as gone whether or not it saw the `Lost` event.
+//!
 //! The ForwardOpen/ForwardClose wire codecs live in [`crate::cm`]; the network call rides the owning
 //! TCP session through the [`ForwardOpenService`] seam (implemented by the explicit-messaging client,
 //! keeping this module below `client` in the layering — §3.2).
@@ -39,8 +49,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::cip::epath::Segment;
 use crate::cip::message::{MessageReply, MessageRequest};
 use crate::cm::{
-    connection_manager_path, io_connection_path, transport_class1_trigger, ConnType,
-    ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
+    connection_manager_path, io_connection_path, transport_class1_trigger, verify_forward_open_echo,
+    ConnType, ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
     NetworkConnectionParams, Priority, ProductionTrigger, TimeoutMultiplier, VariableLength,
 };
 use crate::cpf::{Cpf, CpfItem, ItemType, SequencedAddress, SockAddrInfo};
@@ -63,6 +73,107 @@ const EVENT_CHANNEL_DEPTH: usize = 256;
 /// by [`IoConnection::poll_produce`] / [`IoConnection::poll_watchdog`]; the tick only needs to be
 /// finer than the smallest RPI in play.
 const SCHEDULER_TICK: Duration = Duration::from_millis(1);
+
+/// The smallest actual packet interval a ForwardOpen reply may name (§8.2). Below this the value is
+/// not a timer input but a protocol violation: a 0 µs API used to livelock the produce scheduler.
+pub(crate) const MIN_REPLY_API: Duration = Duration::from_micros(100);
+
+/// The largest actual packet interval a ForwardOpen reply may name (§8.2). Ten minutes is already
+/// far beyond any real class-1 cadence; anything larger is a corrupt or hostile field.
+pub(crate) const MAX_REPLY_API: Duration = Duration::from_secs(600);
+
+/// Consecutive non-survivable `recv_from` errors that declare the shared UDP socket dead (§8.6).
+pub(crate) const MAX_CONSECUTIVE_FATAL_RECV_ERRORS: u32 = 3;
+
+/// Consecutive non-survivable `send_to` errors that declare one connection dead (§8.7).
+pub(crate) const MAX_CONSECUTIVE_SEND_ERRORS: u32 = 3;
+
+/// Validate the **actual** packet intervals a ForwardOpen success reply names (§8.2), returning them
+/// as `Duration`s. Both directions must lie within `[MIN_REPLY_API, MAX_REPLY_API]`; anything else —
+/// most importantly 0 — is [`EnipError::ProtocolViolation`], never a timer input. Class-3 does not
+/// call this: its timing is not API-driven.
+pub(crate) fn validate_reply_apis(success: &ForwardOpenSuccess) -> Result<(Duration, Duration)> {
+    let o2t = Duration::from_micros(u64::from(success.o_t_api));
+    let t2o = Duration::from_micros(u64::from(success.t_o_api));
+    for api in [o2t, t2o] {
+        if api < MIN_REPLY_API || api > MAX_REPLY_API {
+            return Err(EnipError::ProtocolViolation {
+                detail: "forward-open reply API out of range",
+            });
+        }
+    }
+    Ok((o2t, t2o))
+}
+
+/// Whether a socket error kind affects **one datagram** rather than the socket (§8.6–§8.7).
+///
+/// `ConnectionReset` is the Windows case that matters: an ICMP port-unreachable for a datagram we
+/// already sent surfaces as `WSAECONNRESET` on the *next* UDP call even though the socket is
+/// perfectly healthy. `ConnectionRefused` is the Linux spelling of the same condition,
+/// `ConnectionAborted` its BSD cousin, and `Interrupted` / `WouldBlock` are ordinary transient
+/// scheduling outcomes. None of them says anything about the socket's viability.
+pub(crate) fn is_per_datagram_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// The receive-side socket-error policy (§8.6): a consecutive-failure streak over the *non*
+/// per-datagram kinds, reset by any success or by a per-datagram error (which demonstrates the
+/// socket still carries traffic).
+#[derive(Debug, Default)]
+pub(crate) struct RecvErrorPolicy {
+    consecutive_fatal: u32,
+}
+
+/// What the manager should do after a `recv_from` error (§8.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecvErrorAction {
+    /// Survivable — count it, log it, keep receiving.
+    Continue,
+    /// The socket is dead: fan `Lost { Io }` out to every connection and exit the task.
+    FatalSocket,
+}
+
+impl RecvErrorPolicy {
+    /// Classify one `recv_from` error. Per-datagram kinds reset the streak and continue; any other
+    /// kind extends it, declaring the socket dead at [`MAX_CONSECUTIVE_FATAL_RECV_ERRORS`].
+    pub(crate) fn on_recv_error(&mut self, kind: std::io::ErrorKind) -> RecvErrorAction {
+        if is_per_datagram_error(kind) {
+            self.consecutive_fatal = 0;
+            return RecvErrorAction::Continue;
+        }
+        self.consecutive_fatal = self.consecutive_fatal.saturating_add(1);
+        if self.consecutive_fatal >= MAX_CONSECUTIVE_FATAL_RECV_ERRORS {
+            RecvErrorAction::FatalSocket
+        } else {
+            RecvErrorAction::Continue
+        }
+    }
+
+    /// A successful receive clears the streak.
+    pub(crate) fn on_recv_ok(&mut self) {
+        self.consecutive_fatal = 0;
+    }
+}
+
+/// The outcome of accounting one O→T datagram send (§8.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The datagram reached the socket; `frames_produced` advanced.
+    Sent,
+    /// The send failed but the connection survives (a per-datagram error, or a streak short of the
+    /// limit). Counted as `send_errors`.
+    Dropped,
+    /// Consecutive non-survivable send failures reached [`MAX_CONSECUTIVE_SEND_ERRORS`]: this
+    /// connection is dead and must be lost with [`LostReason::Io`].
+    ConnectionDead,
+}
 
 // ---------------------------------------------------------------------------
 // Real-time format & frame codec (§8.5, D-ENIP-10)
@@ -237,6 +348,7 @@ struct ConnCounters {
     sequence_gaps: AtomicU64,
     overflowed_events: AtomicU64,
     produce_overruns: AtomicU64,
+    send_errors: AtomicU64,
 }
 
 /// Manager-wide datagram counters (§8.6, §10.2). Shared across every connection on the socket.
@@ -244,6 +356,7 @@ struct ConnCounters {
 struct ManagerCounters {
     malformed_frames: AtomicU64,
     unknown_connection: AtomicU64,
+    recv_errors: AtomicU64,
 }
 
 /// A snapshot of a connection's peer-driven counters (§10.2). The adapter alarms on these without
@@ -252,7 +365,7 @@ struct ManagerCounters {
 pub struct IoStats {
     /// T→O frames accepted and delivered.
     pub frames_accepted: u64,
-    /// O→T frames produced onto the wire (data or heartbeat) by the produce scheduler (§8.7).
+    /// O→T frames actually sent onto the wire (data or heartbeat) by the produce scheduler (§8.7).
     pub frames_produced: u64,
     /// Frames dropped for a size mismatch (or a runt frame).
     pub size_mismatch: u64,
@@ -264,6 +377,10 @@ pub struct IoStats {
     pub overflowed_events: u64,
     /// Produce ticks skipped because a prior tick had not been serviced.
     pub produce_overruns: u64,
+    /// O→T datagrams whose socket send failed (per connection).
+    pub send_errors: u64,
+    /// UDP recv errors on the shared socket (manager-wide).
+    pub recv_errors: u64,
     /// Datagrams dropped as malformed CPF (manager-wide).
     pub malformed_frames: u64,
     /// Datagrams whose connection id matched no live connection (manager-wide).
@@ -280,6 +397,8 @@ impl ConnCounters {
             sequence_gaps: self.sequence_gaps.load(Ordering::Relaxed),
             overflowed_events: self.overflowed_events.load(Ordering::Relaxed),
             produce_overruns: self.produce_overruns.load(Ordering::Relaxed),
+            send_errors: self.send_errors.load(Ordering::Relaxed),
+            recv_errors: 0,
             malformed_frames: 0,
             unknown_connection: 0,
         }
@@ -399,6 +518,7 @@ pub struct IoConnection {
     output: Bytes,
     run: bool,
     next_produce_at: Instant,
+    consecutive_send_errors: u32,
     // consume state
     last_accepted_seq: Option<u16>,
     up: bool,
@@ -422,6 +542,7 @@ impl IoConnection {
             output: Bytes::new(),
             run: true,
             next_produce_at,
+            consecutive_send_errors: 0,
             last_accepted_seq: None,
             up: false,
             watchdog_deadline,
@@ -533,37 +654,95 @@ impl IoConnection {
     }
 
     /// Produce the next O→T datagram if a produce tick is due at `now` (§8.7). Honours the O→T API
-    /// cadence with `MissedTickBehavior::Skip` semantics — a lapsed schedule fires once and counts
-    /// the skipped ticks as `produce_overruns`. Returns `None` when no tick is due. Production never
-    /// stops while the connection is open (D-ENIP-9): a heartbeat direction still emits the seq-only
-    /// frame.
+    /// cadence with `MissedTickBehavior::Skip` semantics — a lapsed schedule fires **once** and
+    /// counts the skipped ticks as `produce_overruns`. Returns `None` when no tick is due.
+    /// Production never stops while the connection is open (D-ENIP-9): a heartbeat direction still
+    /// emits the seq-only frame.
+    ///
+    /// The catch-up is **arithmetic, not a per-tick loop**: it is O(1) for any `o2t_api` and any
+    /// lapse, and produces exactly the values the loop did (`skipped` = `ticks − 1`, the schedule
+    /// re-armed at the first tick strictly after `now`). A zero `o2t_api` — which a target must
+    /// never name, and [`validate_reply_apis`] rejects before it can reach here — degrades to the
+    /// effective 1 ns floor below, i.e. at most one frame per scheduler tick, instead of spinning
+    /// forever.
+    ///
+    /// In that degraded state the overrun **accounting** is clamped to at most one per call. The 1 ns
+    /// floor is a liveness device, not a schedule: counting one overrun per nanosecond of lapse would
+    /// put ~10⁹ imaginary skipped ticks per second on an operator-visible counter. "The schedule
+    /// lapsed once this tick" is the honest statement. A non-zero API — every reply that survives
+    /// [`validate_reply_apis`] — is counted exactly, unclamped.
     pub fn poll_produce(&mut self, now: Instant) -> Option<Result<Bytes>> {
         if now < self.next_produce_at {
             return None;
         }
-        // Count the scheduled ticks at or before `now`; fire once, skip the rest.
-        let mut ticks: u64 = 0;
-        let mut next = self.next_produce_at;
-        loop {
-            if next <= now {
-                ticks = ticks.saturating_add(1);
-                match next.checked_add(self.params.o2t_api) {
-                    Some(t) => next = t,
-                    None => break,
+        // The effective period never reaches zero: a pathological 0 µs API becomes 1 ns, which keeps
+        // both the division below and the re-arming strictly monotone.
+        let period = self.params.o2t_api.max(Duration::from_nanos(1));
+        let period_ns = period.as_nanos().max(1);
+        let elapsed = now.saturating_duration_since(self.next_produce_at);
+        // Ticks strictly before this one that came and went unserviced.
+        let skipped = elapsed.as_nanos().checked_div(period_ns).unwrap_or(0);
+        // The re-arm below still uses the full `skipped` (the schedule really is that far behind);
+        // only the reported count is clamped in the floored, scheduleless zero-API state.
+        let counted = if self.params.o2t_api.is_zero() {
+            skipped.min(1)
+        } else {
+            skipped
+        };
+        if counted > 0 {
+            self.counters
+                .produce_overruns
+                .fetch_add(u64::try_from(counted).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+        // Re-arm at `next_produce_at + (skipped + 1) × period` — the first tick strictly after `now`.
+        // Any clamp or overflow on the way re-phases the schedule from `now` instead.
+        let rearmed = u32::try_from(skipped.saturating_add(1))
+            .ok()
+            .and_then(|steps| period.checked_mul(steps))
+            .and_then(|delta| self.next_produce_at.checked_add(delta));
+        self.next_produce_at = match rearmed {
+            Some(t) => t,
+            None => now.checked_add(period).unwrap_or(now),
+        };
+        Some(self.produce_frame())
+    }
+
+    /// Account for the result of sending one produced O→T datagram (§8.7). `Ok` is the only path
+    /// that advances `frames_produced` — the counter names frames that reached the socket, not
+    /// frames that were built. Every failure increments `send_errors`; a per-datagram kind
+    /// ([`is_per_datagram_error`]) leaves the streak alone (target liveness is the T→O watchdog's
+    /// job, not the send path's), while any other kind extends it and declares the connection dead
+    /// at [`MAX_CONSECUTIVE_SEND_ERRORS`].
+    pub fn record_send(&mut self, result: core::result::Result<(), std::io::ErrorKind>) -> SendOutcome {
+        match result {
+            Ok(()) => {
+                self.counters.frames_produced.fetch_add(1, Ordering::Relaxed);
+                self.consecutive_send_errors = 0;
+                SendOutcome::Sent
+            }
+            Err(kind) => {
+                self.counters.send_errors.fetch_add(1, Ordering::Relaxed);
+                if is_per_datagram_error(kind) {
+                    return SendOutcome::Dropped;
                 }
-            } else {
-                break;
+                self.consecutive_send_errors = self.consecutive_send_errors.saturating_add(1);
+                if self.consecutive_send_errors >= MAX_CONSECUTIVE_SEND_ERRORS {
+                    SendOutcome::ConnectionDead
+                } else {
+                    SendOutcome::Dropped
+                }
             }
         }
-        self.next_produce_at = next;
-        if ticks > 1 {
-            self.counters.produce_overruns.fetch_add(ticks.saturating_sub(1), Ordering::Relaxed);
-        }
-        Some(self.produce_frame())
     }
 
     /// Build one O→T datagram, advancing the class-1 sequence (skip 0 on wrap) and the encapsulation
     /// sequence (§8.7). Public so the produce logic is testable without the scheduler or a socket.
+    ///
+    /// Building a frame does **not** count it: `frames_produced` advances in
+    /// [`IoConnection::record_send`], once the datagram has actually reached the socket. The
+    /// sequences still advance here, so a failed send leaves a wire-visible sequence gap — which is
+    /// exactly what the target's signed-window consumer is built to tolerate (it counts the gap and
+    /// accepts the next frame), and is preferable to reusing a sequence the peer may already have.
     pub fn produce_frame(&mut self) -> Result<Bytes> {
         self.encap_seq = self.encap_seq.wrapping_add(1);
         self.o2t_class1_seq = self.o2t_class1_seq.wrapping_add(1);
@@ -583,7 +762,6 @@ impl IoConnection {
             data,
         };
         let payload = frame.encode(format);
-        self.counters.frames_produced.fetch_add(1, Ordering::Relaxed);
         let seq_addr = SequencedAddress {
             connection_id: self.params.o2t_connection_id,
             encap_sequence: self.encap_seq,
@@ -787,6 +965,13 @@ impl IoManager {
     /// over `session`, then register it with the socket task and return its handle. The connection
     /// ids and **actual** packet intervals come from the ForwardOpen reply (§8.2), not the request.
     /// A refusal is [`EnipError::ForwardOpenRejected`].
+    ///
+    /// **Invariant: any failure after a successful ForwardOpen issues a best-effort ForwardClose**
+    /// ([`best_effort_forward_close`]) before the typed error propagates. Past the target's success
+    /// reply the target believes a connection is open and will produce into it until its own
+    /// watchdog expires; every way this function can still fail — a reply that fails echo
+    /// verification or API validation, an unresolvable O→T transmit endpoint, a manager task that
+    /// has already exited — leaves that same stranded connection, so all of them tear it down.
     pub async fn forward_open<S: ForwardOpenService>(
         &self,
         session: &S,
@@ -827,6 +1012,22 @@ impl IoManager {
         }
         let success = ForwardOpenSuccess::decode(&reply.data).map_err(EnipError::Malformed)?;
 
+        // The reply is verified BEFORE anything is armed (§8.2, D-ENIP-16): the originator echo quad
+        // must match the request, and both actual packet intervals must be usable timer values. A
+        // reply that fails either check still left the target believing a connection is open, so a
+        // best-effort ForwardClose goes out before the typed error propagates.
+        if let Err(e) = verify_forward_open_echo(&open, &success) {
+            best_effort_forward_close(session, &open).await;
+            return Err(e);
+        }
+        let (o2t_api, t2o_api) = match validate_reply_apis(&success) {
+            Ok(apis) => apis,
+            Err(e) => {
+                best_effort_forward_close(session, &open).await;
+                return Err(e);
+            }
+        };
+
         // Sockaddr items (§8.2): an O→T sockaddr redirects our transmit endpoint; a multicast T→O
         // sockaddr is the group to join.
         let o2t_sock = reply_cpf
@@ -835,7 +1036,15 @@ impl IoManager {
         let t2o_sock = reply_cpf
             .find(ItemType::SockAddrTtoO)
             .and_then(|i| SockAddrInfo::decode(&i.data).ok());
-        let tx_endpoint = resolve_tx_endpoint(o2t_sock, session.target_ip())?;
+        // Same invariant as the two verification failures above: the target already answered with a
+        // success, so an endpoint we cannot address still leaves a connection open on its side.
+        let tx_endpoint = match resolve_tx_endpoint(o2t_sock, session.target_ip()) {
+            Ok(ep) => ep,
+            Err(e) => {
+                best_effort_forward_close(session, &open).await;
+                return Err(e);
+            }
+        };
         let multicast_group = t2o_sock.and_then(|s| {
             let ip = Ipv4Addr::from(s.sin_addr);
             ip.is_multicast().then_some(ip)
@@ -844,8 +1053,8 @@ impl IoManager {
         let params = IoConnectionParams {
             o2t_connection_id: success.o_t_connection_id,
             t2o_connection_id,
-            o2t_api: Duration::from_micros(u64::from(success.o_t_api)),
-            t2o_api: Duration::from_micros(u64::from(success.t_o_api)),
+            o2t_api,
+            t2o_api,
             timeout_multiplier: spec.timeout_multiplier.multiplier(),
             o2t_format: spec.o2t.format,
             t2o_format: spec.t2o.format,
@@ -860,10 +1069,17 @@ impl IoManager {
         let counters = conn.counters.clone();
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
 
-        self.tx
+        // The manager task has exited, so nothing will ever service this connection — but the target
+        // is already producing into it. Tear it down before reporting the closure.
+        if self
+            .tx
             .send(ManagerCommand::Add { conn: Box::new(conn), events_tx })
             .await
-            .map_err(|_| EnipError::Closed)?;
+            .is_err()
+        {
+            best_effort_forward_close(session, &open).await;
+            return Err(EnipError::Closed);
+        }
 
         Ok(IoConnectionHandle {
             connection_id: t2o_connection_id,
@@ -874,8 +1090,8 @@ impl IoManager {
             o2t_data_size: spec.o2t.data_size,
             o2t_fixed: matches!(spec.o2t.variable, VariableLength::Fixed),
             o2t_carries_data: spec.o2t.format.carries_data(),
-            o2t_api: Duration::from_micros(u64::from(success.o_t_api)),
-            t2o_api: Duration::from_micros(u64::from(success.t_o_api)),
+            o2t_api,
+            t2o_api,
             open_request: open,
         })
     }
@@ -953,6 +1169,7 @@ impl IoConnectionHandle {
         let mut s = self.counters.snapshot();
         s.malformed_frames = self.manager_stats.malformed_frames.load(Ordering::Relaxed);
         s.unknown_connection = self.manager_stats.unknown_connection.load(Ordering::Relaxed);
+        s.recv_errors = self.manager_stats.recv_errors.load(Ordering::Relaxed);
         s
     }
 
@@ -972,6 +1189,17 @@ impl IoConnectionHandle {
             .send(ManagerCommand::Remove { connection_id: self.connection_id })
             .await;
         Ok(())
+    }
+}
+
+/// Tear down a connection the target believes it opened but we did not arm (§8.2, §8.8). Every
+/// step is best-effort: the encode, the round trip, and the reply status are all discarded — the
+/// caller is on its way out with a typed error and must not have that error replaced by this one.
+async fn best_effort_forward_close<S: ForwardOpenService>(session: &S, open: &ForwardOpenRequest) {
+    let close = ForwardCloseRequest::for_open(open);
+    if let Ok(data) = close.encode() {
+        let mr = MessageRequest::new(crate::cm::service::FORWARD_CLOSE, connection_manager_path(), data);
+        let _ = session.cm_ucmm(mr, Vec::new()).await;
     }
 }
 
@@ -1046,6 +1274,7 @@ async fn manager_task(
     let mut registry = Registry::new(stats);
     let mut events: HashMap<u32, mpsc::Sender<IoEvent>> = HashMap::new();
     let mut buf = vec![0u8; 65_535];
+    let mut recv_policy = RecvErrorPolicy::default();
     let mut tick = tokio::time::interval(SCHEDULER_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -1078,17 +1307,37 @@ async fn manager_task(
                 }
             }
             recv = socket.recv_from(&mut buf) => {
-                if let Ok((n, _src)) = recv {
-                    let now = Instant::now();
-                    if let Some(slice) = buf.get(..n) {
-                        match registry.consume_datagram(slice, now) {
-                            Routed::Accepted { connection_id, first, update } => {
-                                deliver(&registry, &events, connection_id, first, update);
+                match recv {
+                    Ok((n, _src)) => {
+                        recv_policy.on_recv_ok();
+                        let now = Instant::now();
+                        if let Some(slice) = buf.get(..n) {
+                            match registry.consume_datagram(slice, now) {
+                                Routed::Accepted { connection_id, first, update } => {
+                                    deliver(&registry, &events, connection_id, first, update);
+                                }
+                                Routed::Dropped { connection_id, reason } => {
+                                    // The registry already counted the drop; trace names it for the
+                                    // operator without spending a metric on every hostile packet.
+                                    tracing::trace!(?connection_id, ?reason, "dropped class-1 datagram");
+                                }
                             }
-                            Routed::Dropped { connection_id, reason } => {
-                                // The registry already counted the drop; trace names it for the
-                                // operator without spending a metric on every hostile packet.
-                                tracing::trace!(?connection_id, ?reason, "dropped class-1 datagram");
+                        }
+                    }
+                    Err(e) => {
+                        // Never silent (§8.6): every socket error is counted, then classified.
+                        registry.stats.recv_errors.fetch_add(1, Ordering::Relaxed);
+                        match recv_policy.on_recv_error(e.kind()) {
+                            RecvErrorAction::Continue => {
+                                tracing::debug!(error = %e, "class-1 recv error (survivable)");
+                            }
+                            RecvErrorAction::FatalSocket => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "class-1 udp socket declared dead; losing every connection"
+                                );
+                                fan_out_lost(&mut registry, &mut events, &socket, LostReason::Io);
+                                break;
                             }
                         }
                     }
@@ -1096,18 +1345,36 @@ async fn manager_task(
             }
             _ = tick.tick() => {
                 let now = Instant::now();
-                let mut expired: Vec<u32> = Vec::new();
+                // One collection for both terminal causes: the watchdog (Timeout) and a dead
+                // transmit path (Io), so a single emit/remove loop handles either.
+                let mut expired: Vec<(u32, LostReason)> = Vec::new();
                 for (id, conn) in registry.conns.iter_mut() {
-                    if let Some(Ok(datagram)) = conn.poll_produce(now) {
-                        let _ = socket.send_to(&datagram, conn.tx_endpoint()).await;
+                    let send_result = match conn.poll_produce(now) {
+                        Some(Ok(datagram)) => Some(
+                            socket
+                                .send_to(&datagram, conn.tx_endpoint())
+                                .await
+                                .map(|_sent| ())
+                                .map_err(|e| e.kind()),
+                        ),
+                        // An encode failure is accounted like a send failure so a connection that
+                        // can never build a frame is not silently mute forever.
+                        Some(Err(_encode)) => Some(Err(std::io::ErrorKind::InvalidData)),
+                        None => None,
+                    };
+                    if let Some(result) = send_result {
+                        if conn.record_send(result) == SendOutcome::ConnectionDead {
+                            expired.push((*id, LostReason::Io));
+                            continue;
+                        }
                     }
                     if conn.poll_watchdog(now) {
-                        expired.push(*id);
+                        expired.push((*id, LostReason::Timeout));
                     }
                 }
-                for id in expired {
+                for (id, reason) in expired {
                     if let Some(tx) = events.get(&id) {
-                        let _ = tx.try_send(IoEvent::Lost { reason: LostReason::Timeout });
+                        let _ = tx.try_send(IoEvent::Lost { reason });
                     }
                     remove_connection(&socket, &mut registry, &mut events, id);
                 }
@@ -1136,6 +1403,25 @@ fn deliver(
         if let Some(conn) = registry.conns.get(&connection_id) {
             conn.counters.overflowed_events.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Lose **every** registered connection with one reason (§8.6): the shared socket is dead, so no
+/// connection on it can survive. Each consumer gets a best-effort `Lost` and then has its stream
+/// closed by the removal — the channel closing is the authoritative terminal signal, so a consumer
+/// that was too slow to receive the `Lost` still learns the connection is gone.
+fn fan_out_lost(
+    registry: &mut Registry,
+    events: &mut HashMap<u32, mpsc::Sender<IoEvent>>,
+    socket: &UdpSocket,
+    reason: LostReason,
+) {
+    let ids: Vec<u32> = registry.conns.keys().copied().collect();
+    for id in ids {
+        if let Some(tx) = events.get(&id) {
+            let _ = tx.try_send(IoEvent::Lost { reason });
+        }
+        remove_connection(socket, registry, events, id);
     }
 }
 
@@ -1356,6 +1642,8 @@ mod tests {
         // Advance one O→T API (20 ms) → one frame, seq 1 / encap 1.
         tokio::time::advance(Duration::from_millis(20)).await;
         let d1 = conn.poll_produce(Instant::now()).unwrap().unwrap();
+        // Only a frame that reaches the socket counts (§8.7) — the manager reports that back here.
+        assert_eq!(conn.record_send(Ok(())), SendOutcome::Sent);
         assert_eq!(conn.last_produced_sequence(), 1);
         assert_eq!(conn.last_encap_sequence(), 1);
         // Decode the produced datagram: sequenced address + connected data (seq then header then data).
@@ -1371,6 +1659,7 @@ mod tests {
         // Advance another API → seq 2 / encap 2.
         tokio::time::advance(Duration::from_millis(20)).await;
         conn.poll_produce(Instant::now()).unwrap().unwrap();
+        assert_eq!(conn.record_send(Ok(())), SendOutcome::Sent);
         assert_eq!(conn.last_produced_sequence(), 2);
         assert_eq!(conn.last_encap_sequence(), 2);
         // Each produced datagram (data or heartbeat) counts toward frames_produced (§8.7).
@@ -1400,6 +1689,7 @@ mod tests {
         // Jump three API periods at once: one fire, two skipped.
         tokio::time::advance(Duration::from_millis(60)).await;
         assert!(conn.poll_produce(Instant::now()).is_some());
+        assert_eq!(conn.record_send(Ok(())), SendOutcome::Sent);
         assert_eq!(conn.stats().produce_overruns, 2);
         // Only one frame was produced despite three periods elapsing.
         assert_eq!(conn.last_encap_sequence(), 1);
@@ -1460,6 +1750,478 @@ mod tests {
         assert_eq!(ep1, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 2222));
         // No sockaddr and no target IP → a typed error, never a panic.
         assert!(resolve_tx_endpoint(None, None).is_err());
+    }
+
+    // -- produce catch-up is arithmetic, not a loop (F1 regression) ---------
+
+    /// **Livelock regression.** A ForwardOpen reply naming a 0 µs O→T API used to spin the catch-up
+    /// loop forever (it advanced `next` by zero every iteration), wedging the manager task and every
+    /// connection on the socket. The test *completing* is the assertion.
+    #[tokio::test(start_paused = true)]
+    async fn poll_produce_zero_api_terminates_and_degrades_to_tick_cadence() {
+        let now = Instant::now();
+        let mut p = params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless);
+        p.o2t_api = Duration::ZERO;
+        let mut conn = IoConnection::new(p, now);
+        let armed = conn.next_produce_at;
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let at = Instant::now();
+        assert!(conn.poll_produce(at).is_some(), "a tick is due");
+        assert!(conn.stats().produce_overruns > 0, "the lapsed ticks are counted");
+        assert!(conn.next_produce_at > armed, "the schedule advanced despite the zero period");
+        // Degraded to at most one frame per scheduler tick, not an unbounded burst.
+        assert!(conn.poll_produce(at).is_none());
+
+        // **Counter-inflation regression.** The 1 ns floor is a liveness device, not a schedule:
+        // the 10 ms lapse above must read as one lapse, not 10 million skipped ticks. The clamp is
+        // per call, so the counter can never outrun the number of firing polls.
+        assert_eq!(conn.stats().produce_overruns, 1, "one lapse, counted once");
+        let mut fires = 1u64;
+        for _ in 0..5 {
+            tokio::time::advance(SCHEDULER_TICK).await;
+            if conn.poll_produce(Instant::now()).is_some() {
+                fires = fires.saturating_add(1);
+            }
+            assert!(
+                conn.stats().produce_overruns <= fires,
+                "at most one overrun per firing poll, got {} over {fires} fires",
+                conn.stats().produce_overruns
+            );
+        }
+        assert!(fires > 1, "the degraded connection keeps producing on the tick cadence");
+    }
+
+    /// A huge lapse against a tiny period is O(1): the old loop would have run ~864 million
+    /// iterations here. The overrun count must equal what that loop would have produced.
+    #[tokio::test(start_paused = true)]
+    async fn poll_produce_catchup_is_constant_time_after_huge_lapse() {
+        let now = Instant::now();
+        let period = MIN_REPLY_API; // 100 µs — the smallest API a reply may legally name
+        let mut p = params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless);
+        p.o2t_api = period;
+        let mut conn = IoConnection::new(p, now);
+
+        // The first tick is armed one period out, so the lapse past it is `lapse - period`.
+        let lapse = Duration::from_secs(24 * 3600);
+        tokio::time::advance(lapse).await;
+        let expected_skipped =
+            u64::try_from((lapse.as_nanos() - period.as_nanos()) / period.as_nanos()).unwrap();
+
+        assert!(conn.poll_produce(Instant::now()).is_some());
+        assert_eq!(conn.stats().produce_overruns, expected_skipped);
+        assert_eq!(conn.stats().frames_produced, 0, "nothing was sent, only built");
+    }
+
+    /// The arithmetic form must be indistinguishable from the loop for ordinary periods: fire at
+    /// exactly one API, no overruns; a three-period jump fires once, counts two, re-arms at 3p.
+    #[tokio::test(start_paused = true)]
+    async fn poll_produce_semantics_unchanged_for_normal_periods() {
+        let start = Instant::now();
+        let period = Duration::from_millis(20);
+        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), start);
+
+        assert!(conn.poll_produce(start).is_none());
+        tokio::time::advance(Duration::from_millis(19)).await;
+        assert!(conn.poll_produce(Instant::now()).is_none(), "not due one ms early");
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(conn.poll_produce(Instant::now()).is_some(), "due at exactly one API");
+        assert_eq!(conn.stats().produce_overruns, 0);
+        assert_eq!(conn.next_produce_at, start + period * 2);
+
+        // Three periods pass unserviced: one fire, two counted skips, re-armed at the next period.
+        tokio::time::advance(period * 3).await;
+        assert!(conn.poll_produce(Instant::now()).is_some());
+        assert_eq!(conn.stats().produce_overruns, 2);
+        assert_eq!(conn.next_produce_at, start + period * 5);
+        assert!(conn.poll_produce(Instant::now()).is_none(), "the schedule is re-armed ahead");
+    }
+
+    // -- reply-API validation (F1) -----------------------------------------
+
+    #[test]
+    fn validate_reply_apis_bounds() {
+        fn reply(o_t_api: u32, t_o_api: u32) -> ForwardOpenSuccess {
+            ForwardOpenSuccess {
+                o_t_connection_id: 1,
+                t_o_connection_id: 2,
+                connection_serial: 3,
+                vendor_id: 4,
+                originator_serial: 5,
+                o_t_api,
+                t_o_api,
+                app_data: Bytes::new(),
+            }
+        }
+        const IN_RANGE: u32 = 20_000; // 20 ms
+        const MAX_US: u32 = 600_000_000; // 600 s
+
+        // Each direction is bounded independently: a good partner never rescues a bad value.
+        for &bad in &[0u32, 99, MAX_US + 1] {
+            assert!(validate_reply_apis(&reply(bad, IN_RANGE)).is_err(), "o→t {bad} µs");
+            assert!(validate_reply_apis(&reply(IN_RANGE, bad)).is_err(), "t→o {bad} µs");
+        }
+        for &good in &[100u32, IN_RANGE, MAX_US] {
+            assert!(validate_reply_apis(&reply(good, good)).is_ok(), "{good} µs");
+        }
+        assert_eq!(
+            validate_reply_apis(&reply(100, MAX_US)).unwrap(),
+            (MIN_REPLY_API, MAX_REPLY_API)
+        );
+        match validate_reply_apis(&reply(0, IN_RANGE)) {
+            Err(EnipError::ProtocolViolation { detail }) => {
+                assert_eq!(detail, "forward-open reply API out of range");
+            }
+            other => panic!("expected a protocol violation, got {other:?}"),
+        }
+    }
+
+    // -- send accounting (F6, the io.rs frames_produced regression) --------
+
+    #[test]
+    fn record_send_counts_only_successful_sends() {
+        use std::io::ErrorKind;
+        let now = Instant::now();
+        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+
+        // Building a frame does not count it; only the send does.
+        let _ = conn.produce_frame().unwrap();
+        assert_eq!(conn.stats().frames_produced, 0);
+        assert_eq!(conn.record_send(Ok(())), SendOutcome::Sent);
+        assert_eq!(conn.stats().frames_produced, 1);
+
+        // A per-datagram failure is counted but never advances frames_produced, and never
+        // contributes to the death streak (target liveness is the T→O watchdog's job).
+        for _ in 0..10 {
+            assert_eq!(conn.record_send(Err(ErrorKind::ConnectionReset)), SendOutcome::Dropped);
+        }
+        assert_eq!(conn.stats().frames_produced, 1, "a failed send is not a produced frame");
+        assert_eq!(conn.stats().send_errors, 10);
+
+        // Three consecutive non-survivable failures declare the connection dead.
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::ConnectionDead);
+        assert_eq!(conn.stats().send_errors, 13);
+
+        // An interleaved success resets the streak.
+        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
+        assert_eq!(conn.record_send(Ok(())), SendOutcome::Sent);
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
+        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::ConnectionDead);
+        assert_eq!(conn.stats().frames_produced, 1);
+        assert_eq!(conn.stats().send_errors, 5);
+    }
+
+    // -- recv-error classification (F6, the io.rs silent-`if let Ok` regression) --
+
+    #[test]
+    fn recv_error_policy_matrix() {
+        use std::io::ErrorKind;
+        // Exactly the survivable set: a datagram died, the socket did not.
+        const PER_DATAGRAM: [ErrorKind; 5] = [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+        ];
+        // A spread of kinds that say the socket itself is unusable.
+        const NON_SURVIVABLE: [ErrorKind; 3] = [
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+        ];
+
+        // Per-datagram kinds never escalate, however many arrive.
+        let mut policy = RecvErrorPolicy::default();
+        for _ in 0..4 {
+            for kind in PER_DATAGRAM {
+                assert!(is_per_datagram_error(kind), "{kind:?} is per-datagram");
+                assert_eq!(policy.on_recv_error(kind), RecvErrorAction::Continue, "{kind:?}");
+            }
+        }
+
+        // Every other kind escalates on exactly the third consecutive error.
+        for kind in NON_SURVIVABLE {
+            assert!(!is_per_datagram_error(kind), "{kind:?} is not per-datagram");
+            let mut policy = RecvErrorPolicy::default();
+            assert_eq!(policy.on_recv_error(kind), RecvErrorAction::Continue);
+            assert_eq!(policy.on_recv_error(kind), RecvErrorAction::Continue);
+            assert_eq!(policy.on_recv_error(kind), RecvErrorAction::FatalSocket);
+        }
+
+        // A successful receive clears the streak.
+        let mut policy = RecvErrorPolicy::default();
+        let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
+        let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
+        policy.on_recv_ok();
+        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::Continue);
+
+        // …and so does a per-datagram error mid-streak: it proves the socket still carries traffic.
+        let mut policy = RecvErrorPolicy::default();
+        let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
+        let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
+        assert_eq!(policy.on_recv_error(ErrorKind::ConnectionReset), RecvErrorAction::Continue);
+        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::Continue);
+        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::Continue);
+        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::FatalSocket);
+    }
+
+    #[tokio::test]
+    async fn fan_out_lost_delivers_io_to_every_connection_and_drains_registry() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut registry = Registry::new(Arc::new(ManagerCounters::default()));
+        let mut events: HashMap<u32, mpsc::Sender<IoEvent>> = HashMap::new();
+        let mut receivers = Vec::new();
+        let now = Instant::now();
+
+        for id in [0x1000_0001u32, 0x2000_0002, 0x3000_0003] {
+            let mut p = params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless);
+            p.t2o_connection_id = id;
+            registry.conns.insert(id, IoConnection::new(p, now));
+            let (tx, rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
+            events.insert(id, tx);
+            receivers.push(rx);
+        }
+
+        fan_out_lost(&mut registry, &mut events, &socket, LostReason::Io);
+
+        for mut rx in receivers {
+            match rx.recv().await {
+                Some(IoEvent::Lost { reason }) => assert_eq!(reason, LostReason::Io),
+                other => panic!("expected Lost{{Io}}, got {other:?}"),
+            }
+            // The channel closing is the authoritative terminal signal (§8.6).
+            assert!(rx.recv().await.is_none(), "the stream ends after Lost");
+        }
+        assert!(registry.conns.is_empty(), "the registry is drained");
+        assert!(events.is_empty(), "every event sender is dropped");
+    }
+
+    // -- forward-open reply verification (F1 + F10) ------------------------
+
+    /// Which echoed identity field the fixture corrupts in its ForwardOpen success reply.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EchoField {
+        TargetToOriginatorId,
+        ConnectionSerial,
+        VendorId,
+        OriginatorSerial,
+    }
+
+    /// An in-test [`ForwardOpenService`]: records every request it is handed and answers a
+    /// ForwardOpen with a crafted success reply (optionally corrupting one echoed field or naming
+    /// out-of-range APIs), so `forward_open`'s verification and its best-effort ForwardClose are
+    /// both observable without a socket or a peer.
+    struct FoFixture {
+        seen: std::sync::Mutex<Vec<(u8, Bytes)>>,
+        corrupt: Option<EchoField>,
+        o_t_api: u32,
+        t_o_api: u32,
+        /// What [`ForwardOpenService::target_ip`] answers. `None` models a session with no known
+        /// peer address (an injected byte stream), which leaves the O→T transmit endpoint
+        /// unresolvable when the reply carries no O→T sockaddr either.
+        target_ip: Option<IpAddr>,
+    }
+
+    impl FoFixture {
+        fn new(corrupt: Option<EchoField>, o_t_api: u32, t_o_api: u32) -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                corrupt,
+                o_t_api,
+                t_o_api,
+                target_ip: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            }
+        }
+
+        /// The same fixture with no resolvable target address.
+        fn without_target_ip(mut self) -> Self {
+            self.target_ip = None;
+            self
+        }
+
+        /// Every `(service, service-data)` pair the fixture was asked to send, in order.
+        fn requests(&self) -> Vec<(u8, Bytes)> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// Wrap Message Router reply bytes in the UCMM reply CPF `forward_open` expects.
+        fn reply_cpf(service: u8, data: Bytes) -> Cpf {
+            let mut mr = WireWriter::new();
+            mr.u8(service | 0x80);
+            mr.u8(0); // reserved
+            mr.u8(0); // general status: success
+            mr.u8(0); // extended-status words
+            mr.put_slice(&data);
+            Cpf::from_items(vec![
+                CpfItem::null_address(),
+                CpfItem::unconnected_data(mr.into_bytes()),
+            ])
+        }
+    }
+
+    impl ForwardOpenService for FoFixture {
+        async fn cm_ucmm(&self, request: MessageRequest, _extra_items: Vec<CpfItem>) -> Result<Cpf> {
+            let service = request.service;
+            let data = request.data.clone();
+            self.seen.lock().unwrap().push((service, data.clone()));
+
+            if service == crate::cm::service::FORWARD_CLOSE {
+                // §8.8 success reply: serial, vendor, originator serial (echoed straight back).
+                let mut r = WireReader::new(&data);
+                let _priority = r.u8()?;
+                let _ticks = r.u8()?;
+                let mut w = WireWriter::new();
+                w.u16(r.u16()?);
+                w.u16(r.u16()?);
+                w.u32(r.u32()?);
+                return Ok(Self::reply_cpf(service, w.into_bytes()));
+            }
+
+            // Read the originator identity straight out of the ForwardOpen request (§8.2 fields 3–7).
+            let mut r = WireReader::new(&data);
+            let _priority = r.u8()?;
+            let _ticks = r.u8()?;
+            let _o_t_id = r.u32()?;
+            let mut t_o_id = r.u32()?;
+            let mut serial = r.u16()?;
+            let mut vendor = r.u16()?;
+            let mut orig_serial = r.u32()?;
+            match self.corrupt {
+                Some(EchoField::TargetToOriginatorId) => t_o_id ^= 1,
+                Some(EchoField::ConnectionSerial) => serial ^= 1,
+                Some(EchoField::VendorId) => vendor ^= 1,
+                Some(EchoField::OriginatorSerial) => orig_serial ^= 1,
+                None => {}
+            }
+
+            let mut w = WireWriter::new();
+            w.u32(0xAABB_CCDD); // O→T id: target-assigned, never echo-checked
+            w.u32(t_o_id);
+            w.u16(serial);
+            w.u16(vendor);
+            w.u32(orig_serial);
+            w.u32(self.o_t_api);
+            w.u32(self.t_o_api);
+            w.u8(0); // application reply words
+            w.u8(0); // reserved
+            Ok(Self::reply_cpf(service, w.into_bytes()))
+        }
+
+        fn target_ip(&self) -> Option<IpAddr> {
+            self.target_ip
+        }
+    }
+
+    fn sample_spec() -> IoConnectionSpec {
+        let dir = DirectionSpec {
+            rpi: Duration::from_millis(20),
+            data_size: 8,
+            format: RealTimeFormat::Modeless,
+            conn_type: ConnType::P2P,
+            priority: Priority::Scheduled,
+            variable: VariableLength::Fixed,
+        };
+        IoConnectionSpec {
+            assembly: AssemblyPath { config: Some(151), output: 150, input: 100, route: vec![] },
+            t2o: dir.clone(),
+            o2t: DirectionSpec { data_size: 4, format: RealTimeFormat::Header32Bit, ..dir },
+            timeout_multiplier: TimeoutMultiplier::X16,
+            trigger: ProductionTrigger::Cyclic,
+            vendor_id: 0x1337,
+        }
+    }
+
+    /// Assert the fixture saw the open, then a ForwardClose (`0x4E`) carrying the open's connection
+    /// serial. ForwardOpen: `priority·ticks·o_t_id(4)·t_o_id(4)·serial(2)`; ForwardClose:
+    /// `priority·ticks·serial(2)`.
+    fn assert_forward_closed(requests: &[(u8, Bytes)]) {
+        assert_eq!(requests.len(), 2, "an open then a best-effort close");
+        let (open_service, open_data) = &requests[0];
+        assert!(
+            *open_service == crate::cm::service::FORWARD_OPEN
+                || *open_service == crate::cm::service::LARGE_FORWARD_OPEN,
+            "first request is the open"
+        );
+        let (close_service, close_data) = &requests[1];
+        assert_eq!(*close_service, crate::cm::service::FORWARD_CLOSE, "0x4E follows the refusal");
+        assert_eq!(&close_data[2..4], &open_data[10..12], "the close carries the open's serial");
+    }
+
+    /// **F1 regression.** A reply naming a 0 µs O→T API is refused *before* anything is armed, and
+    /// the connection the target believes it opened is torn down.
+    #[tokio::test]
+    async fn forward_open_rejects_out_of_range_api_and_forward_closes() {
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let fixture = FoFixture::new(None, 0, 20_000);
+        match mgr.forward_open(&fixture, sample_spec()).await {
+            Err(EnipError::ProtocolViolation { detail }) => {
+                assert_eq!(detail, "forward-open reply API out of range");
+            }
+            other => panic!("expected a protocol violation, got {:?}", other.map(|h| h.apis())),
+        }
+        assert_forward_closed(&fixture.requests());
+        mgr.shutdown().await;
+    }
+
+    /// **F10 regression.** Each echoed identity field, corrupted singly, is refused with a typed
+    /// error and a best-effort ForwardClose — an unverified reply could otherwise bind our runtime
+    /// to another originator's connection.
+    #[tokio::test]
+    async fn forward_open_rejects_echo_mismatch_and_forward_closes() {
+        for field in [
+            EchoField::TargetToOriginatorId,
+            EchoField::ConnectionSerial,
+            EchoField::VendorId,
+            EchoField::OriginatorSerial,
+        ] {
+            let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+            let fixture = FoFixture::new(Some(field), 20_000, 20_000);
+            match mgr.forward_open(&fixture, sample_spec()).await {
+                Err(EnipError::ProtocolViolation { detail }) => {
+                    assert!(detail.starts_with("forward-open reply"), "{field:?}: {detail}");
+                }
+                other => panic!("{field:?}: expected a violation, got {:?}", other.map(|h| h.apis())),
+            }
+            assert_forward_closed(&fixture.requests());
+            mgr.shutdown().await;
+        }
+    }
+
+    /// **The invariant, on its third trigger.** A reply that passes both verifications can still
+    /// fail to arm — here the O→T transmit endpoint is unresolvable (no O→T sockaddr in the reply
+    /// and no target address on the session). The target nonetheless believes the connection is
+    /// open, so the same best-effort ForwardClose goes out before the typed error propagates.
+    #[tokio::test]
+    async fn forward_open_unresolvable_tx_endpoint_forward_closes() {
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let fixture = FoFixture::new(None, 20_000, 20_000).without_target_ip();
+        match mgr.forward_open(&fixture, sample_spec()).await {
+            Err(EnipError::ProtocolViolation { detail }) => {
+                assert_eq!(detail, "no O→T transmit address available");
+            }
+            other => panic!("expected a protocol violation, got {:?}", other.map(|h| h.apis())),
+        }
+        assert_forward_closed(&fixture.requests());
+        mgr.shutdown().await;
+    }
+
+    /// The guard against over-tightening: a faithful reply still opens, and the handle reports the
+    /// validated APIs.
+    #[tokio::test]
+    async fn forward_open_accepts_faithful_reply() {
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let fixture = FoFixture::new(None, 20_000, 20_000);
+        let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
+        assert_eq!(handle.apis(), (Duration::from_millis(20), Duration::from_millis(20)));
+        assert_eq!(fixture.requests().len(), 1, "no ForwardClose on the happy path");
+        mgr.shutdown().await;
     }
 
     // -- manager smoke (bind, no live peer) --------------------------------

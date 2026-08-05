@@ -14,6 +14,8 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -22,8 +24,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use enip::cip::types::CipValue;
 use enip::encap::{Command, EncapFrame, EncapHeader};
 use enip::{
-    CipType, ClientOptions, Cpf, CpfItem, EipClient, RoutePath, Scope, TagAddress, WireReader,
-    WireWriter,
+    CipType, ClientOptions, Cpf, CpfItem, EipClient, ItemType, RoutePath, Scope, SockAddrInfo,
+    TagAddress, WireReader, WireWriter,
 };
 
 const SESSION_HANDLE: u32 = 0x00AB_CDEF;
@@ -116,8 +118,15 @@ fn read_dint_mr(value: i32) -> Vec<u8> {
     mr_reply(0x4C, 0x00, &[], v.as_slice())
 }
 
-/// Wrap MR bytes in a `SendRRData` reply frame (UCMM CPF `[null, unconnected-data]`).
+/// Wrap MR bytes in a `SendRRData` reply frame (UCMM CPF `[null, unconnected-data]`), stamped with
+/// the session handle a compliant target echoes.
 fn rrdata_reply(ctx: [u8; 8], mr: &[u8]) -> EncapFrame {
+    rrdata_reply_as(SESSION_HANDLE, ctx, mr)
+}
+
+/// As [`rrdata_reply`], but with an arbitrary session handle in the header — for proving that a
+/// reply carrying somebody else's handle is discarded.
+fn rrdata_reply_as(handle: u32, ctx: [u8; 8], mr: &[u8]) -> EncapFrame {
     let cpf = Cpf::from_items(vec![
         CpfItem::null_address(),
         CpfItem::unconnected_data(Bytes::copy_from_slice(mr)),
@@ -127,7 +136,26 @@ fn rrdata_reply(ctx: [u8; 8], mr: &[u8]) -> EncapFrame {
     w.u32(0); // interface handle
     w.u16(0); // timeout
     w.put_slice(&cpf_bytes);
-    mk_frame(Command::SendRRData, SESSION_HANDLE, ctx, w.into_bytes().to_vec())
+    mk_frame(Command::SendRRData, handle, ctx, w.into_bytes().to_vec())
+}
+
+/// A §5.3 ListIdentity reply data portion: a CPF carrying one Identity (`0x000C`) item.
+fn identity_reply_data() -> Vec<u8> {
+    let mut item = WireWriter::new();
+    item.u16(1); // encapsulation protocol version
+    item.put_slice(&SockAddrInfo::ipv4(0xC0A8_0132, 44818).encode()); // 16 B, big-endian
+    item.u16(0x0001); // vendor: Rockwell
+    item.u16(0x000E); // device type: PLC
+    item.u16(0x0037); // product code
+    item.u8(20); // revision major
+    item.u8(11); // revision minor
+    item.u16(0x0060); // status
+    item.u32(0x1234_5678); // serial number
+    item.u8(11);
+    item.put_slice(b"1756-L71/B "); // SHORT_STRING product name
+    item.u8(0x03); // state
+    let cpf = Cpf::from_items(vec![CpfItem::new(ItemType::Identity, item.into_bytes())]);
+    cpf.encode().unwrap().to_vec()
 }
 
 /// Wrap MR bytes in a `SendUnitData` reply frame (connected CPF `[connected-address, connected-data]`).
@@ -1001,6 +1029,322 @@ async fn write_struct_value_is_unsupported() {
         .await;
     assert!(matches!(r, Err(enip::EnipError::Unsupported { .. })), "got {r:?}");
     drop(client);
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// deadline coverage: write side, handshake, close, and dequeue triage (§10.4)
+// ---------------------------------------------------------------------------
+
+/// §10.4 — a request write that cannot complete by its deadline severs the session as
+/// `ConnectionLost`, **never** `Timeout`. A cancelled `write_all` may already have flushed a partial
+/// encapsulation frame, so the peer's framing is desynchronised and no later request/reply boundary
+/// on this stream is trustworthy: the actor must die rather than quarantine and carry on.
+///
+/// The fixture is a 64-byte pipe — big enough for the 28-byte RegisterSession handshake, far too
+/// small for a 30-element array write — whose peer stops reading once registered.
+#[tokio::test(start_paused = true)]
+async fn send_stall_severs_session_as_connection_lost() {
+    let (client_io, server_io) = tokio::io::duplex(64);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        // ...and never read again. `server_io` stays alive inside `peer`, so the client's write
+        // parks on a full pipe rather than failing with a broken pipe.
+        std::future::pending::<()>().await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let value = CipValue::Array(CipType::Dint, (0..30i32).map(CipValue::Dint).collect());
+    let r = client.write_tag(&tag, CipType::Dint, &value).await;
+    assert!(
+        matches!(r, Err(enip::EnipError::ConnectionLost { .. })),
+        "a stalled write must sever the session, not report a per-request timeout: {r:?}"
+    );
+
+    // The actor is gone, so the next request fails fast instead of speaking into a stream whose
+    // framing we can no longer trust.
+    let r2 = client.read_tag(&tag, 1).await;
+    assert!(matches!(r2, Err(enip::EnipError::Closed)), "follow-up: {r2:?}");
+
+    server.abort();
+}
+
+/// §5.5 / §10.4 — the RegisterSession *write* is bounded by `connect_timeout` too. A peer that
+/// accepts the connection and then never reads must fail the connect at the deadline, not hang it
+/// forever. The 16-byte pipe cannot hold the 28-byte handshake frame.
+#[tokio::test(start_paused = true)]
+async fn register_handshake_write_is_bounded() {
+    let (client_io, server_io) = tokio::io::duplex(16);
+    // Held open, never read: the write parks on a full pipe.
+    let _silent_peer = server_io;
+
+    let opts = ClientOptions {
+        connect_timeout: Duration::from_millis(200),
+        ..base_opts()
+    };
+    let r = EipClient::connect_over(client_io, opts).await;
+    assert!(
+        matches!(r.as_ref(), Err(enip::EnipError::ConnectionLost { .. })),
+        "the handshake write must be deadline-bounded: {:?}",
+        r.err()
+    );
+}
+
+/// §10.4 — `close()` never hangs behind a wedged actor. Here the actor is parked in a 10-second read
+/// on a peer that withholds the reply; `close()` must give up on the UnRegisterSession hand-off/ack
+/// at `CLOSE_HANDOFF_DEADLINE` (2 s) and return, leaving the actor still mid-read.
+#[tokio::test(start_paused = true)]
+async fn close_returns_within_handoff_deadline_when_actor_is_wedged() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (wedged_tx, wedged_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let _req = peer.recv().await.unwrap();
+        let _ = wedged_tx.send(());
+        // Withhold the reply for the whole test: the actor stays parked in its read.
+        std::future::pending::<()>().await;
+    });
+
+    let opts = ClientOptions {
+        connect_timeout: Duration::from_secs(30),
+        request_timeout: Duration::from_secs(10),
+        ..ClientOptions::default()
+    };
+    let client = EipClient::connect_over(client_io, opts).await.unwrap();
+
+    let reader = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let tag = TagAddress::parse("A").unwrap();
+            client.read_tag(&tag, 1).await
+        }
+    });
+    wedged_rx.await.unwrap(); // the request is on the wire; the actor is parked in its read
+
+    let started = tokio::time::Instant::now();
+    client.close().await;
+    let waited = started.elapsed();
+
+    // `CLOSE_HANDOFF_DEADLINE` is crate-private; 2 s is its value.
+    assert!(
+        waited <= Duration::from_secs(2),
+        "close() must return within CLOSE_HANDOFF_DEADLINE, waited {waited:?}"
+    );
+    assert!(
+        !reader.is_finished(),
+        "close() must have given up on the ack while the actor was still mid-read (the request's \
+         own 10 s deadline has not elapsed)"
+    );
+
+    reader.abort();
+    server.abort();
+}
+
+/// §10.3 — a reply that echoes our `sender_context` but carries the wrong encapsulation command is
+/// **not** ours: it is discarded and counted, and the caller still receives its own true reply.
+#[tokio::test]
+async fn reply_with_matching_context_but_wrong_command_is_discarded() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        assert_eq!(req.header.command, Command::SendRRData);
+        // Right context, right handle — wrong command echo.
+        peer.send(&mk_frame(
+            Command::SendUnitData,
+            SESSION_HANDLE,
+            req.header.sender_context,
+            Vec::new(),
+        ))
+        .await;
+        // Then the true reply.
+        peer.send(&rrdata_reply(req.header.sender_context, &read_dint_mr(4242)))
+            .await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await.unwrap();
+    assert_eq!(r.value, CipValue::Dint(4242));
+    assert_eq!(client.stats().stale_replies, 1);
+    drop(client);
+    server.await.unwrap();
+}
+
+/// §5.5 / §10.3 — a `SendRRData` reply stamped with a session handle that is not the one we
+/// registered is discarded and counted; the caller still receives its own true reply.
+#[tokio::test]
+async fn reply_with_wrong_session_handle_is_discarded() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        // Right context, right command — somebody else's session handle.
+        peer.send(&rrdata_reply_as(
+            SESSION_HANDLE.wrapping_add(1),
+            req.header.sender_context,
+            &read_dint_mr(111),
+        ))
+        .await;
+        peer.send(&rrdata_reply(req.header.sender_context, &read_dint_mr(222)))
+            .await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await.unwrap();
+    assert_eq!(
+        r.value,
+        CipValue::Dint(222),
+        "the foreign-handle reply must never be delivered"
+    );
+    assert_eq!(client.stats().stale_replies, 1);
+    drop(client);
+    server.await.unwrap();
+}
+
+/// §5.2 — `ListIdentity` is sessionless-capable, so the session-handle check does not apply to it.
+/// Live targets routinely answer it with handle `0` even inside a registered session; that reply
+/// must be accepted, not quarantined.
+#[tokio::test]
+async fn list_identity_reply_with_zero_handle_is_accepted() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        assert_eq!(req.header.command, Command::ListIdentity);
+        peer.send(&mk_frame(
+            Command::ListIdentity,
+            0, // sessionless reply handle
+            req.header.sender_context,
+            identity_reply_data(),
+        ))
+        .await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let id = client.identity().await.unwrap();
+    assert_eq!(id.product_name, "1756-L71/B ");
+    assert_eq!(id.serial_number, 0x1234_5678);
+    assert_eq!(id.socket_addr.sin_port, 44818);
+    assert_eq!(client.stats().stale_replies, 0);
+    drop(client);
+    server.await.unwrap();
+}
+
+/// §10.4 — dequeue triage. Two requests share one deadline: the first consumes the whole budget in
+/// its read, so the second has already expired by the time the actor reaches it. It must be completed
+/// `Err(Timeout)` **without** being written to the wire, **and** without advancing the
+/// consecutive-timeout kill counter — queue backlog is not evidence of a silent peer, so the session
+/// survives and serves the next request.
+#[tokio::test(start_paused = true)]
+async fn expired_at_dequeue_completes_timeout_without_wire_io() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let frames = Arc::new(AtomicUsize::new(0));
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn({
+        let frames = Arc::clone(&frames);
+        async move {
+            let mut peer = MockPeer::new(server_io);
+            peer.handle_register().await;
+            let mut first_tx = Some(first_tx);
+            // Receive every request; never reply to any of them.
+            while peer.recv().await.is_some() {
+                frames.fetch_add(1, Ordering::SeqCst);
+                if let Some(tx) = first_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+
+    // `base_opts()` gives a 200 ms request deadline and the default 3-timeout kill threshold.
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let tag = TagAddress::parse("A").unwrap();
+            client.read_tag(&tag, 1).await
+        }
+    });
+    // Request 1 is on the wire and the actor is parked in its read — and the paused clock has not
+    // moved, so request 2 is about to be enqueued with exactly the same deadline.
+    first_rx.await.unwrap();
+    assert_eq!(frames.load(Ordering::SeqCst), 1);
+
+    let tag = TagAddress::parse("A").unwrap();
+    let r2 = client.read_tag(&tag, 1).await;
+    assert!(matches!(r2, Err(enip::EnipError::Timeout { .. })), "2: {r2:?}");
+    let r1 = first.await.unwrap();
+    assert!(matches!(r1, Err(enip::EnipError::Timeout { .. })), "1: {r1:?}");
+
+    // Request 2 expired in the queue: no wire I/O for it...
+    assert_eq!(
+        frames.load(Ordering::SeqCst),
+        1,
+        "a request that expired while queued must never reach the wire"
+    );
+    // ...yet it is counted, so the peer-driven counters stay honest.
+    assert_eq!(client.stats().timeouts, 2);
+
+    // And the session is still alive: had the queue-expiry bumped `consecutive_timeouts`, this third
+    // request would be the third strike and come back `ConnectionLost` instead.
+    let r3 = client.read_tag(&tag, 1).await;
+    assert!(matches!(r3, Err(enip::EnipError::Timeout { .. })), "3: {r3:?}");
+    assert_eq!(
+        frames.load(Ordering::SeqCst),
+        2,
+        "the session must still serve fresh requests after a queue expiry"
+    );
+
+    server.abort();
+}
+
+/// §10.2/§10.4 — **no timeout path is silent.** The session command channel is 32 deep, so firing
+/// 40 concurrent reads at a peer that never replies exercises every timeout path at once: the
+/// actor's read deadline, the dequeue triage of everything already queued, and — for the callers
+/// that could not even get a channel permit — the caller-side *enqueue* deadline. Whichever path a
+/// request takes, it must be counted exactly once, so the total is the request count. The
+/// caller-side arms used to return `Err(Timeout)` without touching the counter.
+#[tokio::test(start_paused = true)]
+async fn every_request_timeout_is_counted_whichever_path_it_takes() {
+    const REQUESTS: usize = 40; // deeper than the 32-slot session command channel
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        // Receive whatever arrives; never reply to any of it.
+        while peer.recv().await.is_some() {}
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+
+    let mut tasks = Vec::with_capacity(REQUESTS);
+    for _ in 0..REQUESTS {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let tag = TagAddress::parse("A").unwrap();
+            client.read_tag(&tag, 1).await
+        }));
+    }
+    for (i, t) in tasks.into_iter().enumerate() {
+        let r = t.await.unwrap();
+        assert!(matches!(r, Err(enip::EnipError::Timeout { .. })), "{i}: {r:?}");
+    }
+
+    assert_eq!(
+        client.stats().timeouts,
+        REQUESTS as u64,
+        "every timed-out request is counted exactly once, on whichever path it expired"
+    );
     server.abort();
 }
 

@@ -28,7 +28,10 @@ use crate::assembly::{AssemblyLayout, FieldSpec};
 use crate::cip::message::MessageReply;
 use crate::cip::types::{CipType, CipValue};
 use crate::cip::epath::TagAddress;
-use crate::cm::{ForwardOpenSuccess, ForwardRequestFail};
+use crate::cm::{
+    io_connection_path, ConnType, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
+    NetworkConnectionParams, Priority, TimeoutMultiplier, VariableLength,
+};
 use crate::cpf::{Cpf, SequencedAddress, SockAddrInfo};
 use crate::discovery::{parse_list_interfaces, parse_list_services, DeviceIdentity};
 use crate::encap::codec::EncapCodec;
@@ -106,10 +109,43 @@ pub fn cip_value_typed(code: u16, data: &[u8]) {
 }
 
 /// Exercise the ForwardOpen reply decoders (`fuzz_forward_open_reply`): the success reply (with the
-/// application-word size field) and the failure reply (with the optional remaining-path-size tail).
+/// application-word size field) and the failure reply (with the optional remaining-path-size tail),
+/// plus the two **reply verifiers** a decoded success then faces (§8.2, D-ENIP-16) — the actual
+/// packet-interval range check and the originator echo comparison against a fixed canonical
+/// request. Their verdicts are discarded: the invariant under test is totality, that no arbitrary
+/// reply can panic anywhere on the path from bytes to an armed connection.
 pub fn forward_open_reply(data: &[u8]) {
-    let _ = ForwardOpenSuccess::decode(data);
     let _ = ForwardRequestFail::decode(data);
+    if let Ok(success) = ForwardOpenSuccess::decode(data) {
+        let _ = crate::io::validate_reply_apis(&success);
+        let _ = crate::cm::verify_forward_open_echo(&reference_forward_open(), &success);
+    }
+}
+
+/// The fixed canonical class-1 ForwardOpen [`forward_open_reply`] verifies arbitrary replies
+/// against. Its identity fields are arbitrary but constant, so the sweep exercises both the
+/// matching and (overwhelmingly) the mismatching branch of every echo comparison.
+fn reference_forward_open() -> ForwardOpenRequest {
+    let ncp = NetworkConnectionParams::io(
+        34,
+        VariableLength::Fixed,
+        Priority::Scheduled,
+        ConnType::P2P,
+    );
+    ForwardOpenRequest::class1(
+        0x1122_3344,
+        0x0007,
+        0x1337,
+        0xDEAD_BEEF,
+        TimeoutMultiplier::X16,
+        20_000,
+        ncp,
+        20_000,
+        ncp,
+        crate::cm::TRANSPORT_CLASS1_TRIGGER,
+        io_connection_path(Some(151), 150, 100),
+        false,
+    )
 }
 
 /// Exercise the Get-Instance-Attribute-List record-stream decoder (`fuzz_tag_list`): name-length

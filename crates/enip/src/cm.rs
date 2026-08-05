@@ -557,6 +557,41 @@ impl ForwardOpenSuccess {
     }
 }
 
+/// Verify a ForwardOpen success reply echoes the request's originator identity
+/// (§8.2 reply fields 2–5): T→O connection id, connection serial, vendor id, originator serial.
+///
+/// The target-assigned **O→T** connection id is deliberately *not* checked: the class-1 request
+/// sends 0 and any value the target picks is legitimate. Every other identity field is ours and must
+/// come back unchanged — a reply that does not echo them belongs to a different connection (a
+/// crossed reply, a confused router, or a hostile peer) and must never be allowed to arm a
+/// connection. A mismatch is [`EnipError::ProtocolViolation`] with a field-specific `detail`.
+pub fn verify_forward_open_echo(
+    open: &ForwardOpenRequest,
+    success: &ForwardOpenSuccess,
+) -> core::result::Result<(), EnipError> {
+    if success.t_o_connection_id != open.t_o_connection_id {
+        return Err(EnipError::ProtocolViolation {
+            detail: "forward-open reply t→o connection id mismatch",
+        });
+    }
+    if success.connection_serial != open.connection_serial {
+        return Err(EnipError::ProtocolViolation {
+            detail: "forward-open reply connection serial mismatch",
+        });
+    }
+    if success.vendor_id != open.vendor_id {
+        return Err(EnipError::ProtocolViolation {
+            detail: "forward-open reply vendor id mismatch",
+        });
+    }
+    if success.originator_serial != open.originator_serial {
+        return Err(EnipError::ProtocolViolation {
+            detail: "forward-open reply originator serial mismatch",
+        });
+    }
+    Ok(())
+}
+
 /// A rejected ForwardOpen / ForwardClose reply (§8.2). `remaining_path_size` is present on routing
 /// errors (the reserved byte follows it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -874,6 +909,69 @@ mod tests {
         // trigger + path-words follow the wider params.
         assert_eq!(bytes[38], TRANSPORT_CLASS1_TRIGGER);
         assert_eq!(bytes[39], 4);
+    }
+
+    /// A reference class-1 open plus the faithful success reply that answers it.
+    fn echo_pair() -> (ForwardOpenRequest, ForwardOpenSuccess) {
+        let ncp = NetworkConnectionParams::io(10, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let open = ForwardOpenRequest::class1(
+            0x1122_3344,
+            0x0007,
+            0x1337,
+            0xDEAD_BEEF,
+            TimeoutMultiplier::X16,
+            20_000,
+            ncp,
+            20_000,
+            ncp,
+            TRANSPORT_CLASS1_TRIGGER,
+            io_connection_path(Some(151), 150, 100),
+            false,
+        );
+        let success = ForwardOpenSuccess {
+            // Target-assigned — deliberately unrelated to the request's 0.
+            o_t_connection_id: 0xAABB_CCDD,
+            t_o_connection_id: open.t_o_connection_id,
+            connection_serial: open.connection_serial,
+            vendor_id: open.vendor_id,
+            originator_serial: open.originator_serial,
+            o_t_api: 20_000,
+            t_o_api: 20_000,
+            app_data: Bytes::new(),
+        };
+        (open, success)
+    }
+
+    #[test]
+    fn verify_forward_open_echo_matrix() {
+        let (open, good) = echo_pair();
+        // An exact echo passes — and the target-assigned O→T id is not part of the quad.
+        assert!(verify_forward_open_echo(&open, &good).is_ok());
+        let mut other_otid = good.clone();
+        other_otid.o_t_connection_id = 0x0000_0001;
+        assert!(verify_forward_open_echo(&open, &other_otid).is_ok());
+
+        // Each echoed field, mutated singly, is rejected with its own detail string.
+        let mut bad_tid = good.clone();
+        bad_tid.t_o_connection_id ^= 1;
+        let mut bad_serial = good.clone();
+        bad_serial.connection_serial ^= 1;
+        let mut bad_vendor = good.clone();
+        bad_vendor.vendor_id ^= 1;
+        let mut bad_orig = good.clone();
+        bad_orig.originator_serial ^= 1;
+
+        for (reply, expect) in [
+            (bad_tid, "forward-open reply t→o connection id mismatch"),
+            (bad_serial, "forward-open reply connection serial mismatch"),
+            (bad_vendor, "forward-open reply vendor id mismatch"),
+            (bad_orig, "forward-open reply originator serial mismatch"),
+        ] {
+            match verify_forward_open_echo(&open, &reply) {
+                Err(EnipError::ProtocolViolation { detail }) => assert_eq!(detail, expect),
+                other => panic!("expected {expect}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

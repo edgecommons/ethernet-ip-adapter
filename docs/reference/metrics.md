@@ -137,7 +137,7 @@ Class-1 implicit-I/O health (push mode only). Dimensions: `instance`.
 | `forwardOpens` | Count | counter | ForwardOpen requests. |
 | `forwardOpenFailures` | Count | counter | Failed ForwardOpens. |
 | `framesConsumed` | Count | counter | Accepted T→O frames. |
-| `framesProduced` | Count | counter | O→T frames produced. |
+| `framesProduced` | Count | counter | O→T frames sent onto the wire. |
 | `staleFramesDropped` | Count | counter | Frames dropped as stale. |
 | `sequenceGaps` | Count | counter | Missing frames inferred from sequence jumps. |
 | `sizeMismatchDropped` | Count | counter | Frames dropped for wrong size. |
