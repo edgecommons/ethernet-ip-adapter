@@ -71,6 +71,23 @@ impl EipClient {
             });
         }
         let success = ForwardOpenSuccess::decode(&reply.data)?;
+        // Verify the originator echo quad before adopting the target-assigned O→T id (§8.2,
+        // D-ENIP-16): a reply that does not echo our identity belongs to some other connection and
+        // must never bind this one. Class-3 checks only the echo — its timing is not API-driven, so
+        // the reply's actual packet intervals are not consulted. On a mismatch the target still
+        // believes a connection is open, so a best-effort ForwardClose goes out first.
+        if let Err(e) = crate::cm::verify_forward_open_echo(&open, &success) {
+            let close = ForwardCloseRequest::for_open(&open);
+            if let Ok(data) = close.encode() {
+                let mr = MessageRequest::new(
+                    crate::cm::service::FORWARD_CLOSE,
+                    super::connection_manager_path(),
+                    data,
+                );
+                let _ = self.send_unconnected(mr, "forward_close").await;
+            }
+            return Err(e);
+        }
         Ok(ConnectedState {
             o_t_connection_id: success.o_t_connection_id,
             t_o_connection_id,

@@ -38,7 +38,27 @@ use crate::error::{EnipError, Result};
 use crate::wire::{WireReader, WireWriter};
 
 use connected::ConnectedState;
-use session::{recv_frame, send_frame, spawn_session, SessionCommand, SessionStats, Transaction};
+use session::{
+    deadline_from, recv_frame, send_frame_by, spawn_session, SessionCommand, SessionStats,
+    Transaction,
+};
+
+/// Bounds [`EipClient::close`]'s hand-off to the session actor plus its done-ack (§10.4), so a
+/// graceful shutdown can never hang behind a wedged actor (one parked mid-read on a silent peer, or
+/// one whose queue is still draining). On elapse `close()` returns anyway: the courtesy
+/// UnRegisterSession is best-effort, and dropping the last handle tears the session down regardless.
+pub(crate) const CLOSE_HANDOFF_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Grace added to the caller-side reply backstop, on top of the request deadline (§10.4).
+///
+/// The session actor is the **authority** on a request's outcome: it alone knows whether an elapsed
+/// deadline is an ordinary per-request `Timeout`, the third consecutive strike (`ConnectionLost`), or
+/// a write that stalled mid-frame and desynchronised the stream (`ConnectionLost`). The caller's
+/// `timeout_at` on the reply channel is only a *liveness backstop* for an actor that never answers at
+/// all — so it must fire strictly AFTER the actor's own deadline. Were the two the same instant, the
+/// caller's timer (registered first, and therefore fired first) would pre-empt the actor at every
+/// deadline and collapse every failure class into a bare `Timeout`.
+pub(crate) const REPLY_BACKSTOP_GRACE: Duration = Duration::from_millis(50);
 
 /// The Connection Manager object path `[0x20 0x06 0x24 0x01]` as an [`EPath`] (§7.1).
 pub(crate) fn connection_manager_path() -> EPath {
@@ -99,7 +119,8 @@ pub struct ClientOptions {
     pub port: u16,
     /// Optional route path (`None` for cpppo / CompactLogix-direct).
     pub route: Option<RoutePath>,
-    /// Deadline for the TCP connect + RegisterSession handshake.
+    /// Deadline for **each phase** of opening a session: the TCP connect, then the RegisterSession
+    /// handshake (its request write and its reply read together). Each phase gets the full value.
     pub connect_timeout: Duration,
     /// Per-request deadline (§10.4).
     pub request_timeout: Duration,
@@ -191,7 +212,10 @@ impl EipClient {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        // RegisterSession handshake (§5.5), synchronous before the actor owns the stream.
+        // RegisterSession handshake (§5.5), synchronous before the actor owns the stream. ONE
+        // absolute deadline bounds the whole handshake — write and read alike — so a peer that
+        // accepts the TCP connection and then stops reading cannot park us forever on the write.
+        let handshake_deadline = deadline_from(opts.connect_timeout);
         let mut reg_data = WireWriter::with_capacity(4);
         reg_data.u16(PROTOCOL_VERSION);
         reg_data.u16(0); // options
@@ -199,11 +223,12 @@ impl EipClient {
             EncapHeader::request(Command::RegisterSession, 0, 0, *b"ECREGIST"),
             reg_data.into_bytes(),
         );
-        send_frame(&mut stream, &reg_frame).await?;
+        send_frame_by(&mut stream, &reg_frame, handshake_deadline).await?;
 
         let mut codec = EncapCodec::new();
         let mut buf = BytesMut::new();
-        let reply = recv_frame(&mut stream, &mut buf, &mut codec, opts.connect_timeout, "register").await?;
+        let reply =
+            recv_frame(&mut stream, &mut buf, &mut codec, handshake_deadline, "register").await?;
 
         if !matches!(reply.header.command, Command::RegisterSession) {
             return Err(EnipError::ProtocolViolation { detail: "register reply command mismatch" });
@@ -304,22 +329,52 @@ impl EipClient {
     }
 
     /// Run one encapsulation transaction through the session actor.
+    ///
+    /// The deadline is absolute and computed HERE, before the request is handed to the actor (§10.4),
+    /// so every phase the caller waits through — queueing behind another in-flight request, the
+    /// actor's write, the actor's read — is charged to the one `request_timeout` budget. Both waits
+    /// this side of the actor are bounded: a full command channel cannot park the caller past its
+    /// deadline, and neither can an actor that never answers.
+    ///
+    /// The reply wait is bounded at `deadline + REPLY_BACKSTOP_GRACE` rather than at `deadline`
+    /// itself, because the actor — which shares this exact deadline — is the authority on *which*
+    /// failure occurred (see [`REPLY_BACKSTOP_GRACE`]). The caller's bound exists only so a wedged or
+    /// vanished actor cannot park the caller forever.
+    ///
+    /// Both caller-side bounds count their elapse as a timeout (§10.2, never silent): the actor
+    /// never saw a request that expired queueing for it, and by definition produced no verdict for
+    /// one that tripped the backstop, so neither would otherwise appear on `stats().timeouts`.
     async fn transaction(&self, command: Command, data: Bytes, op: &'static str) -> Result<EncapFrame> {
+        let deadline = deadline_from(self.inner.request_timeout);
         let (reply_tx, reply_rx) = oneshot::channel();
         let t = Transaction {
             command,
             data,
-            deadline: self.inner.request_timeout,
+            deadline,
             reply_tx,
         };
-        let _ = op;
-        self.tx
-            .send(SessionCommand::Transact(t))
-            .await
-            .map_err(|_| EnipError::Closed)?;
-        match reply_rx.await {
-            Ok(res) => res,
-            Err(_) => Err(EnipError::Closed),
+        match tokio::time::timeout_at(deadline, self.tx.send(SessionCommand::Transact(t))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_send_failed)) => return Err(EnipError::Closed),
+            Err(_elapsed) => {
+                // The budget was spent queueing for the actor, so the actor never saw this request
+                // and cannot count it — but no timeout path is silent (§10.2).
+                self.inner.stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                return Err(EnipError::Timeout { op });
+            }
+        }
+        let backstop = deadline
+            .checked_add(REPLY_BACKSTOP_GRACE)
+            .unwrap_or(deadline);
+        match tokio::time::timeout_at(backstop, reply_rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_closed)) => Err(EnipError::Closed),
+            Err(_elapsed) => {
+                // The actor is wedged or gone: it owed a verdict by `deadline` and produced none, so
+                // the backstop fires and — like every other timeout — is counted (§10.2).
+                self.inner.stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                Err(EnipError::Timeout { op })
+            }
         }
     }
 
@@ -347,14 +402,23 @@ impl EipClient {
 
     /// Gracefully close the session (§11.1): ForwardClose any class-3 connection (best-effort), then
     /// UnRegisterSession and drop the socket.
+    ///
+    /// Every wait is bounded. The ForwardClose rides [`EipClient::transaction`] and is therefore
+    /// capped by `request_timeout`; the actor hand-off and its done-ack are capped together by
+    /// [`CLOSE_HANDOFF_DEADLINE`]. If the actor is wedged (parked mid-read on a silent peer) the
+    /// deadline elapses and `close()` returns anyway — the courtesy UnRegisterSession is best-effort
+    /// and shutdown must not hang on a peer's behaviour.
     pub async fn close(&self) {
         if let Some(conn) = &self.inner.connected {
             let _ = self.forward_close(conn).await;
         }
         let (done_tx, done_rx) = oneshot::channel();
-        if self.tx.send(SessionCommand::Unregister { done_tx }).await.is_ok() {
-            let _ = done_rx.await;
-        }
+        let _ = tokio::time::timeout(CLOSE_HANDOFF_DEADLINE, async {
+            if self.tx.send(SessionCommand::Unregister { done_tx }).await.is_ok() {
+                let _ = done_rx.await;
+            }
+        })
+        .await;
     }
 }
 
@@ -430,6 +494,41 @@ mod tests {
         // Then priority 0x03, timeout 0xFA, embedded size.
         assert_eq!(bytes[6], 0x03);
         assert_eq!(bytes[7], 0xFA);
+    }
+
+    /// §10.2/§10.4 — the caller-side **reply backstop**, and that it is not silent. An actor that
+    /// takes the hand-off and then never answers is modelled by a command receiver nobody polls: the
+    /// channel has capacity, so the enqueue succeeds and the caller ends up on the backstop. The
+    /// wait must end one `REPLY_BACKSTOP_GRACE` past the deadline (never at the deadline itself —
+    /// that instant belongs to the actor's own verdict) with a counted `Timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn reply_backstop_fires_past_the_deadline_and_is_counted() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(32); // held open, never polled
+        let request_timeout = Duration::from_millis(200);
+        let client = EipClient {
+            tx,
+            inner: Arc::new(Inner {
+                route: None,
+                request_timeout,
+                max_value_bytes: 1 << 20,
+                stats: Arc::new(SessionStats::default()),
+                connected: None,
+            }),
+            peer_addr: None,
+            #[cfg(feature = "tls")]
+            tls_info: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let r = client
+            .transaction(Command::ListIdentity, Bytes::new(), "identity")
+            .await;
+        assert!(matches!(r, Err(EnipError::Timeout { op: "identity" })), "{r:?}");
+        assert!(
+            started.elapsed() >= request_timeout + REPLY_BACKSTOP_GRACE,
+            "the backstop must fire strictly after the deadline, not on it"
+        );
+        assert_eq!(client.stats().timeouts, 1, "the backstop is never silent");
     }
 
     #[test]

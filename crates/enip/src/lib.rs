@@ -130,8 +130,8 @@ pub use error::TlsErrorKind;
 pub use tokio_rustls::rustls;
 
 pub use cm::{
-    connection_manager_path, io_connection_path, transport_class1_trigger, ConnType,
-    ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
+    connection_manager_path, io_connection_path, transport_class1_trigger, verify_forward_open_echo,
+    ConnType, ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
     NetworkConnectionParams, Priority, ProductionTrigger, TimeoutMultiplier, VariableLength,
     TRANSPORT_CLASS1_TRIGGER,
 };
@@ -143,7 +143,7 @@ pub use logix::{parse_tag_list, Scope, SymbolInfo, SymbolType, TagReadResult};
 pub use io::{
     AssemblyPath, ConsumeOutcome, DirectionSpec, DropReason, ForwardOpenService, IoConnection,
     IoConnectionHandle, IoConnectionParams, IoConnectionSpec, IoEvent, IoFrame, IoManager, IoStats,
-    IoUpdate, LostReason, RealTimeFormat, IO_UDP_PORT,
+    IoUpdate, LostReason, RealTimeFormat, SendOutcome, IO_UDP_PORT,
 };
 
 pub use assembly::{AssemblyError, AssemblyLayout, FieldSpec};

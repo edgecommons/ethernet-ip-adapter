@@ -125,18 +125,26 @@ impl EipClient {
     /// **server** on the other end (a TLS endpoint on a byte pipe — not an embedded EtherNet/IP peer,
     /// D-ENIP-14 preserved).
     ///
+    /// The handshake is bounded by `opts.connect_timeout` **here**, not only in
+    /// [`EipClient::connect_tls`]: this is a public entry point, and a peer that completes the TCP
+    /// connection (or hands over a byte stream) and then stalls mid-handshake must not park a direct
+    /// caller forever. Everything after it — RegisterSession, then every request — is already
+    /// deadline-bounded (PROTOCOL-DESIGN §10.4, §11.2).
+    ///
     /// # Errors
     ///
-    /// [`EnipError::Tls`] for a handshake/verification/no-overlap failure, then the ordinary
-    /// RegisterSession errors.
+    /// [`EnipError::Timeout`] `{ op: "tls handshake" }` if the handshake exceeds
+    /// `opts.connect_timeout`; [`EnipError::Tls`] for a handshake/verification/no-overlap failure,
+    /// then the ordinary RegisterSession errors.
     pub async fn connect_tls_over<S>(stream: S, opts: ClientOptions, tls: TlsOptions) -> Result<Self>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let connector = tokio_rustls::TlsConnector::from(tls.config);
-        let tls_stream = connector
-            .connect(tls.server_name, stream)
+        let handshake = connector.connect(tls.server_name, stream);
+        let tls_stream = tokio::time::timeout(opts.connect_timeout, handshake)
             .await
+            .map_err(|_elapsed| EnipError::Timeout { op: "tls handshake" })?
             .map_err(map_handshake_error)?;
         let info = session_info(&tls_stream);
         let mut client = Self::connect_over(tls_stream, opts).await?;
@@ -542,6 +550,36 @@ mod tests {
             "got {err:?}"
         );
         let _ = server.await;
+    }
+
+    /// §11.2 — the TLS stream-injection entry point is deadline-bounded like every other wait in the
+    /// crate. A peer that takes the byte stream and then says nothing (no ServerHello, no alert, no
+    /// close) must surface as a typed `Timeout` rather than parking the caller forever.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_tls_peer_times_out_the_handshake() {
+        let fx = mint();
+        let client_cfg = client_config(&fx, false);
+        // The server half is held open for the whole test and never answers the ClientHello —
+        // dropping it would give the client an EOF (a handshake *error*), which is not the case
+        // under test.
+        let (client_io, _server_io) = tokio::io::duplex(64 * 1024);
+
+        let opts = ClientOptions {
+            connect_timeout: Duration::from_millis(250),
+            ..Default::default()
+        };
+        let tls = TlsOptions {
+            config: client_cfg,
+            server_name: localhost_name(),
+        };
+        let err = match EipClient::connect_tls_over(client_io, opts, tls).await {
+            Ok(_) => panic!("a stalled peer must not yield a connected client"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, EnipError::Timeout { op: "tls handshake" }),
+            "got {err:?}"
+        );
     }
 
     /// Read one RegisterSession request off the TLS stream and write a well-formed reply, so the

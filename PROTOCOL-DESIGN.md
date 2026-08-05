@@ -131,16 +131,17 @@ throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.
 | **D-ENIP-2** | **`#![forbid(unsafe_code)]` at the crate root — no exceptions, no `unsafe` islands.** | Nothing in this protocol needs `unsafe`: framing is length-prefixed byte handling, decode is cursor reads, UDP/TCP are Tokio. rseip's only `unsafe` (tag-list UTF-8) is exactly the bug class we are eliminating. `forbid` (not `deny`) so no module can opt back in. |
 | **D-ENIP-3** | **All decoding goes through the checked `WireReader` cursor (§4); direct slice indexing of wire data is banned** (`clippy::indexing_slicing` + `clippy::arithmetic_side_effects` denied in decode modules). | Makes the no-panic invariant *reviewable*: any indexing or unchecked arithmetic on wire-derived lengths is a lint failure, not a code-review catch. |
 | **D-ENIP-4** | **Decode by wire-declared type, not caller expectation:** `read_tag` returns the `CipValue` the reply's type code declares; the caller compares against its expectation. | A type mismatch becomes *data* (the adapter maps it to a BAD sample) instead of a decode error deep in a generic; kills the monomorphized `read_tag::<TagValue<T>>` dispatch pattern and its blind trust of the wire. |
-| **D-ENIP-5** | **Explicit correlation is `sender_context`-based with one in-flight request per session**; a reply whose context does not match the outstanding request is discarded (counted, logged), never delivered. Connected class-3 replies must match the connected-data sequence count or be discarded — a hard check, not a `debug_assert!`. | Fixes rseip's worst defect (silent wrong-tag values in release builds). One-in-flight keeps the model simple and is sufficient at adapter poll rates; pipelining is a v2 option the correlation design already permits (§10.3). |
-| **D-ENIP-6** | **Every request has a caller-supplied deadline enforced inside the session task**; on timeout the request completes `Err(Timeout)` and the session enters *stale-reply quarantine* (§10.4) rather than being torn down. | Isolated slowness must not cost a reconnect, but a late reply must never surface as an answer. Quarantine + context matching achieves both. |
-| **D-ENIP-7** | **Class-1 receive validation is mandatory**: CPF shape, connection-id lookup, size-vs-negotiated check, and 16-bit sequence acceptance via the signed-window rule `(new − last) as i16 > 0`; stale/duplicate/mis-sized frames are dropped **and counted**, never delivered and never silent. | EIPScanner swallows all three checks. Counters make the drops observable (the adapter surfaces them as metrics). |
-| **D-ENIP-8** | **I/O connection liveness is originator-monitored**: no valid T2O frame within `timeout_multiplier × T2O_API` ⇒ the connection is declared lost, a typed `Lost` event is emitted, and the connection is closed. Production continues at O2T API regardless of consumption. | The spec's inactivity watchdog, implemented on our side (EIPScanner's shape, made typed and non-silent). API values come from the ForwardOpen **reply** (actual PI), not the request. |
+| **D-ENIP-5** | **Explicit correlation matches the full reply header** with one in-flight request per session: `sender_context` **and** the encapsulation command **and** the session handle (the latter waived for the §5.2 discovery commands, which are sessionless-capable). A reply that fails any of those is discarded (counted, logged), never delivered. Connected class-3 replies must match the connected-data sequence count or be discarded — a hard check, not a `debug_assert!`. | Fixes rseip's worst defect (silent wrong-tag values in release builds). Context alone is not identity: a peer that echoes a context on the wrong command, or from a session we no longer own, must not be able to complete a request. One-in-flight keeps the model simple and is sufficient at adapter poll rates; pipelining is a v2 option the correlation design already permits (§10.3). |
+| **D-ENIP-6** | **Every request has a caller-supplied deadline enforced inside the session task**, bounding the **write** as well as the wait: the deadline is computed at enqueue, the actor hand-off and the frame write run under it, and a write that misses it is `ConnectionLost` (a cancelled write can leave a partial frame — framing is unrecoverable). On a read timeout the request completes `Err(Timeout)` and the session enters *stale-reply quarantine* (§10.4) rather than being torn down. Shutdown is bounded by fixed constants: 500 ms for the UnRegisterSession write, 2 s for the close hand-off. The caller's wait on the reply channel is a **liveness backstop**, not a second deadline: it sits one `REPLY_BACKSTOP_GRACE` (50 ms) past the deadline so the actor's classification — not a tie between two timers expiring on the same instant — is what the caller observes, at the cost of a request being able to complete up to 50 ms late. | Isolated slowness must not cost a reconnect, but a late reply must never surface as an answer, and an unbounded write to a stalled peer is the same hang the deadline exists to prevent. Quarantine + full-header matching achieves the first two; the fixed shutdown bounds ensure teardown cannot hang behind a wedged actor. |
+| **D-ENIP-7** | **Class-1 receive validation is mandatory**: CPF shape, connection-id lookup, size-vs-negotiated check, and 16-bit sequence acceptance via the signed-window rule `(new − last) as i16 > 0`; stale/duplicate/mis-sized frames are dropped **and counted**, never delivered and never silent. This extends to socket-level errors: every `recv_from`/`send_to` failure is counted (`recv_errors`/`send_errors`) and classified as per-datagram (survivable — `ConnectionReset`/`ConnectionRefused`/`ConnectionAborted`/`Interrupted`/`WouldBlock`) or socket-fatal. | EIPScanner swallows all three checks. Counters make the drops observable (the adapter surfaces them as metrics). A silently ignored socket error is the same defect one layer down: Windows' ICMP-driven `WSAECONNRESET` must not kill a healthy socket, and a genuinely broken socket must not look like silence. |
+| **D-ENIP-8** | **I/O connection liveness is originator-monitored**: no valid T2O frame within `timeout_multiplier × T2O_API` ⇒ the connection is declared lost, a typed `Lost` event is emitted, and the connection is closed. Production continues at O2T API regardless of consumption. A dead socket is the collective case: it emits `Lost { Io }` to **every** connection on it before the manager task exits. | The spec's inactivity watchdog, implemented on our side (EIPScanner's shape, made typed and non-silent). API values come from the ForwardOpen **reply** (actual PI), not the request. Connections share one socket, so its death is every connection's death — reporting it once, or not at all, would leave consumers waiting on a stream that can never produce again. |
 | **D-ENIP-9** | **The class-1 produce path always sends at the O2T API cadence** (data, or a heartbeat when the O2T size is 0), incrementing the encapsulation sequence every frame and the class-1 sequence count every produce. | The target runs the same watchdog against us; a paused/idle adapter that stops producing kills its own connection. Run/idle is signaled in the 32-bit header (§8.5), not by stopping. |
 | **D-ENIP-10** | **Frame order for class-1 connected data is `[u16 class-1 sequence][u32 run/idle header, if the format includes it][data]`** — sequence first. | ODVA Vol 2: the run/idle header is *inserted between the sequence count and the data*. EIPScanner encodes this correctly on produce but decodes header-first on consume — a reference bug we pin here so nobody "fixes" our order to match it. |
 | **D-ENIP-11** | **The crate exposes a bounds-checked `AssemblyLayout` helper (§9)** that maps raw assembly bytes ⇄ typed fields (offset/type/bit), but the *naming and configuration* of fields stays in the adapter. | Field extraction from hostile bytes belongs inside the fuzz boundary; signal semantics (names, UNS channels, deadbands) are adapter business the crate must not learn. |
 | **D-ENIP-12** | **Fragmented read/write is auto-driven inside the crate** (status `0x06` → continue at the next offset; writes chunked to the negotiated size), with a configurable `max_value_bytes` cap (default 1 MiB) bounding reassembly memory. | The caller asks for a tag and gets the whole value or a typed error. Wire-supplied sizes never drive unbounded allocation (§4). |
 | **D-ENIP-13** | **v1 restricts routing to port numbers ≤ 14** (covers backplane port 1 + slot, the only routed path the adapter exposes). The extended-port encoding is implemented per spec but gated behind a conformance vector captured from real routed hardware before it is enabled. | The references disagree on extended-port byte order and we have no routed device to arbitrate; shipping an unverified encoding of a rarely-used path is how wire bugs are born. Declared limitation, not silent. |
 | **D-ENIP-14** | **The crate ships NO embedded test target.** Session/connection state-machine tests run over in-memory `tokio::io::duplex` byte-stream fixtures — the session actor is generic over `AsyncRead + AsyncWrite`, so a fixture deterministically injects wrong-`sender_context`, stale, fragmented, and sequence-mismatch frames a real device cannot be scripted to send. Real device behavior is validated against the EXTERNAL cpppo (poll) and OpENer (push) containers in the adapter's integration suite (§12.5). | Keeps every device simulator external to match reality (user decision) while preserving deterministic adversarial testing via raw-byte fixtures: the duplex fixture is a byte pipe, not a peer implementation, so a decoder bug can never be masked by a matching encoder bug in an in-crate double. (The earlier `testserver` in-crate target idea was dropped for this reason — there is no `testserver` module or feature.) |
+| **D-ENIP-16** | **ForwardOpen success replies are verified before use** — originator echo quad equality (T→O connection id, connection serial, vendor id, originator serial) plus, for class-1, an API range of [100 µs, 600 s]; failure ⇒ best-effort ForwardClose + typed error. | An unvalidated reply API of 0 previously livelocked the produce scheduler; an unverified echo can bind a connection to the wrong identity. The target-assigned O→T id is excluded because the request sends 0 and the choice is the target's. |
 
 ---
 
@@ -593,7 +594,7 @@ path; all LE):
 | 1 | priority/time_tick | u8 |
 | 2 | timeout_ticks | u8 |
 | 3 | O→T connection id (0 — target assigns for P2P O→T) | u32 |
-| 4 | T→O connection id (originator-chosen, unique per live connection: `incarnation << 16 \| counter`) | u32 |
+| 4 | T→O connection id (originator-chosen: `rand::random::<u32>() \| 1`, so it is non-zero and collides only by chance across originators) | u32 |
 | 5 | connection serial number (unique per originator) | u16 |
 | 6 | originator vendor id | u16 |
 | 7 | originator serial number | u32 |
@@ -613,6 +614,22 @@ app bytes`. **The APIs (actual packet intervals) from the reply — not the requ
 the produce timer and the timeout watchdog.** The reply CPF may carry Sockaddr Info items
 (§5.4): an O→T sockaddr redirects our transmit endpoint (port, and address unless `0.0.0.0`); a
 T→O sockaddr with a multicast address is the group to join for multicast consumption.
+
+The client verifies a success reply before arming anything: the echoed T→O connection id,
+connection serial, vendor id, and originator serial must equal the request's
+(`verify_forward_open_echo`), and for class-1 both reply APIs must lie within [100 µs, 600 s]
+(`validate_reply_apis` — a zero or absurd API is a protocol violation, not a timer input). Class-3
+verifies the echo only; its timing is not API-driven. The target-assigned O→T connection id is
+deliberately outside the check: the request sends 0 and whatever the target picks is legitimate.
+
+**Any failure after a successful ForwardOpen issues a best-effort ForwardClose** before the typed
+error propagates. Past the target's success reply the target believes a connection is open and
+produces into it until its own watchdog expires, so every remaining failure path tears it down: a
+reply that fails echo verification, a reply whose APIs are out of range, an O→T transmit endpoint
+that cannot be resolved (no usable sockaddr and no known target address), and a manager task that has
+already exited so the connection could never be serviced. The ForwardClose is best-effort throughout
+— its encode, round trip, and reply status are all discarded, because the caller is already leaving
+with a more specific error that must not be replaced.
 
 Failure reply (non-zero status): `u16 serial, u16 vendor, u32 orig serial, u8
 remaining_path_size, u8 reserved` — surfaced as `EnipError::ForwardOpenRejected { status,
@@ -675,19 +692,31 @@ watchdog → deliver `IoEvent::Data { data, run_mode, class1_seq, encap_seq, rec
 connection's channel (bounded; overflow = `overflowed_events` counter + latest-wins, telemetry
 prefers fresh data over backpressure).
 
+**Socket errors are counted and classified, never swallowed.** Every `recv_from` failure increments
+`recv_errors`. Per-datagram kinds (`ConnectionReset` — the Windows ICMP port-unreachable case —
+`ConnectionRefused`, `ConnectionAborted`, `Interrupted`, `WouldBlock`) are survivable drops: they
+concern one datagram, not the socket, so they reset the fatal streak and the loop continues. Three
+consecutive errors of any other kind declare the socket dead: `IoEvent::Lost { reason: Io }` fans
+out to **every** registered connection and the manager task exits. `Lost` delivery is best-effort;
+the event channel closing is the authoritative terminal signal.
+
 **Watchdog (D-ENIP-8):** per connection, a deadline of `multiplier × T2O_API` refreshed on every
 *accepted* frame; expiry ⇒ `IoEvent::Lost { reason: Timeout }`, connection removed, best-effort
 ForwardClose over the TCP session. The first accepted frame after open emits `IoEvent::Up`.
 
 ### 8.7 Produce loop
 
-Per connection, a `tokio::time::interval` at the **O→T API** with
-`MissedTickBehavior::Skip` (skipped ticks increment `produce_overruns`): build frame
-(encap sequence `+1` every send; class-1 sequence `+1` every send, skipping 0 on wrap), encode
-current output buffer + run/idle bit, `send_to` the connection's transmit endpoint. The output
-buffer is set via `IoConnectionHandle::set_output(bytes)` (validated against the negotiated O→T
-data size) and `set_run(bool)`; a heartbeat connection sends the seq-only frame. Production never
-stops while the connection is open (D-ENIP-9) — run/idle conveys intent.
+Per connection, a schedule at the **O→T API** with `MissedTickBehavior::Skip` semantics (skipped
+ticks increment `produce_overruns`): build frame (encap sequence `+1` every send; class-1 sequence
+`+1` every send, skipping 0 on wrap), encode current output buffer + run/idle bit, `send_to` the
+connection's transmit endpoint; `frames_produced` counts only frames actually sent. A failed send is
+counted (`send_errors`) and classified like the receive side; three consecutive non-survivable send
+failures declare that connection `Lost { reason: Io }`. Per-datagram send failures never contribute
+to that streak — a dead target is the T→O watchdog's verdict to render, not the send path's. The
+catch-up computation is arithmetic (O(1)), never a per-tick loop. The output buffer is set via
+`IoConnectionHandle::set_output(bytes)` (validated against the negotiated O→T data size) and
+`set_run(bool)`; a heartbeat connection sends the seq-only frame. Production never stops while the
+connection is open (D-ENIP-9) — run/idle conveys intent.
 
 ### 8.8 ForwardClose (0x4E)
 
@@ -765,6 +794,9 @@ etc.) are *values* to the adapter (BAD samples), not session failures — the cr
 - A malformed **reply to my request** fails that request only; the session survives unless framing
   itself is broken (unrecoverable stream position ⇒ `ConnectionLost`).
 - A malformed **UDP datagram** never affects any connection (dropped + counted, §8.6).
+- A socket-level UDP error is counted (`recv_errors`/`send_errors`); per-datagram errors never
+  affect any connection; a dead socket loses **all** its connections with a typed `Lost{Io}`, never
+  silently.
 - Peer-driven counters (`stale_frames`, `malformed_frames`, …) are exposed on the handles
   (`stats()`), so the adapter can alarm on a noisy/hostile peer without the crate knowing what an
   alarm is.
@@ -773,21 +805,47 @@ etc.) are *values* to the adapter (BAD samples), not session failures — the cr
 
 `sender_context` carries a session-scoped monotonically increasing `u64` (LE in the 8-byte field).
 The session task holds at most **one** outstanding request `{context, deadline, reply_tx}`. Reader
-loop, per inbound frame: match command + context → complete the request; context mismatch → the
-frame is a **stale reply** (from a timed-out predecessor): increment `stale_replies`, log at debug,
-drop. Class-3 additionally matches the connected-data sequence count (hard `Err`-on-mismatch →
-drop + count, never `debug_assert!`).
+loop, per inbound frame: a reply completes the outstanding request iff its `sender_context`, its
+command, and (for session-scoped `SendRRData`/`SendUnitData`) its session handle all match;
+discovery replies (`ListIdentity`/`ListServices`/`ListInterfaces`) are exempt from the handle check
+(§5.2 — sessionless-capable; live targets answer with handle 0). Any non-matching frame is discarded
+and counted (`stale_replies`); a context-matched frame with a wrong command or handle is
+additionally logged at warn. Class-3 additionally matches the connected-data sequence count (hard
+`Err`-on-mismatch → drop + count, never `debug_assert!`).
 
 ### 10.4 Timeouts & stale-reply quarantine (D-ENIP-6)
 
-Every public call runs under a deadline (`ClientOptions.request_timeout`, caller-overridable
-per call). On expiry the caller gets `Err(Timeout)` immediately, and the session notes the
-timed-out context. Because TCP guarantees ordering, the session remains usable: a later reply
-bearing the old context is dropped by §10.3. If **three consecutive** requests time out
+Every public call runs under a deadline taken from `ClientOptions.request_timeout` — one value per
+client; the API exposes no per-call override. On expiry the request completes `Err(Timeout)` and the
+session notes the timed-out context. Because TCP guarantees ordering, the session remains usable: a
+later reply bearing the old context is dropped by §10.3. If **three consecutive** requests time out
 (configurable), the session declares itself dead (`ConnectionLost`) — sustained silence means the
 peer or path is gone, and the adapter's reconnect ladder takes over. There is no state in which a
 late reply can complete a newer request: contexts never repeat (u64), and the map from context to
 waiter is removed at timeout.
+
+Deadlines bound the **write** side too: the deadline is computed at enqueue (queue wait counts), the
+actor hand-off and the frame write run under `timeout_at`, and a write that cannot complete by the
+deadline severs the session as `ConnectionLost` (a cancelled `write_all` may leave a partial frame —
+framing is unrecoverable). A transaction dequeued past its deadline completes `Err(Timeout)` without
+touching the stream and without counting toward the consecutive-timeout ladder; one whose caller has
+gone is skipped.
+
+**Two clocks, one authority.** The session actor is the authority on *which* failure an elapsed
+deadline is: an ordinary per-request `Timeout`, the third consecutive strike (`ConnectionLost`), or a
+write that stalled mid-frame and desynchronised the stream (`ConnectionLost`). Every other bound in
+the path sits exactly at the deadline: the caller's hand-off into the actor's queue (which the actor
+never sees, so a bare `Timeout` is the whole truth there), the dequeue triage, the write, and the
+read. The caller's wait on the reply
+channel is therefore not a second deadline but a *liveness backstop* against an actor that never
+answers at all, and it is set at `deadline + REPLY_BACKSTOP_GRACE` (50 ms). Were the two timers on
+the same instant, the caller's — registered first, and so fired first — would pre-empt the actor at
+every deadline and collapse every failure class into a bare `Timeout`; the grace makes the actor's
+verdict, not a tie, what the caller observes. The accepted consequence is that a request can
+observably complete up to 50 ms past its deadline. Both caller-side bounds (the enqueue wait and the
+reply backstop) increment `timeouts` when they fire — no timeout path is silent (§10.2). Fixed
+constants: `UNREGISTER_WRITE_DEADLINE` = 500 ms, `CLOSE_HANDOFF_DEADLINE` = 2 s,
+`REPLY_BACKSTOP_GRACE` = 50 ms.
 
 Class-1 has its own liveness (§8.6 watchdog); UnRegisterSession/ForwardClose during shutdown are
 best-effort with a short fixed deadline so shutdown never hangs.
@@ -864,8 +922,10 @@ while let Some(ev) = conn.events().recv().await {
 conn.close(&client).await;
 ```
 
-Everything is deadline-bounded, returns `Result<_, EnipError>`, and is documented with rustdoc
-(`//!`/`///` per org convention, `cargo doc` clean).
+Everything is deadline-bounded — including writes, connect/close, shutdown, and the TLS handshake at
+both `connect_tls` and the `connect_tls_over` stream-injection entry point — returns
+`Result<_, EnipError>`, and is documented with rustdoc (`//!`/`///` per org convention, `cargo doc`
+clean).
 
 ---
 
