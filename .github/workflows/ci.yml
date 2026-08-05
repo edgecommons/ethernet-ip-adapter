@@ -132,7 +132,11 @@ jobs:
           tool: cargo-fuzz
       - name: Build every fuzz target (a target that stops compiling is a defect)
         working-directory: crates/enip
-        run: cargo +nightly fuzz build
+        # Name the target triple explicitly. cargo-fuzz otherwise defaults to the triple of its own
+        # binary, and the installed binary is a static musl build — so it asks the nightly toolchain
+        # for a musl std that `--profile minimal` never installed and dies on `can't find crate for
+        # core`.
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: Smoke-run representative targets over the checked-in corpus + regressions
         working-directory: crates/enip
         # Three targets spanning the highest-value hostile surfaces (§12.3): TCP framing, the runt
@@ -142,6 +146,6 @@ jobs:
         run: |
           for target in fuzz_encap_frame fuzz_io_frame fuzz_message_reply; do
             echo "::group::fuzz smoke: $target"
-            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=30
             echo "::endgroup::"
           done
