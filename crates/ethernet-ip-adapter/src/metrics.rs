@@ -229,6 +229,8 @@ pub fn family_defs() -> Vec<FamilyDef> {
     io.extend(pair("malformedFrames"));
     io.extend(pair("ioTimeouts"));
     io.extend(pair("produceOverruns"));
+    io.extend(pair("sendErrors"));
+    io.extend(pair("recvErrors"));
     io.push(m("interFrameMs", UNIT_MS, 1));
     io.push(m("runMode", UNIT_COUNT, 1));
     out.push(FamilyDef { name: IO.to_string(), dimensions: dims(&["instance"]), measures: io });
@@ -425,6 +427,8 @@ struct IoCounters {
     malformed_frames: Pair,
     io_timeouts: Pair,
     produce_overruns: Pair,
+    send_errors: Pair,
+    recv_errors: Pair,
     inter_frame_ms: f64,
     run_mode: bool,
     last_seq: Option<u16>,
@@ -437,6 +441,8 @@ struct IoCounters {
     last_stats_size_mismatch: u64,
     last_stats_malformed: u64,
     last_stats_produce_overruns: u64,
+    last_stats_send_errors: u64,
+    last_stats_recv_errors: u64,
     /// Negotiated APIs from the ForwardOpen reply (ms), surfaced by `sb/status` (§7.1).
     o2t_api_ms: u32,
     t2o_api_ms: u32,
@@ -456,6 +462,8 @@ impl IoCounters {
         self.malformed_frames.drain_into(&mut v, "malformedFrames");
         self.io_timeouts.drain_into(&mut v, "ioTimeouts");
         self.produce_overruns.drain_into(&mut v, "produceOverruns");
+        self.send_errors.drain_into(&mut v, "sendErrors");
+        self.recv_errors.drain_into(&mut v, "recvErrors");
         v.insert("interFrameMs".to_string(), self.inter_frame_ms);
         v.insert("runMode".to_string(), f64::from(u8::from(self.run_mode)));
         v
@@ -906,6 +914,8 @@ impl DeviceMetrics {
             "framesConsumed": pair(&io.frames_consumed),
             "staleDropped": pair(&io.stale_frames_dropped),
             "sequenceGaps": pair(&io.sequence_gaps),
+            "sendErrors": pair(&io.send_errors),
+            "recvErrors": pair(&io.recv_errors),
         })
     }
 
@@ -947,6 +957,8 @@ impl DeviceMetrics {
         feed(&mut io.size_mismatch_dropped, &mut io.last_stats_size_mismatch, s.size_mismatch);
         feed(&mut io.malformed_frames, &mut io.last_stats_malformed, s.malformed_frames);
         feed(&mut io.produce_overruns, &mut io.last_stats_produce_overruns, s.produce_overruns);
+        feed(&mut io.send_errors, &mut io.last_stats_send_errors, s.send_errors);
+        feed(&mut io.recv_errors, &mut io.last_stats_recv_errors, s.recv_errors);
     }
 
     /// The class-1 connection was lost (watchdog / peer close, §8.8): a watchdog expiry is an
@@ -964,6 +976,8 @@ impl DeviceMetrics {
         inner.io.last_stats_size_mismatch = 0;
         inner.io.last_stats_malformed = 0;
         inner.io.last_stats_produce_overruns = 0;
+        inner.io.last_stats_send_errors = 0;
+        inner.io.last_stats_recv_errors = 0;
     }
 
     // ---- definition + emission ----
@@ -1364,7 +1378,7 @@ mod tests {
         let mut io = vec![g("ioConnectionState", "Count", 1)];
         for p in ["forwardOpens", "forwardOpenFailures", "framesConsumed", "framesProduced",
                   "staleFramesDropped", "sequenceGaps", "sizeMismatchDropped", "malformedFrames",
-                  "ioTimeouts", "produceOverruns"] { io.extend(cp(p)); }
+                  "ioTimeouts", "produceOverruns", "sendErrors", "recvErrors"] { io.extend(cp(p)); }
         io.push(g("interFrameMs", "Milliseconds", 1));
         io.push(g("runMode", "Count", 1));
         expected.push((IO, vec!["instance"], io));
@@ -1508,6 +1522,7 @@ mod tests {
             malformed_frames: 0,
             produce_overruns: 3,
             sequence_gaps: 9, // sequenceGaps is fed from frame deltas, not this path — must not double-count
+            ..Default::default()
         });
         m.emit_io(false).await;
         // A second snapshot: counters advanced (cumulative).
@@ -1518,6 +1533,7 @@ mod tests {
             malformed_frames: 1,
             produce_overruns: 3,
             sequence_gaps: 20,
+            ..Default::default()
         });
         m.emit_io(false).await;
 
@@ -1557,6 +1573,79 @@ mod tests {
         };
         assert_eq!(last["framesProducedInterval"], 5.0, "reconnect counts fold in from 0");
         assert_eq!(last["framesProducedTotal"], 30.0, "total stays monotonic across the reconnect");
+    }
+
+    /// The §8.8 IO family carries the class-1 socket-error pairs, so what the stack counts as
+    /// `sendErrors`/`recvErrors` is an emittable measure and not a seam field that dead-ends.
+    #[test]
+    fn io_family_carries_send_and_recv_error_pairs() {
+        let fam = family_defs()
+            .into_iter()
+            .find(|f| f.name == IO)
+            .expect("EtherNetIpIo is defined");
+        let got: BTreeSet<(String, String, u32)> =
+            fam.measures.iter().map(|x| (x.name.clone(), x.unit.clone(), x.res)).collect();
+        for want in ["sendErrorsTotal", "sendErrorsInterval", "recvErrorsTotal", "recvErrorsInterval"] {
+            assert!(
+                got.contains(&(want.to_string(), UNIT_COUNT.to_string(), 60)),
+                "EtherNetIpIo carries the {want} Count measure"
+            );
+        }
+    }
+
+    /// The class-1 socket-error counters fold into `EtherNetIpIo` as deltas of a cumulative snapshot,
+    /// and a lost link re-bases them so the next connection's counts accrue from 0 — the same
+    /// contract the produce/drop counters follow.
+    #[tokio::test]
+    async fn record_io_stats_folds_send_recv_deltas_and_reset() {
+        use crate::device::IoLinkStats;
+        let (svc, m) = dm(push_device());
+
+        m.record_io_stats(IoLinkStats { send_errors: 4, recv_errors: 1, ..Default::default() });
+        m.emit_io(false).await;
+        // Cumulative: sends advanced by 3, receives unchanged.
+        m.record_io_stats(IoLinkStats { send_errors: 7, recv_errors: 1, ..Default::default() });
+        m.emit_io(false).await;
+
+        let io_emits: Vec<HashMap<String, f64>> = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted.iter().filter(|(n, _)| n == IO).map(|(_, v)| v.clone()).collect()
+        };
+        assert_eq!(io_emits.len(), 2, "two EtherNetIpIo emits");
+        assert_eq!(io_emits[0]["sendErrorsTotal"], 4.0);
+        assert_eq!(io_emits[0]["sendErrorsInterval"], 4.0);
+        assert_eq!(io_emits[0]["recvErrorsTotal"], 1.0);
+        assert_eq!(io_emits[1]["sendErrorsTotal"], 7.0, "4 + (7-4)");
+        assert_eq!(io_emits[1]["sendErrorsInterval"], 3.0, "delta only");
+        assert_eq!(io_emits[1]["recvErrorsInterval"], 0.0, "unchanged since the last read");
+
+        // A lost link rebases both baselines: the next connection's lower cumulative snapshot folds
+        // in from 0 rather than going negative.
+        m.on_io_lost();
+        m.record_io_stats(IoLinkStats { send_errors: 2, recv_errors: 1, ..Default::default() });
+        m.emit_io(false).await;
+        let last = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted.iter().rev().find(|(n, _)| n == IO).map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(last["sendErrorsInterval"], 2.0, "reconnect counts fold in from 0");
+        assert_eq!(last["sendErrorsTotal"], 9.0, "total stays monotonic across the reconnect");
+        assert_eq!(last["recvErrorsInterval"], 1.0, "reconnect counts fold in from 0");
+        assert_eq!(last["recvErrorsTotal"], 2.0);
+    }
+
+    /// The push `sb/status` `io` object reports the socket-error pairs alongside the frame counters.
+    #[test]
+    fn io_view_reports_send_and_recv_errors() {
+        use crate::device::IoLinkStats;
+        let (_svc, m) = dm(push_device());
+        m.record_io_stats(IoLinkStats { send_errors: 3, recv_errors: 2, ..Default::default() });
+
+        let iov = m.io_view();
+        assert_eq!(iov["sendErrors"]["total"], 3.0);
+        assert_eq!(iov["sendErrors"]["interval"], 3.0);
+        assert_eq!(iov["recvErrors"]["total"], 2.0);
+        assert_eq!(iov["recvErrors"]["interval"], 2.0);
     }
 
     #[tokio::test]

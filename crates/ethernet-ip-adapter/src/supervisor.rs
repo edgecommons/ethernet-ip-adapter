@@ -10,16 +10,16 @@
 //! integration suites (§11) and the S9 deployed regression, exactly as `file-replicator` validates its
 //! `dest/*/client.rs` seams). The pure decisions it composes are tested in their home modules.
 
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use edgecommons::prelude::*;
-use serde_json::json;
+use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 use crate::app::{
-    connect_reason, connectivity_of, rand01, serve_control_disconnected, Backoff, DeviceControl,
+    connect_reason, rand01, serve_control_disconnected, Backoff, DeviceControl, DisconnectedWait,
     EventSink, Health, LinkState,
 };
 use crate::config::{DeviceConfig, DeviceMode, GlobalConfig};
@@ -91,23 +91,63 @@ impl App {
     }
 
     pub async fn run(&self, gg: &EdgeCommons) -> anyhow::Result<()> {
-        // One control channel per device. The command inbox cannot touch the session directly — the
-        // session lives in the device's own task and is not `Sync` — so every session-touching verb is
-        // *sent* to that task as a [`DeviceControl`], which serializes it against the poll/push loop.
-        let mut controls: HashMap<String, tokio::sync::mpsc::Sender<DeviceControl>> = HashMap::new();
-        // Each device's config/health/metrics, shared with the command surface (routing, allow-list,
-        // status snapshot) and — for health — the connectivity provider.
-        let mut handles: Vec<crate::commands::DeviceHandle> = Vec::new();
-        let mut reported: Vec<(DeviceConfig, Arc<Health>)> = Vec::new();
+        // The live per-instance registry (§10.3, D-EIP-27): the ONE source of truth for the
+        // connectivity provider, the command surface, and the shutdown drain.
+        let registry = Arc::new(crate::lifecycle::DeviceRegistry::default());
+        registry.set_global(Arc::clone(&self.global));
+        // The app-wide cancellation root. Every instance runs under a child of it, so one `cancel()`
+        // reaches every device task, and each instance can still be stopped on its own.
+        let root = CancellationToken::new();
+        let budget = crate::lifecycle::stop_budget(&self.global.timeouts);
 
+        // Startup is fallible while instances are ALREADY running (facade minting, command
+        // registration), so its error takes the same bounded teardown as a signalled shutdown before
+        // it propagates: a failed start must not leave device tasks polling and publishing with
+        // their sessions unclosed (§10.3, D-EIP-27).
+        crate::lifecycle::stop_on_startup_error(
+            self.start_instances(gg, &registry, &root),
+            &registry,
+            &root,
+            budget,
+        )
+        .await?;
+
+        gg.shutdown_signal().await;
+        tracing::info!("shutdown signal received; stopping device tasks");
+        let report = crate::lifecycle::shutdown_all(&registry, &root, budget).await;
+        tracing::info!(
+            joined = report.joined,
+            aborted = report.aborted,
+            budget_ms = budget.as_millis() as u64,
+            "device teardown complete"
+        );
+        self.metrics.flush_metrics().await.ok();
+        Ok(())
+    }
+
+    /// Launch every configured instance into `registry` under a child of `root`, then publish the
+    /// two surfaces that read it (the connectivity provider and the `sb/*` command surface).
+    ///
+    /// Fallible, and deliberately *only* fallible: whatever it has already launched is live by the
+    /// time it can fail, so its `Err` is routed through
+    /// [`crate::lifecycle::stop_on_startup_error`] rather than returned to the caller directly.
+    fn start_instances(
+        &self,
+        gg: &EdgeCommons,
+        registry: &Arc<crate::lifecycle::DeviceRegistry>,
+        root: &CancellationToken,
+    ) -> anyhow::Result<()> {
         for device in &self.devices {
             let instance = gg.instance(&device.id)?;
+            let cancel = root.child_token();
 
+            // One control channel per device. The command inbox cannot touch the session directly —
+            // the session lives in the device's own task and is not `Sync` — so every
+            // session-touching verb is *sent* to that task as a [`DeviceControl`], which serializes
+            // it against the poll/push loop.
             let (control_tx, control_rx) = tokio::sync::mpsc::channel::<DeviceControl>(16);
-            controls.insert(device.id.clone(), control_tx.clone());
 
             let health = Arc::new(Health::default());
-            reported.push((device.clone(), Arc::clone(&health)));
 
             // The full §8 metric set for this device, dimensioned BY INSTANCE (a fleet view can show
             // one device down without averaging it away): the mandatory `southbound_health` plus the
@@ -124,13 +164,19 @@ impl App {
 
             let events: Arc<dyn EventSink> = Arc::new(FacadeEventSink(instance.events()));
 
-            handles.push(crate::commands::DeviceHandle {
+            // The routing view the command surface reads (routing, allow-list, status snapshot) and
+            // the connectivity provider samples.
+            let handle = crate::commands::DeviceHandle {
                 cfg: device.clone(),
                 control: control_tx.clone(),
                 health: Arc::clone(&health),
                 dm: Arc::clone(&dm),
                 events: Arc::clone(&events),
-            });
+            };
+
+            // The supervision view: every spawned task's join handle, so shutdown can actually wait
+            // for the session closes instead of discarding them (F4).
+            let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             // CIP Security Phase 2b: a per-instance cert-lifecycle task for a TLS poll device watches
             // the vault for a rotated client cert / trust store and cert-expiry threshold crossings,
@@ -141,17 +187,18 @@ impl App {
                     .flatten()
                     .is_some_and(|s| s.is_tls());
             if tls_poll {
-                tokio::spawn(security_lifecycle_inner(
+                tasks.push(tokio::spawn(security_lifecycle_inner(
                     device.clone(),
                     self.creds.clone(),
                     control_tx,
                     Arc::clone(&events),
                     Arc::clone(&dm),
                     Some(Arc::clone(&health)),
-                ));
+                    cancel.clone(),
+                )));
             }
 
-            tokio::spawn(run_device(
+            tasks.push(tokio::spawn(run_device(
                 device.clone(),
                 Arc::clone(&self.global),
                 instance.data(),
@@ -160,28 +207,33 @@ impl App {
                 health,
                 control_rx,
                 self.creds.clone(),
-            ));
+                cancel.clone(),
+            )));
+
+            registry.insert(crate::lifecycle::DeviceRuntime {
+                handle,
+                raw: self
+                    .config
+                    .instance(&device.id)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                cancel,
+                tasks,
+            });
         }
 
         // ONE provider, TWO surfaces: the library pushes this sample into the `state` keepalive's
-        // `instances[]` every tick, and returns the same sample from the built-in `status` verb.
-        let provider: Arc<InstanceConnectivityProvider> = Arc::new(move || {
-            reported
-                .iter()
-                .map(|(cfg, health)| connectivity_of(cfg, health))
-                .collect()
-        });
+        // `instances[]` every tick, and returns the same sample from the built-in `status` verb. It
+        // reads the registry, so it reports what is actually running.
+        let reg = Arc::clone(registry);
+        let provider: Arc<InstanceConnectivityProvider> = Arc::new(move || reg.connectivity());
         gg.set_instance_connectivity_provider(Some(provider));
 
         // The full southbound command surface (§7): all nine `sb/*` verbs + the three edge-console
         // panels, mode-aware, with instance routing and the §7.1 error codes.
         if let Some(commands) = gg.commands() {
-            crate::commands::register_all(&commands, handles, Arc::clone(&self.global))?;
+            crate::commands::register_all(&commands, registry.handles(), Arc::clone(&self.global))?;
         }
-
-        gg.shutdown_signal().await;
-        tracing::info!("shutdown signal received");
-        self.metrics.flush_metrics().await.ok();
         Ok(())
     }
 }
@@ -210,6 +262,11 @@ impl EventSink for FacadeEventSink {
 /// drops out of the poll loop and back into connect — which is the only place that knows how to
 /// back off. An explicit `reconnect` short-circuits the backoff; `pause`/`resume` are serviced in
 /// both the loop and the backoff wait, so they take effect whether the device is up or reconnecting.
+///
+/// `cancel` is this instance's child of the app root token (§10.3): every wait selects on it, and
+/// the driver closes the session before returning, so a teardown reaches the wire (UnRegisterSession
+/// / ForwardClose) instead of dropping the socket. A cancelled exit raises no alarm, emits no event,
+/// and never backs off — the link did not fail, the instance was stopped.
 #[allow(clippy::too_many_arguments)]
 async fn run_device(
     cfg: DeviceConfig,
@@ -220,6 +277,7 @@ async fn run_device(
     health: Arc<Health>,
     mut control: tokio::sync::mpsc::Receiver<DeviceControl>,
     creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
+    cancel: CancellationToken,
 ) {
     let backend: Box<dyn DeviceBackend> = match cfg.adapter.as_str() {
         // The in-process simulator — `cargo run` works with no PLC / no OpENer (the runnable configs
@@ -260,6 +318,7 @@ async fn run_device(
             backoff,
             connect_timeout,
             &mut control,
+            &cancel,
         )
         .await;
         return;
@@ -274,7 +333,13 @@ async fn run_device(
         // Connect within the configured deadline (§4.1 connectMs).
         dm.on_connect_attempt();
         let started = Instant::now();
-        let outcome = tokio::time::timeout(connect_timeout, backend.connect(&cfg.connection)).await;
+        // No session is open yet, so a cancel here has nothing to close: drop the connect future and
+        // leave (the enip connect is itself deadline-bounded; the half-open socket dies with RAII).
+        let outcome = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            o = tokio::time::timeout(connect_timeout, backend.connect(&cfg.connection)) => o,
+        };
 
         match outcome {
             Ok(Ok(session)) => {
@@ -342,12 +407,15 @@ async fn run_device(
                     &mut control,
                     events.as_ref(),
                     keepalive_ms,
+                    &cancel,
                 )
                 .await;
 
                 dm.on_connection_dropped(Instant::now());
                 health.set_security(None);
                 match exit {
+                    // The driver already closed the session on its way out — nothing to reconnect.
+                    crate::poll_driver::PollExit::Stopped => return,
                     crate::poll_driver::PollExit::LinkLost => {
                         health.set_link(LinkState::Backoff);
                         health.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -361,10 +429,14 @@ async fn run_device(
                             )
                             .await;
                         let wait = backoff.delay(attempt, rand01());
-                        if let Some(reply) =
-                            serve_control_disconnected(&mut control, &cfg, &health, &dm, events.as_ref(), wait).await
+                        match serve_control_disconnected(
+                            &mut control, &cfg, &health, &dm, events.as_ref(), wait, &cancel,
+                        )
+                        .await
                         {
-                            pending_reconnect = Some(reply);
+                            DisconnectedWait::Stopped => return,
+                            DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
+                            DisconnectedWait::Elapsed => {}
                         }
                         attempt = attempt.saturating_add(1);
                     }
@@ -415,10 +487,14 @@ async fn run_device(
                     wait_ms = wait.as_millis() as u64, "connect failed"
                 );
                 attempt = attempt.saturating_add(1);
-                if let Some(reply) =
-                    serve_control_disconnected(&mut control, &cfg, &health, &dm, events.as_ref(), wait).await
+                match serve_control_disconnected(
+                    &mut control, &cfg, &health, &dm, events.as_ref(), wait, &cancel,
+                )
+                .await
                 {
-                    pending_reconnect = Some(reply);
+                    DisconnectedWait::Stopped => return,
+                    DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
+                    DisconnectedWait::Elapsed => {}
                 }
             }
         }
@@ -441,7 +517,13 @@ async fn run_device(
 /// driver only performs the I/O.
 /// The lifecycle body (Phase 2b rotation/expiry + Phase 2c EST enroll/renew), parameterized on an
 /// optional shared [`crate::app::Health`] so the EST state can be surfaced on `sb/status.security.est`.
-#[allow(clippy::too_many_lines)]
+///
+/// `cancel` ends the task at the tick boundary (§10.3). A cancel landing **mid-EST-exchange** (itself
+/// bounded at 20 s) is deliberately not selected against; that task is instead reaped by
+/// [`crate::lifecycle::stop_tasks`]'s abort at the end of the teardown budget. That is safe: the EST
+/// client holds no device session, its vault write is atomic in the credential service, and
+/// enrollment is idempotent — an interrupted exchange simply re-enrolls on the next start.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn security_lifecycle_inner(
     cfg: DeviceConfig,
     creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
@@ -449,6 +531,7 @@ async fn security_lifecycle_inner(
     events: Arc<dyn EventSink>,
     dm: Arc<crate::metrics::DeviceMetrics>,
     health: Option<Arc<crate::app::Health>>,
+    cancel: CancellationToken,
 ) {
     use crate::eip::est::{enroll_once, next_renew_rfc3339, EstDecision, EstScheduler, EstStatus};
     use crate::eip::rotation::{read_reload_state, CertWatcher, WatchAction};
@@ -497,7 +580,11 @@ async fn security_lifecycle_inner(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
         let now = time::OffsetDateTime::now_utc();
 
         // ---- Phase 2c: EST enrollment/renewal, BEFORE the rotation re-read so a fresh enrollment's
@@ -675,6 +762,7 @@ async fn run_push(
     backoff: Backoff,
     connect_timeout: Duration,
     control: &mut tokio::sync::mpsc::Receiver<DeviceControl>,
+    cancel: &CancellationToken,
 ) {
     let Some(io) = cfg.io.clone() else {
         tracing::error!(instance = %cfg.id, "push device has no io block");
@@ -688,8 +776,12 @@ async fn run_push(
         health.set_link(LinkState::Connecting);
         dm.on_connect_attempt();
         let started = Instant::now();
-        let outcome =
-            tokio::time::timeout(connect_timeout, backend.open_push(&cfg.connection, &io)).await;
+        // No class-1 connection is open yet, so a cancel here has nothing to ForwardClose.
+        let outcome = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            o = tokio::time::timeout(connect_timeout, backend.open_push(&cfg.connection, &io)) => o,
+        };
         match outcome {
             Ok(Ok(mut session)) => {
                 attempt = 0;
@@ -711,12 +803,16 @@ async fn run_push(
                     health,
                     backend.kind(),
                     control,
+                    cancel,
                 )
                 .await;
+                // Unconditional, and therefore also the teardown path: ForwardClose + the class-1
+                // socket release happen before this task returns.
                 session.close().await;
 
                 dm.on_connection_dropped(Instant::now());
                 match exit {
+                    crate::push_driver::PushExit::Stopped => return,
                     crate::push_driver::PushExit::LinkLost => {
                         health.set_link(LinkState::Backoff);
                         health.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -730,10 +826,14 @@ async fn run_push(
                             )
                             .await;
                         let wait = backoff.delay(attempt, rand01());
-                        if let Some(reply) =
-                            serve_control_disconnected(control, cfg, health, dm, events, wait).await
+                        match serve_control_disconnected(
+                            control, cfg, health, dm, events, wait, cancel,
+                        )
+                        .await
                         {
-                            pending_reconnect = Some(reply);
+                            DisconnectedWait::Stopped => return,
+                            DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
+                            DisconnectedWait::Elapsed => {}
                         }
                         attempt = attempt.saturating_add(1);
                     }
@@ -763,10 +863,12 @@ async fn run_push(
                     wait_ms = wait.as_millis() as u64, "push open failed"
                 );
                 attempt = attempt.saturating_add(1);
-                if let Some(reply) =
-                    serve_control_disconnected(control, cfg, health, dm, events, wait).await
+                match serve_control_disconnected(control, cfg, health, dm, events, wait, cancel)
+                    .await
                 {
-                    pending_reconnect = Some(reply);
+                    DisconnectedWait::Stopped => return,
+                    DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
+                    DisconnectedWait::Elapsed => {}
                 }
             }
         }

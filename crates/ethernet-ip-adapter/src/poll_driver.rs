@@ -23,14 +23,19 @@ use crate::metrics::{DeviceMetrics, RESULT_ERROR, RESULT_SUCCESS};
 use crate::poll::{process_group, record_cycle};
 use crate::publish::{self, Engine};
 
-/// How [`poll_until_disconnected`] left the poll loop (§7.5, §10.2). The supervisor
-/// ([`crate::supervisor`]) reconnects on either — but an explicit `reconnect` skips the backoff + the
-/// unreachable alarm and carries its reply to fulfill after the next connect resolves.
+/// How [`poll_until_disconnected`] left the poll loop (§7.5, §10.2, §10.3). The supervisor
+/// ([`crate::supervisor`]) reconnects on `LinkLost` and `Reconnect` — but an explicit `reconnect`
+/// skips the backoff + the unreachable alarm and carries its reply to fulfill after the next connect
+/// resolves. `Stopped` is the teardown exit: no reconnect, no backoff, no alarm.
 pub(crate) enum PollExit {
     /// The link broke (a connection-level read/probe failure) — back off and reconnect.
     LinkLost,
     /// An `sb/reconnect` asked to drop + re-establish now (§7.5).
     Reconnect(tokio::sync::oneshot::Sender<std::result::Result<(), String>>),
+    /// Cancellation or control-channel close (§10.3, D-EIP-27): the session has been closed
+    /// (UnRegisterSession on the wire); the supervisor must NOT reconnect, back off, or raise a
+    /// `device-unreachable` alarm.
+    Stopped,
 }
 
 /// The per-cycle deltas of the shared [`Health`] sample counters — attributes one poll cycle's samples
@@ -75,6 +80,12 @@ impl SampleSnapshot {
 /// batch-window close, the next health emit}, then services whichever are due. A read that returns
 /// `Err` is a connection-level failure: the loop closes the session and returns so the connect loop
 /// backs off.
+///
+/// `cancel` is this instance's child of the app root token (§10.3): when it fires the loop closes the
+/// session — sending UnRegisterSession on the wire — and returns [`PollExit::Stopped`]. An in-flight
+/// CIP call is not interrupted (it must resolve for the session to stay coherent for `close()`), so
+/// the cancel is observed at the next loop head; that bound is the `in_flight` term of the shutdown
+/// budget.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_until_disconnected(
     cfg: &DeviceConfig,
@@ -87,6 +98,7 @@ pub(crate) async fn poll_until_disconnected(
     control: &mut tokio::sync::mpsc::Receiver<DeviceControl>,
     events: &dyn EventSink,
     keepalive_ms: u64,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> PollExit {
     // Resolve each group's cadence + publish mode once; batchMs + staleness are device/global-wide.
     let intervals: Vec<Duration> = cfg
@@ -139,13 +151,24 @@ pub(crate) async fn poll_until_disconnected(
         tokio::select! {
             biased;
 
+            // Teardown (shutdown / instance stop, §10.3): close this task's own session — the
+            // session is `!Sync` and owned here, which is why close lives in the task — then leave
+            // without a reconnect, a backoff, or an unreachable alarm.
+            () = cancel.cancelled() => {
+                tracing::info!(instance = %cfg.id, "cancelled; closing the session and stopping");
+                session.close().await;
+                return PollExit::Stopped;
+            }
+
             // Every session-touching verb shares this one task, so it can never race a read on the
             // same connection (§7).
             ctrl = control.recv() => {
                 let Some(ctrl) = ctrl else {
-                    // The control channel closed (component shutting down) — leave cleanly.
+                    // The control channel closed (component shutting down) — leave cleanly. This is
+                    // a teardown path, not a lost link: no alarm, no reconnect (§10.3).
+                    tracing::info!(instance = %cfg.id, "control channel closed; stopping");
                     session.close().await;
-                    return PollExit::LinkLost;
+                    return PollExit::Stopped;
                 };
                 match ctrl {
                     DeviceControl::Write(req) => {

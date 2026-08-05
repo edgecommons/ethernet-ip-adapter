@@ -33,7 +33,7 @@ Grounding artifacts (re-read them, do not work from memory):
 ## Table of contents
 
 1. [Overview & scope](#1-overview--scope)
-2. [Decisions register (D-EIP-1…D-EIP-26)](#2-decisions-register)
+2. [Decisions register (D-EIP-1…D-EIP-27)](#2-decisions-register)
 3. [Module architecture](#3-module-architecture)
 4. [Configuration schema](#4-configuration-schema)
 5. [Signal & data-type model](#5-signal--data-type-model)
@@ -155,6 +155,7 @@ performed, by this work).
 | **D-EIP-24** | **CIP Security Phase 2c — EST (RFC 7030) client for automatic originator-cert enrollment/renewal.** OFF by default (`connection.security.est.enabled: false`) and severable. When enabled, the per-instance `security_lifecycle` task enrolls/renews the adapter's *own* client certificate from a plant EST server and **writes the key+cert back into the vault**, so Phase 2b's watcher reloads it and reconnects — no restart. A thin owned RFC 7030 client (adapter-side, `src/eip/est.rs`; the `enip` crate is untouched) composed over `rcgen` (keypair + CSR), `tokio-rustls` (the Phase-1 TLS stack, authenticated by TLS client-cert re-enroll / a bootstrap identity / HTTP Basic), and `cms`+`x509-cert` (parse the `application/pkcs7-mime` reply). `POST /simpleenroll` (initial) / `/simplereenroll` (renewal, within `renewBeforeDays`), optional `GET /cacerts` trust bootstrap; a 202 is a typed retry, EST-unreachable never blocks polling (offline-first). Emits `cert-enrolled`/`cert-enroll-failed` + `estEnrollments`/`estFailures`; `sb/status.security.est` surfaces `enabled`/`lastEnroll`/`nextRenew`. No `unsafe`, all bounds-checked. | EST turns hand-provisioned TLS (Phase 1/2b) into a self-servicing cert lifecycle for a real plant PKI, while staying a clean drop-in that a plaintext/no-EST deployment never compiles-in behavior for. The owned client (spike decision) avoids the immature `est-ca` crate. Validated against an independent Go RFC 7030 server (globalsign/est `estserver` + mock CA, `test-infra/est`, mutual TLS) plus an OpenSSL-produced golden PKCS#7 vector; real CIP Security *device*-PKI enrollment joins the lab-hardware gap (§14.6). DESIGN-cip-security.md §4.3. |
 | **D-EIP-25** | **Core 0.4.0 adoption — scoped command registration + addressed-instance routing (SOUTHBOUND §2.2 / D-U28).** *(The registration/`scope_body` half is superseded by D-EIP-26; the `repoll` availability and `receivedTs` rulings stand.)* All nine verbs were registered via `register_scoped`; the library inbox subscribed both command scopes and handed the handler the delivery topic's `{instance}` token, and `scope_body` reconciled it with `body.instance` before D-EIP-13 routing: topic instance authoritative — a conflicting `body.instance` is `BAD_ARGS`; topic-only routes by the token; a component-scoped delivery keeps the existing body routing. Additionally, when *every* configured device runs push mode, `register_all` marks `repoll` `unsupported` in `describe` via `set_command_availability` (the verb is mode-conditional and unserviceable in an all-push configuration; with mixed modes it stays `available` — availability is component-scope and cannot express per-instance truth). `receivedTs` adoption is **N/A**: the adapter is a direct device client — no upstream broker hop stamps a receive time. | Adopts the core 0.4.0 enablers (`rust-lib/v0.4.0`, ef4c624) instead of hand-rolling the two-scope subscription; keeps D-EIP-13's one-inbox-per-component model while making instance-addressed topics first-class per the resolved SOUTHBOUND §2.2 contract. |
 | **D-EIP-26** | **Core 0.5.0 adoption — declared verb scope + keepalive instance state (D-SC-1..9).** The pin moves to `rust-lib/v0.5.0` (a14a328). `register_scoped` is removed from the library: all nine verbs re-register as `commands.register(verb, CommandScope::Instance, command_handler(…))`, every handler taking `(request, addressed_instance)`. Each verb acts on exactly one device, so none declares `Component` or `Both`. The library now owns addressing entirely — topic-token and `body.instance` extraction plus the conflict-first `BAD_ARGS`, all before dispatch — so `scope_body` is **deleted** and `Commander::resolve` takes the resolved `Option<&str>` instead of reading the body (D-SC-4): it keeps only the optional-iff-one configured default and `NO_SUCH_INSTANCE`. Consequence: a malformed (non-object) body at an instance-addressed delivery is no longer a routing `BAD_ARGS` — it reaches the verb, which reports its own per-verb refusal. The companion D-SC-7 keepalive state needs no code change here: `connectivity_of` has carried the `ONLINE`/`CONNECTING`/`BACKOFF`/`PAUSED` token from the single `Health` model since §9.2 — the wave adds an assertion on the **published** element (`InstanceConnectivity::to_json`, public since 0.5.0). | The breaking model makes "a handler blind to the addressing" structurally impossible and removes an entire class of per-adapter topic-parsing code; keeping the configured-default/existence policy adapter-side is exactly where configuration knowledge lives. `describe` now advertises each verb's `scope`, which the console renders as instance-selector affordance. |
+| **D-EIP-27** | **Coordinated, deadline-bounded shutdown (§10.3).** One app-wide root `CancellationToken` with a per-instance child token; every spawned task's `JoinHandle` is held in the live `DeviceRegistry` (`lifecycle.rs`); each task closes its OWN session on the way out (poll: UnRegisterSession via `EipClient::close`; push: ForwardClose + I/O socket release), because the session is `!Sync` and owned there. The whole teardown runs under ONE absolute stop budget composed from the Phase-1 per-session bounds (in-flight request + worst close + grace) and clamped to **[1 s, 10 s]**; a task still running at the deadline is `abort()`ed and counted, never waited on unboundedly. Cancelled exits (`PollExit::Stopped` / `PushExit::Stopped` / `DisconnectedWait::Stopped`) raise no `device-unreachable` alarm and never back off. | The pre-Phase-2 supervisor discarded both `JoinHandle`s and returned straight from `shutdown_signal()`, so the loops were killed with the runtime and the closes §10.3 promised never reached the wire. Alternatives considered: a `JoinSet` (no per-instance token grouping — the same tree has to stop one instance for a configuration change, not just all of them), and a hand-rolled `watch`-channel token (re-implements `CancellationToken`'s child semantics, including the born-cancelled child the drain loop depends on, with subtle races). `tokio-util` was already a workspace dependency via the `enip` crate, so this adds a dependency edge, not a lock entry. The clamp keeps shutdown inside a supervisor's grace period; the abort keeps a wedged peer from hanging the process. |
 
 ---
 
@@ -204,6 +205,9 @@ crates/
                      — mode-agnostic (both engines feed it)
       metrics.rs     Health (southbound_health) + the six EtherNetIp* families (§8)
       commands.rs    the sb/* verb handlers + panel descriptors (§7)
+      lifecycle.rs   the live DeviceRegistry, the root/child cancellation tree, and the
+                     deadline-bounded stop engine (stop_budget / stop_tasks / shutdown_all) —
+                     §10.3, D-EIP-27
     tests/
       live_cpppo.rs  sim-gated POLL integration suite (self-skipping on a 44818 probe, §11.3)
       live_opener.rs sim-gated PUSH integration suite (self-skipping, §11.5)
@@ -250,6 +254,15 @@ The template's nested connect/poll loops, the single-task write serialization, a
 backoff are **kept**. New: the control channel (pause/resume/repoll/reconnect/read-now travel the
 same one-task serialization path as writes), per-group tickers instead of one, and the paused
 gate.
+
+**Two ways out of the loop, and they are not the same (D-EIP-27).** A *link* failure is `LinkLost`:
+alarm, counters, backoff, reconnect. A *stop* — this instance's cancellation token firing, or its
+control channel closing — is `Stopped`: the driver closes the session (UnRegisterSession / class-1
+ForwardClose) and the task returns. `Stopped` raises no `device-unreachable`, emits no event, and
+never backs off, so a teardown can never look like an unreachable device. Every wait in the ladder —
+the connect attempt, the poll/consume select, and the disconnected backoff service
+(`serve_control_disconnected`) — selects on the token `biased`-first, so a stop is observed at the
+next await rather than after a full backoff window. §10.3 has the budget and the join/abort rule.
 
 **The push variant (`mode: "push"`)** runs the same `run_device` supervisor with the poll loop
 replaced by the push engine (`push.rs`): connect = TCP session + class-1 ForwardOpen
@@ -1072,6 +1085,8 @@ Dimensions: `instance`. Sourced from the engine plus the protocol crate's per-co
 | `malformedFramesTotal` / `malformedFramesInterval` | Count | 60 (CPF/decode rejects) |
 | `ioTimeoutsTotal` / `ioTimeoutsInterval` | Count | 60 (watchdog expiries → reconnect) |
 | `produceOverrunsTotal` / `produceOverrunsInterval` | Count | 60 (missed O→T ticks) |
+| `sendErrorsTotal` / `sendErrorsInterval` | Count | 60 (O→T datagram send failures) |
+| `recvErrorsTotal` / `recvErrorsInterval` | Count | 60 (socket receive errors) |
 | `interFrameMs` | Milliseconds | 1 (gauge: last observed T→O inter-arrival — the lived RPI) |
 | `runMode` | Count | 1 (gauge: 1 = we produce Run; 0 = Idle) |
 
@@ -1157,12 +1172,52 @@ survives reconnect** (§9.2). Writes/reads arriving while disconnected fail fast
 `DEVICE_UNAVAILABLE` (the control/write channels are drained with errors during backoff rather
 than queueing into a dead link).
 
-### 10.3 Shutdown
+### 10.3 Shutdown (D-EIP-27)
 
-Template behavior kept: `gg.shutdown_signal().await` → sessions closed (`close()` is
-idempotent — poll: UnRegisterSession; push: ForwardClose + socket teardown, both deadline-bounded
-in the protocol crate so shutdown never hangs), final `flush_metrics()`; the library handles
-unsubscribes and the `STOPPED` state (the org unsubscribe-before-exit rule is satisfied by RAII).
+Shutdown is **coordinated and deadline-bounded**: `cancel → close → join → flush`.
+
+Every instance runs under a child of one app-wide root `CancellationToken`, and every task it spawns
+(the device task, plus the cert-lifecycle task on a TLS poll instance) is registered — with its
+`JoinHandle` — in the live `DeviceRegistry` (`lifecycle.rs`). On `gg.shutdown_signal()`:
+
+1. **Cancel the root.** Every instance's child token fires at once, so the whole fleet tears down
+   concurrently rather than one instance's budget after another's.
+2. **Each task closes its own session on the way out.** The session is `!Sync` and owned by the
+   device task (the same reason the `DeviceControl` channel exists), so nothing outside it can close
+   it. The poll driver closes on cancel and returns `PollExit::Stopped` — `EipClient::close()` sends
+   UnRegisterSession (and the class-3 ForwardClose when connected). The push driver returns
+   `PushExit::Stopped` and `run_push`'s unconditional `session.close()` sends the class-1 ForwardClose
+   and releases the I/O sockets. A cancel arriving mid-backoff leaves `serve_control_disconnected`
+   immediately with `DisconnectedWait::Stopped`; a cancel arriving mid-connect drops the connect
+   future (no session exists yet). **None of these paths raises `device-unreachable`, emits an event,
+   or backs off** — the link did not fail, the instance was stopped.
+3. **Join under ONE absolute budget, then abort stragglers.** `stop_budget(timeouts)` composes
+   the Phase-1 per-session bounds: one in-flight-request bound (a cancel arriving during a CIP
+   read/write is observed only after that call resolves — bounded by `requestTimeoutMs`) + the worst
+   per-session close bound (`max(` push close-handoff cap 5 s`,` `requestTimeoutMs` + the 2 s `enip`
+   session-close handoff`)`) + 500 ms grace, clamped to **[1 s, 10 s]** so a pathological
+   `requestTimeoutMs` cannot make shutdown outlive a supervisor's grace period (Kubernetes default
+   30 s, Greengrass default 15 s). At the shipped defaults that is 2 s + 5 s + 0.5 s = **7.5 s**. The
+   deadline is absolute across the whole fleet, not per task; whatever is still running when it
+   expires is `abort()`ed and counted, so a wedged peer can never hang the process. The teardown logs
+   `joined`/`aborted`/`budget_ms`.
+4. **`flush_metrics()` last**, so the final counters ride out while messaging is still up. The
+   library's RAII then handles unsubscribes and the `STOPPED` state when the runtime drops (the org
+   unsubscribe-before-exit rule is satisfied by RAII).
+
+The drain is a loop, not a single pass: a runtime inserted after the root was cancelled gets a child
+token that is *born cancelled*, so it exits immediately and is reaped by the next pass. Everything is
+idempotent — `cancel()` is idempotent, `close()` is idempotent per the seam contract, and the drain
+consumes — so a second pass over an empty registry is a no-op.
+
+**A failed startup takes the same path.** `App::run` launches instances one at a time and is still
+fallible after the first of them is polling (minting an instance facade, registering the command
+surface), so the whole setup runs behind `lifecycle::stop_on_startup_error`: an `Err` cancels the
+root and drains the registry under the same `stop_budget` before it propagates. Without that, an
+adapter that failed to start instance *N* would exit leaving instances *1…N-1* publishing, their
+sessions never unregistered and their class-1 connections never ForwardClosed.
+
+Consequence, stated plainly: in-memory pause state (D-EIP-14) dies with the task it lived in.
 
 ---
 
@@ -1576,7 +1631,8 @@ a ship blocker.
 | `poll.rs` | deadband none/absolute/percent/non-numeric/array-any-element; onChange vs always; batch window flush (tokio `start_paused` time control); stale accounting incl. pause suspension; overrun detection |
 | `push.rs` | field-change gating (deadband + `sampleMs` floor under `start_paused` time control); idle-frame ⇒ UNCERTAIN samples; pause = consume-but-don't-publish (snapshot advances, zero publishes); resume re-basing (§7.4.8 — no stale-change burst); Lost ⇒ reconnect path; output-write serialization |
 | `sim.rs` + session behavior | per-signal BAD not swallowed; probe; browse paging incl. unsupported marker; scripted push frames (values, idle, stop-producing) |
-| `app.rs` supervisor | backoff math (template tests kept); connectivity tokens incl. PAUSED and break-while-paused, for both modes; provider/metric/token single-source invariants |
+| `app.rs` supervisor | backoff math (template tests kept); connectivity tokens incl. PAUSED and break-while-paused, for both modes; provider/metric/token single-source invariants; the disconnected-wait exit classification (`Elapsed`/`Reconnect`/`Stopped`) — a cancelled or channel-closed instance leaves the backoff immediately, under `start_paused` time control |
+| `lifecycle.rs` (§10.3, D-EIP-27) | `stop_budget` composition and its [1 s, 10 s] clamp; `stop_tasks` joining cooperative tasks and aborting a straggler at the **absolute** deadline (`start_paused`); `shutdown_all`'s drain loop reaping a runtime inserted after the root was cancelled; registry insertion order, remove-by-id, drain, and the connectivity/generation views |
 | `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default; write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused (`PAUSED`) and repoll-on-push (`BAD_ARGS`) refusals; browse error mapping; push sb/read snapshot incl. `NO_FRAME` |
 | `metrics.rs` | Total/Interval pair semantics (interval resets, total doesn't); per-dimension definition set matches §8 exactly incl. `EtherNetIpIo` (this test IS the parity contract's executable form) |
 | wire shape | `DataFacade::build_body` output for a §4.5 signal AND a §4.6 push field asserted field-by-field against §5.2 (id/address/device/quality/serverTs-present/sourceTs-absent) |

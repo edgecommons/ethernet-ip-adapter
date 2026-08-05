@@ -403,6 +403,14 @@ Greengrass build uses the `greengrass` feature (Linux only).
 identity resolves from the Downward API, and the broker/device are reached by in-cluster Service DNS.
 With `--platform auto` the library detects the platform and needs no CLI args.
 
+**Stopping the adapter** — on SIGTERM or Ctrl-C every device connection is closed cleanly: poll
+instances send UnRegisterSession (and the class-3 ForwardClose when they hold a connected session),
+push instances send the class-1 ForwardClose and release their I/O sockets, and the final metrics are
+flushed. The whole teardown is bounded — at most 10 seconds, and about 7.5 seconds at the default
+`timeouts.requestTimeoutMs` — so the adapter fits inside a container runtime's termination grace
+period. A device that stops answering cannot hold the shutdown open past that window. Because pause
+state is in-memory, an instance that was paused starts running again when the adapter next starts.
+
 ---
 
 ## Observe health and status

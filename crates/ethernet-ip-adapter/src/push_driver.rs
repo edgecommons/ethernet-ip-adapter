@@ -31,6 +31,10 @@ pub(crate) enum PushExit {
     LinkLost,
     /// An `sb/reconnect` asked to ForwardClose + ForwardOpen now (§7.5).
     Reconnect(tokio::sync::oneshot::Sender<std::result::Result<(), String>>),
+    /// Cancellation or control-channel close (§10.3, D-EIP-27): the caller closes the session
+    /// (ForwardClose + I/O socket teardown) and leaves — no reconnect, no backoff, no
+    /// `device-unreachable` alarm.
+    Stopped,
 }
 
 /// What woke the consume loop — returned by the `select!` so `session` is no longer borrowed by the
@@ -39,11 +43,17 @@ enum Woke {
     Control(Option<DeviceControl>),
     Update(Option<IoUpdate>),
     Tick,
+    /// The instance token fired — tear this instance down (§10.3).
+    Cancelled,
 }
 
 /// Consume one push session's [`IoUpdate`] stream until the link is lost (§3.2). Gates + batches each
 /// consumed frame's fields and publishes what survives; returns on `Lost` / end-of-stream so the
 /// supervisor reconnects.
+///
+/// `cancel` is this instance's child of the app root token (§10.3): when it fires the loop returns
+/// [`PushExit::Stopped`] and the caller's unconditional `session.close()` performs the ForwardClose
+/// and releases the I/O socket.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn consume_push(
     cfg: &DeviceConfig,
@@ -55,6 +65,7 @@ pub(crate) async fn consume_push(
     health: &Arc<Health>,
     adapter: &str,
     control: &mut tokio::sync::mpsc::Receiver<DeviceControl>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> PushExit {
     let Some(io) = cfg.io.as_ref() else {
         tracing::error!(instance = %cfg.id, "push device has no io block");
@@ -109,15 +120,25 @@ pub(crate) async fn consume_push(
         // receiver) by the time a control message is serviced below.
         let woke = tokio::select! {
             biased;
+            () = cancel.cancelled() => Woke::Cancelled,
             ctrl = control.recv() => Woke::Control(ctrl),
             update = session.updates().recv() => Woke::Update(update),
             _ = tokio::time::sleep(wait) => Woke::Tick,
         };
 
         match woke {
+            // Teardown (shutdown / instance stop, §10.3): leave without a reconnect, a backoff, or
+            // an unreachable alarm; the caller's `session.close()` does the ForwardClose + socket
+            // teardown on the way out.
+            Woke::Cancelled => {
+                tracing::info!(instance = %cfg.id, "cancelled; closing the class-1 connection and stopping");
+                return PushExit::Stopped;
+            }
             Woke::Control(None) => {
-                // The control channel closed (component shutting down) — leave cleanly.
-                return PushExit::LinkLost;
+                // The control channel closed (component shutting down) — leave cleanly. This is a
+                // teardown path, not a lost link: no alarm, no reconnect (§10.3).
+                tracing::info!(instance = %cfg.id, "control channel closed; stopping");
+                return PushExit::Stopped;
             }
             Woke::Control(Some(ctrl)) => {
                 match ctrl {
@@ -228,7 +249,14 @@ pub(crate) async fn consume_push(
                     return PushExit::LinkLost;
                 }
                 None => {
+                    // The translator's event stream ended WITHOUT a preceding `Lost` — a real loss
+                    // transition that would otherwise go unrecorded. Do the same bookkeeping the
+                    // `Lost` arm does; this is the only correct home for it, because synthesizing a
+                    // `Lost` in the translator would double-count when one DID precede the close.
                     tracing::warn!(instance = %cfg.id, "push session ended; reconnecting");
+                    health.read_errors.fetch_add(1, Ordering::Relaxed);
+                    // ioConnectionState → 0, ioTimeouts, stack-counter baseline rebase (§8.8).
+                    dm.on_io_lost();
                     return PushExit::LinkLost;
                 }
             },

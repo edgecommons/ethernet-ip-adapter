@@ -430,12 +430,27 @@ pub(crate) fn connect_reason(
     }
 }
 
+/// Why a disconnected-wait ended (§10.3).
+pub(crate) enum DisconnectedWait {
+    /// The wait elapsed (the backoff is over) — reconnect now.
+    Elapsed,
+    /// An explicit `reconnect` arrived — reconnect immediately, fulfil this reply after.
+    Reconnect(tokio::sync::oneshot::Sender<std::result::Result<(), String>>),
+    /// The instance was cancelled (shutdown / a configuration-driven stop) or the control channel
+    /// closed — leave the connect loop without reconnecting and **without an alarm**.
+    Stopped,
+}
+
 /// Service the device's [`DeviceControl`] channel while the session is **down** (backing off or
 /// between an explicit reconnect and the next connect), for up to `wait`. Pause/resume take effect
 /// (they only need the shared flag + metric + event); the I/O verbs answer "disconnected" (the
 /// command handler maps that to `DEVICE_UNAVAILABLE`/`NO_FRAME`); a `reconnect` returns its reply so
-/// the caller reconnects *now* (cutting the backoff short). Returns that reply, or `None` when `wait`
-/// elapsed / the channel closed.
+/// the caller reconnects *now* (cutting the backoff short).
+///
+/// The `cancel` arm is `biased`-first: a teardown must not wait out a backoff window that can be a
+/// full minute. A closed control channel means the same thing — the owning task is being taken down
+/// — so it returns [`DisconnectedWait::Stopped`] immediately rather than sleeping out the wait.
+/// Verbs still queued at that point die with the channel and their callers get `DEVICE_UNAVAILABLE`.
 pub(crate) async fn serve_control_disconnected(
     control: &mut tokio::sync::mpsc::Receiver<DeviceControl>,
     cfg: &DeviceConfig,
@@ -443,22 +458,24 @@ pub(crate) async fn serve_control_disconnected(
     dm: &DeviceMetrics,
     events: &dyn EventSink,
     wait: Duration,
-) -> Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>> {
+    cancel: &tokio_util::sync::CancellationToken,
+) -> DisconnectedWait {
     let deadline = Instant::now() + wait;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return None;
+            return DisconnectedWait::Elapsed;
         }
         tokio::select! {
             biased;
+            () = cancel.cancelled() => return DisconnectedWait::Stopped,
             ctrl = control.recv() => {
                 match ctrl {
                     None => {
-                        tokio::time::sleep(remaining).await;
-                        return None;
+                        tracing::info!(instance = %cfg.id, "control channel closed; stopping");
+                        return DisconnectedWait::Stopped;
                     }
-                    Some(DeviceControl::Reconnect { reply }) => return Some(reply),
+                    Some(DeviceControl::Reconnect { reply }) => return DisconnectedWait::Reconnect(reply),
                     Some(DeviceControl::Pause { by, reply }) => {
                         let changed = apply_pause(cfg, health, dm, events, true, by.as_deref()).await;
                         let _ = reply.send(changed);
@@ -487,7 +504,7 @@ pub(crate) async fn serve_control_disconnected(
                     }
                 }
             }
-            _ = tokio::time::sleep(remaining) => return None,
+            () = tokio::time::sleep(remaining) => return DisconnectedWait::Elapsed,
         }
     }
 }
@@ -786,10 +803,14 @@ mod tests {
 
         let returned = serve_control_disconnected(
             &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(5),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
-        assert!(returned.is_some(), "a buffered reconnect is returned so the caller reconnects now");
+        assert!(
+            matches!(returned, DisconnectedWait::Reconnect(_)),
+            "a buffered reconnect is returned so the caller reconnects now"
+        );
         assert!(p_rx.await.unwrap(), "pause took effect while disconnected");
         assert!(events.has("adapter-paused"));
         assert!(r_rx.await.unwrap().is_err(), "a read answers disconnected");
@@ -804,7 +825,7 @@ mod tests {
         assert!(events.has("adapter-resumed"));
     }
 
-    /// With no message pending, `serve_control_disconnected` returns `None` once the wait elapses.
+    /// With no message pending, `serve_control_disconnected` reports `Elapsed` once the wait is over.
     #[tokio::test(start_paused = true)]
     async fn serve_control_disconnected_times_out_to_none() {
         let cfg = a_device();
@@ -814,8 +835,63 @@ mod tests {
         let (_tx, mut rx) = tokio::sync::mpsc::channel::<DeviceControl>(4);
         let returned = serve_control_disconnected(
             &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
-        assert!(returned.is_none(), "the backoff wait elapsed with no control message");
+        assert!(
+            matches!(returned, DisconnectedWait::Elapsed),
+            "the backoff wait elapsed with no control message"
+        );
+    }
+
+    /// §10.3: a teardown that lands mid-backoff must not wait out the window — a device sitting on a
+    /// minute-long backoff ceiling would otherwise wedge shutdown for that whole minute.
+    #[tokio::test(start_paused = true)]
+    async fn serve_control_disconnected_returns_stopped_on_cancel() {
+        let cfg = a_device();
+        let health = Health::default();
+        let (_svc, dm) = crate::testutil::device_metrics(cfg.clone(), Arc::new(Health::default()));
+        let events = crate::testutil::RecordingEvents::default();
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<DeviceControl>(4);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let started = tokio::time::Instant::now();
+        let returned = serve_control_disconnected(
+            &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(60), &cancel,
+        )
+        .await;
+
+        assert!(matches!(returned, DisconnectedWait::Stopped));
+        assert_eq!(
+            tokio::time::Instant::now(), started,
+            "a cancelled instance leaves the backoff immediately, not after the window"
+        );
+        assert!(!events.has("device-unreachable"), "a stop raises no alarm here");
+    }
+
+    /// A closed control channel means the owning task is going away, so it stops immediately rather
+    /// than sleeping out the remaining backoff.
+    #[tokio::test(start_paused = true)]
+    async fn serve_control_disconnected_channel_close_is_stopped_not_a_full_sleep() {
+        let cfg = a_device();
+        let health = Health::default();
+        let (_svc, dm) = crate::testutil::device_metrics(cfg.clone(), Arc::new(Health::default()));
+        let events = crate::testutil::RecordingEvents::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DeviceControl>(4);
+        drop(tx);
+
+        let started = tokio::time::Instant::now();
+        let returned = serve_control_disconnected(
+            &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(30),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(returned, DisconnectedWait::Stopped));
+        assert_eq!(
+            tokio::time::Instant::now(), started,
+            "the remaining wait is not slept out"
+        );
     }
 }

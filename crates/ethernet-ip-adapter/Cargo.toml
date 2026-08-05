@@ -56,6 +56,10 @@ cms = { version = "0.2", default-features = false, features = ["std"] }
 der = { version = "0.7", default-features = false, features = ["std"] }
 base64 = "0.22"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "sync"] }
+# Cooperative cancellation for the device-task tree (Phase 2 / D-EIP-27). Already a workspace
+# dependency (the enip crate uses its codec); `CancellationToken` needs no extra features in 0.7,
+# so this adds a dependency EDGE, not a new crate to the lock.
+tokio-util = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

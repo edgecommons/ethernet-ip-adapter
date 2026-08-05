@@ -177,7 +177,9 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
 - **`sb/status`** → `{ id, mode, connected, state ("ONLINE"|"BACKOFF"|"PAUSED"|…), paused, endpoint,
   adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} },
   security: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
-  framesConsumed, staleDropped, sequenceGaps }`.
+  framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors }` — `sendErrors` counts O→T
+  datagrams that failed to send and `recvErrors` counts receive failures on the class-1 socket, each
+  as an `{interval, total}` pair like the other `io` counters.
 - **`security`** — the connection's security posture. A plaintext instance reports
   `{ mode: "plaintext" }`; a TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified,
   peer, clientCertNotAfter, clientCertSerial, clientCertExpiryDays,
