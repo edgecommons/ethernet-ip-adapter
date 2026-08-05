@@ -78,7 +78,12 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        # Name the tool explicitly rather than via an `@<tool>` tag: those tags are periodically
+        # rewritten to `@<version>` by dependabot, which leaves the action with no tool to install
+        # and silently installs nothing.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - name: Authenticate to the private edgecommons git dependency
         env:
           # Same org read token the reusable workflow uses (secrets: inherit); the repo must be on that
@@ -119,7 +124,12 @@ jobs:
       - name: Install nightly toolchain (libFuzzer needs nightly + the sanitizer runtime)
         run: rustup toolchain install nightly --profile minimal --component llvm-tools-preview
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        # Explicit tool name — the `@cargo-fuzz` tag resolved to an empty input, so cargo-fuzz was
+        # never installed and this gate failed at `cargo fuzz build` on every PR since the repo
+        # opened. D-EIP-19 makes fuzzing a release gate; it has to actually run.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Build every fuzz target (a target that stops compiling is a defect)
         working-directory: crates/enip
         run: cargo +nightly fuzz build
