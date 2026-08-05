@@ -28,6 +28,7 @@ mod publish;
 mod publish_sink;
 mod push;
 mod push_driver;
+mod reload;
 mod sim;
 mod supervisor;
 #[cfg(test)]
@@ -40,10 +41,15 @@ const COMPONENT_NAME: &str = "com.mbreissi.edgecommons.EthernetIpAdapter";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let gg = EdgeCommonsBuilder::new(COMPONENT_NAME)
-        .args(std::env::args_os())
-        .build()
-        .await?;
+    // The ONLY strong reference to the runtime. The configuration-application coordinator
+    // ([`reload`]) holds a `Weak` of it, so there is no `Arc` cycle and the RAII teardown below
+    // still runs when this binding drops at process exit.
+    let gg = std::sync::Arc::new(
+        EdgeCommonsBuilder::new(COMPONENT_NAME)
+            .args(std::env::args_os())
+            .build()
+            .await?,
+    );
 
     tracing::info!(
         component = gg.component_name(),

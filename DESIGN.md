@@ -33,7 +33,7 @@ Grounding artifacts (re-read them, do not work from memory):
 ## Table of contents
 
 1. [Overview & scope](#1-overview--scope)
-2. [Decisions register (D-EIP-1…D-EIP-27)](#2-decisions-register)
+2. [Decisions register (D-EIP-1…D-EIP-28)](#2-decisions-register)
 3. [Module architecture](#3-module-architecture)
 4. [Configuration schema](#4-configuration-schema)
 5. [Signal & data-type model](#5-signal--data-type-model)
@@ -156,6 +156,7 @@ performed, by this work).
 | **D-EIP-25** | **Core 0.4.0 adoption — scoped command registration + addressed-instance routing (SOUTHBOUND §2.2 / D-U28).** *(The registration/`scope_body` half is superseded by D-EIP-26; the `repoll` availability and `receivedTs` rulings stand.)* All nine verbs were registered via `register_scoped`; the library inbox subscribed both command scopes and handed the handler the delivery topic's `{instance}` token, and `scope_body` reconciled it with `body.instance` before D-EIP-13 routing: topic instance authoritative — a conflicting `body.instance` is `BAD_ARGS`; topic-only routes by the token; a component-scoped delivery keeps the existing body routing. Additionally, when *every* configured device runs push mode, `register_all` marks `repoll` `unsupported` in `describe` via `set_command_availability` (the verb is mode-conditional and unserviceable in an all-push configuration; with mixed modes it stays `available` — availability is component-scope and cannot express per-instance truth). `receivedTs` adoption is **N/A**: the adapter is a direct device client — no upstream broker hop stamps a receive time. | Adopts the core 0.4.0 enablers (`rust-lib/v0.4.0`, ef4c624) instead of hand-rolling the two-scope subscription; keeps D-EIP-13's one-inbox-per-component model while making instance-addressed topics first-class per the resolved SOUTHBOUND §2.2 contract. |
 | **D-EIP-26** | **Core 0.5.0 adoption — declared verb scope + keepalive instance state (D-SC-1..9).** The pin moves to `rust-lib/v0.5.0` (a14a328). `register_scoped` is removed from the library: all nine verbs re-register as `commands.register(verb, CommandScope::Instance, command_handler(…))`, every handler taking `(request, addressed_instance)`. Each verb acts on exactly one device, so none declares `Component` or `Both`. The library now owns addressing entirely — topic-token and `body.instance` extraction plus the conflict-first `BAD_ARGS`, all before dispatch — so `scope_body` is **deleted** and `Commander::resolve` takes the resolved `Option<&str>` instead of reading the body (D-SC-4): it keeps only the optional-iff-one configured default and `NO_SUCH_INSTANCE`. Consequence: a malformed (non-object) body at an instance-addressed delivery is no longer a routing `BAD_ARGS` — it reaches the verb, which reports its own per-verb refusal. The companion D-SC-7 keepalive state needs no code change here: `connectivity_of` has carried the `ONLINE`/`CONNECTING`/`BACKOFF`/`PAUSED` token from the single `Health` model since §9.2 — the wave adds an assertion on the **published** element (`InstanceConnectivity::to_json`, public since 0.5.0). | The breaking model makes "a handler blind to the addressing" structurally impossible and removes an entire class of per-adapter topic-parsing code; keeping the configured-default/existence policy adapter-side is exactly where configuration knowledge lives. `describe` now advertises each verb's `scope`, which the console renders as instance-selector affordance. |
 | **D-EIP-27** | **Coordinated, deadline-bounded shutdown (§10.3).** One app-wide root `CancellationToken` with a per-instance child token; every spawned task's `JoinHandle` is held in the live `DeviceRegistry` (`lifecycle.rs`); each task closes its OWN session on the way out (poll: UnRegisterSession via `EipClient::close`; push: ForwardClose + I/O socket release), because the session is `!Sync` and owned there. The whole teardown runs under ONE absolute stop budget composed from the Phase-1 per-session bounds (in-flight request + worst close + grace) and clamped to **[1 s, 10 s]**; a task still running at the deadline is `abort()`ed and counted, never waited on unboundedly. Cancelled exits (`PollExit::Stopped` / `PushExit::Stopped` / `DisconnectedWait::Stopped`) raise no `device-unreachable` alarm and never back off. | The pre-Phase-2 supervisor discarded both `JoinHandle`s and returned straight from `shutdown_signal()`, so the loops were killed with the runtime and the closes §10.3 promised never reached the wire. Alternatives considered: a `JoinSet` (no per-instance token grouping — the same tree has to stop one instance for a configuration change, not just all of them), and a hand-rolled `watch`-channel token (re-implements `CancellationToken`'s child semantics, including the born-cancelled child the drain loop depends on, with subtle races). `tokio-util` was already a workspace dependency via the `enip` crate, so this adds a dependency edge, not a lock entry. The clamp keeps shutdown inside a supervisor's grace period; the abort keeps a wedged peer from hanging the process. |
+| **D-EIP-28** | **Transactional instance-diff configuration reload (§10.4).** The adapter registers ONE `ConfigurationApplyListener` (`reload.rs`), which core prepares and commits before it publishes a candidate snapshot. Granularity is **instance-diff restart**: added, removed, and changed instances restart; untouched instances keep their session, facades, `Arc<GlobalConfig>`, and in-memory pause state. The restart-**all** trigger is **any change outside `component.instances`** — `component.global` and the library sections (`topic`, `hierarchy`/`identity`, `tags`, `credentials`, `metricEmission`, …) — because facades, UNS identity, and `DeviceMetrics` bind those at spawn from the configuration snapshot. Startup and every reload derive their instance set through the SAME `reload::parse_instances` (declaration order, duplicate ids first-wins as `Config::instance` resolves them, id-less entries invisible) and construct each instance through the SAME `RuntimeLauncher::launch` — one rule, so an id is launched once and stopping it stops all of it. Skip-bad-instance is preserved verbatim; the reload-time mapping of fail-only-if-zero-valid is that a candidate with **no valid instance is rejected** and the running generation keeps operating (startup, with nothing running, still refuses to start). **Accepted consequence: in-memory pause is LOST on a restarted instance** (the D-EIP-14 corollary) and survives only on untouched ones. | The alternative granularities both fail the bar: restart-everything on any change makes a one-instance edit a fleet outage, and per-key hot-patching would have to re-derive every spawn-time binding (facade identity, metric dimensions, engine schedules) in place — far more surface for a silent mismatch than a bounded restart of the affected instance. The widened restart-all trigger is the honest reading of "a global change restarts all": an instance kept across a `topic`/`identity` change would publish on stale topics with a stale identity, which is worse than a restart. The core apply-listener contract is what makes it atomic — prepare is I/O-free and changes nothing, commit is self-bounded (it reuses D-EIP-27's stop engine and bounds its two operator notifications, which core requires because it deliberately never cancels a commit), and a failed commit is followed by a fully-awaited rollback that relaunches the prior set against the prior snapshot core is keeping. |
 
 ---
 
@@ -206,8 +207,11 @@ crates/
       metrics.rs     Health (southbound_health) + the six EtherNetIp* families (§8)
       commands.rs    the sb/* verb handlers + panel descriptors (§7)
       lifecycle.rs   the live DeviceRegistry, the root/child cancellation tree, and the
-                     deadline-bounded stop engine (stop_budget / stop_tasks / shutdown_all) —
-                     §10.3, D-EIP-27
+                     deadline-bounded stop engine (stop_budget / stop_tasks / stop_runtimes /
+                     shutdown_all) — §10.3, D-EIP-27
+      reload.rs      the configuration transaction: the pure instance diff (plan), the
+                     DeviceLauncher seam, and the ReloadCoordinator / ReloadTransaction that
+                     core prepares, commits, and rolls back — §10.4, D-EIP-28
     tests/
       live_cpppo.rs  sim-gated POLL integration suite (self-skipping on a 44818 probe, §11.3)
       live_opener.rs sim-gated PUSH integration suite (self-skipping, §11.5)
@@ -745,13 +749,14 @@ library resolves the addressing before dispatch: an instance-addressed delivery 
 (`…/{instance}/cmd/{verb}`, SOUTHBOUND §2.2) names the device, a component-scoped delivery names it
 with `"instance": "<id>"` in the body, and a body `instance` that conflicts with the topic token is
 refused with `BAD_ARGS` before the handler runs. What stays adapter-side is the configuration-dependent
-half: an unaddressed request routes to the sole configured device, with ≥ 2 devices it is `BAD_ARGS`,
-and an addressed instance that is not configured is `NO_SUCH_INSTANCE`. Replies always include the
-resolved `"id": "<instance>"`.
+half: an unaddressed request routes to the sole **running** device, with ≥ 2 of them it is `BAD_ARGS`,
+with none of them (the stop stage of a restart-all configuration change, §10.4) it is
+`DEVICE_UNAVAILABLE` — addressing one would only earn a `NO_SUCH_INSTANCE` — and an addressed instance
+that is not running is `NO_SUCH_INSTANCE`. Replies always include the resolved `"id": "<instance>"`.
 
 **Error codes** (reply `{"ok":false,"error":{"code","message"}}` via `CommandError`):
 `BAD_ARGS`, `NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`, `DEVICE_UNAVAILABLE`
-(device task gone / channel closed), `READ_FAILED` (connection-level failure during an on-demand
+(device task gone / channel closed, or no instance running at all), `READ_FAILED` (connection-level failure during an on-demand
 read), `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`, `PAUSED` (a whole operation the
 paused state prohibits — `repoll`, §7.4.7). Per-entry problems inside batch read/write are
 reported inline in the result, not as command errors.
@@ -1219,6 +1224,83 @@ sessions never unregistered and their class-1 connections never ForwardClosed.
 
 Consequence, stated plainly: in-memory pause state (D-EIP-14) dies with the task it lived in.
 
+### 10.4 Configuration reload (D-EIP-28)
+
+A configuration change applies as **one transaction over the live instance set**. The adapter
+registers exactly one `ConfigurationApplyListener` — `reload::ReloadCoordinator` — at startup, and
+core drives it for every reload source (the `-c FILE` watcher, a Kubernetes ConfigMap update,
+`GG_CONFIG`, the built-in `reload-config` verb), serialized by core's apply lock.
+
+**The core contract, and what it obliges us to do**
+
+| Core stage | Our obligation |
+|---|---|
+| `prepare_configuration_apply(candidate)`, under `tokio::time::timeout(validationTimeout ≈ 5 s)`, must not change the live runtime | Ours is **allocation-only**: parse `component.global`, diff the candidate against the running set, stage the transaction. No sockets, no broker, no spawns, no registry mutation. |
+| `commit()` is awaited with **no** external timeout, while the OLD snapshot is still `gg.config()` | Every stage bounds itself, and commit waits on exactly two kinds of thing. The stop stage runs under §10.3's `stop_budget` and aborts stragglers, so a wedged device cannot hang a reload. The two operator notifications — the removed instances' alarm clear and `config-applied` — go out through a plain publish, which awaits a funnel send and a submission ack with **no timeout of its own**; each is therefore wrapped in a short best-effort budget (`reload::NOTIFY_BUDGET`, 2 s), logged and skipped on expiry, so a wedged broker or a saturated funnel cannot stall a commit while it holds core's apply lock and queues every later reload behind it. A failed notification never fails a reload. |
+| Core stores the candidate and bumps the generation only **after** commit returns `Ok` | Instances launched during commit are bound to the candidate snapshot explicitly (`instance_from_config_snapshot`), not to whatever core currently publishes. |
+| On a commit `Err`, core awaits `rollback()` fully, then keeps the prior snapshot | `rollback` stops what the commit launched and relaunches the instances it stopped, bound to the **prior** snapshot and global. |
+
+**Granularity: instance-diff restart.** The plan (`reload::plan`, pure) compares the candidate's
+`component.instances[]` entries against the **running set** — the registry's `(id, raw)` snapshot,
+deliberately not the previous `Config`, so an instance that was skipped at startup starts now even
+though its subtree never changed. Comparison is `serde_json` structural equality, so a re-serialized
+document with reordered keys is not a change.
+
+- unchanged instance → **kept**: same task, same session, same facades, same `Arc<GlobalConfig>`, same
+  `Health` — and therefore the same pause state;
+- new instance → **started**; instance no longer declared → **stopped**;
+- changed instance → **stopped, then started**;
+- **any change outside `component.instances`** → every instance restarts (see D-EIP-28 for why).
+
+**Commit, in order.** (1) Refuse if the shutdown root is already cancelled. (2) Remove the instances
+being replaced from the registry *first*, so command routing answers `NO_SUCH_INSTANCE` /
+`DEVICE_UNAVAILABLE` during the swap instead of dispatching into dying channels; capture the event
+sink of every instance with no successor, because the stop consumes the runtimes. (3) Stop them with
+§10.3's engine, so a replaced device's session is UnRegisterSession'd / ForwardClose'd before its
+successor connects; a budget overrun aborts stragglers and is *not* a commit failure. (4) **Then**
+clear the `device-unreachable` alarm of every instance with no successor — nothing would ever clear it
+again (a restarted instance clears its own on the next connect). Clearing *before* the stop would race
+the instance's own alarm: a link drop in that window — which spans a broker round-trip per earlier
+removal — re-raises the alarm behind the clear, and it latches on the bus forever. (5) Publish the
+candidate's global. (6) Launch the added/changed instances through `RuntimeLauncher::launch`; a launch
+failure is skipped with a warning **and reported in the event's `skipped` list**, so no id vanishes
+from the record, and only an empty registry afterwards fails the commit (`NO_RUNNING_INSTANCES`).
+(7) Recompute the `repoll` availability and emit `config-applied` (`started`/`stopped`/`kept`/
+`skipped`/`restartAll`). (8) Record the new generation as the one the next reload diffs against —
+without which every later candidate would re-diff against the startup document and restart the fleet.
+
+**Invalid candidates.** A malformed instance is skipped with a warning, exactly as at startup. A
+malformed `component.global`, or a candidate with **no valid instance at all**, is rejected at
+prepare (`INVALID_GLOBAL` / `NO_VALID_INSTANCES` in core's `lastErrors`) and the running generation
+keeps operating — the reload-time analog of startup's refuse-to-start, where there is nothing running
+to keep.
+
+**Verbs and surfaces do not re-register.** All nine `sb/*` verbs stay registered once at
+`CommandScope::Instance`; the `Commander` reads the registry per request, so a removed instance
+answers `NO_SUCH_INSTANCE` and an added one is routable the moment commit inserts it. The
+connectivity provider likewise reads the registry, so a keepalive tick mid-commit publishes the
+mid-swap truth. Metric families are re-defined per launched instance (`define_metric` replaces by
+name, so it is idempotent) and nothing is undefined for a removed instance — families are shared and
+`instance` is a dimension, so a removed instance simply stops emitting. Metric **target** changes are
+core's own post-commit business, not the adapter's.
+
+**Both directions of the reload/shutdown race are closed.** Prepare and commit both refuse once the
+root token is cancelled (`SHUTTING_DOWN`), and §10.3's drain loop reaps anything a commit inserted
+just before the cancel, because its child token is born cancelled. A reload arriving before the
+startup launch loop has published its surfaces is refused with `STARTING`.
+
+**Rollback fidelity, stated honestly.** Rollback restores the prior generation's *set and
+configuration*, not its live state: restored instances reconnect with fresh sessions, in-memory pause
+on a restarted or stopped instance is gone, and interval counters restart. What can never be lost is
+the prior configuration itself — core keeps the snapshot, and the transaction retained every stopped
+instance's parsed config plus its raw subtree. Registry order after a reload is kept-instances first,
+then newly-launched ones, which affects only the cosmetic ordering of the connectivity list (the
+single-instance command default depends on the *count*, not the order).
+
+**Consequence, documented rather than hidden:** pause is in-memory (D-EIP-14), so an instance that
+restarts as part of a reload resumes publishing. Pause survives only on instances the reload did not
+touch.
+
 ---
 
 ## 11. Simulator & validation
@@ -1601,7 +1683,11 @@ tested logic. Excluded, with the reason pinned here:
 These five adapter seams are validated by the **live cpppo/OpENer integration suites (§11)** and the
 **S9 deployed regression** — exactly the paths that cover them — not by unit tests.
 
-**Nothing else is excluded.** The protocol crate's own live-socket runtime — `enip/io.rs`'s class-1
+**Nothing else is excluded.** `src/lifecycle.rs` and `src/reload.rs` are inside the gate **by
+design**: the stop engine, the registry, the instance diff, and the whole commit/rollback transaction
+are pure decisions, tested hermetically over a launcher double, and `supervisor.rs` keeps only the
+thin wiring (`RuntimeLauncher`, the loop drivers). The exclusion list above is therefore unchanged by
+the shutdown and reload work. The protocol crate's own live-socket runtime — `enip/io.rs`'s class-1
 UDP `IoManager`/`manager_task`/`IoConnectionHandle`, `client/io_service.rs`, and `client/mod.rs`'s TCP
 connect — is validated by the live OpENer/cpppo suites but is **left inside the denominator, counted
 against the gate**, not laundered out: the crate's well-tested codec (state machines, framing, golden
@@ -1633,7 +1719,8 @@ a ship blocker.
 | `sim.rs` + session behavior | per-signal BAD not swallowed; probe; browse paging incl. unsupported marker; scripted push frames (values, idle, stop-producing) |
 | `app.rs` supervisor | backoff math (template tests kept); connectivity tokens incl. PAUSED and break-while-paused, for both modes; provider/metric/token single-source invariants; the disconnected-wait exit classification (`Elapsed`/`Reconnect`/`Stopped`) — a cancelled or channel-closed instance leaves the backoff immediately, under `start_paused` time control |
 | `lifecycle.rs` (§10.3, D-EIP-27) | `stop_budget` composition and its [1 s, 10 s] clamp; `stop_tasks` joining cooperative tasks and aborting a straggler at the **absolute** deadline (`start_paused`); `shutdown_all`'s drain loop reaping a runtime inserted after the root was cancelled; registry insertion order, remove-by-id, drain, and the connectivity/generation views |
-| `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default; write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused (`PAUSED`) and repoll-on-push (`BAD_ARGS`) refusals; browse error mapping; push sb/read snapshot incl. `NO_FRAME` |
+| `reload.rs` (§10.4, D-EIP-28) | the pure diff: keep/start/stop/restart dispositions, the restart-all trigger (`component.global` **and** any other non-instances change), object-key-order insensitivity, skip-bad + zero-valid + invalid-global rejection, duplicate-id first-wins, and the previously-skipped-instance case; the shared startup/reload instance set (`parse_instances` deduping first-wins, and re-applying the startup document moving nothing); the transaction over a launcher double: stop→swap→launch proven by the **interleaving** (each stub task journals its own cancellation, so launch-before-stop fails), commit-path launches pinned to the candidate snapshot and global, kept-runtime identity (`Arc::ptr_eq` on `Health` — the pause-survival contract), the shutdown gate, self-boundedness when a stopping task wedges *and* when the broker wedges (`start_paused`), alarm clearing for removed instances ordered **after** their stop, `config-applied` (incl. a launch failure reported as a skip) + `repoll` availability, a second reload diffing against the generation the first one installed, and commit-failure ⇒ rollback restoring the prior set bound to the **prior** snapshot |
+| `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default tracked from the live count (incl. the empty-registry window answering `DEVICE_UNAVAILABLE`); write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused (`PAUSED`) and repoll-on-push (`BAD_ARGS`) refusals; browse error mapping; push sb/read snapshot incl. `NO_FRAME` |
 | `metrics.rs` | Total/Interval pair semantics (interval resets, total doesn't); per-dimension definition set matches §8 exactly incl. `EtherNetIpIo` (this test IS the parity contract's executable form) |
 | wire shape | `DataFacade::build_body` output for a §4.5 signal AND a §4.6 push field asserted field-by-field against §5.2 (id/address/device/quality/serverTs-present/sourceTs-absent) |
 
@@ -1765,8 +1852,9 @@ language) in the user-facing docs where relevant.
    legacy `write.enabled` boolean (strictly stronger, D-EIP-5); `sb/subscribe-preview` from
    §2.2 is N/A (no dynamic subscription spec to preview — push connections are config-declared)
    and is deliberately not registered.
-9. **Pause state does not survive restart** (in-memory; D-EIP-14/D-EIP-20). `sourceTs` is never
-   emitted (D-EIP-11).
+9. **Pause state does not survive restart** (in-memory; D-EIP-14/D-EIP-20) — nor an instance
+   restart performed by a configuration reload (D-EIP-28, §10.4): pause survives only on instances
+   the reload leaves untouched. `sourceTs` is never emitted (D-EIP-11).
 10. **One mode per instance** (D-EIP-2): a device needing both poll and push telemetry is two
     instances (they share nothing but the target device; each has its own session/connection).
 

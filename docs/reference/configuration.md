@@ -299,6 +299,36 @@ after `ecv1` on a multi-site broker.
 `pollIntervalMs` / `publishMode` / `batchMs` resolve: **signal/group value ▸ device `defaults` ▸
 `global.defaults` ▸ built-in**.
 
+## Applying changes
+
+A changed configuration document is applied while the component runs — from the watched config source
+(`FILE`, `CONFIGMAP`, `GG_CONFIG`, `SHADOW`, `CONFIG_COMPONENT`) or on demand through the built-in
+`reload-config` verb. The candidate is validated first, then applied as one transaction whose
+granularity is the instance:
+
+| Changed | Effect |
+|---------|--------|
+| One `component.instances[]` entry | That instance restarts (stop, then start on the new entry). Every other instance keeps running, connected, and — if paused — paused. |
+| An added `component.instances[]` entry | That instance starts. |
+| A removed `component.instances[]` entry | That instance stops, closes its device connection, and its `device-unreachable` alarm is cleared. |
+| `component.global`, `component.token`, or any section outside `component.instances[]` (`topic`, `hierarchy`, `identity`, `tags`, `messaging`, `metricEmission`, `logging`, `credentials`, `heartbeat`) | **Every** instance restarts. These settings are bound when an instance starts — its topics, UNS identity, metric identity, and connection timings. |
+| Nothing structural (key order, whitespace, formatting) | No restart. Entries are compared structurally. |
+
+Instance entries are matched by `id`, in declaration order; a duplicate `id` resolves to the first
+entry and the later one is ignored, as at startup.
+
+**Rejection.** A candidate that fails schema validation, whose `component.global` is malformed, or
+that contains no valid `component.instances[]` entry is rejected: the running configuration stays in
+effect and the component keeps operating on it. A single malformed instance inside an otherwise valid
+candidate is skipped with a warning and the rest of the document applies — the same skip-bad rule as
+startup, where the component instead refuses to start if no instance is valid.
+
+**Pause.** Pause state lives in memory. An instance that a change restarts comes back running; an
+instance the change leaves untouched keeps its pause.
+
+Each applied change publishes an `evt/info/config-applied` event carrying the started, stopped, kept
+and skipped instance ids (see the [messaging interface](messaging-interface.md#events-evt-class)).
+
 ## Limitations
 
 - **Value types** — CIP elementary scalars and 1-D arrays thereof (see [data-types](data-types.md)).

@@ -22,6 +22,13 @@
 //! Everything here is idempotent: [`CancellationToken::cancel`] is idempotent, `close()` is
 //! idempotent per the [`crate::device`] seam contract, and [`DeviceRegistry::take_all`] consumes —
 //! so a second [`shutdown_all`] pass over an empty registry is a no-op.
+//!
+//! ## The same engine stops one instance
+//!
+//! A configuration change (§10.4, [`crate::reload`]) stops the instances its candidate replaces
+//! through exactly the same path — [`stop_runtimes`], with the same [`stop_budget`] — so a replaced
+//! device's session is UnRegisterSession'd / ForwardClose'd before its successor connects, and a
+//! wedged instance can no more hang a reload than it can hang shutdown.
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -69,9 +76,8 @@ pub(crate) fn stop_budget(timeouts: &Timeouts) -> Duration {
 pub(crate) struct DeviceRuntime {
     /// The routing view shared with the command surface (cfg, control, health, dm, events).
     pub handle: DeviceHandle,
-    /// This instance's raw `component.instances[]` subtree — the configuration-diff key.
-    // Read through `DeviceRegistry::snapshot_running`, the reload transaction's plan input.
-    #[allow(dead_code)]
+    /// This instance's raw `component.instances[]` subtree — the configuration-diff key
+    /// ([`crate::reload::plan`]) and the undo record a rollback relaunches from.
     pub raw: serde_json::Value,
     /// Child of the app root token; cancelling it stops this instance's tasks.
     pub cancel: CancellationToken,
@@ -80,8 +86,10 @@ pub(crate) struct DeviceRuntime {
 }
 
 /// The live per-instance registry — the ONE source of truth for the connectivity provider, the
-/// command surface, and shutdown. Insertion order == configuration order (the single-instance
-/// command default depends on it).
+/// command surface, and shutdown. Insertion order is configuration order at startup, and
+/// kept-instances-then-newly-launched after a configuration change; it is the order the connectivity
+/// list and the routing snapshot report. The single-instance command default depends on the live
+/// *count*, not on that order (§10.4).
 ///
 /// Lock discipline: a `std::sync::RwLock`, **never** held across an `.await` — every method takes
 /// it, copies or moves what it needs, and drops it before returning.
@@ -97,15 +105,16 @@ struct RegistryState {
 }
 
 impl DeviceRegistry {
-    /// Append a launched runtime. The caller guarantees id-uniqueness (the configuration parse and
-    /// the reload plan both dedupe first-wins).
+    /// Append a launched runtime. The caller guarantees id-uniqueness: startup and every reload
+    /// derive their instance set from [`crate::reload::parse_instances`], which resolves a duplicate
+    /// id first-wins exactly as `Config::instance` does — so an id is launched once, and stopping it
+    /// stops all of it.
     pub fn insert(&self, rt: DeviceRuntime) {
         self.inner.write().unwrap().devices.push(rt);
     }
 
-    /// Remove one instance's runtime by id, if present.
-    // Consumed by the reload transaction (stop-then-launch); shutdown drains with `take_all`.
-    #[allow(dead_code)]
+    /// Remove one instance's runtime by id, if present — the reload transaction's detach step
+    /// (shutdown drains with [`Self::take_all`] instead).
     pub fn remove(&self, id: &str) -> Option<DeviceRuntime> {
         let mut state = self.inner.write().unwrap();
         let idx = state.devices.iter().position(|rt| rt.handle.cfg.id == id)?;
@@ -129,8 +138,6 @@ impl DeviceRegistry {
     }
 
     /// The live instance ids, in configuration order.
-    // Consumed by the reload transaction's logging/event payload.
-    #[allow(dead_code)]
     pub fn ids(&self) -> Vec<String> {
         self.inner
             .read()
@@ -160,10 +167,11 @@ impl DeviceRegistry {
 
     /// The generation's parsed `component.global`.
     ///
+    /// Read by the command surface (so `sb/signals` reflects the post-swap generation) and by the
+    /// reload transaction (whose stop stage is budgeted from the generation being torn down).
+    ///
     /// # Panics
-    /// Panics when no global has been published yet; `App::run` sets it before anything can read it.
-    // Consumed by the command surface, so `sb/signals` reflects the post-swap generation.
-    #[allow(dead_code)]
+    /// Panics when no global has been published yet; `App::new` sets it before anything can read it.
     pub fn global(&self) -> Arc<GlobalConfig> {
         self.inner
             .read()
@@ -175,7 +183,6 @@ impl DeviceRegistry {
 
     /// The `(id, raw subtree)` view of what is actually running — the reload plan's input (the
     /// running set, deliberately not the previous `Config`).
-    #[allow(dead_code)]
     pub fn snapshot_running(&self) -> Vec<(String, serde_json::Value)> {
         self.inner
             .read()
@@ -186,8 +193,8 @@ impl DeviceRegistry {
             .collect()
     }
 
-    /// Whether every live instance runs push mode — the `repoll` availability rule (D-EIP-25).
-    #[allow(dead_code)]
+    /// Whether every live instance runs push mode — the `repoll` availability rule (D-EIP-25),
+    /// recomputed after every generation swap.
     pub fn all_push(&self) -> bool {
         let state = self.inner.read().unwrap();
         !state.devices.is_empty()
@@ -199,8 +206,7 @@ impl DeviceRegistry {
 
     /// Whether no instance is live.
     // The shutdown drain reads the emptiness of what it just took, under the same lock acquisition;
-    // this is the standalone probe the command surface and the reload transaction use.
-    #[allow(dead_code)]
+    // this is the standalone probe the reload transaction uses to refuse an empty generation.
     pub fn is_empty(&self) -> bool {
         self.inner.read().unwrap().devices.is_empty()
     }
@@ -250,6 +256,29 @@ pub(crate) async fn stop_tasks(
     report
 }
 
+/// Stop a set of runtimes under one absolute budget: cancel each token, then join-or-abort every
+/// task it owns.
+///
+/// The cancel is the stop signal; consuming the [`DeviceRuntime`]s is the second half of it.
+/// Dropping each one drops its [`DeviceHandle`], releasing the registry's `DeviceControl` sender, so
+/// once the instance's own tasks let go of their clones the device task sees a closed control
+/// channel too — the same `Stopped` exit, reached from either side.
+///
+/// Shared by shutdown ([`shutdown_all`]) and by the configuration transaction
+/// ([`crate::reload`]), which stops one generation's replaced instances the same way.
+pub(crate) async fn stop_runtimes(runtimes: Vec<DeviceRuntime>, budget: Duration) -> StopReport {
+    let tasks: Vec<(String, Vec<JoinHandle<()>>)> = runtimes
+        .into_iter()
+        .map(|rt| {
+            // Redundant when the token is a child of an already-cancelled root — and exactly right
+            // for a per-instance stop, where nothing else has cancelled it.
+            rt.cancel.cancel();
+            (rt.handle.cfg.id.clone(), rt.tasks)
+        })
+        .collect();
+    stop_tasks(tasks, budget).await
+}
+
 /// Cancel the root, then drain-and-stop until the registry is empty.
 ///
 /// The drain is a **loop**, not a single pass: a reload transaction committing concurrently can
@@ -278,17 +307,8 @@ pub(crate) async fn shutdown_all(
         if runtimes.is_empty() {
             return report;
         }
-        let tasks: Vec<(String, Vec<JoinHandle<()>>)> = runtimes
-            .into_iter()
-            .map(|rt| {
-                // Redundant while the token is a child of `root` — and exactly right for a runtime
-                // whose token is not (or is re-parented by a later change).
-                rt.cancel.cancel();
-                (rt.handle.cfg.id.clone(), rt.tasks)
-            })
-            .collect();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let pass = stop_tasks(tasks, remaining).await;
+        let pass = stop_runtimes(runtimes, remaining).await;
         report.joined += pass.joined;
         report.aborted += pass.aborted;
     }

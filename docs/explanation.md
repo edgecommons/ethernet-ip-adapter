@@ -123,8 +123,48 @@ verbs answer, I/O verbs report the device unavailable.
 polling/publishing (or, for push, suppresses publishing) while keeping the connection alive and truthful
 with a slow real CIP round-trip every `keepaliveProbeIntervalMs`. A paused instance reports `state:
 "PAUSED"` while `connected` stays truthful, stale-signal health is suspended, and `repoll` is refused
-(error code `PAUSED`) until you resume. Pause is in-memory and does not survive a restart. `sb/resume` reverses it. Both are
+(error code `PAUSED`) until you resume. Pause is in-memory and does not survive a restart of the
+instance. `sb/resume` reverses it. Both are
 idempotent — the reply's `changed` tells you whether the call actually changed state.
+
+## How configuration changes apply
+
+The adapter applies a configuration change **as a transaction, per instance**, without restarting the
+component. The candidate document is validated first; only then is it turned into a plan of which
+instances to keep, start, stop, and restart, and that plan is carried out in one pass.
+
+The plan is a diff of `component.instances[]` against what is running:
+
+- An instance whose entry is **unchanged** keeps running. Its task, its device session, its metrics,
+  and its pause state are untouched — a configuration change elsewhere in the document does not
+  interrupt its telemetry.
+- An instance the candidate **adds** starts, exactly as it would at startup.
+- An instance the candidate **removes** stops: its device connection is closed cleanly (poll sessions
+  send UnRegisterSession, class-1 connections send ForwardClose), and its `device-unreachable` alarm
+  is cleared so a device that no longer exists does not leave a latched alarm on the bus.
+- An instance whose entry **changed** restarts — stop, then start on the new entry.
+
+Comparison is structural, not textual: reordering the keys of an instance object, or reformatting the
+document, changes nothing and restarts nothing.
+
+Anything **outside `component.instances[]`** — `component.global`, and library sections such as
+`topic`, `hierarchy`/`identity`, `tags`, `credentials`, and `metricEmission` — restarts **every**
+instance. Those settings are bound when an instance starts: they determine its topics, its UNS
+identity, its metric identity, and its connection timings, so an instance carried across such a change
+would keep publishing under the previous generation's settings.
+
+**Pause is in-memory, so an instance that restarts starts running again.** That applies to a restart
+caused by a configuration change exactly as it does to a component restart: a paused instance that the
+change restarts — because its own entry changed, or because a setting outside `component.instances[]`
+changed — comes back publishing. Pause survives only on instances the change leaves untouched. Pause an
+instance again after a change that restarts it.
+
+Rejection is all-or-nothing at the document level, and forgiving at the instance level — the same rule
+as startup. A candidate that fails schema validation, carries a malformed `component.global`, or
+contains no valid instance is **rejected**: the running configuration stays in effect and the adapter
+keeps operating on it. An individual malformed instance inside an otherwise valid candidate is skipped
+with a warning, and the rest of the document applies. Each applied change publishes a `config-applied`
+event listing what started, stopped, was kept, and was skipped.
 
 ## Two planes
 
@@ -149,8 +189,28 @@ data/events/logs/command replies, not in metric dimensions.
 
 ## A note on security
 
-EtherNet/IP here is **plaintext** — CIP over TCP `44818` and class-1 UDP `2222`, with no CIP Security /
-TLS. There is deliberately no credential/cert handling in the protocol layer; secure it at the
-**network** layer by deploying on an isolated OT segment (a dedicated VLAN, firewalled device subnet).
-Combined with the empty-by-default write allow-list, the adapter's default posture is read-only on an
-isolated network.
+An instance speaks **plaintext by default** — CIP over TCP `44818`, and class-1 implicit I/O over UDP
+`2222`. That default is deliberate: most installed EtherNet/IP devices offer nothing else, and the
+adapter should not pretend to a protection the wire does not have.
+
+Where the device supports CIP Security, a poll instance's explicit-messaging session runs over
+**EtherNet/IP over TLS** (TCP `2221`) with mutual X.509 authentication: set `security.mode` to `tls` on
+the device's `connection`. The client certificate, private key, and CA trust anchors come from the
+credentials vault, from files, or from inline `$secret` references, and the trust store is a set of
+roots, so a CA rollover trusts old and new at the same time. The adapter re-reads that material while it
+runs and reconnects when it changes, so a rotation takes effect without a restart; it also watches its
+own certificate's expiry and reports `cert-rotated`, `cert-expiring`, and `cert-expired` events. With
+`est.enabled`, it obtains and renews that certificate from an EST server (RFC 7030) on its own,
+authenticating with a bootstrap identity, an HTTP Basic credential, or the current certificate.
+
+`sb/status` reports the negotiated posture — TLS version, cipher suite, whether the device was verified,
+the client certificate's serial and expiry, and the trust anchors — alongside the device's own CIP
+Security configuration read from the target, which also works on a plaintext instance and tells you
+whether the device implements CIP Security at all. Connecting with `verifyPeer: false` accepts any
+device certificate and raises a `tls-peer-unverified` event, so a commissioning shortcut is visible on
+the bus rather than silent.
+
+Class-1 implicit I/O is plaintext: a `mode: push` instance configured with TLS is rejected at startup.
+So on a push instance, and on any device without CIP Security, the protection is the **network** layer —
+deploy on an isolated OT segment (a dedicated VLAN, a firewalled device subnet). Combined with the
+empty-by-default write allow-list, the adapter's posture on such a segment is read-only.

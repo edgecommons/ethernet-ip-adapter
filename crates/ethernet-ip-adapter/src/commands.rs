@@ -5,7 +5,8 @@
 //! push), each declaring [`CommandScope::Instance`] (D-EIP-26 / SOUTHBOUND §2.2: the library owns
 //! addressing — the topic token, `body.instance`, and the conflict refusal — and hands the handler
 //! the resolved instance; [`Commander::resolve`] then applies only the adapter-side policies of
-//! D-EIP-13: the sole configured device when none is addressed, `NO_SUCH_INSTANCE` when unknown)
+//! D-EIP-13: the sole **running** device when none is addressed — `BAD_ARGS` with several running,
+//! `DEVICE_UNAVAILABLE` with none — and `NO_SUCH_INSTANCE` when the addressed id is not running)
 //! and the §7.1 error codes
 //! (`BAD_ARGS`, `NO_SUCH_INSTANCE`, `WRITE_NOT_ALLOWED`, `WRITE_FAILED`, `DEVICE_UNAVAILABLE`,
 //! `READ_FAILED`, `RECONNECT_FAILED`, `BROWSE_UNSUPPORTED`, `BROWSE_FAILED`, `PAUSED`).
@@ -17,20 +18,31 @@
 //!
 //! Three panels (§7.6) are registered via `commands.register_panel` for the edge-console descriptor
 //! surface — `overview`, `signals`, `diagnostics`, each `scope: "instance"` with `order` 10/20/30.
+//!
+//! ## The surface is registered once and routes dynamically (D-EIP-28)
+//!
+//! Verbs and panels are registered exactly once, at startup. Routing is therefore resolved per
+//! request against the live [`crate::lifecycle::DeviceRegistry`] rather than a startup snapshot, so a
+//! configuration change that starts, stops, or restarts instances is answered truthfully by the same
+//! registrations: an instance the current configuration no longer runs is `NO_SUCH_INSTANCE`, a newly
+//! started one routes the moment it is inserted, and the effective `component.global` behind
+//! `sb/signals` is the running generation's. A request that reaches an instance while it is being
+//! replaced finds a closed control channel and is answered `DEVICE_UNAVAILABLE`.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use edgecommons::commands::{command_handler, AVAILABILITY_UNSUPPORTED};
+use edgecommons::commands::{command_handler, AVAILABILITY_AVAILABLE, AVAILABILITY_UNSUPPORTED};
 use edgecommons::prelude::{CommandError, CommandInbox, CommandScope, Severity};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::app::{BrowseError, DeviceControl, EventSink, Health, LinkState, WriteRequest};
-use crate::config::{DeviceConfig, DeviceMode, EipType, GlobalConfig, IoConfig, IoFieldSpec, SignalSpec};
+use crate::config::{DeviceConfig, DeviceMode, EipType, IoConfig, IoFieldSpec, SignalSpec};
 use crate::device::{BrowsePage, Quality, Reading};
+use crate::lifecycle::DeviceRegistry;
 use crate::metrics::{CommandTally, DeviceMetrics};
 
 /// The per-device handles the command surface needs: the config (routing, allow-list, address view),
@@ -52,21 +64,23 @@ pub struct DeviceHandle {
 /// conflicts with the topic's instance token with `BAD_ARGS` — and hands the handler the resolved
 /// instance (the topic token, else the body-named one, else `None`).
 ///
-/// When every configured device runs push mode, `repoll` is marked `unsupported` in `describe`
-/// via `set_command_availability` (D-EIP-25): the verb is mode-conditional and no instance can
-/// service it in an all-push configuration. The verb stays registered — an addressed request
-/// still gets its per-instance `BAD_ARGS` refusal (§7.5).
+/// Registration happens **once**; the handlers close over the `registry`, so they keep routing
+/// correctly across a configuration change that starts, stops, or restarts instances (D-EIP-28).
+///
+/// When every device the registry runs is in push mode, `repoll` is marked `unsupported` in
+/// `describe` via `set_command_availability` (D-EIP-25): the verb is mode-conditional and no
+/// instance can service it in an all-push configuration. The verb stays registered — an addressed
+/// request still gets its per-instance `BAD_ARGS` refusal (§7.5). The same
+/// [`repoll_availability`] rule is re-applied whenever the running set changes, so the describe
+/// entry follows the configuration.
 ///
 /// # Errors
-/// Propagates [`CommandInbox::register`] / [`CommandInbox::register_panel`] failures
-/// (a verb/panel name clash or an invalid token).
-pub fn register_all(
-    commands: &CommandInbox,
-    handles: Vec<DeviceHandle>,
-    global: Arc<GlobalConfig>,
-) -> anyhow::Result<()> {
-    let all_push = repoll_unsupported(&handles);
-    let commander = Arc::new(Commander::new(handles, global));
+/// Propagates [`CommandInbox::register`] / [`CommandInbox::register_panel`] /
+/// [`CommandInbox::set_command_availability`] failures (a verb/panel name clash or an invalid
+/// token).
+pub fn register_all(commands: &CommandInbox, registry: Arc<DeviceRegistry>) -> anyhow::Result<()> {
+    let all_push = registry.all_push();
+    let commander = Arc::new(Commander::new(registry));
 
     macro_rules! verb {
         ($name:expr, $method:ident) => {{
@@ -108,13 +122,8 @@ pub fn register_all(
         )?;
     }
 
-    if all_push {
-        commands.set_command_availability(
-            "repoll",
-            AVAILABILITY_UNSUPPORTED,
-            Some("all configured instances are push-mode (class-1 cyclic I/O); repoll applies to poll instances"),
-        )?;
-    }
+    let (state, reason) = repoll_availability(all_push);
+    commands.set_command_availability("repoll", state, reason)?;
 
     for panel in panels() {
         commands.register_panel(panel)?;
@@ -122,10 +131,26 @@ pub fn register_all(
     Ok(())
 }
 
-/// True when `repoll` is unserviceable in this configuration (D-EIP-25): every configured device
-/// runs push mode, so `register_all` marks the verb `unsupported` in `describe`.
-fn repoll_unsupported(handles: &[DeviceHandle]) -> bool {
-    !handles.is_empty() && handles.iter().all(|h| matches!(h.cfg.mode, DeviceMode::Push))
+/// The `repoll` describe availability for a running set (D-EIP-25), as the
+/// `(state, reason)` pair [`CommandInbox::set_command_availability`] takes.
+///
+/// `repoll` is mode-conditional: when every running instance is push mode (class-1 cyclic I/O) no
+/// instance can service it, so `describe` reports it `unsupported` with the reason. Otherwise it is
+/// `available`, which clears any stored describe entry — which is what makes the rule
+/// re-appliable: a configuration change that adds the first poll instance to an all-push adapter
+/// restores the verb, and one that removes the last poll instance marks it unsupported again.
+///
+/// One rule, one home: both the registration site and the configuration-change path call it.
+#[must_use]
+pub fn repoll_availability(all_push: bool) -> (&'static str, Option<&'static str>) {
+    if all_push {
+        (
+            AVAILABILITY_UNSUPPORTED,
+            Some("all configured instances are push-mode (class-1 cyclic I/O); repoll applies to poll instances"),
+        )
+    } else {
+        (AVAILABILITY_AVAILABLE, None)
+    }
 }
 
 /// The three edge-console panel descriptors (§7.6). Core validates `id`/`title`/uniqueness; the rest
@@ -193,46 +218,54 @@ pub fn panels() -> Vec<Value> {
     ]
 }
 
-/// The command dispatcher: owns the per-device handles + the config order (for the single-instance
-/// default) and the shared global (effective poll/publish resolution for `sb/signals`).
-struct Commander {
-    devices: HashMap<String, DeviceHandle>,
-    ids: Vec<String>,
-    global: Arc<GlobalConfig>,
+/// The command dispatcher. It holds **no** per-generation state: every request resolves against the
+/// live [`DeviceRegistry`] — the running instances in configuration order (the single-instance
+/// default depends on that order) and the running `component.global` (effective poll/publish
+/// resolution for `sb/signals`).
+pub struct Commander {
+    registry: Arc<DeviceRegistry>,
 }
 
 type Reply = std::result::Result<Option<Value>, CommandError>;
 
 impl Commander {
-    fn new(handles: Vec<DeviceHandle>, global: Arc<GlobalConfig>) -> Self {
-        let ids: Vec<String> = handles.iter().map(|h| h.cfg.id.clone()).collect();
-        let devices = handles.into_iter().map(|h| (h.cfg.id.clone(), h)).collect();
-        Self { devices, ids, global }
+    fn new(registry: Arc<DeviceRegistry>) -> Self {
+        Self { registry }
     }
 
     /// Route to the addressed device — the adapter-side half of the resolution (D-SC-4, D-EIP-13).
     ///
     /// The library has already resolved the addressing (the delivery topic's instance token, else
     /// the body's `instance` field) and refused any conflict between the two; what needs this
-    /// adapter's configuration stays here: an unaddressed request routes to the sole configured
-    /// device (`BAD_ARGS` with ≥ 2), and an addressed instance that is not configured is
-    /// `NO_SUCH_INSTANCE`.
-    fn resolve(&self, addressed: Option<&str>) -> std::result::Result<&DeviceHandle, CommandError> {
+    /// adapter's configuration stays here: an unaddressed request routes to the sole running device
+    /// (`BAD_ARGS` otherwise), and an addressed instance that is not running is `NO_SUCH_INSTANCE`.
+    ///
+    /// The lookup reads the registry per request, so it follows the running configuration rather
+    /// than a startup snapshot (D-EIP-28), and it hands back an owned handle so no registry lock is
+    /// held across the verb's `.await`s. That costs a clone of the routing snapshot — every running
+    /// device's handle, not just the addressed one — per request: the control plane is low-rate by
+    /// construction, and the alternative (a lock held across device I/O) would serialize the whole
+    /// surface behind one instance.
+    fn resolve(&self, addressed: Option<&str>) -> std::result::Result<DeviceHandle, CommandError> {
+        let mut running = self.registry.handles();
         match addressed {
-            Some(id) => self
-                .devices
-                .get(id)
+            Some(id) => running
+                .into_iter()
+                .find(|h| h.cfg.id == id)
                 .ok_or_else(|| CommandError::new("NO_SUCH_INSTANCE", format!("no configured device `{id}`"))),
-            None => {
-                if self.ids.len() == 1 {
-                    Ok(self.devices.get(&self.ids[0]).expect("one device"))
-                } else {
-                    Err(CommandError::new(
-                        "BAD_ARGS",
-                        "the request must address an instance when multiple devices are configured",
-                    ))
-                }
-            }
+            // Exactly one running instance answers an unaddressed request.
+            None if running.len() == 1 => Ok(running.remove(0)),
+            // No instance is running: the registry is empty for the length of the stop stage of a
+            // configuration change that restarts every instance. Addressing one would only earn a
+            // `NO_SUCH_INSTANCE`, so say what is actually true instead of asking for an address.
+            None if running.is_empty() => Err(CommandError::new(
+                "DEVICE_UNAVAILABLE",
+                "no device is running; a configuration change is being applied",
+            )),
+            None => Err(CommandError::new(
+                "BAD_ARGS",
+                "the request must address an instance when multiple devices are configured",
+            )),
         }
     }
 
@@ -276,9 +309,9 @@ impl Commander {
             .and_then(|v| v.as_array())
             .ok_or_else(|| CommandError::new("BAD_ARGS", "expected a `signals` array"))?;
         let result = if matches!(h.cfg.mode, DeviceMode::Push) {
-            self.read_push(h, refs).await
+            self.read_push(&h, refs).await
         } else {
-            self.read_poll(h, refs).await
+            self.read_poll(&h, refs).await
         };
         let (ok, served) = match &result {
             Ok((_, n)) => (true, *n),
@@ -408,9 +441,9 @@ impl Commander {
         let started = Instant::now();
         let entries = write_entries(body)?;
         let result = if matches!(h.cfg.mode, DeviceMode::Push) {
-            self.write_push(h, &entries).await
+            self.write_push(&h, &entries).await
         } else {
-            self.write_poll(h, &entries).await
+            self.write_poll(&h, &entries).await
         };
         let (ok, attempted, failures) = match &result {
             Ok((_, tally)) => (true, tally.write_signals, tally.write_failures),
@@ -580,20 +613,23 @@ impl Commander {
         let h = self.resolve(addressed)?;
         let started = Instant::now();
         let out = if matches!(h.cfg.mode, DeviceMode::Push) {
-            self.signals_push(h)
+            self.signals_push(&h)
         } else {
-            self.signals_poll(h)
+            self.signals_poll(&h)
         };
         h.dm.record_command("sb/signals", true, ms(started), CommandTally::default());
         Ok(Some(out))
     }
 
     fn signals_poll(&self, h: &DeviceHandle) -> Value {
+        // The RUNNING generation's global, not a startup snapshot: after a configuration change the
+        // resolved cadence/publish mode this reports is the one the poll engine is actually using.
+        let global = self.registry.global();
         let mut signals = Vec::new();
         for g in &h.cfg.poll_groups {
             let group = g.id.clone().unwrap_or_default();
-            let interval = h.cfg.effective_poll_ms(g, &self.global);
-            let mode = h.cfg.effective_publish_mode(g, &self.global).as_str();
+            let interval = h.cfg.effective_poll_ms(g, &global);
+            let mode = h.cfg.effective_publish_mode(g, &global).as_str();
             for s in &g.signals {
                 signals.push(json!({
                     "name": s.name,
@@ -611,12 +647,13 @@ impl Commander {
     }
 
     fn signals_push(&self, h: &DeviceHandle) -> Value {
+        let global = self.registry.global();
         let mut signals = Vec::new();
         let mode = h
             .cfg
             .defaults
             .publish_mode
-            .or(self.global.defaults.publish_mode)
+            .or(global.defaults.publish_mode)
             .unwrap_or(crate::config::PublishMode::OnChange)
             .as_str();
         if let Some(io) = h.cfg.io.as_ref() {
@@ -661,7 +698,7 @@ impl Commander {
             ));
         }
         if body.get("ref").is_some() {
-            let result = self.browse_hierarchical(h, body).await;
+            let result = self.browse_hierarchical(&h, body).await;
             let (ok, browsed) = match &result {
                 Ok(Some(v)) => (true, v.get("refCount").and_then(Value::as_u64).unwrap_or(0)),
                 _ => (false, 0),
@@ -678,7 +715,7 @@ impl Commander {
         let max = body.get("max").and_then(|v| v.as_u64()).unwrap_or(200).clamp(1, 1000) as usize;
 
         let result: std::result::Result<Value, CommandError> = if matches!(h.cfg.mode, DeviceMode::Push) {
-            Ok(browse_push_layout(h))
+            Ok(browse_push_layout(&h))
         } else {
             let (tx, rx) = oneshot::channel();
             h.control
@@ -686,7 +723,7 @@ impl Commander {
                 .await
                 .map_err(|_| device_unavailable())?;
             match rx.await {
-                Ok(Ok(page)) => Ok(browse_page_json(h, page)),
+                Ok(Ok(page)) => Ok(browse_page_json(&h, page)),
                 Ok(Err(BrowseError::Unsupported)) => {
                     Err(CommandError::new("BROWSE_UNSUPPORTED", "device has no tag-list service"))
                 }
@@ -1180,18 +1217,50 @@ mod tests {
     //! allow-list refusal proven to happen BEFORE any device I/O; confirmed/push writes; poll-live vs
     //! push-snapshot reads; repoll refusals; browse mapping; the catalog. A mock device task services
     //! the control channel and RECORDS every write that reaches it — no PLC, no socket.
+    //!
+    //! Every `Commander` here is built over a real [`DeviceRegistry`], the same one the supervisor
+    //! feeds, so the routing assertions exercise the live-lookup path (D-EIP-28) rather than a
+    //! startup snapshot.
     use super::*;
     use std::sync::Mutex;
 
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     use crate::app::{apply_pause, Health, LinkState};
     use crate::config::GlobalConfig;
     use crate::device::{BrowsedTag, InputSnapshot};
+    use crate::lifecycle::DeviceRuntime;
     use crate::testutil::{device_metrics, RecordingEvents};
 
     fn dev(v: Value) -> DeviceConfig {
         DeviceConfig::from_value(&v).unwrap()
+    }
+
+    /// A registry entry for a routing-only handle: no tasks, an unused token — the registry is the
+    /// routing view under test, not the supervision one.
+    fn runtime(handle: DeviceHandle) -> DeviceRuntime {
+        DeviceRuntime {
+            raw: json!({ "id": handle.cfg.id }),
+            handle,
+            cancel: CancellationToken::new(),
+            tasks: Vec::new(),
+        }
+    }
+
+    /// A live registry holding `handles` in order, with the default global published.
+    fn registry_of(handles: Vec<DeviceHandle>) -> Arc<DeviceRegistry> {
+        let registry = Arc::new(DeviceRegistry::default());
+        registry.set_global(Arc::new(GlobalConfig::default()));
+        for h in handles {
+            registry.insert(runtime(h));
+        }
+        registry
+    }
+
+    /// A `Commander` over a live registry holding `handles`.
+    fn commander_of(handles: Vec<DeviceHandle>) -> Commander {
+        Commander::new(registry_of(handles))
     }
 
     fn poll_device() -> DeviceConfig {
@@ -1260,6 +1329,8 @@ mod tests {
 
     struct Harness {
         commander: Arc<Commander>,
+        /// The registry the commander routes over — tests mutate it to model a generation swap.
+        registry: Arc<DeviceRegistry>,
         /// Every write that REACHED the device (`(id, value)`) — empty proves the allow-list refused
         /// before any device I/O.
         writes: Arc<Mutex<Vec<(String, Value)>>>,
@@ -1364,8 +1435,9 @@ mod tests {
         });
 
         let handle = DeviceHandle { cfg, control: tx, health: Arc::clone(&health), dm, events };
-        let commander = Arc::new(Commander::new(vec![handle], Arc::new(GlobalConfig::default())));
-        Harness { commander, writes, events: events_rec, health, _task: task }
+        let registry = registry_of(vec![handle]);
+        let commander = Arc::new(Commander::new(Arc::clone(&registry)));
+        Harness { commander, registry, writes, events: events_rec, health, _task: task }
     }
 
     fn ok(reply: Reply) -> Value {
@@ -1387,16 +1459,7 @@ mod tests {
         assert_eq!(err_code(h.commander.status(Some("nope"), &json!({})).await), "NO_SUCH_INSTANCE");
 
         // Two devices: an unaddressed request is BAD_ARGS.
-        let mk = |cfg: DeviceConfig| {
-            let (tx, _rx) = mpsc::channel(1);
-            let health = Arc::new(Health::default());
-            let (_m, dm) = device_metrics(cfg.clone(), Arc::clone(&health));
-            let events: Arc<dyn EventSink> = Arc::new(RecordingEvents::default());
-            DeviceHandle { cfg, control: tx, health, dm, events }
-        };
-        let mut b = poll_device();
-        b.id = "second".into();
-        let multi = Commander::new(vec![mk(poll_device()), mk(b)], Arc::new(GlobalConfig::default()));
+        let multi = two_device_commander();
         assert_eq!(err_code(multi.status(None, &json!({})).await), "BAD_ARGS");
     }
 
@@ -1411,11 +1474,16 @@ mod tests {
         DeviceHandle { cfg, control: tx, health, dm, events }
     }
 
-    /// Two poll devices: `filler-plc` + `second`.
-    fn two_device_commander() -> Commander {
+    /// A second poll device, `second`.
+    fn second_device() -> DeviceConfig {
         let mut b = poll_device();
         b.id = "second".into();
-        Commander::new(vec![bare_handle(poll_device()), bare_handle(b)], Arc::new(GlobalConfig::default()))
+        b
+    }
+
+    /// Two poll devices: `filler-plc` + `second`.
+    fn two_device_commander() -> Commander {
+        commander_of(vec![bare_handle(poll_device()), bare_handle(second_device())])
     }
 
     #[tokio::test]
@@ -1441,14 +1509,123 @@ mod tests {
         assert_eq!(ok(single.commander.status(None, &json!({})).await)["id"], json!("filler-plc"));
     }
 
+    /// The describe availability `register_all` and the configuration-change path both apply
+    /// (D-EIP-25). `available` is the clearing state, which is what lets an all-push adapter that
+    /// gains a poll instance get the verb back.
+    #[test]
+    fn repoll_availability_rule() {
+        let (state, reason) = repoll_availability(true);
+        assert_eq!(state, AVAILABILITY_UNSUPPORTED);
+        assert!(reason.is_some_and(|r| r.contains("push-mode")));
+
+        let (state, reason) = repoll_availability(false);
+        assert_eq!(state, AVAILABILITY_AVAILABLE);
+        assert_eq!(reason, None);
+    }
+
+    // --- routing over the LIVE registry across a generation swap (D-EIP-28) -----------------------
+
+    /// Routing follows the registry, not a startup snapshot: an instance a configuration change
+    /// stopped is `NO_SUCH_INSTANCE`, and one it starts routes as soon as it is inserted. Against a
+    /// `Commander` holding its own startup map, the second assertion cannot fail and the third
+    /// cannot pass.
     #[tokio::test]
-    async fn repoll_is_unsupported_only_when_every_device_is_push() {
-        // The predicate `register_all` feeds into `set_command_availability` (D-EIP-25): true
-        // only when every configured device runs push mode.
-        assert!(repoll_unsupported(&[bare_handle(push_device())]));
-        assert!(!repoll_unsupported(&[bare_handle(poll_device())]));
-        assert!(!repoll_unsupported(&[bare_handle(poll_device()), bare_handle(push_device())]));
-        assert!(!repoll_unsupported(&[]));
+    async fn resolve_follows_the_live_registry() {
+        let registry = registry_of(vec![bare_handle(poll_device()), bare_handle(second_device())]);
+        let commander = Commander::new(Arc::clone(&registry));
+        assert_eq!(ok(commander.status(Some("second"), &json!({})).await)["id"], json!("second"));
+
+        // The configuration no longer runs `second`.
+        registry.remove("second").expect("second was running");
+        assert_eq!(err_code(commander.status(Some("second"), &json!({})).await), "NO_SUCH_INSTANCE");
+
+        // A configuration change starts it again — same registrations, routable immediately.
+        registry.insert(runtime(bare_handle(second_device())));
+        assert_eq!(ok(commander.status(Some("second"), &json!({})).await)["id"], json!("second"));
+    }
+
+    /// The single-instance default is computed from the live count, so removing one of two devices
+    /// makes the survivor answer unaddressed requests — and adding one takes the default away.
+    #[tokio::test]
+    async fn single_instance_default_tracks_the_live_count() {
+        let registry = registry_of(vec![bare_handle(poll_device()), bare_handle(second_device())]);
+        let commander = Commander::new(Arc::clone(&registry));
+        assert_eq!(err_code(commander.status(None, &json!({})).await), "BAD_ARGS");
+
+        registry.remove("second").expect("second was running");
+        assert_eq!(
+            ok(commander.status(None, &json!({})).await)["id"],
+            json!("filler-plc"),
+            "the sole survivor answers an unaddressed request"
+        );
+
+        registry.insert(runtime(bare_handle(second_device())));
+        assert_eq!(err_code(commander.status(None, &json!({})).await), "BAD_ARGS");
+    }
+
+    /// The window a configuration change that restarts every instance opens: for the length of the
+    /// stop stage the registry is empty. An unaddressed request then gets the truth — no device is
+    /// running — rather than being told to address an instance that would only answer
+    /// `NO_SUCH_INSTANCE`.
+    #[tokio::test]
+    async fn an_unaddressed_request_with_nothing_running_is_device_unavailable() {
+        let registry = registry_of(vec![bare_handle(poll_device())]);
+        let commander = Commander::new(Arc::clone(&registry));
+        assert_eq!(ok(commander.status(None, &json!({})).await)["id"], json!("filler-plc"));
+
+        registry.take_all();
+        let err = commander
+            .status(None, &json!({}))
+            .await
+            .expect_err("nothing is running");
+        assert_eq!(err.code, "DEVICE_UNAVAILABLE");
+        assert!(
+            err.message.contains("no device is running"),
+            "the message states what is actually wrong: {}",
+            err.message
+        );
+        // Addressing an instance in that window is still `NO_SUCH_INSTANCE`, which is why asking the
+        // caller to address one would be useless advice.
+        assert_eq!(
+            err_code(commander.status(Some("filler-plc"), &json!({})).await),
+            "NO_SUCH_INSTANCE"
+        );
+    }
+
+    /// `sb/signals` resolves its cadence/publish mode against the registry's global, so the reply
+    /// reflects the generation the poll engine is running — not the one captured at startup.
+    #[tokio::test]
+    async fn sb_signals_reads_the_swapped_global() {
+        let h = harness(poll_device(), MockOpts::default());
+        let poll_ms = |out: &Value| out["signals"][0]["pollIntervalMs"].as_u64().unwrap();
+        let before = ok(h.commander.signals(None, &json!({})).await);
+        assert_eq!(poll_ms(&before), 5_000, "the built-in default");
+        assert_eq!(before["signals"][0]["publishMode"], json!("onChange"));
+
+        h.registry.set_global(Arc::new(
+            GlobalConfig::from_value(&json!({
+                "defaults": { "pollIntervalMs": 250, "publishMode": "always" }
+            }))
+            .unwrap(),
+        ));
+
+        let after = ok(h.commander.signals(None, &json!({})).await);
+        assert_eq!(poll_ms(&after), 250, "the swapped global's cadence");
+        assert_eq!(after["signals"][0]["publishMode"], json!("always"));
+
+        // Push instances resolve their publish mode from the same live global.
+        let hp = harness(push_device(), MockOpts::default());
+        assert_eq!(
+            ok(hp.commander.signals(None, &json!({})).await)["signals"][0]["publishMode"],
+            json!("onChange")
+        );
+        hp.registry.set_global(Arc::new(
+            GlobalConfig::from_value(&json!({ "defaults": { "publishMode": "always" } })).unwrap(),
+        ));
+        assert_eq!(
+            ok(hp.commander.signals(None, &json!({})).await)["signals"][0]["publishMode"],
+            json!("always")
+        );
     }
 
     // --- sb/status ---------------------------------------------------------------------------------

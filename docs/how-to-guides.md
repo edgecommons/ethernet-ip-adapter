@@ -160,7 +160,8 @@ While paused, the instance reports `state: "PAUSED"` (with `connected` still tru
 health is suspended, a slow liveness probe keeps `connected` honest, and `repoll` is refused with the
 `PAUSED` error code. Both verbs
 are idempotent — `changed` tells you whether the call moved the state. Pause is in-memory and resets to
-running on restart.
+running on restart — including a restart of that instance caused by a
+[configuration change](#change-the-configuration-without-restarting-the-component).
 
 ---
 
@@ -380,6 +381,71 @@ An unreachable EST server never blocks polling: the current certificate is kept 
 retried after `retryBackoffMins`. Enrollment reports through the `cert-enrolled` / `cert-enroll-failed`
 events, the `estEnrollments` / `estFailures` metrics, and `sb/status` `security.est` (`enabled`,
 `lastEnroll`, `nextRenew`, `enrollments`, `failures`).
+
+---
+
+## Change the configuration without restarting the component
+
+The adapter applies configuration changes while it runs. Take whichever of the three paths matches how
+the component gets its configuration — all three end in the same transaction.
+
+**Edit the configuration document** (`-c FILE`). The adapter watches the file and applies the change
+when you save it. Write it atomically (edit a temporary file and rename it over the target) so the
+adapter never reads a half-written document:
+
+```bash
+cp config.json config.json.new
+$EDITOR config.json.new
+mv config.json.new config.json     # applied on the rename
+```
+
+**Update the Kubernetes ConfigMap** (`-c CONFIGMAP`). The ConfigMap is mounted as a directory, and the
+adapter applies the change when the kubelet swaps the mount — within its sync period after you apply
+the manifest. The pod is not restarted:
+
+```bash
+$EDITOR k8s/configmap.yaml
+kubectl apply -f k8s/configmap.yaml
+```
+
+**Ask for a re-read** with the built-in `reload-config` verb. It re-fetches from whichever source the
+component was started with (file, ConfigMap, Greengrass deployment, shadow, or configuration
+component) and applies it — useful when you changed the source out of band:
+
+```
+publish   ecv1/<device>/ethernet-ip-adapter/cmd/reload-config
+          { "header": { "name": "reload-config", "reply_to": "app/r", "correlation_id": "9" }, "body": {} }
+subscribe app/r   → { "ok": true, "result": { "reloaded": true } }
+```
+
+A rejected candidate answers `{ "ok": false, "error": { "code": "RELOAD_FAILED", … } }` and the running
+configuration stays in effect.
+
+**What restarts, and what does not:**
+
+| You change | Effect |
+|------------|--------|
+| One `component.instances[]` entry | That instance restarts. Every other instance keeps running. |
+| An added / removed `component.instances[]` entry | The added instance starts; the removed one stops, closes its device connection, and its `device-unreachable` alarm is cleared. |
+| Anything else — `component.global`, `topic`, `hierarchy`/`identity`, `tags`, `metricEmission`, … | **Every** instance restarts. |
+| Formatting or key order only | Nothing. The comparison is structural. |
+
+Each applied change publishes an `evt/info/config-applied` event listing what started, stopped, was
+kept, and was skipped.
+
+Two consequences worth planning around:
+
+- **A restarted instance is no longer paused.** Pause is in-memory, so an instance that the change
+  restarts comes back publishing — re-issue `sb/pause` afterwards if you still want it paused. An
+  instance the change leaves untouched keeps its pause.
+- **A restarted instance reconnects.** Its session is closed and re-opened, so it re-publishes its
+  `device-connected` event and its interval counters restart.
+
+If the candidate document fails validation, carries a malformed `component.global`, or contains no
+valid instance, it is rejected and the running configuration keeps operating — check the component log
+for the reason. A single malformed instance inside an otherwise valid document is skipped with a
+warning and the rest applies, exactly as at startup. See
+[explanation.md](explanation.md#how-configuration-changes-apply) for the model.
 
 ---
 
