@@ -69,6 +69,10 @@ pub(crate) struct SessionStats {
     /// Connected class-3 replies discarded because the connected-data sequence count did not match
     /// (D-ENIP-5).
     pub connected_seq_mismatches: AtomicU64,
+    /// Class-3 inactivity keepalives that completed an exchange with the target (§7.6, D-ENIP-18) —
+    /// the observable evidence that the session is feeding the target's connection watchdog. A
+    /// keepalive whose reply carried a CIP error still counts: the exchange flowed.
+    pub keepalives_sent: AtomicU64,
 }
 
 /// A single request/reply transaction for the actor to run.

@@ -494,8 +494,10 @@ state is in-memory, an instance that was paused starts running again when the ad
   (`CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` — the same one `sb/status` returns), and its
   `connectionMode`.
 - **Events** — `evt/{info|critical}/device-connected|device-unreachable` (a stateful link alarm),
-  `evt/{warning|info}/adapter-paused|adapter-resumed`, `evt/{info|warning}/write-audit`, and — for
-  TLS instances — `evt/warning/tls-handshake-failed` and `evt/warning/tls-peer-unverified`.
+  `evt/{warning|info}/adapter-paused|adapter-resumed`, `evt/{info|warning}/write-audit`, for push
+  instances `evt/warning/io-redirect-refused` (the device asks for its outputs at a foreign address,
+  which the adapter refuses), and — for TLS instances — `evt/warning/tls-handshake-failed` and
+  `evt/warning/tls-peer-unverified`.
 - **Security posture** — `sb/status` returns a `security` object per instance, and the `state`
   keepalive carries `attributes.security` (`"tls"`|`"plaintext"`).
 - **Status verb** `sb/status` → connection state, paused, a counter snapshot (and an `io` block on push).

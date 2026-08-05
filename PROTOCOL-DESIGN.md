@@ -34,7 +34,7 @@ Grounding artifacts (verified 2026-07-18, do not work from memory):
 ## Table of contents
 
 1. [Goals, non-goals & isolation contract](#1-goals-non-goals--isolation-contract)
-2. [Decisions register (D-ENIP-1…D-ENIP-17)](#2-decisions-register)
+2. [Decisions register (D-ENIP-1…D-ENIP-18)](#2-decisions-register)
 3. [Workspace & crate layout](#3-workspace--crate-layout)
 4. [Memory-safe decoding: the `WireReader` invariant](#4-memory-safe-decoding-the-wirereader-invariant)
 5. [Encapsulation layer](#5-encapsulation-layer)
@@ -142,7 +142,8 @@ throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.
 | **D-ENIP-13** | **v1 restricts routing to port numbers ≤ 14** (covers backplane port 1 + slot, the only routed path the adapter exposes). The extended-port encoding is implemented per spec but gated behind a conformance vector captured from real routed hardware before it is enabled. | The references disagree on extended-port byte order and we have no routed device to arbitrate; shipping an unverified encoding of a rarely-used path is how wire bugs are born. Declared limitation, not silent. |
 | **D-ENIP-14** | **The crate ships NO embedded test target.** Session/connection state-machine tests run over in-memory `tokio::io::duplex` byte-stream fixtures — the session actor is generic over `AsyncRead + AsyncWrite`, so a fixture deterministically injects wrong-`sender_context`, stale, fragmented, and sequence-mismatch frames a real device cannot be scripted to send. Real device behavior is validated against the EXTERNAL cpppo (poll) and OpENer (push) containers in the adapter's integration suite (§12.5). | Keeps every device simulator external to match reality (user decision) while preserving deterministic adversarial testing via raw-byte fixtures: the duplex fixture is a byte pipe, not a peer implementation, so a decoder bug can never be masked by a matching encoder bug in an in-crate double. (The earlier `testserver` in-crate target idea was dropped for this reason — there is no `testserver` module or feature.) |
 | **D-ENIP-16** | **ForwardOpen success replies are verified before use** — originator echo quad equality (T→O connection id, connection serial, vendor id, originator serial) plus, for class-1, an API range of [100 µs, 600 s]; failure ⇒ best-effort ForwardClose + typed error. | An unvalidated reply API of 0 previously livelocked the produce scheduler; an unverified echo can bind a connection to the wrong identity. The target-assigned O→T id is excluded because the request sends 0 and the choice is the target's. |
-| **D-ENIP-17** | **A ForwardOpen reply cannot steer our class-1 traffic.** (a) The O→T Sockaddr Info item retargets the **port only**: the transmit address is always the target's own. A sockaddr naming `0.0.0.0` contributes its port; one naming the target's address is honoured as written; one naming any other address — foreign unicast, broadcast, multicast, loopback — has its address **refused** (warned, naming the address) and only its port kept. With no known target address a redirect is unresolvable and the open fails. (b) The T→O multicast group is joined **only** when the ForwardOpen requested `ConnType::Multicast` for T→O; a multicast T→O sockaddr answering any other request is a `ProtocolViolation` whose detail names the type that was requested (`"multicast T→O sockaddr on a point-to-point request"`, `"multicast T→O sockaddr on a null (reconfigure) request"`) — the adapter only ever requests P2P, but the crate API accepts either, and a violation must not misreport which one it refused. A requested-multicast connection whose reply carries a unicast or absent T→O sockaddr consumes unicast. Both paths keep the D-ENIP-16 teardown invariant (best-effort ForwardClose before the typed error). Strict by default, with no opt-out knob. | Honouring a concrete foreign address let any target aim our cyclic O→T stream at a third party — a reflection/amplification primitive driven entirely by an attacker-controlled reply — and a multicast offer subscribed our socket to an arbitrary group on a connection we asked to keep point-to-point. The address is the one field the originator already knows (it opened the TCP session); the port is the only field a target legitimately needs to move, which is why the split is address-refuse/port-honour rather than reject-the-reply — real targets that relocate the port keep working. No config knob ships: a strict default needs none, and if field interop ever demands honouring a foreign redirect, that is a `ClientOptions` opt-in to be argued on evidence, not a hedge built in advance. **Phase-3 observability seam (recorded, not built):** a refused redirect is warn-only today, which leaves one narrow silent failure mode — a device that both *requires* the redirect to receive O→T **and** never enforces its own O→T inactivity watchdog keeps producing inputs while its outputs are dead, and the adapter still reports ONLINE because the local `send_to` succeeds, so `sendErrors` cannot catch it. Phase 3 closes it with a `refused_redirects` counter on `enip::IoStats` (riding the `sendErrors`/`recvErrors` plumbing) or a disposition accessor on `IoConnectionHandle`, with the adapter emitting an event off it. |
+| **D-ENIP-17** | **A ForwardOpen reply cannot steer our class-1 traffic.** (a) The O→T Sockaddr Info item retargets the **port only**: the transmit address is always the target's own. A sockaddr naming `0.0.0.0` contributes its port; one naming the target's address is honoured as written; one naming any other address — foreign unicast, broadcast, multicast, loopback — has its address **refused** (warned, naming the address) and only its port kept. With no known target address a redirect is unresolvable and the open fails. (b) The T→O multicast group is joined **only** when the ForwardOpen requested `ConnType::Multicast` for T→O; a multicast T→O sockaddr answering any other request is a `ProtocolViolation` whose detail names the type that was requested (`"multicast T→O sockaddr on a point-to-point request"`, `"multicast T→O sockaddr on a null (reconfigure) request"`) — the adapter only ever requests P2P, but the crate API accepts either, and a violation must not misreport which one it refused. A requested-multicast connection whose reply carries a unicast or absent T→O sockaddr consumes unicast. Both paths keep the D-ENIP-16 teardown invariant (best-effort ForwardClose before the typed error). Strict by default, with no opt-out knob. | Honouring a concrete foreign address let any target aim our cyclic O→T stream at a third party — a reflection/amplification primitive driven entirely by an attacker-controlled reply — and a multicast offer subscribed our socket to an arbitrary group on a connection we asked to keep point-to-point. The address is the one field the originator already knows (it opened the TCP session); the port is the only field a target legitimately needs to move, which is why the split is address-refuse/port-honour rather than reject-the-reply — real targets that relocate the port keep working. No config knob ships: a strict default needs none, and if field interop ever demands honouring a foreign redirect, that is a `ClientOptions` opt-in to be argued on evidence, not a hedge built in advance. **The refusal is observable, not just logged:** it increments `refused_redirects` on the connection (`enip::IoStats`, 0 or 1 per connection), and the adapter surfaces it as the `refusedRedirects` measure (DESIGN §8.8) plus a one-shot `io-redirect-refused` warning event per ForwardOpen. That closes the one narrow silent failure mode the address-refusal leaves: a device that both *requires* the redirect to receive O→T **and** never enforces its own O→T inactivity watchdog keeps producing inputs while its outputs are dead, and the local `send_to` still succeeds — so `sendErrors` cannot catch it and the adapter would otherwise report the link healthy. |
+| **D-ENIP-18** | **The class-3 inactivity keepalive is crate-owned and window-derived, with no adapter knob.** A class-3 ForwardOpen arms an inactivity watchdog on the target (`timeout_multiplier × O→T API`), so the crate keeps the connection off it: when no request has flowed for **¾ of the window** the session sends a connected `Get_Attribute_Single` of the Identity object (`0x01`, instance 1, attribute 4 = Revision). The window comes from the negotiated values — the reply's actual O→T API when it lies in [100 µs, 600 s], else the clamped requested RPI — and the requested pair is `ClientOptions.class3_rpi` / `class3_timeout_multiplier` (defaults 2 s / ×16, the values the crate previously hard-coded, so a caller that changes nothing emits a byte-identical ForwardOpen). An implausible reply API falls back; it never fails the open (§7.6). Any completed exchange, CIP-error replies included, counts as activity; `ClientStats.keepalives_sent` is the observable face. **No adapter config-schema key is added.** | Feeding the connection's own watchdog is a protocol obligation of the connection's owner, and the owner is this crate — an adapter that has to remember to poll fast enough is a defect waiting for the first paused instance or slow poll group (the adapter's only idle traffic is a `ListIdentity` encapsulation command, which never rides the connected path and so cannot feed the watchdog at any cadence). Deriving the window from the negotiated values rather than a constant means a target that shortens the interval is honoured instead of outlived. The values become options because they are what arms the watchdog and a field device may need them moved; they stay out of the adapter's schema because nothing about a correct default needs operator attention, and the adapter's `keepaliveProbeIntervalMs` is a different surface entirely (paused-state health reporting) that stays as it is. |
 
 ---
 
@@ -542,13 +543,43 @@ identity polling uses when ListIdentity is not appropriate (Identity object `0x0
 ### 7.6 Connected class-3 explicit messaging
 
 `ForwardOpen` (§8.2) with `transport_class_trigger = 0xA3` (dir=server, trigger=application,
-class 3), P2P, size 500/504 fixed, connection path `[port?] 0x20 0x02 0x24 0x01` (Message Router).
-Requests then ride `SendUnitData` CPF `[Connected address (o_t_connection_id),
-Connected data (u16 sequence + MR)]`; each request increments the 16-bit sequence (skipping 0);
-the reply's sequence **must equal** the request's (D-ENIP-5) and its connection id must be our
-T→O id. Class-3 connections idle-timeout on the target: the session sends a NOP-level keepalive
-(a Get_Attribute_Single of Identity revision) if no request has flowed for ¾ of the inactivity
-window. ForwardClose on shutdown.
+class 3), P2P, variable-length size 500 both directions, connection path
+`[port?] 0x20 0x02 0x24 0x01` (Message Router). Requests then ride `SendUnitData` CPF
+`[Connected address (o_t_connection_id), Connected data (u16 sequence + MR)]`; each request
+increments the 16-bit sequence (skipping 0); the reply's sequence **must equal** the request's
+(D-ENIP-5) and its connection id must be our T→O id. ForwardClose on shutdown.
+
+**Inactivity keepalive (D-ENIP-18).** The open's requested packet interval and timeout-multiplier
+code are `ClientOptions` fields — `class3_rpi` (default **2 s**, clamped into the §8.2 plausible band
+[100 µs, 600 s] and sent as **both** the O→T and T→O RPI) and `class3_timeout_multiplier` (default
+**×16**) — because together they arm the **target's** inactivity watchdog on the connection:
+`multiplier × O→T API`. Left at the defaults the ForwardOpen is byte-identical to the pair the crate
+previously hard-coded, and the window is 32 s.
+
+The window the client keeps itself inside is derived from the negotiated values: the success reply's
+**actual** O→T API when it lies within [100 µs, 600 s], otherwise the clamped requested RPI. This is
+the deliberate asymmetry with class-1's reply-API validation (D-ENIP-16): there an implausible API
+poisons the produce scheduler and the connection watchdog, so it is a hard `ProtocolViolation`; here
+the only timer it feeds is our own keepalive, so an implausible value forfeits the refinement and
+never fails the open.
+
+When no request has flowed for **¾ of that window**, the session sends a NOP-level read on the
+connected path — `Get_Attribute_Single` of the Identity object (class `0x01`, instance 1,
+attribute 4 = Revision), the cheapest mandatory attribute every CIP device serves. The probe rides
+the ordinary request path, so it is correlated, deadline-bounded and sequence-checked like any other
+request, and it refreshes the same activity clock. **Activity is any completed exchange**, including
+one whose MessageReply carries a non-OK CIP status: the reply proves traffic flowed both ways, which
+is exactly what the target's watchdog measures. A request that timed out or broke the transport does
+not count as activity — the keepalive may then fire though bytes did flow, which costs one tiny read.
+`ClientStats.keepalives_sent` (from `SessionStats`) counts probes that completed an exchange, a CIP
+error reply included.
+
+The keepalive task holds only a `Weak` reference to the client's inner state plus a `WeakSender` for
+the session actor's command channel, so it keeps neither alive: it returns when the last `EipClient`
+handle drops, and when a probe reports the session `Closed` or lost. Any other probe failure is
+logged at debug and retried by the next due-time computation — the actor's consecutive-timeout ladder
+(§10.4) stays the liveness authority. A sleep is additionally capped at 60 s so liveness is
+re-checked at that cadence whatever the window size.
 
 ### 7.7 CIP Security posture reads (0x5D / 0x5E / 0x5F)
 
@@ -701,16 +732,29 @@ size (fixed-size mismatch → `size_mismatch` counter, drop) → **sequence acce
 `(seq − last_accepted) as i16 > 0` (mod-65536 forward window; duplicates/stale → `stale_frames`
 counter, drop; a forward jump > 1 additionally increments `sequence_gaps` by the gap) → feed the
 watchdog → deliver `IoEvent::Data { data, run_mode, class1_seq, encap_seq, received_at }` to the
-connection's channel (bounded; overflow = `overflowed_events` counter + latest-wins, telemetry
-prefers fresh data over backpressure).
+connection's queue.
+
+**The per-connection event queue is bounded and latest-wins.** Its capacity (256) bounds `Data`
+events; a sample arriving at capacity evicts the **oldest** queued `Data` event and increments
+`overflowed_events` — telemetry prefers fresh data over backpressure, so a consumer that falls
+behind reads the newest frames rather than an ever-staler backlog. The control events `Up` and
+`Lost` are **never** evicted and always enqueue: a connection emits at most one of each, so the
+queue is bounded by capacity + 2, and a terminal reason can never be lost behind a flood of samples.
+The surviving events keep their relative order, and a push to a queue whose receiver has been
+dropped is discarded without counting an overflow (nothing was evicted — there is nobody to deliver
+to). `IoConnectionHandle::events()` hands out the consumer half (`IoEventReceiver`, with `recv` /
+`try_recv` mirroring `mpsc::Receiver`'s shapes); the sender half lives with the manager task and
+owns the connection's counters, so an eviction is counted where it happens.
 
 **Socket errors are counted and classified, never swallowed.** Every `recv_from` failure increments
 `recv_errors`. Per-datagram kinds (`ConnectionReset` — the Windows ICMP port-unreachable case —
 `ConnectionRefused`, `ConnectionAborted`, `Interrupted`, `WouldBlock`) are survivable drops: they
 concern one datagram, not the socket, so they reset the fatal streak and the loop continues. Three
 consecutive errors of any other kind declare the socket dead: `IoEvent::Lost { reason: Io }` fans
-out to **every** registered connection and the manager task exits. `Lost` delivery is best-effort;
-the event channel closing is the authoritative terminal signal.
+out to **every** registered connection and the manager task exits. `Lost` is a control event, so a
+backlog of samples cannot displace it; the event stream **ending** remains the authoritative
+terminal signal — a consumer that sees `recv() == None` must treat the connection as gone whether or
+not it drained the `Lost`.
 
 **Watchdog (D-ENIP-8):** per connection, a deadline of `multiplier × T2O_API` refreshed on every
 *accepted* frame; expiry ⇒ `IoEvent::Lost { reason: Timeout }`, connection removed, best-effort
@@ -809,9 +853,13 @@ etc.) are *values* to the adapter (BAD samples), not session failures — the cr
 - A socket-level UDP error is counted (`recv_errors`/`send_errors`); per-datagram errors never
   affect any connection; a dead socket loses **all** its connections with a typed `Lost{Io}`, never
   silently.
-- Peer-driven counters (`stale_frames`, `malformed_frames`, …) are exposed on the handles
-  (`stats()`), so the adapter can alarm on a noisy/hostile peer without the crate knowing what an
-  alarm is.
+- Peer-driven counters (`stale_frames`, `malformed_frames`, `overflowed_events`,
+  `refused_redirects`, …) are exposed on the handles (`stats()`), so the adapter can alarm on a
+  noisy/hostile peer without the crate knowing what an alarm is. `refused_redirects` is 0 or 1 per
+  connection and records that the ForwardOpen reply's O→T sockaddr named a foreign address, whose
+  address half was refused and only its port honoured (D-ENIP-17) — the one disposition a healthy
+  link would otherwise hide. `keepalives_sent` on `ClientStats` is the explicit-side equivalent for
+  the class-3 keepalive (§7.6).
 
 ### 10.3 Explicit correlation (D-ENIP-5)
 
@@ -869,15 +917,17 @@ best-effort with a short fixed deadline so shutdown never hangs.
 ### 11.1 Task topology
 
 - **One session task per `EipClient`** (`client/session.rs`): owns the `TcpStream` (via the
-  `encap::codec` framed transport), an mpsc request channel, the correlation state, and the
-  keepalive timer. Requests are `{encoded frame, deadline, oneshot reply}`. The task dies on
-  `ConnectionLost`; pending and subsequent requests complete with `Err(Closed)`. **No global
-  mutable state anywhere in the crate**; every handle is `Send + Sync` (`EipClient` is a cheap
-  clone around the channel sender).
+  `encap::codec` framed transport), an mpsc request channel, and the correlation state. Requests are
+  `{encoded frame, deadline, oneshot reply}`. The task dies on `ConnectionLost`; pending and
+  subsequent requests complete with `Err(Closed)`. **No global mutable state anywhere in the crate**;
+  every handle is `Send + Sync` (`EipClient` is a cheap clone around the channel sender).
+- **One keepalive task per connected-messaging client** (`client/keepalive.rs`, §7.6): drives the
+  ¾-window class-3 probe. It holds only a `Weak` to the client's inner state and a `WeakSender` for
+  the session channel, so it keeps neither alive and exits with the last client handle.
 - **One `IoManager` task per bound UDP socket** (usually one per adapter process): owns the
   socket, the connection registry, the consume loop, and all produce timers (spawned per
-  connection, aborted on close). `IoConnectionHandle` exposes `events` (bounded receiver),
-  `set_output`, `set_run`, `stats`, `close`.
+  connection, aborted on close). `IoConnectionHandle` exposes `events` (a bounded latest-wins
+  receiver, §8.6), `set_output`, `set_run`, `stats`, `close`.
 - **Graceful teardown**: `EipClient::close()` → UnRegisterSession → socket close;
   `IoConnectionHandle::close()` → ForwardClose (needs the `EipClient`) → produce timer aborted →
   registry removal. `Drop` is non-async: it aborts tasks and closes sockets (RAII), spawning
@@ -896,6 +946,8 @@ let client = EipClient::connect(
         route: Some(RoutePath::backplane_slot(0)),   // None for cpppo / CompactLogix-direct
         connect_timeout: …, request_timeout: …,
         connected_messaging: false,                  // true ⇒ class-3 ForwardOpen (§7.6)
+        class3_rpi: Duration::from_secs(2),          // requested class-3 RPI, both directions
+        class3_timeout_multiplier: TimeoutMultiplier::X16,   // ⇒ a 32 s target watchdog, ¾-window keepalive
         max_value_bytes: 1 << 20,
         ..Default::default()
     },
@@ -924,6 +976,8 @@ let conn = io.forward_open(&client, IoConnectionSpec {
 
 conn.set_output(&bytes)?;            // validated against negotiated O→T size
 conn.set_run(true);
+// `events()` is an IoEventReceiver: bounded + latest-wins on Data, Up/Lost never evicted (§8.6);
+// `None` is the authoritative "connection is gone".
 while let Some(ev) = conn.events().recv().await {
     match ev {
         IoEvent::Up { o2t_api, t2o_api } => …,
@@ -976,6 +1030,17 @@ window (the codec and window rules are pure): Up on first frame, stale/dup/size-
 with exact counter assertions, gap counting, watchdog Lost on producer stop, produce cadence +
 heartbeat under `tokio::time::pause()`. Because the fixture injects raw bytes rather than replaying
 the crate's own encoders, a decoder bug cannot be cancelled out by a matching encoder bug.
+
+The **class-3 keepalive** (§7.6) rides the same fixtures under `start_paused` time
+(`tests/class3_keepalive.rs`): the probe's exact `SendUnitData` / MessageRequest shape at the
+¾ point, request traffic pushing the deadline out, the window derived from the reply's O→T API and
+the fallback when that API is implausible, a CIP-error reply still counting as a completed probe,
+and the task exiting when the last client handle drops or the session is closed — no socket, no
+timing race. The **latest-wins event queue** (§8.6) is proven as a pure policy function
+(`push_latest_wins`: oldest-`Data` eviction, control-event immunity, order preservation, receiver
+gone) and through its real sender/receiver pair (the counted overflow, `Lost` surviving a flood,
+terminal-after-drain, wakeup and cancel-safety), with the manager's `select!` glue driven end to end
+over a loopback UDP pair.
 
 ### 12.3 Fuzzing (the safety claim, made executable)
 

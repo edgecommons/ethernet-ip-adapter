@@ -130,6 +130,7 @@ fn map_io_stats(s: enip::IoStats) -> IoLinkStats {
         produce_overruns: s.produce_overruns,
         send_errors: s.send_errors,
         recv_errors: s.recv_errors,
+        refused_redirects: s.refused_redirects,
     }
 }
 

@@ -231,6 +231,7 @@ pub fn family_defs() -> Vec<FamilyDef> {
     io.extend(pair("produceOverruns"));
     io.extend(pair("sendErrors"));
     io.extend(pair("recvErrors"));
+    io.extend(pair("refusedRedirects"));
     io.push(m("interFrameMs", UNIT_MS, 1));
     io.push(m("runMode", UNIT_COUNT, 1));
     out.push(FamilyDef { name: IO.to_string(), dimensions: dims(&["instance"]), measures: io });
@@ -429,6 +430,8 @@ struct IoCounters {
     produce_overruns: Pair,
     send_errors: Pair,
     recv_errors: Pair,
+    /// O→T sockaddr redirects refused at ForwardOpen (D-ENIP-17, §8.8) — 0 or 1 per connection.
+    refused_redirects: Pair,
     inter_frame_ms: f64,
     run_mode: bool,
     last_seq: Option<u16>,
@@ -443,6 +446,7 @@ struct IoCounters {
     last_stats_produce_overruns: u64,
     last_stats_send_errors: u64,
     last_stats_recv_errors: u64,
+    last_stats_refused_redirects: u64,
     /// Negotiated APIs from the ForwardOpen reply (ms), surfaced by `sb/status` (§7.1).
     o2t_api_ms: u32,
     t2o_api_ms: u32,
@@ -464,9 +468,42 @@ impl IoCounters {
         self.produce_overruns.drain_into(&mut v, "produceOverruns");
         self.send_errors.drain_into(&mut v, "sendErrors");
         self.recv_errors.drain_into(&mut v, "recvErrors");
+        self.refused_redirects.drain_into(&mut v, "refusedRedirects");
         v.insert("interFrameMs".to_string(), self.inter_frame_ms);
         v.insert("runMode".to_string(), f64::from(u8::from(self.run_mode)));
         v
+    }
+
+    /// Drop **everything that belongs to one class-1 connection**, because that connection is over.
+    /// Three kinds of state, all per-ForwardOpen:
+    ///
+    /// - `ioConnectionState` → 0. The link is down from this instant until the next
+    ///   [`DeviceMetrics::on_io_up`]; reporting 1 while the adapter is reconnecting is the
+    ///   "healthy-looking but not connected" shape this whole surface exists to make impossible.
+    /// - The frame-continuity state (`last_seq`, `last_frame_at`). The next connection restarts its
+    ///   class-1 sequence at its own value, so a retained `last_seq` turns the first frame's backward
+    ///   or forward step into a fabricated `sequenceGaps` jump; a retained `last_frame_at` turns the
+    ///   whole reconnect outage into one bogus `interFrameMs` reading of "the lived RPI".
+    /// - The cumulative-snapshot baselines. The next ForwardOpen's stack counters restart at 0, so
+    ///   its counts must fold in from 0 rather than going negative — and every per-connection latch
+    ///   built on a baseline delta (the refused-redirect report in
+    ///   [`DeviceMetrics::record_io_stats`]) re-arms for the new connection.
+    ///
+    /// One place, called from **both** connection-ending paths ([`DeviceMetrics::on_io_lost`] and
+    /// [`DeviceMetrics::on_io_link_replaced`], which differ only in whether an `ioTimeouts` is
+    /// counted): state cleared on only one of them is the silent-miss shape this exists to prevent.
+    fn end_connection(&mut self) {
+        self.io_connection_state = false;
+        self.last_seq = None;
+        self.last_frame_at = None;
+        self.last_stats_frames_produced = 0;
+        self.last_stats_stale = 0;
+        self.last_stats_size_mismatch = 0;
+        self.last_stats_malformed = 0;
+        self.last_stats_produce_overruns = 0;
+        self.last_stats_send_errors = 0;
+        self.last_stats_recv_errors = 0;
+        self.last_stats_refused_redirects = 0;
     }
 }
 
@@ -916,6 +953,7 @@ impl DeviceMetrics {
             "sequenceGaps": pair(&io.sequence_gaps),
             "sendErrors": pair(&io.send_errors),
             "recvErrors": pair(&io.recv_errors),
+            "refusedRedirects": pair(&io.refused_redirects),
         })
     }
 
@@ -944,11 +982,19 @@ impl DeviceMetrics {
     /// a decrease (a reconnect reset the stack counters) folds the new absolute value in from 0. This
     /// is what makes `framesProduced` / `staleFramesDropped` / `sizeMismatchDropped` / `malformedFrames`
     /// / `produceOverruns` read REAL values (the S5-flagged gap), rather than 0.
-    pub fn record_io_stats(&self, s: crate::device::IoLinkStats) {
-        fn feed(pair: &mut Pair, last: &mut u64, cur: u64) {
+    ///
+    /// Returns `true` when this snapshot carried a **newly observed** refused O→T redirect
+    /// (D-ENIP-17): the delta over the current connection's baseline is nonzero. The caller emits the
+    /// one-shot `io-redirect-refused` event off it, so the warning fires once per ForwardOpen — a
+    /// reconnect that still gets its redirect refused reports again, because every path that ends a
+    /// class-1 connection rebases the baseline: [`Self::on_io_lost`] for a watchdog expiry or peer
+    /// close, [`Self::on_io_link_replaced`] for an explicit `sb/reconnect`.
+    pub fn record_io_stats(&self, s: crate::device::IoLinkStats) -> bool {
+        fn feed(pair: &mut Pair, last: &mut u64, cur: u64) -> u64 {
             let delta = if cur >= *last { cur - *last } else { cur };
             pair.add(delta as f64);
             *last = cur;
+            delta
         }
         let mut inner = self.inner.lock().unwrap();
         let io = &mut inner.io;
@@ -959,25 +1005,34 @@ impl DeviceMetrics {
         feed(&mut io.produce_overruns, &mut io.last_stats_produce_overruns, s.produce_overruns);
         feed(&mut io.send_errors, &mut io.last_stats_send_errors, s.send_errors);
         feed(&mut io.recv_errors, &mut io.last_stats_recv_errors, s.recv_errors);
+        feed(&mut io.refused_redirects, &mut io.last_stats_refused_redirects, s.refused_redirects) > 0
     }
 
-    /// The class-1 connection was lost (watchdog / peer close, §8.8): a watchdog expiry is an
+    /// The class-1 connection was lost (watchdog / peer close, §8.8): everything belonging to that
+    /// connection is dropped ([`IoCounters::end_connection`]) and the expiry is counted as an
     /// `ioTimeouts` event.
     pub fn on_io_lost(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.io.io_connection_state = false;
+        inner.io.end_connection();
         inner.io.io_timeouts.add(1.0);
-        inner.io.last_seq = None;
-        inner.io.last_frame_at = None;
-        // The next connection's stack counters restart at 0; drop our deltas' baselines so they fold
-        // in from 0 rather than going negative.
-        inner.io.last_stats_frames_produced = 0;
-        inner.io.last_stats_stale = 0;
-        inner.io.last_stats_size_mismatch = 0;
-        inner.io.last_stats_malformed = 0;
-        inner.io.last_stats_produce_overruns = 0;
-        inner.io.last_stats_send_errors = 0;
-        inner.io.last_stats_recv_errors = 0;
+    }
+
+    /// The class-1 connection is being **replaced on request** — an `sb/reconnect`, or the Phase-2b
+    /// cert-lifecycle watcher injecting one — rather than lost. Identical to [`Self::on_io_lost`]
+    /// except that **no `ioTimeouts` is counted**: an operator-requested reconnect is not a watchdog
+    /// expiry, and conflating the two would make the timeout counter useless for finding devices that
+    /// actually drop out.
+    ///
+    /// Everything else the lost path clears is cleared here too, because the connection really is
+    /// over ([`IoCounters::end_connection`] documents each field). Skipping any of it leaves the
+    /// metrics describing a connection that no longer exists: `ioConnectionState` reads 1 while the
+    /// adapter is reconnecting, the next connection's first frame fabricates a `sequenceGaps` jump
+    /// and an `interFrameMs` spanning the whole outage, and a device whose O→T redirect is refused
+    /// **again** reports nothing — the delta against the stale baseline is 0 — at exactly the moment
+    /// someone is watching (§8.8, D-ENIP-17).
+    pub fn on_io_link_replaced(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.io.end_connection();
     }
 
     // ---- definition + emission ----
@@ -1378,7 +1433,8 @@ mod tests {
         let mut io = vec![g("ioConnectionState", "Count", 1)];
         for p in ["forwardOpens", "forwardOpenFailures", "framesConsumed", "framesProduced",
                   "staleFramesDropped", "sequenceGaps", "sizeMismatchDropped", "malformedFrames",
-                  "ioTimeouts", "produceOverruns", "sendErrors", "recvErrors"] { io.extend(cp(p)); }
+                  "ioTimeouts", "produceOverruns", "sendErrors", "recvErrors",
+                  "refusedRedirects"] { io.extend(cp(p)); }
         io.push(g("interFrameMs", "Milliseconds", 1));
         io.push(g("runMode", "Count", 1));
         expected.push((IO, vec!["instance"], io));
@@ -1646,6 +1702,175 @@ mod tests {
         assert_eq!(iov["sendErrors"]["interval"], 3.0);
         assert_eq!(iov["recvErrors"]["total"], 2.0);
         assert_eq!(iov["recvErrors"]["interval"], 2.0);
+    }
+
+    /// **D-ENIP-17 latch.** A refused O→T redirect is reported to the caller (which emits the
+    /// one-shot `io-redirect-refused` event) exactly once per ForwardOpen: the first snapshot that
+    /// carries it says `true`, every repeat of the same cumulative snapshot says `false`, and a
+    /// reconnect whose redirect is refused again re-reports — because **both** connection-ending
+    /// paths rebase the baseline: `on_io_lost` (watchdog expiry / peer close) and
+    /// `on_io_link_replaced` (an explicit `sb/reconnect`, which must not be counted as a timeout).
+    /// The explicit leg is the one an operator hits while debugging dead outputs, so it is pinned
+    /// here: rebasing on only one path would silently swallow the second report.
+    /// The measure itself rides the `EtherNetIpIo` family and the `sb/status` `io` object.
+    #[tokio::test]
+    async fn record_io_stats_reports_a_newly_refused_redirect_once() {
+        use crate::device::IoLinkStats;
+        let (svc, m) = dm(push_device());
+
+        // A connection with no refusal never reports.
+        assert!(!m.record_io_stats(IoLinkStats { frames_produced: 3, ..Default::default() }));
+
+        // The ForwardOpen's refusal is newly observed ⇒ report once, then never again for the same
+        // connection (the stack counter stays 1 for the connection's lifetime).
+        let refused = IoLinkStats { frames_produced: 5, refused_redirects: 1, ..Default::default() };
+        assert!(m.record_io_stats(refused), "the first snapshot carrying it reports");
+        assert!(!m.record_io_stats(refused), "the same cumulative snapshot does not re-report");
+        assert!(!m.record_io_stats(refused));
+        m.emit_io(false).await;
+
+        // A LOST link that reconnects and is refused again is a NEW connection's problem: report
+        // once more.
+        m.on_io_lost();
+        assert!(m.record_io_stats(IoLinkStats { refused_redirects: 1, ..Default::default() }));
+        assert!(!m.record_io_stats(IoLinkStats { refused_redirects: 1, ..Default::default() }));
+        m.emit_io(false).await;
+
+        // An EXPLICIT reconnect (`sb/reconnect`, or the Phase-2b cert-lifecycle watcher injecting
+        // one) ends the connection just as surely, and the supervisor answers it with
+        // `on_io_link_replaced` rather than `on_io_lost` — which must rebase the baseline all the
+        // same. Without it the next connection's refusal is a zero delta against a stale baseline and
+        // reports NOTHING, at exactly the moment an operator asked for the reconnect.
+        m.on_io_link_replaced();
+        assert!(
+            m.record_io_stats(IoLinkStats { refused_redirects: 1, ..Default::default() }),
+            "an explicit reconnect re-arms the latch"
+        );
+        assert!(!m.record_io_stats(IoLinkStats { refused_redirects: 1, ..Default::default() }));
+        m.emit_io(false).await;
+
+        let io_emits: Vec<HashMap<String, f64>> = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted.iter().filter(|(n, _)| n == IO).map(|(_, v)| v.clone()).collect()
+        };
+        assert_eq!(io_emits.len(), 3, "three EtherNetIpIo emits");
+        assert_eq!(io_emits[0]["refusedRedirectsTotal"], 1.0);
+        assert_eq!(io_emits[0]["refusedRedirectsInterval"], 1.0);
+        assert_eq!(io_emits[1]["refusedRedirectsTotal"], 2.0, "the lost link's refusal folds in");
+        assert_eq!(io_emits[1]["refusedRedirectsInterval"], 1.0);
+        assert_eq!(
+            io_emits[2]["refusedRedirectsTotal"], 3.0,
+            "the explicit reconnect's refusal folds in too"
+        );
+        assert_eq!(io_emits[2]["refusedRedirectsInterval"], 1.0);
+
+        // …and the two paths stay distinguishable: a lost link is a watchdog expiry, an explicit
+        // reconnect is not, so only the former moves `ioTimeouts`.
+        assert_eq!(io_emits[0]["ioTimeoutsInterval"], 0.0);
+        assert_eq!(io_emits[1]["ioTimeoutsInterval"], 1.0, "the lost link is a watchdog expiry");
+        assert_eq!(io_emits[2]["ioTimeoutsInterval"], 0.0, "an explicit reconnect is not");
+
+        // The push `sb/status` io object carries it too.
+        let iov = m.io_view();
+        assert_eq!(iov["refusedRedirects"]["total"], 3.0);
+
+        // …and the family definition declares both measures, so the emit is not an undefined name.
+        let fam = family_defs()
+            .into_iter()
+            .find(|f| f.name == IO)
+            .expect("EtherNetIpIo is defined");
+        let got: BTreeSet<(String, String, u32)> =
+            fam.measures.iter().map(|x| (x.name.clone(), x.unit.clone(), x.res)).collect();
+        for want in ["refusedRedirectsTotal", "refusedRedirectsInterval"] {
+            assert!(
+                got.contains(&(want.to_string(), UNIT_COUNT.to_string(), 60)),
+                "EtherNetIpIo carries the {want} Count measure"
+            );
+        }
+    }
+
+    /// An explicit reconnect (`sb/reconnect`, or the Phase-2b cert-lifecycle watcher's injected one)
+    /// ends the class-1 connection, so **every** piece of per-connection state goes with it — the same
+    /// set `on_io_lost` clears — with exactly one difference: it is not a watchdog expiry, so it
+    /// counts no `ioTimeouts`.
+    ///
+    /// The two misreadings this pins are the ones an operator is actively harmed by, and both are the
+    /// "healthy-looking but not connected" family: `ioConnectionState` reading 1 while the adapter is
+    /// reconnecting, and the replacement connection's first frame fabricating a `sequenceGaps` jump
+    /// (and an `interFrameMs` spanning the whole outage) against the dead connection's counters.
+    #[tokio::test]
+    async fn an_explicit_reconnect_ends_the_connection_without_counting_a_timeout() {
+        let base = Instant::now();
+        let (svc, m) = dm(push_device());
+
+        // (1) A live connection, well into its sequence space, with a lived inter-arrival of 20 ms.
+        m.on_io_up(10, 10);
+        m.record_frame_consumed(5_000, base, true);
+        m.record_frame_consumed(5_001, base + std::time::Duration::from_millis(20), true);
+        m.record_io_stats(crate::device::IoLinkStats {
+            frames_produced: 900,
+            ..Default::default()
+        });
+        m.emit_io(false).await;
+
+        // (2) The operator asks for a reconnect. The link is down from here until the next open.
+        m.on_io_link_replaced();
+        m.emit_io(false).await;
+
+        // (3) The replacement connection: its class-1 sequence restarts at 1 and its stack counters
+        // restart at 0, thirty seconds later.
+        m.on_io_up(10, 10);
+        m.record_frame_consumed(1, base + std::time::Duration::from_secs(30), true);
+        m.record_io_stats(crate::device::IoLinkStats {
+            frames_produced: 7,
+            ..Default::default()
+        });
+        m.emit_io(false).await;
+
+        let io: Vec<HashMap<String, f64>> = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted.iter().filter(|(n, _)| n == IO).map(|(_, v)| v.clone()).collect()
+        };
+        assert_eq!(io.len(), 3, "three EtherNetIpIo emits");
+
+        // The gauge tracks reality across the reconnect, in both directions.
+        assert_eq!(io[0]["ioConnectionState"], 1.0, "the first connection is up");
+        assert_eq!(io[1]["ioConnectionState"], 0.0, "reconnecting is NOT connected");
+        assert_eq!(io[2]["ioConnectionState"], 1.0, "the replacement connection is up");
+
+        // Frame continuity belonged to the dead connection: a sequence that restarts at 1 is not
+        // ~60 000 missed frames, and the reconnect outage is not a lived RPI.
+        assert_eq!(io[0]["sequenceGapsInterval"], 0.0, "consecutive frames, no gap");
+        assert_eq!(io[2]["sequenceGapsInterval"], 0.0, "a restarted sequence is not a gap");
+        assert_eq!(io[2]["sequenceGapsTotal"], 0.0);
+        assert_eq!(io[2]["interFrameMs"], 20.0, "still the last real inter-arrival, not the outage");
+
+        // The cumulative baselines went too: the new connection's lower snapshot folds in from 0.
+        assert_eq!(io[2]["framesProducedInterval"], 7.0, "folds in from 0, never negative");
+        assert_eq!(io[2]["framesProducedTotal"], 907.0, "the total stays monotonic");
+
+        // And the one thing that must NOT happen: no watchdog expiry is invented anywhere. That
+        // distinction is the entire reason this is a separate entry point from `on_io_lost`.
+        for (i, e) in io.iter().enumerate() {
+            assert_eq!(e["ioTimeoutsInterval"], 0.0, "emit {i} counted a phantom timeout");
+        }
+        assert_eq!(io[2]["ioTimeoutsTotal"], 0.0);
+
+        // …whereas a genuinely lost link clears the same state AND counts the expiry — the two paths
+        // differ in that one measure and nothing else.
+        m.record_frame_consumed(2, base + std::time::Duration::from_secs(31), true);
+        m.on_io_lost();
+        m.on_io_up(10, 10);
+        // Sequence 1 against a retained `last_seq` of 2 wraps to a ~65 500-frame phantom gap.
+        m.record_frame_consumed(1, base + std::time::Duration::from_secs(60), true);
+        m.emit_io(false).await;
+        let last = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted.iter().rev().find(|(n, _)| n == IO).map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(last["ioTimeoutsInterval"], 1.0, "a lost link IS a watchdog expiry");
+        assert_eq!(last["sequenceGapsInterval"], 0.0, "and clears the same continuity state");
+        assert_eq!(last["ioConnectionState"], 1.0, "reopened after the loss");
     }
 
     #[tokio::test]

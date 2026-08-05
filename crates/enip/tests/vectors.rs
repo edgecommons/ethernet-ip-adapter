@@ -25,7 +25,7 @@ use enip::cip::message::MessageReply;
 use enip::cip::types::CipValue;
 use enip::cm::{
     connection_manager_path, ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess,
-    ForwardRequestFail,
+    ForwardRequestFail, TimeoutMultiplier,
 };
 use enip::cpf::{Cpf, SockAddrInfo};
 use enip::discovery::DeviceIdentity;
@@ -281,8 +281,20 @@ fn golden_forward_open_request() {
     // §8.2 layout: 0A 0E | o_t=0 | t_o=0x11223344 | serial=5 | vendor=0x4D | orig=0xDEADBEEF |
     // tmo code 2 (×16) | 3× reserved | o_t rpi 2_000_000 | o_t ncp 0x43F4 (P2P/variable/500) |
     // t_o rpi 2_000_000 | t_o ncp 0x43F4 | class/trigger 0xA3 | path 2 words | [20 06 24 01].
+    //
+    // The RPI and multiplier are `ClientOptions` inputs (§7.6); passing their defaults here is the
+    // wire-equivalence proof — the golden bytes are unchanged by the parameterisation.
     let expected = vector("forward_open_request");
-    let req = ForwardOpenRequest::class3(0, 0x1122_3344, 0x0005, 0x004D, 0xDEAD_BEEF, connection_manager_path());
+    let req = ForwardOpenRequest::class3(
+        0,
+        0x1122_3344,
+        0x0005,
+        0x004D,
+        0xDEAD_BEEF,
+        connection_manager_path(),
+        2_000_000,
+        TimeoutMultiplier::X16,
+    );
     assert_eq!(req.encode().unwrap().as_ref(), expected.as_slice());
 }
 
@@ -317,7 +329,16 @@ fn golden_forward_close_request() {
     // §8.8: ForwardClose that tears down the golden ForwardOpen — note the reserved byte after the
     // path-size word (absent in ForwardOpen).
     let expected = vector("forward_close_request");
-    let open = ForwardOpenRequest::class3(0, 0x1122_3344, 0x0005, 0x004D, 0xDEAD_BEEF, connection_manager_path());
+    let open = ForwardOpenRequest::class3(
+        0,
+        0x1122_3344,
+        0x0005,
+        0x004D,
+        0xDEAD_BEEF,
+        connection_manager_path(),
+        2_000_000,
+        TimeoutMultiplier::X16,
+    );
     let close = ForwardCloseRequest::for_open(&open);
     assert_eq!(close.encode().unwrap().as_ref(), expected.as_slice());
 }

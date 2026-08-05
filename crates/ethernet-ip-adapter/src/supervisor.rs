@@ -951,6 +951,12 @@ async fn run_push(
                     }
                     crate::push_driver::PushExit::Reconnect(reply) => {
                         health.set_link(LinkState::Connecting);
+                        // The class-1 connection just closed and a fresh ForwardOpen follows, so the
+                        // §8.8 stack-counter baselines belong to a connection that no longer exists:
+                        // rebase them, and with them the per-connection latches, so a redirect that is
+                        // refused again on the new connection re-reports (D-ENIP-17). Deliberately NOT
+                        // `on_io_lost` — a requested reconnect is not a watchdog timeout.
+                        dm.on_io_link_replaced();
                         pending_reconnect = Some(reply);
                     }
                 }

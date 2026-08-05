@@ -133,18 +133,19 @@ Class-1 implicit-I/O health (push mode only). Dimensions: `instance`.
 
 | Measure | Unit | Kind | Meaning |
 |---|---|---|---|
-| `ioConnectionState` | Count | gauge | `1` when the class-1 connection is established, else `0`. |
+| `ioConnectionState` | Count | gauge | `1` when the class-1 connection is established, else `0` — including while the adapter is reconnecting, whether the link dropped or `sb/reconnect` replaced it. |
 | `forwardOpens` | Count | counter | ForwardOpen requests. |
 | `forwardOpenFailures` | Count | counter | Failed ForwardOpens. |
 | `framesConsumed` | Count | counter | Accepted T→O frames. |
 | `framesProduced` | Count | counter | O→T frames sent onto the wire. |
 | `staleFramesDropped` | Count | counter | Frames dropped as stale. |
-| `sequenceGaps` | Count | counter | Missing frames inferred from sequence jumps. |
+| `sequenceGaps` | Count | counter | Missing frames inferred from sequence jumps within one class-1 connection. Each new connection starts the inference over, so a reconnect never shows up here as missed frames. |
 | `sizeMismatchDropped` | Count | counter | Frames dropped for wrong size. |
 | `malformedFrames` | Count | counter | Malformed frames. |
 | `ioTimeouts` | Count | counter | Class-1 inactivity/timeout events. |
 | `produceOverruns` | Count | counter | O→T produce overruns. |
 | `sendErrors` | Count | counter | O→T datagrams that failed to send. |
 | `recvErrors` | Count | counter | Receive failures on the class-1 socket. |
-| `interFrameMs` | Milliseconds | gauge | Most recent T→O inter-arrival time. |
+| `refusedRedirects` | Count | counter | O→T redirect refusals: the device asked the adapter to send its outputs to a foreign address, and the adapter refuses the address and keeps the device's own (only the port the device named is honoured). When this is nonzero and the device requires the redirect, outputs do not reach it — check the device's socket configuration. |
+| `interFrameMs` | Milliseconds | gauge | Most recent T→O inter-arrival time within one class-1 connection. The gap across a reconnect is not one of them. |
 | `runMode` | Count | gauge | The peer's run/idle bit (`1` run, `0` idle). |

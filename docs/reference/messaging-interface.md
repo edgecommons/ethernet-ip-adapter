@@ -181,9 +181,11 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
 - **`sb/status`** → `{ id, mode, connected, state ("ONLINE"|"BACKOFF"|"PAUSED"|…), paused, endpoint,
   adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} },
   security: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
-  framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors }` — `sendErrors` counts O→T
-  datagrams that failed to send and `recvErrors` counts receive failures on the class-1 socket, each
-  as an `{interval, total}` pair like the other `io` counters.
+  framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors, refusedRedirects }` —
+  `sendErrors` counts O→T datagrams that failed to send, `recvErrors` counts receive failures on the
+  class-1 socket, and `refusedRedirects` counts connections whose device asked for its outputs at a
+  foreign address (the adapter refuses the address and keeps the device's own), each as an
+  `{interval, total}` pair like the other `io` counters.
 - **`security`** — the connection's security posture. A plaintext instance reports
   `{ mode: "plaintext" }`; a TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified,
   peer, clientCertNotAfter, clientCertSerial, clientCertExpiryDays,
@@ -249,6 +251,7 @@ Published through the library's `events()` facade: severity **derives** the chan
 | `evt/info/adapter-resumed` | Info | `sb/resume` moved the instance back to running. |
 | `evt/info/write-audit` | Info | An `sb/write` entry succeeded. `context` carries `{instance, signalId, ok, value}`. |
 | `evt/warning/write-audit` | Warning | An `sb/write` entry failed or was refused. `context` adds `error`. |
+| `evt/warning/io-redirect-refused` | Warning | A push instance's device answered the class-1 connection request by pointing the outbound (O→T) stream at a foreign address. The adapter refuses that address and keeps sending to the device's own, honouring only the port the device named. A device that requires the redirect does not receive the adapter's outputs, so check its socket configuration. Fired once per connection; `context` carries `{refusedRedirects}`. |
 | `evt/warning/tls-handshake-failed` | Warning | A TLS instance's handshake failed (bad certificate, no cipher overlap, protocol mismatch) — fired on the transition into failing. `context` carries `{instance, security:"tls"}`. |
 | `evt/warning/tls-peer-unverified` | Warning | A TLS instance connected with `verifyPeer:false` (the device certificate was not verified). |
 | `evt/info/cert-rotated` | Info | The adapter's client certificate or trust store rotated in the vault; the adapter reconnected to apply it. `context` carries `{instance, security:"tls", serial, notAfter}`. |

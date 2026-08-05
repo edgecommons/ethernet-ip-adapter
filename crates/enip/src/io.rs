@@ -27,9 +27,15 @@
 //! `ConnectionReset` from an ICMP port-unreachable for a previously sent datagram) is a survivable
 //! drop that proves the socket still works. Three consecutive errors of any other kind declare the
 //! socket dead: [`IoEvent::Lost`] with [`LostReason::Io`] fans out to **every** registered
-//! connection and the manager task exits. `Lost` delivery is best-effort `try_send`; **the event
-//! channel closing is the authoritative terminal signal** — a consumer that sees `recv() == None`
-//! must treat the connection as gone whether or not it saw the `Lost` event.
+//! connection and the manager task exits. `Lost` is a control event on the per-connection queue and
+//! is never evicted by a backlog of samples; **the event stream ending is still the authoritative
+//! terminal signal** — a consumer that sees `recv() == None` must treat the connection as gone
+//! whether or not it saw the `Lost` event.
+//!
+//! The per-connection event stream is **latest-wins** (§8.6): the queue bounds `Data` events, and a
+//! sample arriving at capacity evicts the OLDEST queued sample (counted as `overflowed_events`).
+//! Telemetry prefers fresh data over backpressure — a consumer that falls behind reads the newest
+//! frames, never a stale backlog.
 //!
 //! The ForwardOpen/ForwardClose wire codecs live in [`crate::cm`]; the network call rides the owning
 //! TCP session through the [`ForwardOpenService`] seam (implemented by the explicit-messaging client,
@@ -64,9 +70,11 @@ pub const IO_UDP_PORT: u16 = 2222;
 /// switches to LargeForwardOpen (§8.2).
 const LARGE_FORWARD_OPEN_THRESHOLD: u16 = 505;
 
-/// Per-connection event channel depth. Bounded so a stalled consumer cannot grow memory without
-/// bound; overflow is counted (`overflowed_events`) and the newest frame is dropped — telemetry
-/// consumers drain fresh samples and alarm on the counter (§8.6).
+/// Per-connection event queue depth, in `Data` events. Bounded so a stalled consumer cannot grow
+/// memory without bound; overflow is counted (`overflowed_events`) and the **oldest** queued `Data`
+/// event is evicted — latest-wins, telemetry prefers fresh data over backpressure (§8.6).
+/// [`IoEvent::Up`] and [`IoEvent::Lost`] are never evicted: a connection emits at most one of each,
+/// and losing a terminal event would hide why a connection ended.
 const EVENT_CHANNEL_DEPTH: usize = 256;
 
 /// The scheduler-tick resolution. Per-connection produce cadence and watchdog deadlines are honoured
@@ -90,8 +98,15 @@ pub(crate) const MAX_CONSECUTIVE_SEND_ERRORS: u32 = 3;
 
 /// Validate the **actual** packet intervals a ForwardOpen success reply names (§8.2), returning them
 /// as `Duration`s. Both directions must lie within `[MIN_REPLY_API, MAX_REPLY_API]`; anything else —
-/// most importantly 0 — is [`EnipError::ProtocolViolation`], never a timer input. Class-3 does not
-/// call this: its timing is not API-driven.
+/// most importantly 0 — is [`EnipError::ProtocolViolation`], never a timer input.
+///
+/// Class-3 does not call this. Its keepalive window IS derived from the reply's O→T API
+/// ([`crate::client::keepalive::class3_inactivity_window`], §7.6), but under the opposite rule: an
+/// API outside the band forfeits the refinement and falls back to the requested RPI instead of
+/// failing the open. The asymmetry is deliberate — here the APIs drive the produce scheduler and the
+/// connection watchdog, so an implausible one poisons the connection; there the only timer they feed
+/// is our own keepalive, and explicit messaging has always worked against targets that answer with a
+/// wonky API.
 pub(crate) fn validate_reply_apis(success: &ForwardOpenSuccess) -> Result<(Duration, Duration)> {
     let o2t = Duration::from_micros(u64::from(success.o_t_api));
     let t2o = Duration::from_micros(u64::from(success.t_o_api));
@@ -340,7 +355,7 @@ pub enum DropReason {
 /// Live, lock-free per-connection counters (§8.6, §10.2). Shared between the manager task (writer)
 /// and the handle (reader).
 #[derive(Debug, Default)]
-struct ConnCounters {
+pub(crate) struct ConnCounters {
     frames_accepted: AtomicU64,
     frames_produced: AtomicU64,
     size_mismatch: AtomicU64,
@@ -349,6 +364,7 @@ struct ConnCounters {
     overflowed_events: AtomicU64,
     produce_overruns: AtomicU64,
     send_errors: AtomicU64,
+    refused_redirects: AtomicU64,
 }
 
 /// Manager-wide datagram counters (§8.6, §10.2). Shared across every connection on the socket.
@@ -373,7 +389,8 @@ pub struct IoStats {
     pub stale_frames: u64,
     /// Sum of forward sequence gaps observed (missed frames).
     pub sequence_gaps: u64,
-    /// Accepted samples dropped because the event channel was full.
+    /// Accepted samples evicted because the event queue was at its `Data` capacity (latest-wins,
+    /// §8.6): each one is an older sample the consumer never saw.
     pub overflowed_events: u64,
     /// Produce ticks skipped because a prior tick had not been serviced.
     pub produce_overruns: u64,
@@ -385,6 +402,11 @@ pub struct IoStats {
     pub malformed_frames: u64,
     /// Datagrams whose connection id matched no live connection (manager-wide).
     pub unknown_connection: u64,
+    /// O→T sockaddr redirects whose foreign address was refused at ForwardOpen (D-ENIP-17); 0 or 1
+    /// per connection. Nonzero means the target asked for its outputs on an address we will not
+    /// transmit to: only the sockaddr's **port** was honoured, and a device that genuinely requires
+    /// the redirect never receives the O→T stream.
+    pub refused_redirects: u64,
 }
 
 impl ConnCounters {
@@ -401,8 +423,243 @@ impl ConnCounters {
             recv_errors: 0,
             malformed_frames: 0,
             unknown_connection: 0,
+            refused_redirects: self.refused_redirects.load(Ordering::Relaxed),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The per-connection event queue: latest-wins overflow (§8.6)
+// ---------------------------------------------------------------------------
+
+/// Pure latest-wins queue state (§8.6). `capacity` bounds **`Data` events only**; control events
+/// ([`IoEvent::Up`] / [`IoEvent::Lost`]) always enqueue — a connection emits at most one of each per
+/// lifetime, so the queue is bounded by `capacity + 2`.
+pub(crate) struct EventQueueState {
+    deque: std::collections::VecDeque<IoEvent>,
+    capacity: usize,
+    data_len: usize,
+    tx_closed: bool,
+    rx_closed: bool,
+}
+
+impl EventQueueState {
+    /// A queue holding at most `capacity` `Data` events. A zero capacity is clamped to one: the
+    /// policy is "prefer the newest sample", never "deliver nothing".
+    fn new(capacity: usize) -> Self {
+        Self {
+            deque: std::collections::VecDeque::new(),
+            capacity: capacity.max(1),
+            data_len: 0,
+            tx_closed: false,
+            rx_closed: false,
+        }
+    }
+
+    /// Pop the front (oldest surviving) event, keeping the `Data` census in step.
+    fn pop(&mut self) -> Option<IoEvent> {
+        let ev = self.deque.pop_front()?;
+        if matches!(ev, IoEvent::Data(_)) {
+            self.data_len = self.data_len.saturating_sub(1);
+        }
+        Some(ev)
+    }
+}
+
+/// What [`push_latest_wins`] did with one event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushOutcome {
+    /// Enqueued; nothing dropped.
+    Queued,
+    /// The queue was at `Data` capacity: the OLDEST queued `Data` event was evicted to admit this
+    /// one (latest-wins, §8.6). The caller counts it as `overflowed_events`.
+    EvictedOldest,
+    /// The receiver is gone; the event was dropped (nothing to deliver to).
+    ReceiverGone,
+}
+
+/// **PURE**: push one event under the latest-wins policy (§8.6).
+///
+/// * A closed receiver ⇒ [`PushOutcome::ReceiverGone`] — a dead consumer never grows the queue.
+/// * `Data` at capacity ⇒ the frontmost `Data` event is removed to admit the new one
+///   ([`PushOutcome::EvictedOldest`]). The scan is front→back over at most `capacity + 2` entries,
+///   and in steady state the front **is** a `Data` event, so it is O(1) amortised.
+/// * `Up` / `Lost` ⇒ enqueued unconditionally: control events are never evicted, so a terminal
+///   reason cannot be lost behind a flood of samples.
+///
+/// The relative order of the surviving events is preserved.
+pub(crate) fn push_latest_wins(state: &mut EventQueueState, ev: IoEvent) -> PushOutcome {
+    if state.rx_closed {
+        return PushOutcome::ReceiverGone;
+    }
+    if !matches!(ev, IoEvent::Data(_)) {
+        state.deque.push_back(ev);
+        return PushOutcome::Queued;
+    }
+    if state.data_len >= state.capacity {
+        if let Some(idx) = state.deque.iter().position(|e| matches!(e, IoEvent::Data(_))) {
+            state.deque.remove(idx);
+            state.data_len = state.data_len.saturating_sub(1);
+            state.deque.push_back(ev);
+            state.data_len = state.data_len.saturating_add(1);
+            return PushOutcome::EvictedOldest;
+        }
+    }
+    state.deque.push_back(ev);
+    state.data_len = state.data_len.saturating_add(1);
+    PushOutcome::Queued
+}
+
+/// The shared half of one connection's event queue: the state plus the receiver's wakeup.
+struct EventQueueShared {
+    state: std::sync::Mutex<EventQueueState>,
+    notify: tokio::sync::Notify,
+}
+
+/// Lock the queue state. A poisoned lock is impossible here — no code path can panic inside a
+/// critical section — but the crate denies `unwrap`/`expect`, so the total form is used.
+fn lock_state(m: &std::sync::Mutex<EventQueueState>) -> std::sync::MutexGuard<'_, EventQueueState> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl EventQueueShared {
+    /// Take the next event, or say why there is none. One lock acquisition serves both the
+    /// non-blocking `try_recv` and each iteration of `recv`.
+    fn take(&self) -> core::result::Result<IoEvent, TryRecvError> {
+        let mut state = lock_state(&self.state);
+        if let Some(ev) = state.pop() {
+            return Ok(ev);
+        }
+        if state.tx_closed {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+}
+
+/// Why [`IoEventReceiver::try_recv`] returned no event (mirrors `mpsc`'s shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// Nothing queued right now; the connection is still live.
+    Empty,
+    /// The sender is gone and the queue is drained — the connection is over (§8.6).
+    Disconnected,
+}
+
+impl core::fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("no event queued"),
+            Self::Disconnected => f.write_str("the connection's event stream is closed"),
+        }
+    }
+}
+
+impl std::error::Error for TryRecvError {}
+
+/// The manager-side producer half of a connection's event queue. Owns the connection's counters, so
+/// a latest-wins eviction is counted at the source (§8.6).
+pub(crate) struct IoEventSender {
+    shared: Arc<EventQueueShared>,
+    counters: Arc<ConnCounters>,
+}
+
+impl IoEventSender {
+    /// Deliver one event. Non-blocking and infallible: `Data` follows the latest-wins policy (an
+    /// eviction counts `overflowed_events`), `Up`/`Lost` always enqueue, and a gone receiver simply
+    /// discards. The receiver is woken for anything that landed.
+    pub(crate) fn send(&self, ev: IoEvent) {
+        let outcome = {
+            let mut state = lock_state(&self.shared.state);
+            push_latest_wins(&mut state, ev)
+        };
+        match outcome {
+            PushOutcome::EvictedOldest => {
+                self.counters.overflowed_events.fetch_add(1, Ordering::Relaxed);
+                self.shared.notify.notify_one();
+            }
+            PushOutcome::Queued => self.shared.notify.notify_one(),
+            PushOutcome::ReceiverGone => {}
+        }
+    }
+}
+
+impl Drop for IoEventSender {
+    /// Dropping the sender is the terminal signal (§8.6): the receiver drains what is queued and
+    /// then reports end-of-stream.
+    fn drop(&mut self) {
+        lock_state(&self.shared.state).tx_closed = true;
+        self.shared.notify.notify_waiters();
+    }
+}
+
+/// The consumer half of a connection's event stream, exposed by [`IoConnectionHandle::events`]. The
+/// API mirrors `tokio::sync::mpsc::Receiver`: [`recv`](Self::recv) awaits the next event and yields
+/// `None` once the stream has ended, [`try_recv`](Self::try_recv) never blocks.
+///
+/// Overflow is **latest-wins** (§8.6): when a slow consumer lets the queue reach its `Data`
+/// capacity, the oldest queued sample is evicted (and counted as `overflowed_events`) so what the
+/// consumer eventually reads is the freshest telemetry. `Up` and `Lost` are never evicted.
+pub struct IoEventReceiver {
+    shared: Arc<EventQueueShared>,
+}
+
+impl IoEventReceiver {
+    /// The next event, FIFO over the surviving events. `None` once the sender is gone **and** the
+    /// queue is drained — the authoritative terminal signal (§8.6).
+    ///
+    /// Cancel-safe: dropping the returned future never loses a queued event, so it can be used
+    /// directly as a `tokio::select!` branch.
+    pub async fn recv(&mut self) -> Option<IoEvent> {
+        loop {
+            // Lost-wakeup discipline: register interest BEFORE inspecting the queue, so a `send`
+            // that lands between the inspection and the await still wakes this future. `enable()`
+            // registers the waiter exactly as a first poll would (and consumes any stored permit,
+            // which the loop's re-check then makes harmless).
+            let notified = self.shared.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.shared.take() {
+                Ok(ev) => return Some(ev),
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) => notified.await,
+            }
+        }
+    }
+
+    /// The next event without waiting (the drain-to-latest idiom): [`TryRecvError::Empty`] while the
+    /// connection is live, [`TryRecvError::Disconnected`] once it has ended and drained.
+    ///
+    /// # Errors
+    ///
+    /// [`TryRecvError`] when no event is available.
+    pub fn try_recv(&mut self) -> core::result::Result<IoEvent, TryRecvError> {
+        self.shared.take()
+    }
+}
+
+impl Drop for IoEventReceiver {
+    /// A gone consumer stops the queue growing: further pushes are [`PushOutcome::ReceiverGone`].
+    fn drop(&mut self) {
+        lock_state(&self.shared.state).rx_closed = true;
+    }
+}
+
+/// Construct a connected sender/receiver pair whose queue holds at most `capacity` `Data` events.
+/// `counters` is the connection's counter block, so evictions are counted where they happen.
+pub(crate) fn io_event_channel(
+    capacity: usize,
+    counters: Arc<ConnCounters>,
+) -> (IoEventSender, IoEventReceiver) {
+    let shared = Arc::new(EventQueueShared {
+        state: std::sync::Mutex::new(EventQueueState::new(capacity)),
+        notify: tokio::sync::Notify::new(),
+    });
+    (
+        IoEventSender { shared: Arc::clone(&shared), counters },
+        IoEventReceiver { shared },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +1174,7 @@ pub trait ForwardOpenService {
 enum ManagerCommand {
     Add {
         conn: Box<IoConnection>,
-        events_tx: mpsc::Sender<IoEvent>,
+        events_tx: IoEventSender,
     },
     SetOutput {
         connection_id: u32,
@@ -1047,6 +1304,12 @@ impl IoManager {
                 return Err(e);
             }
         };
+        // A refused redirect is not fatal (the port is still honoured), but it IS the one silent
+        // failure mode left in D-ENIP-17: a device that requires the redirect to receive outputs and
+        // never enforces its own O→T inactivity watchdog keeps producing T→O, so the adapter reports
+        // the link healthy while its outputs go nowhere. Counted per connection so the adapter can
+        // surface it (`refusedRedirects`, `io-redirect-refused`).
+        let redirect_refused = matches!(disposition, TxEndpointDisposition::RefusedForeign(_));
         if let TxEndpointDisposition::RefusedForeign(refused) = disposition {
             tracing::warn!(
                 %refused,
@@ -1083,7 +1346,10 @@ impl IoManager {
         };
         let conn = IoConnection::new(params, Instant::now());
         let counters = conn.counters.clone();
-        let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
+        if redirect_refused {
+            counters.refused_redirects.store(1, Ordering::Relaxed);
+        }
+        let (events_tx, events_rx) = io_event_channel(EVENT_CHANNEL_DEPTH, counters.clone());
 
         // The manager task has exited, so nothing will ever service this connection — but the target
         // is already producing into it. Tear it down before reporting the closure.
@@ -1122,7 +1388,7 @@ impl IoManager {
 /// counter snapshot, and a graceful close (ForwardClose + registry removal).
 pub struct IoConnectionHandle {
     connection_id: u32,
-    events: mpsc::Receiver<IoEvent>,
+    events: IoEventReceiver,
     cmd: mpsc::Sender<ManagerCommand>,
     counters: Arc<ConnCounters>,
     manager_stats: Arc<ManagerCounters>,
@@ -1147,8 +1413,10 @@ impl IoConnectionHandle {
         (self.o2t_api, self.t2o_api)
     }
 
-    /// The event stream (`Up`, `Data`, `Lost`) — a bounded receiver (§11.2).
-    pub fn events(&mut self) -> &mut mpsc::Receiver<IoEvent> {
+    /// The event stream (`Up`, `Data`, `Lost`) — a bounded, latest-wins receiver (§11.2, §8.6). A
+    /// consumer that falls behind loses the OLDEST samples (counted as `overflowed_events`), never
+    /// the freshest ones and never `Up`/`Lost`.
+    pub fn events(&mut self) -> &mut IoEventReceiver {
         &mut self.events
     }
 
@@ -1341,7 +1609,7 @@ async fn manager_task(
     stats: Arc<ManagerCounters>,
 ) {
     let mut registry = Registry::new(stats);
-    let mut events: HashMap<u32, mpsc::Sender<IoEvent>> = HashMap::new();
+    let mut events: HashMap<u32, IoEventSender> = HashMap::new();
     let mut buf = vec![0u8; 65_535];
     let mut recv_policy = RecvErrorPolicy::default();
     let mut tick = tokio::time::interval(SCHEDULER_TICK);
@@ -1443,7 +1711,9 @@ async fn manager_task(
                 }
                 for (id, reason) in expired {
                     if let Some(tx) = events.get(&id) {
-                        let _ = tx.try_send(IoEvent::Lost { reason });
+                        // `Lost` is a control event: it is never evicted by a full queue, so the
+                        // typed reason survives even a flooded consumer (§8.6).
+                        tx.send(IoEvent::Lost { reason });
                     }
                     remove_connection(&socket, &mut registry, &mut events, id);
                 }
@@ -1453,10 +1723,11 @@ async fn manager_task(
 }
 
 /// Deliver an accepted sample to its connection's stream: an `Up` on the first frame, then the
-/// `Data`; a full channel counts `overflowed_events` and drops the newest (§8.6).
+/// `Data`. A queue at its `Data` capacity evicts its OLDEST sample to admit this one — latest-wins,
+/// counted as `overflowed_events` by the sender (§8.6).
 fn deliver(
     registry: &Registry,
-    events: &HashMap<u32, mpsc::Sender<IoEvent>>,
+    events: &HashMap<u32, IoEventSender>,
     connection_id: u32,
     first: bool,
     update: IoUpdate,
@@ -1465,30 +1736,27 @@ fn deliver(
     if first {
         if let Some(conn) = registry.conns.get(&connection_id) {
             let (o2t_api, t2o_api) = conn.apis();
-            let _ = tx.try_send(IoEvent::Up { o2t_api, t2o_api });
+            tx.send(IoEvent::Up { o2t_api, t2o_api });
         }
     }
-    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(IoEvent::Data(update)) {
-        if let Some(conn) = registry.conns.get(&connection_id) {
-            conn.counters.overflowed_events.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    tx.send(IoEvent::Data(update));
 }
 
 /// Lose **every** registered connection with one reason (§8.6): the shared socket is dead, so no
-/// connection on it can survive. Each consumer gets a best-effort `Lost` and then has its stream
-/// closed by the removal — the channel closing is the authoritative terminal signal, so a consumer
-/// that was too slow to receive the `Lost` still learns the connection is gone.
+/// connection on it can survive. Each consumer gets the `Lost` — a control event, never evicted by a
+/// full queue — and then has its stream closed by the removal; the stream ending is the
+/// authoritative terminal signal, so even a consumer that never drains learns the connection is
+/// gone.
 fn fan_out_lost(
     registry: &mut Registry,
-    events: &mut HashMap<u32, mpsc::Sender<IoEvent>>,
+    events: &mut HashMap<u32, IoEventSender>,
     socket: &UdpSocket,
     reason: LostReason,
 ) {
     let ids: Vec<u32> = registry.conns.keys().copied().collect();
     for id in ids {
         if let Some(tx) = events.get(&id) {
-            let _ = tx.try_send(IoEvent::Lost { reason });
+            tx.send(IoEvent::Lost { reason });
         }
         remove_connection(socket, registry, events, id);
     }
@@ -1498,7 +1766,7 @@ fn fan_out_lost(
 fn remove_connection(
     socket: &UdpSocket,
     registry: &mut Registry,
-    events: &mut HashMap<u32, mpsc::Sender<IoEvent>>,
+    events: &mut HashMap<u32, IoEventSender>,
     connection_id: u32,
 ) {
     if let Some(conn) = registry.conns.remove(&connection_id) {
@@ -2155,15 +2423,16 @@ mod tests {
     async fn fan_out_lost_delivers_io_to_every_connection_and_drains_registry() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut registry = Registry::new(Arc::new(ManagerCounters::default()));
-        let mut events: HashMap<u32, mpsc::Sender<IoEvent>> = HashMap::new();
+        let mut events: HashMap<u32, IoEventSender> = HashMap::new();
         let mut receivers = Vec::new();
         let now = Instant::now();
 
         for id in [0x1000_0001u32, 0x2000_0002, 0x3000_0003] {
             let mut p = params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless);
             p.t2o_connection_id = id;
-            registry.conns.insert(id, IoConnection::new(p, now));
-            let (tx, rx) = mpsc::channel(EVENT_CHANNEL_DEPTH);
+            let conn = IoConnection::new(p, now);
+            let (tx, rx) = io_event_channel(EVENT_CHANNEL_DEPTH, conn.counters.clone());
+            registry.conns.insert(id, conn);
             events.insert(id, tx);
             receivers.push(rx);
         }
@@ -2180,6 +2449,239 @@ mod tests {
         }
         assert!(registry.conns.is_empty(), "the registry is drained");
         assert!(events.is_empty(), "every event sender is dropped");
+    }
+
+    // -- latest-wins event queue (F8, §8.6) --------------------------------
+
+    /// One accepted sample carrying `seq`, for queue tests (the payload is irrelevant here).
+    fn sample(seq: u16) -> IoUpdate {
+        IoUpdate {
+            data: Bytes::new(),
+            sequence: seq,
+            encap_sequence: u32::from(seq),
+            run_mode: true,
+            received_at: Instant::now(),
+        }
+    }
+
+    /// The class-1 sequences of the `Data` events currently queued, oldest first.
+    fn queued_sequences(state: &EventQueueState) -> Vec<u16> {
+        state
+            .deque
+            .iter()
+            .filter_map(|e| match e {
+                IoEvent::Data(u) => Some(u.sequence),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drain a receiver without waiting, returning everything queued right now.
+    fn drain(rx: &mut IoEventReceiver) -> Vec<IoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// **F8, the policy.** At capacity the queue evicts the OLDEST sample, not the newest: telemetry
+    /// prefers fresh data over backpressure (§8.6). The surviving order is preserved.
+    #[test]
+    fn push_latest_wins_evicts_the_oldest_data_and_preserves_order() {
+        let mut state = EventQueueState::new(3);
+        let outcomes: Vec<PushOutcome> = (1..=5)
+            .map(|seq| push_latest_wins(&mut state, IoEvent::Data(sample(seq))))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                PushOutcome::Queued,
+                PushOutcome::Queued,
+                PushOutcome::Queued,
+                PushOutcome::EvictedOldest,
+                PushOutcome::EvictedOldest,
+            ]
+        );
+        assert_eq!(queued_sequences(&state), vec![3, 4, 5], "the three newest survive, in order");
+        assert_eq!(state.data_len, 3, "the Data census never exceeds the capacity");
+    }
+
+    /// **Control events are immune.** `Up` and `Lost` enqueue even while `Data` is at capacity, and
+    /// an eviction never consumes them — a terminal reason cannot be lost behind a flood.
+    #[test]
+    fn push_latest_wins_never_evicts_control() {
+        let mut state = EventQueueState::new(2);
+        assert_eq!(
+            push_latest_wins(&mut state, IoEvent::Up {
+                o2t_api: Duration::from_millis(10),
+                t2o_api: Duration::from_millis(10)
+            }),
+            PushOutcome::Queued
+        );
+        assert_eq!(push_latest_wins(&mut state, IoEvent::Data(sample(1))), PushOutcome::Queued);
+        assert_eq!(push_latest_wins(&mut state, IoEvent::Data(sample(2))), PushOutcome::Queued);
+        assert_eq!(
+            push_latest_wins(&mut state, IoEvent::Data(sample(3))),
+            PushOutcome::EvictedOldest
+        );
+        assert_eq!(
+            push_latest_wins(&mut state, IoEvent::Lost { reason: LostReason::Timeout }),
+            PushOutcome::Queued,
+            "Lost enqueues even at Data capacity"
+        );
+
+        // [Up, Data(2), Data(3), Lost] — the evicted entry was the oldest Data, never the Up.
+        let kinds: Vec<&'static str> = state
+            .deque
+            .iter()
+            .map(|e| match e {
+                IoEvent::Up { .. } => "up",
+                IoEvent::Data(_) => "data",
+                IoEvent::Lost { .. } => "lost",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["up", "data", "data", "lost"]);
+        assert_eq!(queued_sequences(&state), vec![2, 3]);
+    }
+
+    /// A dead consumer never grows the queue: every push after the receiver is gone is dropped.
+    #[test]
+    fn push_latest_wins_after_receiver_drop_is_receiver_gone() {
+        let mut state = EventQueueState::new(4);
+        state.rx_closed = true;
+        assert_eq!(
+            push_latest_wins(&mut state, IoEvent::Data(sample(1))),
+            PushOutcome::ReceiverGone
+        );
+        assert_eq!(
+            push_latest_wins(&mut state, IoEvent::Lost { reason: LostReason::Io }),
+            PushOutcome::ReceiverGone
+        );
+        assert!(state.deque.is_empty(), "nothing is retained for a gone receiver");
+    }
+
+    /// **The F8 headline, end to end on the real queue.** A stalled consumer that finally drains
+    /// reads the NEWEST samples; the ones it missed are counted as `overflowed_events`. Against the
+    /// pre-F8 mpsc channel this drained 1,2,3,4 — the oldest, and progressively staler under load.
+    #[tokio::test]
+    async fn overflow_prefers_the_newest_data_and_counts() {
+        let counters = Arc::new(ConnCounters::default());
+        let (tx, mut rx) = io_event_channel(4, counters.clone());
+        for seq in 1..=10u16 {
+            tx.send(IoEvent::Data(sample(seq)));
+        }
+        let seqs: Vec<u16> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                IoEvent::Data(u) => Some(u.sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs, vec![7, 8, 9, 10], "the four freshest samples survive");
+        assert_eq!(counters.snapshot().overflowed_events, 6, "every evicted sample is counted");
+    }
+
+    /// **The second F8 defect.** `Lost` used to be a droppable `try_send` on a full channel, so a
+    /// flooded consumer could lose the typed reason entirely. It now rides through a full queue and
+    /// arrives after the freshest sample.
+    #[tokio::test]
+    async fn lost_is_delivered_even_when_the_queue_is_full() {
+        let counters = Arc::new(ConnCounters::default());
+        let (tx, mut rx) = io_event_channel(2, counters.clone());
+        for seq in 1..=8u16 {
+            tx.send(IoEvent::Data(sample(seq)));
+        }
+        tx.send(IoEvent::Lost { reason: LostReason::Timeout });
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 3, "two surviving samples plus the terminal event");
+        match events.last() {
+            Some(IoEvent::Lost { reason }) => assert_eq!(*reason, LostReason::Timeout),
+            other => panic!("expected Lost{{Timeout}} last, got {other:?}"),
+        }
+        match events.first() {
+            Some(IoEvent::Data(u)) => assert_eq!(u.sequence, 7, "the older samples were the ones evicted"),
+            other => panic!("expected the freshest Data first, got {other:?}"),
+        }
+    }
+
+    /// The terminal contract is unchanged: queued events drain first, then the stream ends.
+    #[tokio::test]
+    async fn sender_drop_is_terminal_after_drain() {
+        let (tx, mut rx) = io_event_channel(4, Arc::new(ConnCounters::default()));
+        tx.send(IoEvent::Data(sample(1)));
+        drop(tx);
+        match rx.recv().await {
+            Some(IoEvent::Data(u)) => assert_eq!(u.sequence, 1),
+            other => panic!("expected the queued Data first, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none(), "the stream ends once the sender is gone and drained");
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+        assert_eq!(
+            TryRecvError::Disconnected.to_string(),
+            "the connection's event stream is closed"
+        );
+        assert_eq!(TryRecvError::Empty.to_string(), "no event queued");
+    }
+
+    /// A consumer that goes away stops the queue: further events are dropped, and dropping them is
+    /// not an overflow (nothing was evicted — there is simply nobody to deliver to).
+    #[tokio::test]
+    async fn send_after_the_receiver_is_gone_is_dropped_not_counted() {
+        let counters = Arc::new(ConnCounters::default());
+        let (tx, rx) = io_event_channel(2, counters.clone());
+        drop(rx);
+        for seq in 1..=8u16 {
+            tx.send(IoEvent::Data(sample(seq)));
+        }
+        tx.send(IoEvent::Lost { reason: LostReason::Io });
+        assert_eq!(counters.snapshot().overflowed_events, 0, "a gone consumer is not an overflow");
+    }
+
+    /// `Up` carries the negotiated APIs and must reach the consumer whatever the sample rate — the
+    /// eviction scan skips it, so a flood cannot consume it.
+    #[tokio::test]
+    async fn up_survives_a_data_flood() {
+        let (tx, mut rx) = io_event_channel(4, Arc::new(ConnCounters::default()));
+        tx.send(IoEvent::Up { o2t_api: Duration::from_millis(10), t2o_api: Duration::from_millis(20) });
+        for seq in 1..=8u16 {
+            tx.send(IoEvent::Data(sample(seq)));
+        }
+        match rx.recv().await {
+            Some(IoEvent::Up { o2t_api, t2o_api }) => {
+                assert_eq!(o2t_api, Duration::from_millis(10));
+                assert_eq!(t2o_api, Duration::from_millis(20));
+            }
+            other => panic!("expected Up first, got {other:?}"),
+        }
+    }
+
+    /// `recv()` wakes on a send that lands while it is waiting (the lost-wakeup discipline), and is
+    /// cancel-safe: a cancelled `recv` — the shape `tokio::select!` gives every consumer — never
+    /// swallows the event it was waiting for.
+    #[tokio::test]
+    async fn recv_wakes_on_a_late_send_and_is_cancel_safe() {
+        let (tx, mut rx) = io_event_channel(4, Arc::new(ConnCounters::default()));
+
+        // Cancel a pending recv (nothing queued), then send: the event is still there.
+        assert!(tokio::time::timeout(Duration::from_millis(20), rx.recv()).await.is_err());
+        tx.send(IoEvent::Data(sample(9)));
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(IoEvent::Data(u))) => assert_eq!(u.sequence, 9),
+            other => panic!("expected the sample to survive the cancelled recv, got {other:?}"),
+        }
+
+        // A send from another task while recv is parked wakes it.
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx.send(IoEvent::Lost { reason: LostReason::ClosedByPeer });
+        });
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(IoEvent::Lost { reason })) => assert_eq!(reason, LostReason::ClosedByPeer),
+            other => panic!("expected a woken Lost, got {other:?}"),
+        }
+        handle.await.unwrap();
     }
 
     // -- forward-open reply verification (F1 + F10) ------------------------
@@ -2435,6 +2937,150 @@ mod tests {
         let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
         assert_eq!(handle.apis(), (Duration::from_millis(20), Duration::from_millis(20)));
         assert_eq!(fixture.requests().len(), 1, "no ForwardClose on the happy path");
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-17 observability.** A refused foreign O→T redirect is no longer only a log line: the
+    /// connection counts it, so the adapter can surface `refusedRedirects` and warn that a device
+    /// requiring the redirect will never receive its outputs. Both polarities are pinned — an
+    /// honoured (target's own) address and a reply with no sockaddr at all count zero.
+    #[tokio::test]
+    async fn refused_foreign_redirect_sets_the_stats_counter() {
+        // The fixture's target is 127.0.0.1; 192.168.1.100 is foreign.
+        let foreign = SockAddrInfo::ipv4(0xC0A8_0164, 9999);
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let fixture = FoFixture::new(None, 20_000, 20_000).with_o2t_sock(foreign);
+        let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
+        assert_eq!(handle.stats().refused_redirects, 1, "the refusal is counted once");
+        assert_eq!(fixture.requests().len(), 1, "and is not fatal — the connection still opens");
+        mgr.shutdown().await;
+
+        // The target's own address, honoured as written: nothing was refused.
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let own = SockAddrInfo::ipv4(0x7F00_0001, 4444);
+        let fixture = FoFixture::new(None, 20_000, 20_000).with_o2t_sock(own);
+        let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
+        assert_eq!(handle.stats().refused_redirects, 0);
+        mgr.shutdown().await;
+
+        // No O→T sockaddr at all: the plain path, nothing refused.
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let fixture = FoFixture::new(None, 20_000, 20_000);
+        let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
+        assert_eq!(handle.stats().refused_redirects, 0);
+        mgr.shutdown().await;
+    }
+
+    // -- manager select-loop glue, end to end over real loopback UDP -------
+
+    /// **The wiring test.** [`RecvErrorPolicy`], [`fan_out_lost`], the consume gauntlet, and the
+    /// produce scheduler are each unit-proven; this drives the `select!` that composes them over a
+    /// real socket: recv → route → deliver, tick → produce → `send_to`, watchdog → `Lost` → remove.
+    /// It also exercises the D-ENIP-17 port-honouring path on a live endpoint (the reply's O→T
+    /// sockaddr is `0.0.0.0:<peer port>`, so O→T frames must arrive at the peer's port on the
+    /// target's address) and the latest-wins queue in its real position.
+    ///
+    /// Deliberately NOT covered here: injecting a socket-fatal `recv_from` error through the loop.
+    /// There is no cross-platform way to make a bound UDP socket fail that way on demand without a
+    /// socket trait seam whose only consumer would be this test — the seam would then be the
+    /// untested wiring. The policy and the fan-out stay unit-proven above.
+    #[tokio::test]
+    async fn manager_select_loop_end_to_end_consume_produce_watchdog() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+
+        // 10 ms APIs in the reply; X16 ⇒ a 160 ms T→O watchdog.
+        let fixture = FoFixture::new(None, 10_000, 10_000)
+            .with_o2t_sock(SockAddrInfo::ipv4(0, peer_port));
+        let dir = DirectionSpec { rpi: Duration::from_millis(10), ..sample_spec().t2o };
+        let spec = IoConnectionSpec {
+            t2o: dir.clone(),
+            o2t: DirectionSpec { data_size: 4, format: RealTimeFormat::Header32Bit, ..dir },
+            ..sample_spec()
+        };
+        let mut handle = mgr.forward_open(&fixture, spec).await.unwrap();
+
+        // The T→O connection id the target was told to produce into, read off the recorded
+        // ForwardOpen request (`priority·ticks·o_t_id(4)·t_o_id(4)`).
+        let requests = fixture.requests();
+        let open_data = &requests[0].1;
+        let t2o_cid = u32::from_le_bytes([open_data[6], open_data[7], open_data[8], open_data[9]]);
+        assert_eq!(t2o_cid, handle.connection_id(), "the handle routes by the on-wire T→O id");
+
+        // (1) The peer produces T→O frames until the loop routes one and delivers Up.
+        //
+        // Deliberately a retry, not a single datagram: the manager's `select!` is unbiased, so a
+        // datagram that lands before the `Add` command has been dequeued is dropped as an unknown
+        // connection and there is nothing to redeliver it. That ordering is not part of the contract
+        // this test is proving — recv → route → deliver is — so the test must not rest on it. Each
+        // attempt carries the next sequence, so a retry is never rejected as a stale duplicate.
+        let mut sent: u16 = 0;
+        loop {
+            sent += 1;
+            assert!(
+                sent <= 40,
+                "the manager never reported Up after {sent} T→O frames — the recv → route → deliver \
+                 path is not running, or the connection was never registered"
+            );
+            peer.send_to(
+                &datagram(t2o_cid, u32::from(sent), &modeless_payload(sent, &[0u8; 8])),
+                mgr.local_addr(),
+            )
+            .await
+            .unwrap();
+            match tokio::time::timeout(Duration::from_millis(25), handle.events().recv()).await {
+                Ok(Some(IoEvent::Up { o2t_api, t2o_api })) => {
+                    assert_eq!(o2t_api, Duration::from_millis(10));
+                    assert_eq!(t2o_api, Duration::from_millis(10));
+                    break;
+                }
+                // Nothing yet — the connection may not be registered. Send another.
+                Err(_) => {}
+                other => panic!("expected Up as the first event, got {other:?}"),
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(2), handle.events().recv()).await {
+            Ok(Some(IoEvent::Data(u))) => assert!(
+                (1..=sent).contains(&u.sequence),
+                "the delivered sample is one of the frames the peer sent (got {}, sent 1..={sent})",
+                u.sequence
+            ),
+            other => panic!("expected the accepted sample, got {other:?}"),
+        }
+
+        // (2) The scheduler produces O→T frames at the peer's port on the target's address.
+        let mut buf = vec![0u8; 2048];
+        let Ok(received) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf)).await
+        else {
+            panic!("expected a produced O→T datagram at the peer within 2 s");
+        };
+        let (n, _src) = received.unwrap();
+        let cpf = Cpf::decode(&buf[..n]).unwrap();
+        let addr = SequencedAddress::decode(&cpf.find(ItemType::SequencedAddress).unwrap().data).unwrap();
+        assert_eq!(addr.connection_id, 0xAABB_CCDD, "produced under the target-assigned O→T id");
+        assert!(cpf.find(ItemType::ConnectedData).is_some(), "the frame carries connected data");
+
+        // (3) The peer goes silent ⇒ the watchdog declares the connection lost and removes it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut lost = None;
+        while lost.is_none() && Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), handle.events().recv()).await {
+                Ok(Some(IoEvent::Lost { reason })) => lost = Some(reason),
+                Ok(Some(IoEvent::Data(_) | IoEvent::Up { .. })) => {}
+                other => panic!("expected Lost from the watchdog, got {other:?}"),
+            }
+        }
+        assert_eq!(lost, Some(LostReason::Timeout), "the T→O watchdog fired");
+        assert!(
+            handle.events().recv().await.is_none(),
+            "the stream ends when the connection is removed"
+        );
+
+        // (4) Both directions really moved through the loop.
+        let stats = handle.stats();
+        assert!(stats.frames_accepted >= 1, "consume path: {stats:?}");
+        assert!(stats.frames_produced >= 1, "produce path: {stats:?}");
         mgr.shutdown().await;
     }
 

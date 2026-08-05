@@ -282,7 +282,14 @@ pub(crate) async fn consume_push(
             // so framesProduced / staleFramesDropped / sizeMismatchDropped / malformedFrames /
             // produceOverruns read REAL values (§8.8, the S5-flagged gap) rather than 0.
             if let Some(stats) = session.io_stats() {
-                dm.record_io_stats(stats);
+                // A newly refused O→T redirect (D-ENIP-17), reported once per ForwardOpen by the
+                // covered latch in `record_io_stats`: the device asked for its outputs at an address
+                // the stack refuses, so a device that requires it is not receiving them (§6.3, §8.8).
+                if dm.record_io_stats(stats) {
+                    let msg = "forward-open reply pointed the O→T stream at a foreign address; address refused, sockaddr port honoured";
+                    let ctx = json!({ "refusedRedirects": stats.refused_redirects });
+                    events.emit(Severity::Warning, "io-redirect-refused", Some(msg.into()), Some(ctx)).await;
+                }
             }
             // The full §8 family set for this push device (§8.7).
             dm.emit_periodic().await;

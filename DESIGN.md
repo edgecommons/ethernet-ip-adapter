@@ -724,6 +724,7 @@ Via the `events()` facade only (verified signatures: `emit`, `raise_alarm`, `cle
 | `adapter-paused` | emit, Warning | `sb/pause` took effect | `{instance, by: <requester identity path if present>}` |
 | `adapter-resumed` | emit, Info | `sb/resume` took effect | `{instance}` |
 | `write-audit` | emit, Info (success) / Warning (failure or refusal) | every `sb/write` entry, INCLUDING allow-list refusals | `{instance, signalId, ok, value, error?}` |
+| `io-redirect-refused` | emit, Warning | push instances: the ForwardOpen reply pointed the O→T stream at a foreign address (PROTOCOL-DESIGN D-ENIP-17). The address is refused and only the sockaddr's port honoured, so a device that *requires* the redirect never receives its outputs while still looking healthy. One-shot per ForwardOpen: the `record_io_stats` latch re-arms on every path that ends the connection — `on_io_lost` for a watchdog expiry or peer close, `on_io_link_replaced` for an explicit `sb/reconnect` (which is not counted as an `ioTimeouts`) — so a reconnect that is refused again re-reports, including the reconnect an operator asks for while investigating | `{refusedRedirects}` |
 | `tls-handshake-failed` | emit, Warning | a `mode: tls` connect handshake failed (bad cert / no cipher overlap / protocol mismatch), fired on the transition into failing (D-EIP-21) | `{instance, security: "tls"}` |
 | `tls-peer-unverified` | emit, Warning | a TLS session connected with `verifyPeer: false` (device cert not verified) | `{instance}` |
 | `cert-rotated` | emit, Info | Phase 2b (D-EIP-23): the vault's client cert / trust store changed and the adapter reconnected to apply it | `{instance, security: "tls", serial, notAfter}` |
@@ -810,8 +811,9 @@ and no `target`.
 
 A push instance answers the same shape plus an `io` object:
 `"io": { "o2tApiMs": 100, "t2oApiMs": 100, "run": true, "peerRun": true,
-"framesConsumed": {...}, "staleDropped": {...}, "sequenceGaps": {...} }` (negotiated APIs from
-the ForwardOpen reply, run/idle both directions, and the §8.8 counters).
+"framesConsumed": {...}, "staleDropped": {...}, "sequenceGaps": {...}, "sendErrors": {...},
+"recvErrors": {...}, "refusedRedirects": {...} }` (negotiated APIs from the ForwardOpen reply,
+run/idle both directions, and the §8.8 counters as `{interval, total}` pairs).
 
 `connected`/`state`/`paused` come from the SAME shared Health/Paused state the connectivity
 provider reads — ask or watch, same answer. (The universal `status` built-in already returns
@@ -1079,21 +1081,34 @@ Dimensions: `instance`. Sourced from the engine plus the protocol crate's per-co
 
 | Measure | Unit | Res |
 |---|---|---|
-| `ioConnectionState` | Count | 1 (gauge: 1 = class-1 connection open) |
+| `ioConnectionState` | Count | 1 (gauge: 1 = class-1 connection open. Drops to 0 the moment the connection ends — watchdog/peer close **or** a deliberate `sb/reconnect` — and returns to 1 only on the next ForwardOpen, so it never reads "connected" while the adapter is reconnecting) |
 | `forwardOpensTotal` / `forwardOpensInterval` | Count | 60 |
 | `forwardOpenFailuresTotal` / `forwardOpenFailuresInterval` | Count | 60 (rejections, typed) |
 | `framesConsumedTotal` / `framesConsumedInterval` | Count | 60 (accepted T→O frames) |
 | `framesProducedTotal` / `framesProducedInterval` | Count | 60 (O→T frames sent, incl. heartbeat) |
 | `staleFramesDroppedTotal` / `staleFramesDroppedInterval` | Count | 60 (sequence-window rejects: dup/out-of-order) |
-| `sequenceGapsTotal` / `sequenceGapsInterval` | Count | 60 (missed frames inferred from forward jumps) |
+| `sequenceGapsTotal` / `sequenceGapsInterval` | Count | 60 (missed frames inferred from forward jumps **within one connection**: the inference state is dropped when a connection ends, so a replacement connection restarting its sequence is never counted as missed frames) |
 | `sizeMismatchDroppedTotal` / `sizeMismatchDroppedInterval` | Count | 60 |
 | `malformedFramesTotal` / `malformedFramesInterval` | Count | 60 (CPF/decode rejects) |
 | `ioTimeoutsTotal` / `ioTimeoutsInterval` | Count | 60 (watchdog expiries → reconnect) |
 | `produceOverrunsTotal` / `produceOverrunsInterval` | Count | 60 (missed O→T ticks) |
 | `sendErrorsTotal` / `sendErrorsInterval` | Count | 60 (O→T datagram send failures) |
 | `recvErrorsTotal` / `recvErrorsInterval` | Count | 60 (socket receive errors) |
-| `interFrameMs` | Milliseconds | 1 (gauge: last observed T→O inter-arrival — the lived RPI) |
+| `refusedRedirectsTotal` / `refusedRedirectsInterval` | Count | 60 (ForwardOpen replies whose foreign O→T sockaddr address was refused — 0 or 1 per connection; also fires the one-shot `io-redirect-refused` event, §6.3, PROTOCOL-DESIGN D-ENIP-17) |
+| `interFrameMs` | Milliseconds | 1 (gauge: last observed T→O inter-arrival **within one connection** — the lived RPI. An interval spanning a reconnect is not a lived RPI and is never recorded as one) |
 | `runMode` | Count | 1 (gauge: 1 = we produce Run; 0 = Idle) |
+
+**Known observability gap — event-queue eviction is not surfaced.** The protocol crate counts
+`overflowed_events` per connection (PROTOCOL-DESIGN §8.6: a `Data` event arriving at the queue's
+capacity evicts the oldest queued one, latest-wins), but that counter stops at the crate boundary:
+there is no `IoLinkStats` field, `eip/live.rs`'s `map_io_stats` does not copy it, and no
+`EtherNetIpIo` measure carries it. Only `enip`'s own `handle.stats()` — inside the crate, and the
+live suite — can see it. So routine eviction pressure, which is what a consumer falling behind looks
+like, is invisible to an operator. It is recorded rather than wired because latest-wins makes
+eviction benign for the thing telemetry cares about: what the adapter publishes is always the
+freshest frame, and a consumer that never keeps up is already visible as publish latency and
+`sequenceGaps`. Wiring it through the seam is a metric-surface decision on its own evidence, not a
+side effect of the queue change.
 
 ---
 
@@ -1447,14 +1462,21 @@ live-slave gating). Each has its own default port (overridable by env var) so it
 own sim is up. Covered live paths:
 
 - **`live_cpppo.rs`** (poll, `:44818`): connect; scalar/array/DINT reads with exact seeded values;
-  write + readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD; and
+  write + readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD;
   that browse (`0x55`) is *typed-refused* — cpppo does not implement the tag-list service (§11.1), so
-  the client surfaces the refusal as a typed error, never a panic.
+  the client surfaces the refusal as a typed error, never a panic; and the class-3 inactivity
+  keepalive across a 75 s idle (PROTOCOL-DESIGN §7.6) — the second peer for that leg, so it stands as
+  long as either peer serves a class-3 connection. A peer that refuses the class-3 ForwardOpen prints
+  a bench gap rather than faking the result.
 - **`live_opener.rs`** (push, `:44819`): ForwardOpen against the OpENer sample assemblies (§11.5);
   cyclic consume ≥ N frames with an advancing class-1 sequence; O→T produce observed via OpENer's
   sample output→input **mirror** (`AfterAssemblyDataReceived` copies the consumed output assembly into
   the produced input assembly, so a value we produce reappears in the next consumed frame); watchdog
-  `IoEvent::Lost { Timeout }` when the target is silenced.
+  `IoEvent::Lost { Timeout }` when the target is silenced; the class-3 inactivity keepalive across a
+  75 s idle on defaults (2 s RPI × ×16 ⇒ a 32 s window, probes every 24 s — PROTOCOL-DESIGN §7.6);
+  and latest-wins overflow (PROTOCOL-DESIGN §8.6) under a 10 ms-RPI flood the consumer ignores for
+  10 s, where the first sample it then reads sits past the evicted prefix instead of at the start of
+  the run.
 - **`live_ab_server.rs`** (poll, `:44820`, §11.6): the same read/write surface as cpppo but reached
   through a real Unconnected_Send (`0x52`) **route wrapper** (`ClientOptions.route =
   RoutePath::backplane_slot(0)`) — the backplane path cpppo never exercises; browse is typed-refused
@@ -1711,7 +1733,8 @@ a ship blocker.
 
 | Area | Representative tests |
 |---|---|
-| `crates/enip` (the protocol crate) | its own suite per PROTOCOL-DESIGN §12: codec round-trips, golden conformance vectors, truncation sweeps, `duplex`-fixture state-machine tests (correlation, quarantine, watchdog, sequence windows), fuzz targets |
+| `crates/enip` (the protocol crate) | its own suite per PROTOCOL-DESIGN §12: codec round-trips, golden conformance vectors, truncation sweeps, `duplex`-fixture state-machine tests (correlation, quarantine, watchdog, sequence windows), fuzz targets; the class-3 keepalive (§7.6) end-to-end on scripted bytes under `start_paused` time (`tests/class3_keepalive.rs`: the ¾-window probe, traffic deferring it, the reply-API-derived window and its fallback, task exit on client-drop and on `close`, a CIP-error probe still counting) and the latest-wins event queue (§8.6) as pure policy plus real senders/receivers |
+| `crates/enip` manager select loop | `manager_select_loop_end_to_end_consume_produce_watchdog` drives the `select!` that composes the unit-proven parts over a real loopback UDP pair: recv → route → deliver, tick → produce → `send_to`, watchdog → `Lost` → remove, plus the D-ENIP-17 port-honouring path on a live socket. **Declared residual:** injecting a socket-fatal `recv_from` error through that loop is not covered — there is no cross-platform way to make a bound UDP socket fail that way on demand without a socket trait seam whose only consumer would be the test, which would make the seam itself the untested wiring. The error policy (`recv_error_policy_matrix`) and the fan-out (`fan_out_lost_delivers_io_to_every_connection_and_drains_registry`) stay unit-proven, and their composition rests on review plus this happy-path glue |
 | `config.rs` | precedence chain (signal ▸ group ▸ device ▸ global ▸ built-in); duplicate name/tagPath rejection; `string` type rejection; unknown-key rejection (template `deny_unknown_fields` kept); allow-list parse; slot range; mode/block cross-validation (`poll`+`io` rejected, `push`+`pollGroups` rejected); push layout validation (field beyond `sizeBytes`, `bit` on non-bool, output signals on a heartbeat connection — all rejected at startup) |
 | `eip/types.rs` codec | every §5.1 row round-trip JSON⇄typed; array length checks; scale/offset incl. inverse-on-write and out-of-range refusal; non-finite ⇒ UNCERTAIN |
 | `poll.rs` | deadband none/absolute/percent/non-numeric/array-any-element; onChange vs always; batch window flush (tokio `start_paused` time control); stale accounting incl. pause suspension; overrun detection |
@@ -1738,7 +1761,7 @@ a ship blocker.
 | HOST/dual-MQTT smoke | local | **in scope** (S9) |
 | Kubernetes | kind cluster, `k8s/` manifests + cpppo & OpENer as cluster services (UDP :2222 pod-to-pod for push) | **in scope** (S9, smoke: pod Ready, data on bus both modes, probes green) |
 | Greengrass deployed regression | `lab-5950x` (build via WSL `--features greengrass`, `greengrass-cli` local deploy) | **required before the component is "done"** (org rule: new capability ⇒ deployed GG regression). Scheduled S9; if the lab is unreachable in a session, report a **blocking validation gap** — do not claim completion. |
-| True `slot`/backplane **routing semantics** + connected class-3 messaging + real-Logix browse (hundreds of tags, UDT/`RECIPE` `supported:false` on real Rockwell symbol types) + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6. `enip` now *emits* a well-formed Unconnected_Send route (validated vs ab_server, §11.6) and *decodes* a real `0x55` browse page (validated vs EthernetIPSharp, §11.7), but ab_server ignores the route content (no real slot-routing) and sim browse is a handful of atomic tags — so plant-grade backplane routing and real-Logix browse semantics still need a physical controller; push conformance beyond OpENer likewise stays sim-grade. |
+| True `slot`/backplane **routing semantics** + connected class-3 messaging (incl. whether a real Logix Connection Manager enforces the class-3 idle window the §7.6 keepalive covers) + real-Logix browse (hundreds of tags, UDT/`RECIPE` `supported:false` on real Rockwell symbol types) + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6. `enip` now *emits* a well-formed Unconnected_Send route (validated vs ab_server, §11.6) and *decodes* a real `0x55` browse page (validated vs EthernetIPSharp, §11.7), but ab_server ignores the route content (no real slot-routing) and sim browse is a handful of atomic tags — so plant-grade backplane routing and real-Logix browse semantics still need a physical controller; push conformance beyond OpENer likewise stays sim-grade. |
 
 CI: `.github/workflows/ci.yml` calls the org reusable
 `edgecommons/.github/.github/workflows/component-ci.yml@main` (`language: RUST`,
@@ -1832,7 +1855,11 @@ language) in the user-facing docs where relevant.
    cert fires the event). **Roadmap (Phase 2c, not built):** EST enrollment of the adapter's own
    certificate; and DTLS on the implicit path. See DESIGN-cip-security.md §4/§6 for the phase gates.
 6. **Lab-hardware-only validation paths, declared:** the `slot`/backplane routing path,
-   connected class-3 messaging, **multicast T→O consume**, push against a real PLC/remote-I/O
+   connected class-3 messaging — including **idle-window keepalive semantics against real Logix**
+   (whether a genuine ControlLogix Connection Manager enforces the inactivity watchdog the ¾-window
+   keepalive keeps the session off, PROTOCOL-DESIGN §7.6 / D-ENIP-18; the bench proves the probes
+   are well-formed, flow on cadence, and survive a multi-window idle against OpENer/cpppo) —
+   **multicast T→O consume**, push against a real PLC/remote-I/O
    device, and **CIP Security against a certified Vol 8 device** (port policy with 44818 closed,
    Vol-8-exact suite lists, `Send Certificate Chain`/`Verify Client Certificate` corner semantics) —
    cpppo has no chassis/class-1, OpENer exercises P2P direct connections, and the CIP Security Phase-1

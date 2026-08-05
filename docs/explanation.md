@@ -50,7 +50,11 @@ every poll. One CIP request is issued per signal per cycle — the `EtherNetIpIn
 metric makes that cost visible, and the answer to a large tag count is fewer, larger poll groups at
 longer intervals (or push mode, which has no per-signal request cost). The connection can be
 **unconnected** explicit messaging (the default) or CIP **connected** messaging (`connection.connected:
-true`, a ForwardOpen-backed class-3 session).
+true`, a ForwardOpen-backed class-3 session). A connected session maintains itself: the controller
+closes a class-3 connection that sits idle past its own inactivity window, so when no request has
+flowed for a while the adapter sends a small CIP keepalive read over the connection and the
+controller keeps it open. That happens on its own — there is no setting for it, and a paused or
+slowly-polled instance keeps its connection.
 
 ### Push — class-1 implicit I/O
 

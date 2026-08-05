@@ -17,14 +17,16 @@
 //! ## What it proves (§11.3 poll paths)
 //! connect (RegisterSession) · scalar/array/DINT reads with **exact** values (we seed by writing
 //! first, since cpppo boots every tag at 0) · write + read-back of `FILL_SETPOINT` · a per-tag CIP
-//! error on a nonexistent tag while a real tag stays GOOD in the same run · tag-list browse paging.
+//! error on a nonexistent tag while a real tag stays GOOD in the same run · tag-list browse paging ·
+//! the class-3 inactivity keepalive (§7.6) across a multi-window idle, when this peer serves a
+//! class-3 connection (the second bench peer for that leg — see `live_opener.rs` for the first).
 //!
 //! Excluded from the coverage denominator (`tests[/\\]live_(cpppo|opener)`, §12.2).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::float_cmp)]
 
 use std::time::Duration;
 
-use enip::{CipType, CipValue, ClientOptions, EipClient, EnipError, Scope, TagAddress};
+use enip::{CipType, CipValue, ClientOptions, EipClient, EnipError, Scope, TagAddress, TimeoutMultiplier};
 
 const CPPPO_ADDR: &str = "127.0.0.1:44818";
 
@@ -197,4 +199,81 @@ async fn cpppo_live_tag_browse_is_gracefully_refused() {
         }
     }
     client.close().await;
+}
+
+/// **The class-3 inactivity keepalive on the wire (§7.6, D-ENIP-18) — the second bench peer.**
+///
+/// The same scenario `live_opener.rs` runs against OpENer, on an independent implementation: a
+/// class-3 ForwardOpen arms an inactivity watchdog on the **target** (`timeout_multiplier × O→T
+/// API`), which the shipped defaults (2 s requested RPI × ×16) put at 32 s, and the client probes at
+/// ¾ of it with a connected `Get_Attribute_Single` of the Identity object's Revision attribute. Idle
+/// **75 s** (≈ 2.3 windows), then use the connection.
+///
+/// A peer that does not serve class-3 explicit messaging refuses the ForwardOpen at connect; that is
+/// reported as a bench gap, not faked — the two peers are tried so that the leg stands as long as
+/// EITHER serves it. Keepalive mechanics themselves are pinned offline in `class3_keepalive.rs`.
+#[tokio::test]
+async fn cpppo_live_class3_idle_survives_the_inactivity_window() {
+    if !sim_up().await {
+        eprintln!("live_cpppo (class-3 keepalive): skipped (no cpppo on {CPPPO_ADDR})");
+        return;
+    }
+    println!("== live_cpppo: class-3 idle survival against real cpppo at {CPPPO_ADDR} ==");
+
+    let options = ClientOptions { connected_messaging: true, ..opts() };
+    // The scenario is the DEFAULT tuning — nothing is dialled down to make it pass, and no adapter
+    // config key exists for it.
+    assert_eq!(options.class3_rpi, Duration::from_secs(2), "the default requested class-3 RPI");
+    assert_eq!(
+        options.class3_timeout_multiplier,
+        TimeoutMultiplier::X16,
+        "the default class-3 timeout multiplier"
+    );
+
+    let client = match EipClient::connect(CPPPO_ADDR, options).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!(
+                "BENCH GAP: cpppo refused the class-3 ForwardOpen to the Message Router ({e:?}). \
+                 If OpENer refused it as well, report the idle-survival leg as a bench gap and stand \
+                 on the offline `class3_keepalive.rs` suite alone."
+            );
+            return;
+        }
+    };
+    assert!(client.is_connected_messaging(), "the session rides a class-3 connection");
+    println!("class-3 ForwardOpen ACCEPTED — explicit requests now ride SendUnitData");
+
+    let baseline = client
+        .get_attribute_single(0x01, 1, 4)
+        .await
+        .expect("baseline Identity/Revision read over the class-3 connection");
+    println!("baseline Get_Attribute_Single(Identity, 1, 4) -> {} byte(s)", baseline.len());
+
+    let idle = Duration::from_secs(75);
+    println!("idling {idle:?} — no request at all; keepalives are due every 24 s...");
+    tokio::time::sleep(idle).await;
+
+    let after = client.read_tag(&tag("LINE_SPEED"), 1).await;
+    let stats = client.stats();
+    println!(
+        "post-idle read: {after:?}; keepalives_sent={} seq_mismatches={}",
+        stats.keepalives_sent, stats.connected_seq_mismatches
+    );
+    assert!(
+        after.is_ok(),
+        "the class-3 connection is still usable after a multi-window idle: {after:?}"
+    );
+    assert!(
+        stats.keepalives_sent >= 2,
+        "at least two ¾-window keepalives completed across a 75 s idle (got {})",
+        stats.keepalives_sent
+    );
+    assert_eq!(
+        stats.connected_seq_mismatches, 0,
+        "keepalive replies correlate on the connected sequence like any other request"
+    );
+
+    client.close().await;
+    println!("== live_cpppo class-3 keepalive: PASS (keepalives flowed; session survived the idle) ==");
 }
