@@ -291,8 +291,9 @@ Notes:
   (any `ca` style, or a `certSecret` bundle carrying `caPem`).
 - The device is dialed by IP by default, so its certificate must carry the endpoint IP as a
   Subject Alternative Name. Set `serverName` to override the verified name.
-- Only GCM-based and TLS 1.3 cipher suites are supported. A device that offers only CBC-based suites
-  fails with a "no cipher overlap" error — enable GCM-based suites on the device.
+- Only AEAD cipher suites are negotiated — TLS 1.3, and TLS 1.2 ECDHE with AES-GCM or
+  ChaCha20-Poly1305. A device that offers only CBC, NULL, or PSK suites fails with a "no cipher overlap"
+  error — enable an AEAD suite on the device.
 - TLS applies to poll instances. A push (`mode: push`) instance configured with TLS is rejected at
   startup (class-1 implicit I/O runs over plaintext UDP `2222`).
 - `sb/status` returns a `security` object (`mode`, `tlsVersion`, `cipherSuite`, `peerVerified`,

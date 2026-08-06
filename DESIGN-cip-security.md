@@ -1,11 +1,15 @@
-# CIP Security for ethernet-ip-adapter — design spike
+# CIP Security for ethernet-ip-adapter — phased design & delivery record
 
-**Status: SPIKE (decision document, 2026-07-19). Nothing here is implemented.** This document is
-the output of the CIP Security design spike: a phased design (TLS on the explicit path; the
-originator-side certificate/security-object model), a **definite answer on the validation
-target**, and effort/risk/go-no-go per phase. It is written to be promotable into
-`DESIGN.md`/`PROTOCOL-DESIGN.md` decisions if the phases are approved; until then it is internal
-planning material and none of its content belongs in user-facing docs.
+**Status: phased design + delivery record (spike 2026-07-19; updated 2026-08-06). Phases 1 (TLS on
+the explicit path, D-EIP-21), 2a (security-posture reads, D-EIP-22), 2b (managed trust store +
+certificate lifecycle, D-EIP-23), and 2c (EST enrollment, D-EIP-24) are SHIPPED and live-validated
+against independent peers; DTLS on the implicit path is not built, and validation against a
+certified Vol-8 device remains the declared lab-hardware gap (§5.2, §6.3).** This document remains
+the deep design and phase-gate record for CIP Security — the phased design (TLS on the explicit
+path; the originator-side certificate/security-object model), the **definite answer on the
+validation target**, and effort/risk/go-no-go per phase; its shipped decisions are promoted into
+`DESIGN.md` (D-EIP-21…24). It is internal planning material — none of its status content belongs in
+user-facing docs.
 
 Grounding artifacts (all re-verified 2026-07-19, none from memory):
 
@@ -614,20 +618,20 @@ cert → non-transient loud failure).
 
 ### 6.3 Go/no-go recommendation
 
-- **Phase 1 — GO.** The seam is confirmed ideal (a `TlsStream` drops into `connect_over`
-  untouched), the spec's current cipher reality (GCM mandatory since Vol 8 1.13) makes
-  pure-rustls interoperable with spec-current devices, the vault provides the material story
+- **Phase 1 — GO; SHIPPED** (D-EIP-21). The seam is confirmed ideal (a `TlsStream` drops into
+  `connect_over` untouched), the spec's current cipher reality (GCM mandatory since Vol 8 1.13)
+  makes pure-rustls interoperable with spec-current devices, the vault provides the material story
   wholesale, effort is ~a week, and Target A gives real independent-implementation validation
   of exactly the changed layer. The one honest asterisk — no certified device in the loop — is
   a declared, precedented gap, not a reason to hold the capability.
-- **Phase 2 — SPLIT GO.** **GO on 2(a) posture reads and 2(b) lifecycle/rotation** (cheap,
-  validatable, and they make Phase 1 operable). **2(c) EST — SHIPPED** (D-EIP-24): the owned
-  RFC 7030 client is built behind config (`connection.security.est`, off by default) and severable —
-  nothing in 1/2(a)/2(b) depends on it. It is validated against an OSS EST server (the independent Go
-  `globalsign/est` `estserver` + mock CA in `test-infra/est/`, not the intractable libest C build —
-  see the note below) plus an OpenSSL-produced golden PKCS#7 vector and an in-process rustls EST
-  responder. As stated at go/no-go: **real plant/device pull-model PKI enrollment joins the lab-hardware
-  gap list** (§5.2, DESIGN.md §14.6). *EST-server-implementation note: the spike named Cisco `libest`
+- **Phase 2 — SPLIT GO.** **2(a) posture reads (D-EIP-22) and 2(b) lifecycle/rotation (D-EIP-23) —
+  GO; SHIPPED** (cheap, validatable, and they make Phase 1 operable). **2(c) EST — SHIPPED**
+  (D-EIP-24): the owned RFC 7030 client is built behind config (`connection.security.est`, off by
+  default) and severable — nothing in 1/2(a)/2(b) depends on it. It is validated against an OSS EST
+  server (the independent Go `globalsign/est` `estserver` + mock CA in `test-infra/est/`, not the
+  intractable libest C build — see the note below) plus an OpenSSL-produced golden PKCS#7 vector and
+  an in-process rustls EST responder. As stated at go/no-go: **real plant/device pull-model PKI
+  enrollment joins the lab-hardware gap list** (§5.2, DESIGN.md §14.6). *EST-server-implementation note: the spike named Cisco `libest`
   (C, awkward to build); the shipped harness uses the Go `globalsign/est` reference server instead — an
   equally independent RFC 7030 implementation that builds cleanly in a container, so the live gate ran
   green without falling back to golden-vector-only.*
@@ -652,10 +656,10 @@ cert → non-transient loud failure).
   Security / TLS" beside the new truth) with the phased statement: explicit-path TLS supported
   (Phase 1 scope), push+TLS refused at validation, DTLS unsupported; new decisions
   **D-EIP-21** (TLS explicit / config surface / vault sourcing), **D-EIP-22** (security-object
-  read surface), **D-EIP-23** (EST, if 2(c) goes); §4.2 `connection.security` table; §7.1
-  `sb/status.security`; §8.2 the handshake-failure measures; §11 gains the `tls-proxy` (+
-  OpENer-CIPSecurity, libest) target rows and `live_tls.rs`; §12.4/§14.6 gain the declared
-  **lab CIP-Security-PLC gap** row.
+  read surface), **D-EIP-23** (managed trust store + client-cert lifecycle), **D-EIP-24** (EST
+  enrollment); §4.2 `connection.security` table; §7.1 `sb/status.security`; §8.2 the
+  handshake-failure measures; §11 gains the `tls-proxy` (+ OpENer-CIPSecurity, globalsign/est)
+  target rows and `live_tls.rs`; §12.4/§14.6 gain the declared **lab CIP-Security-PLC gap** row.
 - This file graduates into the repo (e.g. `DESIGN-cip-security.md` beside the other two) as the
   decision record for the phase gates.
 
@@ -666,8 +670,9 @@ each phase, stated as plain current fact):**
   over TLS, TCP port 2221) with mutual X.509 authentication. Certificates and trusted CAs come
   from the EdgeCommons credentials vault or from files; `{"$secret": …}` references are
   supported. TLS applies to poll instances; class-1 implicit I/O (`mode: "push"`) uses plaintext
-  UDP 2222, and a push instance configured with TLS is rejected at startup. Devices that offer
-  only CBC-based cipher suites are not supported; enable GCM-based suites on the device."
+  UDP 2222, and a push instance configured with TLS is rejected at startup. Only AEAD cipher
+  suites are negotiated — TLS 1.3, and TLS 1.2 ECDHE with AES-GCM or ChaCha20-Poly1305; CBC,
+  NULL, and PSK suites are not available."
   Plus the `security` block in `docs/reference/configuration.md`, the `security` object in
   `docs/reference/messaging-interface.md` (`sb/status`), the new measures in
   `docs/reference/metrics.md`, and a how-to: "Connect to a CIP Security device" (cert
