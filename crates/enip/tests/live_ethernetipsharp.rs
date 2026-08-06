@@ -8,11 +8,12 @@
 //! independent-implementation conformance cross-check of the read/write paths (a third opinion beyond
 //! `enip`'s own assumptions and cpppo/ab_server).
 //!
-//! ## Self-skipping (the cpppo/OpENer/ab_server sibling pattern, §11.3)
+//! ## Self-skipping, and the required mode that removes it (§11.3)
 //! At suite start we TCP-probe `ETHERNETIPSHARP_ADDR` (default `127.0.0.1:44821` — the §11.2 compose
 //! host mapping for `enip-sharp`, distinct from cpppo `:44818` / OpENer `:44819` / ab_server `:44820`).
 //! If nothing answers, the test prints a skip and returns `Ok`, so `cargo test --workspace` stays green
-//! with no sim. Bring it up:
+//! with no sim. **`ENIP_LIVE_REQUIRED=1` turns that skip into a failure** ([`live_required`]), so the
+//! CI live gate cannot pass vacuously. Bring it up:
 //!
 //! ```bash
 //! docker build -t ethernetip-sharp-sim test-infra/ethernetip-sharp
@@ -51,6 +52,13 @@ async fn sim_up(addr: &str) -> bool {
     )
 }
 
+/// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer is a **FAILURE**, never a
+/// silent skip — the live gate cannot pass vacuously. Unset (or empty, or `0`) keeps the
+/// bench-friendly self-skip, so `cargo test --workspace` stays green with no sims up.
+fn live_required() -> bool {
+    std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// EthernetIPSharp dispatches bare Message-Router requests over UCMM (like cpppo, no backplane), so no
 /// route is set.
 fn opts() -> ClientOptions {
@@ -70,6 +78,11 @@ fn tag(name: &str) -> TagAddress {
 async fn sharp_live_read_write() {
     let addr = sharp_addr();
     if !sim_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no EthernetIPSharp on {addr} — \
+             docker compose up -d enip-sharp"
+        );
         eprintln!("live_ethernetipsharp: skipped (no EthernetIPSharp on {addr})");
         return;
     }
@@ -133,6 +146,11 @@ async fn sharp_live_read_write() {
 async fn sharp_live_tag_browse_enumerates() {
     let addr = sharp_addr();
     if !sim_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no EthernetIPSharp on {addr} (browse leg) — \
+             docker compose up -d enip-sharp"
+        );
         eprintln!("live_ethernetipsharp (browse): skipped (no EthernetIPSharp on {addr})");
         return;
     }
@@ -220,6 +238,11 @@ async fn sharp_live_tag_browse_enumerates() {
 async fn sharp_live_browse_cursor_walk_and_32bit_instance_segment() {
     let addr = sharp_addr();
     if !sim_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no EthernetIPSharp on {addr} (browse-cursor leg) — \
+             docker compose up -d enip-sharp"
+        );
         eprintln!("live_ethernetipsharp (browse cursor): skipped (no EthernetIPSharp on {addr})");
         return;
     }
@@ -278,7 +301,9 @@ async fn sharp_live_browse_cursor_walk_and_32bit_instance_segment() {
         Err(EnipError::Cip(status)) => {
             // The recorded outcome for this peer: its Symbol object answers the enumeration only at
             // the class-level start instance. A typed CIP status is still the right shape — the
-            // request was well formed and routed; the peer simply declines.
+            // request was well formed and routed; the peer simply declines. This is a peer-limit
+            // path, not a missing peer: it stays a recorded capability gap even under
+            // ENIP_LIVE_REQUIRED=1, which only demands that the peer was REACHED.
             println!(
                 "  resume at {mid}: declined with CIP general status 0x{:02X} — this peer serves \
                  the enumeration only from the class-level start instance (one page, no cursor)",

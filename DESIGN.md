@@ -250,8 +250,9 @@ crates/
                      responder (testutil::pki)
 ```
 
-(The six live-peer conformance suites are `crates/enip/tests/live_*.rs`, §11.3; the two in-source
-live tests — TLS client-cert rotation and EST enrollment — sit in `eip/tls.rs` and `eip/est/tests.rs`.)
+(The six live-peer conformance suites are `crates/enip/tests/live_*.rs`, §11.3; the three in-source
+live tests — TLS client-cert rotation and near-expiry in `eip/tls.rs`, EST enrollment in
+`eip/est/tests.rs`.)
 
 ### 3.2 The loop, and where everything hooks in
 
@@ -1459,9 +1460,9 @@ browse path — a real `0x55` reply decoded by `enip::list_tags` — is now serv
 (§11.7); `RECIPE`/UDT `supported:false` semantics on real Rockwell symbol types stay a real-Logix
 (lab, §12.4) path.**
 
-### 11.2 compose.yaml — add the sim services
+### 11.2 compose.yaml — the sim services, and how each consumer reaches them
 
-The existing HOST pack (emqx + adapter) gains the poll sim:
+The HOST pack (emqx + adapter) sits alongside the peers. The poll sim:
 
 ```yaml
   enip-sim:
@@ -1471,41 +1472,100 @@ The existing HOST pack (emqx + adapter) gains the poll sim:
       python -m cpppo.server.enip --address 0.0.0.0:44818 -v
       LINE_SPEED=REAL FILL_TEMP=REAL TANK_LEVEL=REAL PRODUCT_COUNT=DINT
       FILL_SETPOINT=REAL ZONE_TEMPS=REAL[8] MOTOR_RUN=DINT RECIPE=SSTRING
-    ports: ["44818:44818"]
     restart: unless-stopped
 ```
 
-and the push target (§11.5):
+and the class-1 push target (§11.5), which carries the `opener-sim` network alias the push
+test-configs resolve:
 
 ```yaml
-  opener-sim:
+  enip-io-sim:
     build: ./test-infra/opener      # small owned Dockerfile over EIPStackGroup/OpENer (§11.5)
-    container_name: ethernet-ip-adapter-opener-sim
-    ports: ["44819:44818", "2222:2222/udp"]   # 44819 on the host to coexist with cpppo
+    container_name: ethernet-ip-adapter-enip-io-sim
+    command: ["eth0"]
+    networks: { default: { aliases: [opener-sim] } }
     restart: unless-stopped
 ```
 
-with the adapter's `connection.endpoint` pointing at `enip-sim:44818` / `opener-sim:44818` in
-the compose config (and `127.0.0.1:44818` / `127.0.0.1:44819` in `test-configs/` for bare
-`cargo run` + `docker run` of the sims). cpppo tags and OpENer assemblies reset on container
-restart — E2E writes must not assume persistence. **Class-1 note:** the adapter binds UDP :2222
-locally; compose must run the adapter and `opener-sim` on the same network so the UDP path is
-symmetric (host-mode caveats documented in the compose file).
+**Neither of those two publishes a host port**, deliberately: the containerized E2E (§11.4) reaches
+them by service name on the compose network, where a publish buys nothing. The peers that exist only
+to serve a host-side test do publish — `enip-ab-server` `44820:44818`, `enip-sharp` `44821:44818`,
+`enip-tls` `2221`, `enip-tls-cbc` `2223`, `opener-cipsec` `44822:44818`, `est-server` `8443`.
 
-### 11.3 Sim-gated integration tests (four suites)
+So the two unpublished services need something extra whenever a **host-side** consumer dials them,
+and the live suites are exactly that: `live_cpppo` hard-codes `127.0.0.1:44818` (a const, not an env
+override) and `live_opener` defaults to `127.0.0.1:44819`.
 
-All four self-skip: a `TcpStream::connect` probe with a short timeout at suite start; on failure
-every test returns early with an eprintln "skipped (no sim)" — exactly the sibling pattern (Modbus's
-live-slave gating). Each has its own default port (overridable by env var) so it fires only when its
-own sim is up. Covered live paths:
+- **CI** layers `test-infra/ci-overrides.yaml` over the base file. It *adds* a cpppo publish (there
+  is no `ports:` key to override) and scopes it to **`127.0.0.1` only** — which is not a detail but
+  the whole answer to a bind conflict: a wildcard `44818:44818` makes docker-proxy listen on
+  `0.0.0.0:44818` and blocks every later bind of that port, so the host-networked OpENer the class-1
+  legs require would die on `EADDRINUSE`. Loopback-scoping leaves the runner's primary IPv4 free for
+  it. `enip-io-sim` is built but never started from compose there; the job runs the same image with
+  `--network host` (§11.3).
+- **A bench** wanting the host-side suites can layer the same overlay for cpppo. OpENer must run
+  natively or `--network host` on a Linux docker host: a bridge-NATed OpENer cannot serve class-1 at
+  all, because the T→O UDP return path does not survive the NAT (and on Docker Desktop for Windows
+  the WSL2 NAT breaks it regardless — §11.3).
+
+Adapter configs point at `enip-sim:44818` / `opener-sim:44818` on the compose network, and at
+`127.0.0.1:44818` / `127.0.0.1:44819` in `test-configs/` for a bare `cargo run` against
+`docker run`-started sims. cpppo tags and OpENer assemblies reset on container restart — E2E writes
+must not assume persistence. **Class-1 note:** the adapter binds UDP :2222 locally and advertises its
+actual receive port in the ForwardOpen's T→O Sockaddr Info item, so it never fights OpENer for that
+port; compose must still run the adapter and `opener-sim` on the same network for the UDP path to be
+symmetric.
+
+### 11.3 Sim-gated integration tests (six suites)
+
+Six live-peer suites in `crates/enip/tests/`, plus three **in-source** live tests in the adapter
+crate. All of them self-skip: a `TcpStream::connect` probe with a short timeout at suite start; on
+failure every test returns early with an eprintln "skipped (no …)" — exactly the sibling pattern
+(Modbus's live-slave gating). Each has its own default port (overridable by env var) so it fires
+only when its own peer is up, which is what keeps `cargo test --workspace` green on a bench with no
+containers.
+
+**`ENIP_LIVE_REQUIRED=1` turns the skip into a failure.** Under it a probe that finds no peer
+panics instead of printing a skip, so a live run cannot pass vacuously. Each suite carries its own
+six-line `live_required()` helper — `ENIP_LIVE_REQUIRED` set, non-empty, and not `0` — matching the
+per-suite `sim_up()` convention rather than introducing a shared `tests/common` module (which would
+change the §12.2 coverage regex). There are **21 hardened skip sites across 8 files**, of two kinds
+whose rationales differ:
+
+- **20 reachability sites** — a peer that does not answer its probe, or live test material that is
+  not on disk. 14 sit in the six suites (`live_cpppo` 3, `live_opener` 3, `live_ab_server` 2,
+  `live_ethernetipsharp` 3, `live_tls` 2 — the `:2221` probe and the CBC `:2223` probe —
+  `live_cip_security` 1) and 6 in the three in-source live tests, where the generated test PKI is
+  gated too: a missing cert file is its own skip site.
+- **1 harness-configuration site** — `live_opener`'s watchdog leg needs a shell command that
+  silences the target (`OPENER_STOP_CMD`), and an unset or empty one retires the assertion while the
+  job still reports success. That is precisely the vacuous pass this variable exists to eliminate, so
+  required mode fails on it as well.
+
+The split is the rule, not bookkeeping: required mode punishes a peer that was not **reached** or a
+harness that was not **configured**, and never a peer that legitimately refuses a service it does not
+implement (the soft paths below). Every assertion message names the peer, its address, and the
+command that starts it. With the variable unset the bench behaviour is unchanged.
+
+**What that is protecting against, concretely.** Standing this gate up found that the EST live leg
+had never been runnable: `test-infra/est/gen-certs.sh` was broken three ways on Linux — it did not
+`mkdir -p` the gitignored `certs/` directory, it wrote subjects in the Windows `//CN=` idiom that a
+Linux OpenSSL reads literally and turns into an *empty* subject, and it omitted an `-extfile`, so
+`openssl x509 -req` minted an X.509 **v1** client certificate that rustls rejects outright. Any one
+of those makes `live_est_enroll_against_globalsign_estserver` impossible to pass. None of them was
+visible, because `certs/` does not exist in a clean tree, so the test always took the certs-missing
+skip and reported green. That is the same defect class as the coverage carve-out this phase removed:
+cited evidence that never actually ran. Gating the material as well as the peer is what turns it into
+a failure someone has to look at.
+
+Covered live paths:
 
 - **`live_cpppo.rs`** (poll, `:44818`): connect; scalar/array/DINT reads with exact seeded values;
   write + readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD;
   that browse (`0x55`) is *typed-refused* — cpppo does not implement the tag-list service (§11.1), so
   the client surfaces the refusal as a typed error, never a panic; and the class-3 inactivity
   keepalive across a 75 s idle (PROTOCOL-DESIGN §7.6) — the second peer for that leg, so it stands as
-  long as either peer serves a class-3 connection. A peer that refuses the class-3 ForwardOpen prints
-  a bench gap rather than faking the result.
+  long as either peer serves a class-3 connection (this one does not; see the soft paths below).
 - **`live_opener.rs`** (push, `:44819`): ForwardOpen against the OpENer sample assemblies (§11.5);
   cyclic consume ≥ N frames with an advancing class-1 sequence; O→T produce observed via OpENer's
   sample output→input **mirror** (`AfterAssemblyDataReceived` copies the consumed output assembly into
@@ -1526,10 +1586,79 @@ own sim is up. Covered live paths:
   and the **browse-cursor leg** — the exactly-once ascending walk, plus a >`0xFFFF` cursor emitting
   the 32-bit instance segment (`0x26`) that this independent decoder parses and answers at the CIP
   layer.
+- **`live_tls.rs`** (poll over **TLS**, `:2221`; needs `--features tls`): CIP Security Phase 1
+  against the OpenSSL `stunnel` terminator fronting cpppo — mutual-TLS connect plus tag read/write
+  over TLS, and the negative matrix: wrong CA ⇒ `PeerUnverified`, missing client cert rejected by
+  the peer's `verify=2`, and a deliberately CBC-only terminator on `:2223` proving the typed
+  `NoCipherOverlap` (DESIGN-cip-security.md §5.2).
+- **`live_cip_security.rs`** (posture reads, `:44822`): CIP Security Phase 2a against the OpENer
+  `CIPSecurity` branch — real `Get_Attribute_Single` reads of 0x5D/0x5E/0x5F decoded by
+  `enip::read_security_posture` into the CIP Security state/profiles, the EtherNet/IP Security
+  cipher-suite lists and flags, and the Certificate Management summary (DESIGN-cip-security.md
+  §4.1).
 
-All four are excluded from the coverage denominator (§12.2). *(The protocol crate's own
-`duplex`-fixture state-machine tests — PROTOCOL-DESIGN §12.2 — need no container, are NOT gated, and
-run everywhere.)*
+The three **in-source** live tests follow the same pattern from inside the adapter crate:
+`eip/tls.rs`'s `live_client_cert_rotation_presents_the_new_cert` and
+`live_near_expiry_cert_fires_expiring` (both probing the `:2221` stunnel terminator) and
+`eip/est/tests.rs`'s `live_est_enroll_against_globalsign_estserver` (probing the `:8443`
+globalsign/est server).
+
+The six suite **files** sit outside the coverage denominator (§12.2), because test code that only
+executes against a live peer says nothing about product-code coverage — what they are is conformance
+evidence against independent implementations. **No product file is excluded.** The three in-source
+live tests are *inside* the denominator and simply read uncovered on a bench with those containers
+down. *(The protocol crate's own `duplex`-fixture state-machine tests — PROTOCOL-DESIGN §12.2 — need
+no container, are NOT gated, and run everywhere.)*
+
+**What stays soft on purpose.** Required mode enforces that a peer was **reached**; it never demands
+that a peer implement a service it does not have. These in-body paths therefore stay soft even under
+`ENIP_LIVE_REQUIRED=1`, each because of a measured peer limit:
+
+- **cpppo refuses class-3.** Its ForwardOpen to the Message Router is rejected, so the class-3
+  idle-survival leg cannot run against it and prints a bench gap rather than faking a result. The leg
+  stands on OpENer, which does accept class-3 — but OpENer does not itself enforce the inactivity
+  watchdog, so what it proves is the test's stated two-level claim: the keepalive probes are
+  well-formed, an independent implementation decodes and answers them, they fire on the ¾-window
+  cadence, and the session is still usable after a multi-window idle. Target-*enforced* survival
+  needs a peer that enforces the timeout, and stays on the §14.6 real-Logix row.
+- **EthernetIPSharp serves `0x55` only from start instance 0.** It has no resume capability, so a
+  mid-set cursor is answered with a typed CIP refusal and a multi-page walk is unobtainable at any
+  page size. The test records that as the peer's capability and asserts the refusal's shape;
+  multi-page paging and mid-set resume stay on the §14.6 lab row.
+- **cpppo and ab_server have no `0x55` at all**, so their browse legs assert the *typed refusal* — a
+  real pass, not a skip.
+- **The latest-wins flood leg needs a peer that accepts a 10 ms RPI.** A refusal is recorded as a
+  bench gap rather than asserted. (The watchdog leg's `OPENER_STOP_CMD` is deliberately *not* in this
+  list: that is harness configuration, and required mode hardens it — see above.)
+
+**The gate: the `live-sims` job.** `.github/workflows/ci.yml` runs every suite above against real
+peers on `ubuntu-latest` **on every pull request**, with `ENIP_LIVE_REQUIRED=1` on each test step, so
+a peer that failed to start turns the job red instead of green-with-skips. The TCP peers come up from
+`compose.yaml` with `test-infra/ci-overrides.yaml` layered on top (`enip-sim`, `enip-ab-server`,
+`enip-sharp`, `enip-tls`, `enip-tls-cbc`, `opener-cipsec`, `est-server`); OpENer runs separately as a
+**host-networked** container (`opener-live`) because the class-1 T→O return path cannot cross a
+bridge NAT. Those two placements are one decision: the overlay publishes cpppo on **127.0.0.1 only**,
+which leaves the runner's primary IPv4 `:44818` free for OpENer to bind — a wildcard `44818:44818`
+publish would claim that port and OpENer would die on `EADDRINUSE` (§11.2).
+`test-infra/wait-ports.sh` then gates the suites on a real `accept()` from all eight addresses (a
+60 s budget each, and a failure names the peers that never came up) rather than on a sleep, and both
+throwaway PKIs are generated before the images are built.
+
+Execution is split across four steps, all of it forced by the single-threaded OpENer sample: the TCP
+suites first; then the adapter's in-source live tests, matched by name so a new `live_…` test joins
+the gate by existing; then `live_opener`'s class-3 idle and latest-wins flood legs with
+`--test-threads=1`, because run in parallel a class-1 timeout closes the TCP session the class-3 leg
+is idling on and one root cause reports as two failures; and **last, on its own**, the watchdog leg
+with `OPENER_STOP_CMD=docker kill opener-live` — that leg leaves the peer dead, and alphabetically it
+would otherwise run first and sabotage the other two.
+
+**Bench versus Linux runner.** The TCP peers are reachable from any dev bench. The **class-1 UDP legs
+are not**: on Docker Desktop for Windows the WSL2 UDP NAT breaks the T→O return path, so
+`live_opener`'s ForwardOpen/consume/produce/watchdog and latest-wins legs need a Linux docker host
+with OpENer on host networking (or OpENer built natively). So a Windows developer can reproduce every
+TCP suite locally but not the class-1 ones, while the `live-sims` job proves all of them on each PR.
+That asymmetry is a property of the bench, not of the code — worth knowing before reading a local
+"skipped (no OpENer)" as agreement with CI.
 
 **Live findings (S7) — two `enip` interop fixes surfaced by OpENer (the first real class-1 target).**
 
@@ -1813,9 +1942,9 @@ laundered out of it:
 - `src/publish_sink.rs` (3 lines) — `FacadePublisher::publish_update`, the single `.await` on the
   `data()` facade. The `DataFacade` has the same offline-construction problem.
 - `src/main.rs` (16 lines) — the binary entry.
-- The bodies of the two **in-source** live tests — `eip/tls.rs`'s client-cert-rotation test against
-  the `:2221` stunnel terminator and `eip/est/tests.rs`'s enrollment test against the `:8443`
-  globalsign/est server — read uncovered on a bench with those containers down.
+- The bodies of the three **in-source** live tests — `eip/tls.rs`'s client-cert-rotation and
+  near-expiry tests against the `:2221` stunnel terminator, and `eip/est/tests.rs`'s enrollment test
+  against the `:8443` globalsign/est server — read uncovered on a bench with those containers down.
 - The protocol crate's own live-socket runtime — `enip/io.rs`'s class-1 UDP
   `IoManager`/`manager_task`/`IoConnectionHandle`, `client/io_service.rs`, and `client/mod.rs`'s TCP
   connect — validated by the live OpENer/cpppo suites, and still counted here.
@@ -1825,10 +1954,23 @@ Those uncovered paths are exercised by the HOST / full-system E2E and the deploy
 
 ### 12.2b Fuzzing (D-EIP-19)
 
-The protocol crate's cargo-fuzz targets and cadence are specified in PROTOCOL-DESIGN §12.3 (one
-target per hostile decode surface; no-panic/no-OOM invariant; corpus + crash regressions checked
-in). Adapter CI runs the short-budget fuzz smoke on every PR (Linux); a reproducible finding is
-a ship blocker.
+The protocol crate's cargo-fuzz targets are specified in PROTOCOL-DESIGN §12.3 (one target per
+hostile decode surface; no-panic/no-OOM invariant; corpus + crash regressions checked in). Two
+cadences run them, both on Linux, and both enumerate targets with `cargo fuzz list` rather than
+naming them — so a new hostile surface joins the gate by existing, the same self-syncing property
+`enip::harness::SURFACES` gives the corpus regression, and no target can be forgotten at review time:
+
+- **Per-PR smoke** — `ci.yml`'s `fuzz-smoke` job builds every target and runs **each one** at
+  `-max_total_time=30` (11 targets today, ≈ 6 min of execution). An empty target list is a hard
+  error, so the gate cannot pass vacuously.
+- **Weekly campaign** — `.github/workflows/fuzz-weekly.yml`, Saturdays 03:17 UTC plus
+  `workflow_dispatch` (which takes a shorter budget as an input, for verifying the workflow itself),
+  runs each target at **600 s** inside a 180-minute job and uploads the libFuzzer reproducer as an
+  artifact when one crashes.
+
+A reproducible finding is a ship blocker. Promoting the reproducer into
+`crates/enip/fuzz/corpus/<target>/`, where `tests/fuzz_corpus.rs` replays it on every platform, stays
+the human follow-up.
 
 ### 12.3 Unit-test surface (reaches the gate with no PLC and no container)
 
@@ -1859,22 +2001,29 @@ a ship blocker.
 | Path | Where | This build |
 |---|---|---|
 | Unit + coverage gate (workspace: protocol crate + adapter) | local (Linux-authoritative) + CI | **in scope** (P-slices + S7) |
-| Decoder fuzzing (D-EIP-19) | Linux (CI/WSL — libFuzzer) | **in scope** (P4; PR smoke budget in CI) |
-| Live protocol + E2E (§11.4, both modes) | local Docker: EMQX + cpppo + OpENer | **in scope** (S7/S9) |
-| Live protocol: 2nd/3rd independent poll peers + Unconnected_Send route + browse `0x55` | local Docker: ab_server (§11.6) + EthernetIPSharp (§11.7) | **in scope** (S8): read/write cross-checked on two more independent impls; the `0x52` route wrapper exercised via ab_server; `enip::list_tags` browse validated against EthernetIPSharp's real `0x55` — single-page request/decode, which needed no `enip` change. |
-| Live protocol: browse cursors — exactly-once walk + the 32-bit instance segment | local Docker: EthernetIPSharp (§11.7) | **in scope**: the walk enumerates every tag once in ascending instance order, and an independent decoder parses the `0x26` segment a >`0xFFFF` cursor emits (answering at the CIP layer, not with a path error). The adapter-layer leg this peer supports is **page 1**, captured: `sb/browse` with no cursor at `max: 2` ⇒ `["LINE_SPEED", "FILL_TEMP"]`, `next = Some("4")` — the instance-0 start and the resume-from-the-last-*returned*-record cut, both on a real device page (§11.7). A **multi-page** adapter walk is **not obtainable here**: the peer refuses every non-zero start instance, so it has no resume capability and page 2 cannot be served at any page size. Multi-page paging and mid-set cursor resume — at both layers — have no container peer and stay on the §14.6 lab row. |
-| CIP Security Phase 1: poll over TLS (mutual X.509) + negative matrix | local Docker: `test-infra/enip-tls/` stunnel (OpenSSL) fronting cpppo on `:2221` (+ CBC-only `:2223`) | **in scope**: `crates/enip/tests/live_tls.rs` drives real `enip::connect_tls` — mutual-TLS read/write over TLS, wrong-CA `PeerUnverified`, missing-client-cert rejection, and CBC-only `NoCipherOverlap`, against an independent TLS + EtherNet/IP pair at exactly the changed layer (DESIGN-cip-security.md §5.2). |
-| CIP Security Phase 2a: posture reads (0x5D/0x5E/0x5F) | local Docker: `test-infra/opener-cipsecurity/` OpENer `CIPSecurity` branch on `:44822` | **in scope**: `crates/enip/tests/live_cip_security.rs` drives real `enip::read_security_posture` — decodes CIP Security state/profiles, EtherNet/IP Security cipher-suite lists + flags, and the Certificate Management summary against an independent implementation of the three objects (DESIGN-cip-security.md §4.1). Duplex-fixture decoder tests (`tests/security_posture.rs`) + fuzz (`fuzz_security_attrs`) cover the decoders in-gate. |
+| Decoder fuzzing (D-EIP-19) | Linux (CI/WSL — libFuzzer) | **in scope** (P4): `ci.yml`'s `fuzz-smoke` runs **every** target at 30 s on each PR, and `fuzz-weekly.yml` runs every target at 600 s on a weekly schedule; both enumerate with `cargo fuzz list` (§12.2b). |
+| Live protocol conformance vs cpppo + OpENer (both modes) | local Docker **+ CI `live-sims` (per PR, skip-free)** | **in scope** (S7): `live_cpppo` and `live_opener` run under `ENIP_LIVE_REQUIRED=1` in the job, so an absent peer fails rather than skips. The class-1 legs need OpENer host-networked — CI does that; a Docker-Desktop/Windows bench cannot (§11.2/§11.3). |
+| Scripted HOST E2E (§11.4, both modes — adapter binary on the bus) | local Docker: EMQX + cpppo + OpENer | **in scope** (S9). **Not** part of `live-sims`: that job gates the protocol and in-source live layers; the containerized adapter E2E stays a bench/lab pass. |
+| Live protocol: 2nd/3rd independent poll peers + Unconnected_Send route + browse `0x55` | local Docker: ab_server (§11.6) + EthernetIPSharp (§11.7) **+ CI `live-sims` (per PR, skip-free)** | **in scope** (S8): read/write cross-checked on two more independent impls; the `0x52` route wrapper exercised via ab_server; `enip::list_tags` browse validated against EthernetIPSharp's real `0x55` — single-page request/decode, which needed no `enip` change. |
+| Live protocol: browse cursors — exactly-once walk + the 32-bit instance segment | local Docker: EthernetIPSharp (§11.7) **+ CI `live-sims` (per PR, skip-free)** | **in scope**: the walk enumerates every tag once in ascending instance order, and an independent decoder parses the `0x26` segment a >`0xFFFF` cursor emits (answering at the CIP layer, not with a path error). The adapter-layer leg this peer supports is **page 1**, captured: `sb/browse` with no cursor at `max: 2` ⇒ `["LINE_SPEED", "FILL_TEMP"]`, `next = Some("4")` — the instance-0 start and the resume-from-the-last-*returned*-record cut, both on a real device page (§11.7). A **multi-page** adapter walk is **not obtainable here**: the peer refuses every non-zero start instance, so it has no resume capability and page 2 cannot be served at any page size. Multi-page paging and mid-set cursor resume — at both layers — have no container peer and stay on the §14.6 lab row. |
+| CIP Security Phase 1: poll over TLS (mutual X.509) + negative matrix | local Docker: `test-infra/enip-tls/` stunnel (OpenSSL) fronting cpppo on `:2221` (+ CBC-only `:2223`) **+ CI `live-sims` (per PR, skip-free, `--features tls`)** | **in scope**: `crates/enip/tests/live_tls.rs` drives real `enip::connect_tls` — mutual-TLS read/write over TLS, wrong-CA `PeerUnverified`, missing-client-cert rejection, and CBC-only `NoCipherOverlap`, against an independent TLS + EtherNet/IP pair at exactly the changed layer (DESIGN-cip-security.md §5.2). |
+| CIP Security Phase 2a: posture reads (0x5D/0x5E/0x5F) | local Docker: `test-infra/opener-cipsecurity/` OpENer `CIPSecurity` branch on `:44822` **+ CI `live-sims` (per PR, skip-free)** | **in scope**: `crates/enip/tests/live_cip_security.rs` drives real `enip::read_security_posture` — decodes CIP Security state/profiles, EtherNet/IP Security cipher-suite lists + flags, and the Certificate Management summary against an independent implementation of the three objects (DESIGN-cip-security.md §4.1). Duplex-fixture decoder tests (`tests/security_posture.rs`) + fuzz (`fuzz_security_attrs`) cover the decoders in-gate. |
+| CIP Security Phases 2b/2c on the adapter side: client-cert rotation-without-restart, the near-expiry event, and EST enrollment against a live RFC 7030 server | local Docker: `test-infra/enip-tls/` stunnel on `:2221` + `test-infra/est/` globalsign/est on `:8443` **+ CI `live-sims` (per PR, skip-free)** | **in scope**, as the three **in-source** live tests (§11.3): `eip/tls.rs`'s `live_client_cert_rotation_presents_the_new_cert` (rotate the vault ⇒ the next `connect_tls` presents the new serial to the `verify=2` peer) and `live_near_expiry_cert_fires_expiring`, and `eip/est/tests.rs`'s `live_est_enroll_against_globalsign_estserver` (a real issued cert lands in the vault). These live inside the coverage denominator, so they read uncovered when the containers are down. |
 | CIP Security against a **certified Vol 8 device** (44818-closed port policy, Vol-8-exact suite lists, `Send Certificate Chain` / `Verify Client Certificate` corner semantics, device-side commissioning; **EST enrollment against a real plant/device pull-model PKI**, Phase 2c) | lab CIP-Security PLC (none on the bench) | **deferred to lab hardware** (§14.6) — the stunnel terminator + globalsign/est `estserver` cover the changed *layers* faithfully (independent TLS/EtherNet/IP + independent RFC 7030 server) but neither is a real CIP-Security device. Acquire a CompactLogix 5380 / ControlLogix 5580 v32+ or a 1756-EN4TR (commissioned with FactoryTalk Policy Manager) when CIP Security becomes a shipping claim (DESIGN-cip-security.md §5.2/§6.3). |
 | HOST/dual-MQTT smoke | local | **in scope** (S9) |
 | Kubernetes | kind cluster, `k8s/` manifests + cpppo & OpENer as cluster services (UDP :2222 pod-to-pod for push) | **in scope** (S9, smoke: pod Ready, data on bus both modes, probes green) |
 | Greengrass deployed regression | `lab-5950x` (build via WSL `--features greengrass`, `greengrass-cli` local deploy) | **required before the component is "done"** (org rule: new capability ⇒ deployed GG regression). Scheduled S9; if the lab is unreachable in a session, report a **blocking validation gap** — do not claim completion. |
 | True `slot`/backplane **routing semantics** + connected class-3 messaging (incl. whether a real Logix Connection Manager enforces the class-3 idle window the §7.6 keepalive covers) + real-Logix browse (hundreds of tags, UDT/`RECIPE` `supported:false` on real Rockwell symbol types) + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6. `enip` now *emits* a well-formed Unconnected_Send route (validated vs ab_server, §11.6) and *decodes* a real `0x55` browse page (validated vs EthernetIPSharp, §11.7), but ab_server ignores the route content (no real slot-routing) and sim browse is a handful of atomic tags — so plant-grade backplane routing and real-Logix browse semantics still need a physical controller; push conformance beyond OpENer likewise stays sim-grade. |
 
-CI: `.github/workflows/ci.yml` calls the org reusable
+CI: `.github/workflows/ci.yml` carries four jobs. `ci` calls the org reusable
 `edgecommons/.github/.github/workflows/component-ci.yml@main` (`language: RUST`,
-`secrets: inherit` for the private git dep) with the §12.1 llvm-cov invocation — the
-file-replicator/telemetry-processor pattern.
+`secrets: inherit` for the private git dep) — the file-replicator/telemetry-processor pattern;
+`coverage` runs the §12.1 llvm-cov invocation; `fuzz-smoke` runs every fuzz target at a 30 s budget
+(§12.2b); and `live-sims` runs every live suite against real peers under `ENIP_LIVE_REQUIRED=1`
+(§11.3). `fuzz-smoke` and `live-sims` are `pull_request`-only, and the workflow's `paths-ignore`
+(`**.md`, `docs/**`) means a docs-only PR runs no jobs at all. The weekly fuzz campaign is a separate
+workflow, `.github/workflows/fuzz-weekly.yml`. Adding a job does not make it *required* — marking
+`coverage`, `fuzz-smoke` and `live-sims` as required checks on `main` is a repo-settings action.
 
 ---
 

@@ -3,11 +3,14 @@
 //! genuine, independent EtherNet/IP *target* on the wire — ForwardOpen, cyclic T→O consume, O→T
 //! produce, and the inactivity watchdog — not a `duplex`/crafted-bytes fixture.
 //!
-//! ## Self-skipping (§11.3)
+//! ## Self-skipping, and the required mode that removes it (§11.3)
 //! We TCP-probe the OpENer encapsulation port (`OPENER_ADDR`, default `127.0.0.1:44818`). If nothing
 //! answers the test prints a skip and returns — `cargo test --workspace` stays green without the
-//! target. Build + run OpENer (native on Linux, or `--network host` on a Linux docker host so the
-//! class-1 UDP :2222 loop is symmetric — see `test-infra/opener/Dockerfile`):
+//! target. **`ENIP_LIVE_REQUIRED=1` turns that skip into a failure** ([`live_required`]), so the CI
+//! live gate cannot pass vacuously. Required mode additionally demands `OPENER_STOP_CMD`, without
+//! which the watchdog assertion retires itself while the run stays green — a harness
+//! misconfiguration, not a peer limit. Build + run OpENer (native on Linux, or `--network host` on a
+//! Linux docker host so the class-1 UDP :2222 loop is symmetric — see `test-infra/opener/Dockerfile`):
 //!
 //! ```bash
 //! # native (WSL/Linux): build via the same source the Dockerfile uses, then
@@ -51,7 +54,9 @@ fn opener_addr() -> String {
 
 /// A shell command that makes OpENer go silent (to fire the originator watchdog), e.g.
 /// `pkill -x OpENer` (native) or `docker kill opener-test` (container). When unset, the watchdog
-/// assertion is skipped with a printed note rather than faked.
+/// assertion is skipped with a printed note rather than faked — except under
+/// `ENIP_LIVE_REQUIRED=1`, where its absence is a harness misconfiguration and therefore a failure
+/// ([`live_required`]).
 fn opener_stop_cmd() -> Option<String> {
     std::env::var("OPENER_STOP_CMD").ok().filter(|s| !s.is_empty())
 }
@@ -61,6 +66,13 @@ async fn opener_up(addr: &str) -> bool {
         tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(addr)).await,
         Ok(Ok(_))
     )
+}
+
+/// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer is a **FAILURE**, never a
+/// silent skip — the live gate cannot pass vacuously. Unset (or empty, or `0`) keeps the
+/// bench-friendly self-skip, so `cargo test --workspace` stays green with no sims up.
+fn live_required() -> bool {
+    std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The OpENer exclusive-owner class-1 spec at the suite's ordinary 100 ms RPI.
@@ -103,6 +115,12 @@ fn opener_spec_at(rpi: Duration) -> IoConnectionSpec {
 async fn opener_live_class1_forward_open_consume_produce_watchdog() {
     let addr = opener_addr();
     if !opener_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no OpENer on {addr} — \
+             docker run -d --name opener-live --network host <opener image> <iface> \
+             (set OPENER_ADDR to the host's primary IPv4:44818)"
+        );
         eprintln!("live_opener: skipped (no OpENer on {addr})");
         return;
     }
@@ -234,6 +252,20 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
         assert!(lost, "the inactivity watchdog fired IoEvent::Lost after the target went silent");
         println!("== live_opener: PASS (ForwardOpen + consume + produce + watchdog) ==");
     } else {
+        // Harness configuration, NOT peer reachability — and therefore the one soft path that
+        // required mode DOES harden. Every other soft path in these suites is a peer legitimately
+        // refusing a service it does not implement, which the gate must never punish. A missing
+        // `OPENER_STOP_CMD`, by contrast, silently retires the watchdog assertion while the job
+        // stays green: exactly the vacuous-gate failure `ENIP_LIVE_REQUIRED` exists to eliminate.
+        // Unset required mode keeps the bench soft, so a local run without a stop command is
+        // unaffected.
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but OPENER_STOP_CMD is unset or empty — the live watchdog leg \
+             needs a shell command that silences the OpENer target on {addr} so the originator's \
+             inactivity watchdog fires, e.g. OPENER_STOP_CMD='docker kill opener-live' (container) \
+             or OPENER_STOP_CMD='pkill -x OpENer' (native)"
+        );
         println!(
             "OPENER_STOP_CMD unset — skipping the live watchdog assertion (the watchdog is proven \
              deterministically in io.rs unit tests with a paused clock). ForwardOpen + consume + \
@@ -268,6 +300,12 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
 async fn opener_live_class3_idle_survives_the_inactivity_window() {
     let addr = opener_addr();
     if !opener_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no OpENer on {addr} (class-3 keepalive leg) — \
+             docker run -d --name opener-live --network host <opener image> <iface> \
+             (set OPENER_ADDR to the host's primary IPv4:44818)"
+        );
         eprintln!("live_opener (class-3 keepalive): skipped (no OpENer on {addr})");
         return;
     }
@@ -291,6 +329,9 @@ async fn opener_live_class3_idle_survives_the_inactivity_window() {
     let client = match EipClient::connect(&addr, opts).await {
         Ok(c) => c,
         Err(e) => {
+            // A peer-limit path, NOT a missing peer — stays soft even under ENIP_LIVE_REQUIRED=1.
+            // Required mode enforces that the peer was REACHED; it never demands a service the peer
+            // does not implement. (OpENer does accept class-3; cpppo does not.)
             println!(
                 "BENCH GAP: this peer refused the class-3 ForwardOpen to the Message Router \
                  ({e:?}) — the idle-survival leg cannot run against it. Run the same scenario \
@@ -359,6 +400,12 @@ async fn opener_live_class3_idle_survives_the_inactivity_window() {
 async fn opener_live_slow_consumer_receives_fresh_frames() {
     let addr = opener_addr();
     if !opener_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no OpENer on {addr} (latest-wins flood leg) — \
+             docker run -d --name opener-live --network host <opener image> <iface> \
+             (set OPENER_ADDR to the host's primary IPv4:44818)"
+        );
         eprintln!("live_opener (latest-wins): skipped (no OpENer on {addr})");
         return;
     }
@@ -378,6 +425,7 @@ async fn opener_live_slow_consumer_receives_fresh_frames() {
     let mut handle = match manager.forward_open(&client, spec).await {
         Ok(h) => h,
         Err(e) => {
+            // A peer-limit path, NOT a missing peer — stays soft even under ENIP_LIVE_REQUIRED=1.
             println!(
                 "BENCH GAP: this peer refused a 10 ms-RPI class-1 ForwardOpen ({e:?}); the flood \
                  leg needs a cadence fast enough to overflow a 256-deep queue. The policy itself is \

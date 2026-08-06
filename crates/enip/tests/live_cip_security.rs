@@ -8,9 +8,11 @@
 //! **posture decoders** (`cip/security.rs`): this drives the real `Get_Attribute_Single` reads of
 //! 0x5D/0x5E/0x5F and asserts the typed decode against an implementation that is NOT ours.
 //!
-//! ## Self-skipping (the sibling live-sim pattern, §11.3)
-//! At start we probe `TcpStream::connect(127.0.0.1:44818)`; if nothing is listening the test prints
-//! `skipped` and returns, so `cargo test --workspace` stays green without the peer. Bring it up:
+//! ## Self-skipping, and the required mode that removes it (§11.3)
+//! At start we probe `TcpStream::connect(127.0.0.1:44822)`; if nothing is listening the test prints
+//! `skipped` and returns, so `cargo test --workspace` stays green without the peer.
+//! **`ENIP_LIVE_REQUIRED=1` turns that skip into a failure** ([`live_required`]), so the CI live gate
+//! cannot pass vacuously. Bring it up:
 //!
 //! ```bash
 //! docker build -t opener-cipsec test-infra/opener-cipsecurity
@@ -35,6 +37,13 @@ async fn up(addr: &str) -> bool {
     )
 }
 
+/// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer is a **FAILURE**, never a
+/// silent skip — the live gate cannot pass vacuously. Unset (or empty, or `0`) keeps the
+/// bench-friendly self-skip, so `cargo test --workspace` stays green with no sims up.
+fn live_required() -> bool {
+    std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 fn opts() -> ClientOptions {
     ClientOptions {
         connect_timeout: Duration::from_secs(5),
@@ -46,6 +55,11 @@ fn opts() -> ClientOptions {
 #[tokio::test]
 async fn opener_cipsecurity_posture_reads() {
     if !up(ADDR).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no OpENer-CIPSecurity on {ADDR} — \
+             docker compose up -d opener-cipsec"
+        );
         eprintln!(
             "live_cip_security: skipped (no OpENer-CIPSecurity on {ADDR}) — \
              docker build -t opener-cipsec test-infra/opener-cipsecurity && \

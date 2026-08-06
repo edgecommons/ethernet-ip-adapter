@@ -6,11 +6,12 @@
 //! **Unconnected_Send (`0x52`) route wrapper** (`ClientOptions.route`, the CompactLogix/ControlLogix
 //! backplane path) live — cpppo is direct (no backplane) and never wraps.
 //!
-//! ## Self-skipping (the cpppo/OpENer sibling pattern, §11.3)
+//! ## Self-skipping, and the required mode that removes it (§11.3)
 //! At suite start we TCP-probe `AB_SERVER_ADDR` (default `127.0.0.1:44820` — the §11.2 compose host
 //! mapping for `enip-ab-server`, distinct from cpppo `:44818` / OpENer `:44819`). If nothing answers,
-//! the test prints a skip and returns `Ok`, so `cargo test --workspace` stays green with no sim. Bring
-//! it up with the §11.6 tag layout:
+//! the test prints a skip and returns `Ok`, so `cargo test --workspace` stays green with no sim.
+//! **`ENIP_LIVE_REQUIRED=1` turns that skip into a failure** ([`live_required`]), so the CI live gate
+//! cannot pass vacuously. Bring it up with the §11.6 tag layout:
 //!
 //! ```bash
 //! docker build -t ab-server-sim test-infra/ab-server
@@ -50,6 +51,13 @@ async fn sim_up(addr: &str) -> bool {
     )
 }
 
+/// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer is a **FAILURE**, never a
+/// silent skip — the live gate cannot pass vacuously. Unset (or empty, or `0`) keeps the
+/// bench-friendly self-skip, so `cargo test --workspace` stays green with no sims up.
+fn live_required() -> bool {
+    std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// ab_server is a ControlLogix target reached through the backplane path (`1,0`), so the client wraps
 /// every explicit request in a real Unconnected_Send (`0x52`) with the backplane-slot route — the path
 /// cpppo never exercises. (ab_server accepts any route in the `0x52` wrapper; the point here is that
@@ -74,6 +82,11 @@ fn tag(name: &str) -> TagAddress {
 async fn ab_server_live_read_write_routed() {
     let addr = ab_addr();
     if !sim_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no ab_server on {addr} — \
+             docker compose up -d enip-ab-server"
+        );
         eprintln!("live_ab_server: skipped (no ab_server on {addr})");
         return;
     }
@@ -160,6 +173,11 @@ async fn ab_server_live_read_write_routed() {
 async fn ab_server_live_browse_is_gracefully_refused() {
     let addr = ab_addr();
     if !sim_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no ab_server on {addr} (browse leg) — \
+             docker compose up -d enip-ab-server"
+        );
         eprintln!("live_ab_server (browse): skipped (no ab_server on {addr})");
         return;
     }

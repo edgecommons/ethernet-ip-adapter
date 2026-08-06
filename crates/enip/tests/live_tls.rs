@@ -5,10 +5,12 @@
 //! rustls duplex fixture. EtherNet/IP-over-TLS is byte-identical EtherNet/IP inside a standard TLS
 //! tunnel on TCP 2221, so this exercises exactly the layer Phase 1 changes.
 //!
-//! ## Self-skipping (the sibling live-sim pattern, §11.3)
+//! ## Self-skipping, and the required mode that removes it (§11.3)
 //! At suite start we probe `TcpStream::connect(127.0.0.1:2221)`. If nothing is listening the test
 //! prints `skipped (no stunnel)` and returns — so `cargo test --workspace` stays green on a machine
-//! with no peer. Bring the peer up (from the repo root):
+//! with no peer. The CBC leg probes `:2223` the same way. **`ENIP_LIVE_REQUIRED=1` turns both skips
+//! into failures** ([`live_required`]), so the CI live gate cannot pass vacuously. Bring the peers up
+//! (from the repo root):
 //!
 //! ```bash
 //! ./test-infra/enip-tls/gen-certs.sh
@@ -45,6 +47,13 @@ async fn up(addr: &str) -> bool {
         tokio::time::timeout(Duration::from_millis(400), tokio::net::TcpStream::connect(addr)).await,
         Ok(Ok(_))
     )
+}
+
+/// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer is a **FAILURE**, never a
+/// silent skip — the live gate cannot pass vacuously. Unset (or empty, or `0`) keeps the
+/// bench-friendly self-skip, so `cargo test --workspace` stays green with no sims up.
+fn live_required() -> bool {
+    std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 fn certs_dir() -> PathBuf {
@@ -110,6 +119,11 @@ fn opts() -> ClientOptions {
 #[tokio::test]
 async fn tls_live_mutual_read_write_and_negative_matrix() {
     if !up(TLS_ADDR).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no stunnel TLS terminator on {TLS_ADDR} — \
+             ./test-infra/enip-tls/gen-certs.sh && docker compose up -d enip-sim enip-tls enip-tls-cbc"
+        );
         eprintln!("live_tls: skipped (no stunnel on {TLS_ADDR}) — run gen-certs.sh + docker compose up enip-sim enip-tls enip-tls-cbc");
         return;
     }
@@ -204,6 +218,11 @@ async fn tls_live_mutual_read_write_and_negative_matrix() {
         );
         eprintln!("live_tls: CBC-only NoCipherOverlap PASSED ({err})");
     } else {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no CBC-only stunnel terminator on {CBC_ADDR} — \
+             ./test-infra/enip-tls/gen-certs.sh && docker compose up -d enip-tls-cbc"
+        );
         eprintln!("live_tls: CBC leg skipped (no stunnel on {CBC_ADDR})");
     }
 }
