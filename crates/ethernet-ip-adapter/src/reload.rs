@@ -626,6 +626,11 @@ impl PreparedConfigurationApply for ReloadTransaction {
     async fn rollback(&mut self) -> ConfigurationApplicationResult<()> {
         let budget = crate::lifecycle::stop_budget(&self.undo.prior.global.timeouts);
 
+        // Currently unreachable in practice: commit() can only fail before any launch (shutting down)
+        // or with an empty registry (zero successful launches), so `undo.launched` is empty whenever
+        // core calls rollback. Kept deliberately — it is the correct inverse for any future commit
+        // failure mode added after the launch stage, and its cost is nil. Re-verify this note if a
+        // new `Err` path is added to commit().
         let mut stopping: Vec<DeviceRuntime> = Vec::new();
         for id in std::mem::take(&mut self.undo.launched) {
             if let Some(rt) = self.registry.remove(&id) {

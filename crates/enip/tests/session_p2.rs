@@ -1368,15 +1368,22 @@ async fn handle_forward_open(peer: &mut MockPeer) -> u32 {
     let vendor = r.u16().unwrap();
     let orig_serial = r.u32().unwrap();
 
-    // Success reply: assign an O→T id, echo T→O + identifiers, APIs = 2000µs, no app data.
+    // Success reply: assign an O→T id, echo T→O + identifiers, echo the requested 2 s packet
+    // interval as the actual one, no app data.
+    //
+    // The APIs are not incidental: class-3 derives its inactivity-keepalive window from the reply's
+    // actual O→T API (§7.6), so 2 s × the default ×16 multiplier gives a 32 s window — no probe can
+    // fall due inside these scripted exchanges. (A compliant target echoes the requested interval;
+    // the previous 2000 µs would have armed a 32 ms window and injected keepalive frames into every
+    // class-3 script below.)
     let mut body = WireWriter::new();
     body.u32(0x1000_0001); // O→T (target-assigned)
     body.u32(t_o); // T→O (echo)
     body.u16(serial);
     body.u16(vendor);
     body.u32(orig_serial);
-    body.u32(2000);
-    body.u32(2000);
+    body.u32(2_000_000);
+    body.u32(2_000_000);
     body.u8(0); // app words
     body.u8(0); // reserved
     peer.send(&rrdata_reply(

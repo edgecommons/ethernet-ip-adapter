@@ -89,7 +89,7 @@ pub fn connection_manager_path() -> EPath {
 pub fn io_connection_path(config: Option<u16>, output: u16, input: u16) -> EPath {
     let mut p = EPath::new().class(0x04);
     if let Some(config) = config {
-        p = p.instance(config);
+        p = p.instance(u32::from(config));
     }
     p.connection_point(output).connection_point(input)
 }
@@ -203,8 +203,9 @@ pub struct NetworkConnectionParams {
 }
 
 impl NetworkConnectionParams {
-    /// A point-to-point, fixed-length, low-priority parameter set of the given size — the class-3
-    /// explicit-messaging default (§7.6).
+    /// A point-to-point, **variable**-length, low-priority parameter set of the given size — the
+    /// class-3 explicit-messaging default (§7.6). Variable length is what explicit messaging needs:
+    /// `size` is the maximum a request or reply may reach, not the size every frame must be.
     #[must_use]
     pub fn p2p(size: u16) -> Self {
         Self {
@@ -388,7 +389,17 @@ pub struct ForwardOpenRequest {
 
 impl ForwardOpenRequest {
     /// A class-3 explicit-messaging ForwardOpen (§7.6) against the Message Router, with the given
-    /// originator ids and a fixed-size (500) connection.
+    /// originator ids, requested packet interval (µs, both directions), timeout-multiplier code,
+    /// and a variable-size (500) P2P connection.
+    ///
+    /// `rpi_micros` and `timeout_multiplier` together set the **target's inactivity watchdog** on
+    /// the connection (`multiplier × O→T API`), which is what the client's ¾-window keepalive
+    /// ([`crate::client`], §7.6) is derived from — so they are caller-supplied rather than fixed.
+    /// [`crate::ClientOptions`] defaults them to 2 s / ×16, the historical hard-coded pair.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a ForwardOpen is an inherently wide wire record; the class-3 caller builds it once"
+    )]
     #[must_use]
     pub fn class3(
         o_t_connection_id: u32,
@@ -397,6 +408,8 @@ impl ForwardOpenRequest {
         vendor_id: u16,
         originator_serial: u32,
         connection_path: EPath,
+        rpi_micros: u32,
+        timeout_multiplier: TimeoutMultiplier,
     ) -> Self {
         Self {
             priority_time_tick: 0x0A,
@@ -406,10 +419,10 @@ impl ForwardOpenRequest {
             connection_serial,
             vendor_id,
             originator_serial,
-            timeout_multiplier: TimeoutMultiplier::X16,
-            o_t_rpi: 2_000_000,
+            timeout_multiplier,
+            o_t_rpi: rpi_micros,
             o_t_params: NetworkConnectionParams::p2p(500),
-            t_o_rpi: 2_000_000,
+            t_o_rpi: rpi_micros,
             t_o_params: NetworkConnectionParams::p2p(500),
             transport_class_trigger: TRANSPORT_CLASS3_TRIGGER,
             connection_path,
@@ -738,7 +751,16 @@ mod tests {
 
     #[test]
     fn forward_open_encode_shape() {
-        let req = ForwardOpenRequest::class3(0, 0x1122_3344, 0x0007, 0x1337, 0xDEAD_BEEF, message_router_path());
+        let req = ForwardOpenRequest::class3(
+            0,
+            0x1122_3344,
+            0x0007,
+            0x1337,
+            0xDEAD_BEEF,
+            message_router_path(),
+            2_000_000,
+            TimeoutMultiplier::X16,
+        );
         let bytes = req.encode().unwrap();
         // 36-byte fixed header + connection path (Message Router = 4 bytes = 2 words).
         // priority(1)+ticks(1)+otcid(4)+tocid(4)+serial(2)+vendor(2)+origserial(4)+mult(1)+rsv(3)
@@ -750,6 +772,28 @@ mod tests {
         assert_eq!(bytes[34], TRANSPORT_CLASS3_TRIGGER);
         assert_eq!(bytes[35], 2); // path words
         assert_eq!(&bytes[36..40], &[0x20, 0x02, 0x24, 0x01]); // Message Router path
+    }
+
+    /// §7.6 — the class-3 open carries the **caller's** requested packet interval and
+    /// timeout-multiplier code in both directions, at their §8.2 field offsets. These two values are
+    /// what arms the target's inactivity watchdog, so a regression that reorders or drops them would
+    /// silently restore the old hard-coded 32 s window under a caller that asked for something else.
+    #[test]
+    fn class3_forward_open_carries_configured_rpi_and_multiplier() {
+        let req = ForwardOpenRequest::class3(
+            0,
+            0x1122_3344,
+            0x0007,
+            0x1337,
+            0xDEAD_BEEF,
+            message_router_path(),
+            500_000,
+            TimeoutMultiplier::X4,
+        );
+        let bytes = req.encode().unwrap();
+        assert_eq!(bytes[18], 0, "timeout-multiplier code for ×4");
+        assert_eq!(&bytes[22..26], &500_000u32.to_le_bytes(), "O→T RPI");
+        assert_eq!(&bytes[28..32], &500_000u32.to_le_bytes(), "T→O RPI");
     }
 
     #[test]
@@ -981,7 +1025,16 @@ mod tests {
 
     #[test]
     fn forward_close_encode_has_reserved_byte() {
-        let open = ForwardOpenRequest::class3(0, 1, 2, 3, 4, message_router_path());
+        let open = ForwardOpenRequest::class3(
+            0,
+            1,
+            2,
+            3,
+            4,
+            message_router_path(),
+            2_000_000,
+            TimeoutMultiplier::X16,
+        );
         let close = ForwardCloseRequest::for_open(&open);
         let bytes = close.encode().unwrap();
         // priority(1)+ticks(1)+serial(2)+vendor(2)+origserial(4)+pathwords(1)+reserved(1)=12, +4 path

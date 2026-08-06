@@ -12,8 +12,10 @@
 //!   request/reply, an error-status reply, and ListIdentity.
 //! * [`Source::HandAssembledPerSpec`] — assembled from the ODVA CIP/EtherNet/IP layouts in §5–§8 for
 //!   shapes with no live producer on this bench: the ForwardOpen request/reply and ForwardClose, the
-//!   class-1 real-time frames in both directions, the big-endian sockaddr item, and an encapsulation
-//!   error-status frame.
+//!   class-1 real-time frames in both directions, the big-endian sockaddr item, an encapsulation
+//!   error-status frame, and the 32-bit logical instance segment (`0x26`) — both bare and inside a
+//!   Get-Instance-Attribute-List request — which no bench peer produces because none serves more
+//!   than 65 535 symbol instances.
 //!
 //! The [`MANIFEST`] table below is the machine-readable index (name · layer · direction · source ·
 //! hex); the `golden_*` tests are the executable byte-exact proofs. A vector may only change with a
@@ -25,13 +27,13 @@ use enip::cip::message::MessageReply;
 use enip::cip::types::CipValue;
 use enip::cm::{
     connection_manager_path, ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess,
-    ForwardRequestFail,
+    ForwardRequestFail, TimeoutMultiplier,
 };
 use enip::cpf::{Cpf, SockAddrInfo};
 use enip::discovery::DeviceIdentity;
 use enip::encap::{Command, EncapFrame, EncapHeader, EncapStatus};
 use enip::io::{IoFrame, RealTimeFormat};
-use enip::{CipType, GeneralStatus, MessageRequest, TagAddress};
+use enip::{CipType, EPath, GeneralStatus, MessageRequest, TagAddress};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -118,11 +120,15 @@ const MANIFEST: &[Vector] = &[
         hex: "2a00aabb" },
     Vector { name: "class1_o2t_heartbeat", layer: "io", direction: Direction::Both, source: Source::HandAssembledPerSpec,
         hex: "0100" },
+    Vector { name: "epath_instance_32bit", layer: "epath", direction: Direction::EncodeOnly, source: Source::HandAssembledPerSpec,
+        hex: "260000000100" },
+    Vector { name: "get_instance_attribute_list_request_32bit_instance", layer: "cip", direction: Direction::EncodeOnly, source: Source::HandAssembledPerSpec,
+        hex: "5504206b26000000010002000100 0200" },
 ];
 
 #[test]
 fn manifest_is_labelled_and_hex_is_valid() {
-    assert!(MANIFEST.len() >= 15, "the manifest must cover every §12.4 vector");
+    assert!(MANIFEST.len() >= 17, "the manifest must cover every §12.4 vector");
     for v in MANIFEST {
         // Every entry carries a source label and a layer, and its hex parses (empty allowed only for
         // the deliberately-empty class-1 zero-length frame, which is not in the table).
@@ -281,8 +287,20 @@ fn golden_forward_open_request() {
     // §8.2 layout: 0A 0E | o_t=0 | t_o=0x11223344 | serial=5 | vendor=0x4D | orig=0xDEADBEEF |
     // tmo code 2 (×16) | 3× reserved | o_t rpi 2_000_000 | o_t ncp 0x43F4 (P2P/variable/500) |
     // t_o rpi 2_000_000 | t_o ncp 0x43F4 | class/trigger 0xA3 | path 2 words | [20 06 24 01].
+    //
+    // The RPI and multiplier are `ClientOptions` inputs (§7.6); passing their defaults here is the
+    // wire-equivalence proof — the golden bytes are unchanged by the parameterisation.
     let expected = vector("forward_open_request");
-    let req = ForwardOpenRequest::class3(0, 0x1122_3344, 0x0005, 0x004D, 0xDEAD_BEEF, connection_manager_path());
+    let req = ForwardOpenRequest::class3(
+        0,
+        0x1122_3344,
+        0x0005,
+        0x004D,
+        0xDEAD_BEEF,
+        connection_manager_path(),
+        2_000_000,
+        TimeoutMultiplier::X16,
+    );
     assert_eq!(req.encode().unwrap().as_ref(), expected.as_slice());
 }
 
@@ -317,9 +335,79 @@ fn golden_forward_close_request() {
     // §8.8: ForwardClose that tears down the golden ForwardOpen — note the reserved byte after the
     // path-size word (absent in ForwardOpen).
     let expected = vector("forward_close_request");
-    let open = ForwardOpenRequest::class3(0, 0x1122_3344, 0x0005, 0x004D, 0xDEAD_BEEF, connection_manager_path());
+    let open = ForwardOpenRequest::class3(
+        0,
+        0x1122_3344,
+        0x0005,
+        0x004D,
+        0xDEAD_BEEF,
+        connection_manager_path(),
+        2_000_000,
+        TimeoutMultiplier::X16,
+    );
     let close = ForwardCloseRequest::for_open(&open);
     assert_eq!(close.encode().unwrap().as_ref(), expected.as_slice());
+}
+
+#[test]
+fn golden_epath_instance_32bit() {
+    // §6.2 logical segment, hand-assembled from the ODVA segment-type byte layout (NOT generated
+    // from this crate's encoder — that would make the vector circular):
+    //
+    //   bit 7..5 = 001  segment type   = Logical Segment
+    //   bit 4..2 = 001  logical type   = Instance ID
+    //   bit 1..0 = 10   logical format = 32-bit address
+    //   ⇒ 0b0010_0110 = 0x26
+    //
+    //   26          logical segment · instance id · 32-bit format
+    //   00          pad byte — the padded EPATH form aligns any address wider than 8 bits to the
+    //               16-bit word boundary that follows the segment-type byte
+    //   00 00 01 00 the instance id 0x0001_0000, little-endian (the CIP wire byte order)
+    //
+    // 6 bytes = 3 words, so the segment is self-padding and keeps the path even-length.
+    let expected = vector("epath_instance_32bit");
+    assert_eq!(EPath::new().instance(0x0001_0000).encode().unwrap().as_ref(), expected.as_slice());
+}
+
+#[test]
+fn golden_get_instance_attribute_list_request_32bit() {
+    // §6.1 + §7.3, hand-assembled byte by byte from the ODVA layouts — the browse request for the
+    // first symbol instance ABOVE the 16-bit space. No bench peer serves > 65 535 symbol instances,
+    // so this vector (not a captured frame) is the proof that the 32-bit cursor reaches the wire.
+    //
+    //   55                service — Get Instance Attribute List (§7.3)
+    //   04                request path size in 16-bit WORDS: the 8 path bytes below = 4 words
+    //   20                logical segment · class id · 8-bit format (001 000 00)
+    //   6B                the class id — Symbol object 0x6B
+    //   26                logical segment · instance id · 32-bit format (001 001 10)
+    //   00                pad byte before the wider-than-8-bit address
+    //   00 00 01 00       instance id 0x0001_0000, little-endian
+    //   02 00             service data — attribute count = 2 (UINT, little-endian)
+    //   01 00             attribute 1 — Symbol Name
+    //   02 00             attribute 2 — Symbol Type
+    let expected = vector("get_instance_attribute_list_request_32bit_instance");
+
+    let mut data = enip::WireWriter::with_capacity(6);
+    data.u16(2); // attribute count
+    data.u16(1); // attribute 1 — symbol name
+    data.u16(2); // attribute 2 — symbol type
+    let req = MessageRequest::new(
+        enip::logix::SERVICE_GET_INSTANCE_ATTRIBUTE_LIST,
+        EPath::new()
+            .class(enip::logix::CLASS_SYMBOL)
+            .instance(0x0001_0000),
+        data.into_bytes(),
+    );
+    assert_eq!(req.encode().unwrap().as_ref(), expected.as_slice());
+
+    // The 8-bit and 16-bit instance forms are unchanged by the widening (regression guard for the
+    // paths every other service builds).
+    let small = MessageRequest::new(
+        enip::logix::SERVICE_GET_INSTANCE_ATTRIBUTE_LIST,
+        EPath::new().class(enip::logix::CLASS_SYMBOL).instance(1),
+        bytes::Bytes::new(),
+    );
+    assert_eq!(small.encode().unwrap().as_ref(), &hx("5502206b2401")[..]);
 }
 
 #[test]

@@ -71,13 +71,14 @@ impl PortSegment {
     }
 }
 
-/// A logical EPATH segment (§6.2). The builder chooses the 8-bit or 16-bit encoding by magnitude.
+/// A logical EPATH segment (§6.2). The builder chooses the 8-bit, 16-bit, or (where the logical
+/// type defines it) 32-bit encoding by magnitude.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
     /// Class id (`0x20`/`0x21`).
     Class(u16),
-    /// Instance id (`0x24`/`0x25`).
-    Instance(u16),
+    /// Instance id (`0x24`/`0x25`/`0x26`).
+    Instance(u32),
     /// Attribute id (`0x30`/`0x31`).
     Attribute(u16),
     /// Member/element index (`0x28`/`0x29`/`0x2A`).
@@ -107,26 +108,40 @@ impl Segment {
         }
     }
 
+    /// A logical segment whose type defines all three address formats (§6.2): the format bits of the
+    /// segment-type byte select 8-bit (`code8`), 16-bit (`code16`), or 32-bit (`code32`); the wider
+    /// forms carry the pad byte the padded EPATH requires before the little-endian value.
+    fn encode_logical_wide(
+        w: &mut WireWriter,
+        code8: u8,
+        code16: u8,
+        code32: u8,
+        value: u32,
+    ) {
+        if value <= u32::from(u8::MAX) {
+            w.u8(code8);
+            w.u8(value as u8);
+        } else if value <= u32::from(u16::MAX) {
+            w.u8(code16);
+            w.u8(0x00); // pad
+            w.u16(value as u16);
+        } else {
+            w.u8(code32);
+            w.u8(0x00); // pad
+            w.u32(value);
+        }
+    }
+
     fn encode(&self, w: &mut WireWriter) -> Result<(), EnipError> {
         match self {
             Self::Class(v) => Self::encode_logical(w, 0x20, 0x21, *v),
-            Self::Instance(v) => Self::encode_logical(w, 0x24, 0x25, *v),
+            // Instance ids widen to the 32-bit logical format (`0x26`): a Logix controller's Symbol
+            // object routinely serves instance ids above `0xFFFF`, and browse cursors must address
+            // them (§7.3).
+            Self::Instance(v) => Self::encode_logical_wide(w, 0x24, 0x25, 0x26, *v),
             Self::Attribute(v) => Self::encode_logical(w, 0x30, 0x31, *v),
             Self::ConnectionPoint(v) => Self::encode_logical(w, 0x2C, 0x2D, *v),
-            Self::Element(v) => {
-                if *v <= u32::from(u8::MAX) {
-                    w.u8(0x28);
-                    w.u8(*v as u8);
-                } else if *v <= u32::from(u16::MAX) {
-                    w.u8(0x29);
-                    w.u8(0x00);
-                    w.u16(*v as u16);
-                } else {
-                    w.u8(0x2A);
-                    w.u8(0x00);
-                    w.u32(*v);
-                }
-            }
+            Self::Element(v) => Self::encode_logical_wide(w, 0x28, 0x29, 0x2A, *v),
             Self::Symbol(name) => {
                 let bytes = name.as_bytes();
                 let count = u8::try_from(bytes.len()).map_err(|_| EnipError::TooLarge { limit: 255 })?;
@@ -175,9 +190,9 @@ impl EPath {
         self
     }
 
-    /// Append an instance segment.
+    /// Append an instance segment (`0x24`/`0x25`/`0x26` by magnitude, §6.2).
     #[must_use]
-    pub fn instance(mut self, id: u16) -> Self {
+    pub fn instance(mut self, id: u32) -> Self {
         self.segments.push(Segment::Instance(id));
         self
     }
@@ -439,6 +454,37 @@ mod tests {
         let odd = EPath::new().symbol("TotalCountt").encode().unwrap();
         assert_eq!(odd.len(), 14);
         assert_eq!(*odd.last().unwrap(), 0x00);
+    }
+
+    #[test]
+    fn instance_widths_encode_smallest_form() {
+        // §6.2 logical segment: type bits 001 (logical) · 001 (instance) · format bits
+        // 00 / 01 / 10 ⇒ 0x24 (8-bit), 0x25 (16-bit), 0x26 (32-bit); the wider forms pad before the
+        // little-endian value.
+        assert_eq!(EPath::new().instance(0x01).encode().unwrap().as_ref(), &[0x24, 0x01]);
+        // 0xFF is the last id the 8-bit form addresses.
+        assert_eq!(EPath::new().instance(0xFF).encode().unwrap().as_ref(), &[0x24, 0xFF]);
+        // 0x100 is the first that needs the 16-bit form.
+        assert_eq!(
+            EPath::new().instance(0x0100).encode().unwrap().as_ref(),
+            &[0x25, 0x00, 0x00, 0x01]
+        );
+        // 0xFFFF is the last id the 16-bit form addresses.
+        assert_eq!(
+            EPath::new().instance(0xFFFF).encode().unwrap().as_ref(),
+            &[0x25, 0x00, 0xFF, 0xFF]
+        );
+        // 0x1_0000 is the first that needs the 32-bit form — the F7 browse-cursor case.
+        assert_eq!(
+            EPath::new().instance(0x0001_0000).encode().unwrap().as_ref(),
+            &[0x26, 0x00, 0x00, 0x00, 0x01, 0x00]
+        );
+        assert_eq!(
+            EPath::new().instance(u32::MAX).encode().unwrap().as_ref(),
+            &[0x26, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        // Every form is even-length, so the path stays word-aligned (§6.2).
+        assert_eq!(EPath::new().class(0x6B).instance(0x0001_0000).word_len().unwrap(), 4);
     }
 
     #[test]

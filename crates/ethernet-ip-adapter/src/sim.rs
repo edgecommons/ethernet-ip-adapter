@@ -7,7 +7,8 @@
 //! It implements the same [`DeviceSession`] seam the real EtherNet/IP backend (`src/eip/`, slice
 //! S3) will: it reads whatever [`SignalSpec`]s a poll group asks for (synthesizing plausible values
 //! per type, including a live array and a writable setpoint that reflects the last write), answers
-//! `browse` with the cpppo tag set, and answers `probe`.
+//! `browse` with the cpppo tag set — paged by the same cursor/`max` contract the real backend
+//! honours — and answers `probe`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -289,12 +290,18 @@ impl DeviceSession for SimSession {
         Ok(())
     }
 
-    async fn browse(&mut self, _cursor: Option<String>, max: usize) -> Result<BrowsePage> {
-        // The sim returns its whole tag set in one page (cpppo's set is tiny). `RECIPE=SSTRING`
-        // is included; the command layer marks it unsupported by its type name.
-        let tags = SIM_TAGS
+    async fn browse(&mut self, cursor: Option<String>, max: usize) -> Result<BrowsePage> {
+        // The sim mirrors the poll backend's cursor contract exactly (§7.3) — same parser, same
+        // truncation rule — so a paged browse walk driven against the simulator exercises the real
+        // paging and cannot mask an adapter paging bug: the cursor is the decimal symbol-instance id
+        // to resume from, an uncursored walk starts at instance 0 (the bottom of the instance space,
+        // one below this set's first symbol), an unreadable cursor is the caller's error, and a page
+        // cut short by `max` resumes from the last tag actually returned. `RECIPE=SSTRING` is
+        // included; the command layer marks it unsupported by its type name.
+        let start = crate::eip::session::parse_browse_cursor(cursor.as_deref())?;
+        let limit = max.max(1);
+        let mut tags: Vec<BrowsedTag> = SIM_TAGS
             .iter()
-            .take(max.max(1))
             .enumerate()
             .map(|(i, (name, type_name, array_dim))| BrowsedTag {
                 name: (*name).to_string(),
@@ -302,11 +309,15 @@ impl DeviceSession for SimSession {
                 array_dim: *array_dim,
                 instance_id: i as u32 + 1,
             })
+            .filter(|t| t.instance_id >= start)
             .collect();
-        Ok(BrowsePage {
-            tags,
-            next_cursor: None,
-        })
+        let truncated = tags.len() > limit;
+        tags.truncate(limit);
+        let next_cursor = truncated
+            .then(|| tags.last().and_then(|t| t.instance_id.checked_add(1)))
+            .flatten()
+            .map(|n| n.to_string());
+        Ok(BrowsePage { tags, next_cursor })
     }
 
     async fn probe(&mut self) -> Result<()> {
@@ -381,6 +392,41 @@ mod tests {
         assert_eq!(recipe.type_name, "SSTRING", "the unsupported type is surfaced by name");
         let zones = page.tags.iter().find(|t| t.name == "ZONE_TEMPS").unwrap();
         assert_eq!(zones.array_dim, Some(8));
+    }
+
+    /// The sim pages exactly like the real backend (§4.3): a `max`-limited walk enumerates every tag
+    /// **exactly once**, resuming from the last tag each page returned, and a cursor it cannot read
+    /// is the caller's error rather than a silent restart at the top of the set.
+    #[tokio::test]
+    async fn browse_pages_with_cursor_and_rejects_garbage() {
+        let mut s = SimBackend.connect(&conn("h")).await.unwrap();
+
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let page = s.browse(cursor.clone(), 2).await.unwrap();
+            pages += 1;
+            assert!(pages <= SIM_TAGS.len() + 1, "the walk must terminate");
+            assert!(page.tags.len() <= 2, "`max` is honoured truthfully");
+            walked.extend(page.tags.iter().map(|t| t.name.clone()));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        let expected: Vec<String> = SIM_TAGS.iter().map(|(n, _, _)| (*n).to_string()).collect();
+        assert_eq!(walked, expected, "every tag exactly once, in order, no skips or repeats");
+
+        // A resume cursor is honoured mid-set.
+        let mid = s.browse(Some("7".to_string()), 100).await.unwrap();
+        assert_eq!(mid.tags.len(), 2, "instances 7 and 8 remain");
+        assert_eq!(mid.tags[0].name, "MOTOR_RUN");
+        assert!(mid.next_cursor.is_none());
+
+        let err = s.browse(Some("x".to_string()), 100).await.unwrap_err();
+        assert!(!err.is_transient(), "a corrupt cursor never fixes itself by retrying");
+        assert!(err.to_string().contains("invalid browse cursor"), "{err}");
     }
 
     #[tokio::test]

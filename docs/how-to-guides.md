@@ -180,9 +180,18 @@ publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/browse
        "cursor": "…" } }
 ```
 
-Pass the returned `cursor` back to page. The tag-list service is a Logix-family capability; a generic CIP
-device (e.g. a plain I/O adapter) answers `BROWSE_UNSUPPORTED`. On a **push** instance `sb/browse`
-returns the configured assembly layout (input + output fields) with no device round-trip.
+A request without a cursor starts at the beginning of the device's tag list. Pass the returned `cursor`
+back to page. `max` bounds each page and the `cursor` resumes exactly where that page stopped, so
+following cursors until the reply has none lists every tag once. Treat the cursor
+as opaque and send it back unchanged — a value the adapter did not issue is refused (`BROWSE_FAILED`)
+rather than silently starting the walk over. The tag-list service is a Logix-family capability; a
+generic CIP device (e.g. a plain I/O adapter) answers `BROWSE_UNSUPPORTED`. Some devices serve their
+whole tag list only from the start of the list and refuse a cursor that resumes mid-list; that page
+answers `BROWSE_FAILED` naming the refused resume, and the pages already returned stand.
+
+On a **push** instance `sb/browse` returns the configured assembly layout (input + output fields) with
+no device round-trip, paged by the same `cursor`/`max` contract — so one client loop walks either mode.
+A push cursor the adapter did not issue is `BAD_ARGS`.
 
 A body carrying `ref` selects the **hierarchical** form over the same inventory — the shape the
 edge-console tree browser drives. `ref: "root"` answers the device node with one `contains` ref per
@@ -494,8 +503,10 @@ state is in-memory, an instance that was paused starts running again when the ad
   (`CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` — the same one `sb/status` returns), and its
   `connectionMode`.
 - **Events** — `evt/{info|critical}/device-connected|device-unreachable` (a stateful link alarm),
-  `evt/{warning|info}/adapter-paused|adapter-resumed`, `evt/{info|warning}/write-audit`, and — for
-  TLS instances — `evt/warning/tls-handshake-failed` and `evt/warning/tls-peer-unverified`.
+  `evt/{warning|info}/adapter-paused|adapter-resumed`, `evt/{info|warning}/write-audit`, for push
+  instances `evt/warning/io-redirect-refused` (the device asks for its outputs at a foreign address,
+  which the adapter refuses), and — for TLS instances — `evt/warning/tls-handshake-failed` and
+  `evt/warning/tls-peer-unverified`.
 - **Security posture** — `sb/status` returns a `security` object per instance, and the `state`
   keepalive carries `attributes.security` (`"tls"`|`"plaintext"`).
 - **Status verb** `sb/status` → connection state, paused, a counter snapshot (and an `io` block on push).

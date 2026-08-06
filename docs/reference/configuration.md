@@ -98,7 +98,7 @@ targets need different keys; everything else in the schema is strict.
 |-----|------|---------|---------|
 | `endpoint` | string | **required** | `<host>` or `<host>:<port>` (default CIP port `44818`, or `2221` when `security.mode` is `tls`). Published in `device.endpoint`. |
 | `slot` | integer 0–255 | — | ControlLogix CPU slot ⇒ backplane connection path (`1,<slot>`). Absent ⇒ no routing path (correct for cpppo / CompactLogix-direct). |
-| `connected` | boolean | `false` | `true` ⇒ CIP connected messaging (ForwardOpen); `false` ⇒ unconnected explicit messaging. |
+| `connected` | boolean | `false` | `true` ⇒ CIP connected messaging (ForwardOpen); `false` ⇒ unconnected explicit messaging. A connected session maintains itself: when no request has flowed for a while the adapter sends a small CIP keepalive read over the connection, so the controller's inactivity timeout does not close it. |
 | `security` | object | — | TLS (CIP Security) on the explicit-messaging path (below). Absent ⇒ plaintext. |
 
 #### `connection.security` (CIP Security / TLS)

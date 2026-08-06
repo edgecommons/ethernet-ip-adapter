@@ -12,6 +12,9 @@
 
 pub mod connected;
 pub mod io_service;
+// The class-3 inactivity keepalive (§7.6) — internal machinery, not part of the crate's surface; its
+// observable face is `ClientStats::keepalives_sent`.
+pub(crate) mod keepalive;
 pub mod session;
 // TLS transport (CIP Security Phase 1) — off by default; adds `connect_tls`/`TlsOptions` over the
 // transport-generic session actor (DESIGN-cip-security.md §3.1).
@@ -132,6 +135,40 @@ pub struct ClientOptions {
     pub max_consecutive_timeouts: u32,
     /// The originator vendor id stamped into ForwardOpen (§8.2).
     pub vendor_id: u16,
+    /// Class-3 requested packet interval, used for **both** the O→T and T→O RPI of the class-3
+    /// ForwardOpen (§7.6). Clamped to `[MIN_REPLY_API, MAX_REPLY_API]` at open time. Only read when
+    /// `connected_messaging` is true.
+    ///
+    /// Together with [`ClientOptions::class3_timeout_multiplier`] this sets the target's inactivity
+    /// watchdog on the connection, and therefore the cadence of the keepalive that keeps the
+    /// connection off it — the client probes at ¾ of the negotiated window.
+    ///
+    /// # Keep `request_timeout` well inside a quarter of the window
+    ///
+    /// The client's idle clock is stamped when a request **completes**, while the target re-arms its
+    /// watchdog when a request **arrives**: the client's notion of "idle since" therefore lags the
+    /// target's by roughly one request latency, and the ¾ rule leaves only a quarter of the window to
+    /// absorb that lag. Keep
+    ///
+    /// ```text
+    /// request_timeout  ≪  (class3_timeout_multiplier × negotiated interval) / 4
+    /// ```
+    ///
+    /// At the defaults there is no contest — a 32 s window leaves 8 s of margin against a 3 s
+    /// worst-case request. It becomes reachable two ways: setting a small `class3_rpi`, and a target
+    /// that echoes an actual O→T API far below what was requested (the window follows the
+    /// **negotiated** value, so a 100 ms echo at ×16 is a 1.6 s window — a quarter of which is
+    /// already under the 3 s default `request_timeout`). The client warns once at open when the
+    /// derived window lands implausibly low; a window that small means the target claims a watchdog
+    /// too tight for the round trips it is answering.
+    pub class3_rpi: Duration,
+    /// Class-3 connection timeout-multiplier code (§8.2 field 8). Only read when
+    /// `connected_messaging` is true.
+    ///
+    /// This is the other half of the inactivity window (`multiplier × negotiated O→T interval`), so
+    /// lowering it tightens the keepalive margin exactly as lowering [`ClientOptions::class3_rpi`]
+    /// does — see that field for the `request_timeout` relationship an operator must respect.
+    pub class3_timeout_multiplier: crate::cm::TimeoutMultiplier,
 }
 
 impl Default for ClientOptions {
@@ -145,6 +182,8 @@ impl Default for ClientOptions {
             connected_messaging: false,
             max_consecutive_timeouts: 3,
             vendor_id: 0x1337,
+            class3_rpi: Duration::from_secs(2),
+            class3_timeout_multiplier: crate::cm::TimeoutMultiplier::X16,
         }
     }
 }
@@ -166,6 +205,8 @@ pub struct ClientStats {
     pub timeouts: u64,
     /// Connected class-3 replies discarded for a sequence-count mismatch (D-ENIP-5).
     pub connected_seq_mismatches: u64,
+    /// Class-3 inactivity keepalives that completed an exchange with the target (§7.6, D-ENIP-18).
+    pub keepalives_sent: u64,
 }
 
 /// The explicit-messaging client handle (§11.2). Cheap to clone.
@@ -277,7 +318,7 @@ impl EipClient {
             None
         };
 
-        Ok(Self {
+        let client = Self {
             tx,
             inner: Arc::new(Inner {
                 route: opts.route,
@@ -289,7 +330,13 @@ impl EipClient {
             peer_addr: None,
             #[cfg(feature = "tls")]
             tls_info: None,
-        })
+        };
+        // A class-3 connection carries a target-side inactivity watchdog, so the session must keep
+        // itself alive (§7.6). The task holds nothing strong — it dies with the client.
+        if client.inner.connected.is_some() {
+            keepalive::spawn(client.tx.clone(), Arc::downgrade(&client.inner));
+        }
+        Ok(client)
     }
 
     /// The `max_value_bytes` reassembly cap (D-ENIP-12).
@@ -309,6 +356,7 @@ impl EipClient {
             stale_replies: self.inner.stats.stale_replies.load(Ordering::Relaxed),
             timeouts: self.inner.stats.timeouts.load(Ordering::Relaxed),
             connected_seq_mismatches: self.inner.stats.connected_seq_mismatches.load(Ordering::Relaxed),
+            keepalives_sent: self.inner.stats.keepalives_sent.load(Ordering::Relaxed),
         }
     }
 
@@ -538,5 +586,14 @@ mod tests {
         assert_eq!(o.max_value_bytes, 1 << 20);
         assert_eq!(o.max_consecutive_timeouts, 3);
         assert!(!o.connected_messaging);
+        // §7.6 — the class-3 knobs default to the values the crate hard-coded before they became
+        // options, so a caller that changes nothing gets a byte-identical ForwardOpen.
+        assert_eq!(o.class3_rpi, Duration::from_secs(2));
+        assert_eq!(o.class3_timeout_multiplier, crate::cm::TimeoutMultiplier::X16);
+        assert_eq!(
+            o.class3_rpi.as_micros(),
+            2_000_000,
+            "the requested packet interval is what lands on the wire, in µs"
+        );
     }
 }

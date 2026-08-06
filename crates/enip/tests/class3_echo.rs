@@ -156,7 +156,9 @@ fn forward_open_success(id: &OpenIdentity) -> Vec<u8> {
     w.u16(id.connection_serial);
     w.u16(id.vendor_id);
     w.u32(id.originator_serial);
-    w.u32(2_000_000); // O→T API (µs) — class-3 does not consult these
+    // Class-3 consults the reply O→T API only for the keepalive window (§7.6): 2 s × the default ×16
+    // multiplier is a 32 s inactivity window, so no probe falls due inside these tests.
+    w.u32(2_000_000); // O→T API (µs)
     w.u32(2_000_000); // T→O API (µs)
     w.u8(0); // application reply words
     w.u8(0); // reserved

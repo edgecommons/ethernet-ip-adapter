@@ -25,7 +25,9 @@
 //! a real tag stays GOOD · and crucially **`list_tags` (browse)**: a real `0x55` reply, enumerating the
 //! defined tags with their symbol types — scalars value-supported, the REAL[8] array value-unsupported
 //! (array dims) — the first live proof that `enip` emits a well-formed `0x55` request and correctly
-//! decodes a genuine Get-Instance-Attribute-List page.
+//! decodes a genuine Get-Instance-Attribute-List page. It additionally proves the **32-bit logical
+//! instance segment** (`0x26`, §6.2) that browse cursors above `0xFFFF` ride: an independent CIP
+//! decoder accepts it as a well-formed path and answers at the CIP layer.
 //!
 //! Excluded from the coverage denominator (`tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp)`,
 //! §12.2).
@@ -33,7 +35,7 @@
 
 use std::time::Duration;
 
-use enip::{CipType, CipValue, ClientOptions, EipClient, EnipError, Scope, TagAddress};
+use enip::{CipType, CipValue, ClientOptions, EipClient, EnipError, GeneralStatus, Scope, TagAddress};
 
 /// EthernetIPSharp's encapsulation endpoint. `127.0.0.1:44821` by default (the §11.2 compose host
 /// mapping), overridable, e.g. `ETHERNETIPSHARP_ADDR=192.168.1.50:44818`.
@@ -193,4 +195,145 @@ async fn sharp_live_tag_browse_enumerates() {
 
     client.close().await;
     println!("== live_ethernetipsharp browse: PASS (real 0x55 — browse gap CLOSED) ==");
+}
+
+/// **The browse-cursor bench leg (F7).** `list_tags` carries a full `u32` symbol-instance cursor and
+/// addresses it with the 8-, 16-, or 32-bit logical instance segment by magnitude (`0x24`/`0x25`/
+/// `0x26`, §6.2). Fixtures prove the arithmetic; this proves the two things only a real, independent
+/// CIP decoder can:
+///
+/// 1. **The enumeration is complete and exactly-once against a real `0x55` server** — every defined
+///    tag appears once, with strictly ascending instance ids, and the walk terminates from the
+///    reply's own status rather than from a caller-side page cap.
+/// 2. **A cursor above the 16-bit space reaches the wire as a well-formed path.** A request built
+///    for `start_instance = 0x0001_0000` emits `26 00 00 00 01 00` where an 8-bit cursor emits
+///    `24 xx`. EthernetIPSharp parses it and answers at the CIP layer — the reply is a *CIP status
+///    about the instance*, never a path-segment or path-size error, and never a framing failure that
+///    would drop the session. That is an independent implementation agreeing with our encoding of a
+///    segment no bench peer can otherwise exercise (none serves more than 65 535 symbol instances).
+///
+/// **Recorded peer capability:** EthernetIPSharp serves the enumeration only from the class-level
+/// start instance and returns its whole symbol table in one page, so resuming mid-set is not a
+/// capability it has. The test asserts what the peer actually does in either case and never passes
+/// silently: a mid-set resume must be either a correct resumed page or a *typed* CIP refusal.
+#[tokio::test]
+async fn sharp_live_browse_cursor_walk_and_32bit_instance_segment() {
+    let addr = sharp_addr();
+    if !sim_up(&addr).await {
+        eprintln!("live_ethernetipsharp (browse cursor): skipped (no EthernetIPSharp on {addr})");
+        return;
+    }
+    println!("== live_ethernetipsharp browse cursor: connecting to real EthernetIPSharp at {addr} ==");
+    let client = EipClient::connect(&addr, opts()).await.expect("connect for the cursor walk");
+
+    // ---- 1. the reference walk: page from the start of the instance space to completion ----------
+    let mut all: Vec<(u32, String)> = Vec::new();
+    let mut cursor: Option<u32> = Some(0);
+    let mut pages = 0usize;
+    while let Some(start) = cursor {
+        let (records, next) = client
+            .list_tags(start, &Scope::Controller)
+            .await
+            .unwrap_or_else(|e| panic!("list_tags({start}) against the live 0x55 server: {e:?}"));
+        pages += 1;
+        println!("  page {pages}: start={start} -> {} record(s), next={next:?}", records.len());
+        for s in &records {
+            all.push((s.instance_id, s.name.clone()));
+        }
+        cursor = next;
+        assert!(pages <= 50, "the walk must terminate on the reply's own status");
+    }
+
+    let names: Vec<&str> = all.iter().map(|(_, n)| n.as_str()).collect();
+    for expected in ["LINE_SPEED", "PRODUCT_COUNT", "FILL_SETPOINT", "MOTOR_RUN", "ZONE_TEMPS"] {
+        assert!(names.contains(&expected), "the walk enumerates {expected}; got {names:?}");
+    }
+    // Exactly once, and in ascending instance order — the property the cursor rules depend on.
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "no tag is enumerated twice: {names:?}");
+    let ids: Vec<u32> = all.iter().map(|(i, _)| *i).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "instance ids ascend: {ids:?}");
+    println!("  reference walk: {} tag(s) over {pages} page(s), ids {ids:?}", all.len());
+
+    // ---- 2. resume from a cursor mid-set ---------------------------------------------------------
+    // The §7.3 contract a compliant server offers: re-issuing at `last_id + 1` continues where the
+    // page stopped. Whether this peer HAS that capability is what we record.
+    let mid = ids[ids.len() / 2];
+    match client.list_tags(mid, &Scope::Controller).await {
+        Ok((records, next)) => {
+            println!("  resume at {mid}: {} record(s), next={next:?}", records.len());
+            assert!(
+                records.iter().all(|s| s.instance_id >= mid),
+                "a resumed page returns nothing before its cursor: {:?}",
+                records.iter().map(|s| s.instance_id).collect::<Vec<_>>()
+            );
+            let resumed: Vec<&str> = records.iter().map(|s| s.name.as_str()).collect();
+            assert!(
+                resumed.iter().all(|n| names.contains(n)),
+                "a resumed page is a suffix of the full set: {resumed:?} vs {names:?}"
+            );
+        }
+        Err(EnipError::Cip(status)) => {
+            // The recorded outcome for this peer: its Symbol object answers the enumeration only at
+            // the class-level start instance. A typed CIP status is still the right shape — the
+            // request was well formed and routed; the peer simply declines.
+            println!(
+                "  resume at {mid}: declined with CIP general status 0x{:02X} — this peer serves \
+                 the enumeration only from the class-level start instance (one page, no cursor)",
+                status.general.code()
+            );
+        }
+        Err(other) => panic!("a mid-set resume must be a page or a typed CIP refusal, got {other:?}"),
+    }
+
+    // ---- 3. the 32-bit instance segment on the wire (the F7 encoding proof) ----------------------
+    // `list_tags` builds `EPath::new().class(0x6B).instance(start)`, which emits the 32-bit logical
+    // instance form for anything above 0xFFFF. Nothing in this tag set lives there, so what the peer
+    // answers is "no such instance" — but it has to PARSE the path to say so.
+    for start in [0x0001_0000u32, u32::MAX] {
+        match client.list_tags(start, &Scope::Controller).await {
+            Err(EnipError::Cip(status)) => {
+                println!(
+                    "  32-bit cursor {start:#010X} (0x26 segment): CIP general status 0x{:02X}",
+                    status.general.code()
+                );
+                assert_ne!(
+                    status.general,
+                    GeneralStatus::PathSegmentError,
+                    "an independent decoder must not read the 0x26 segment as a malformed path"
+                );
+                assert_ne!(
+                    status.general,
+                    GeneralStatus::InvalidPathSize,
+                    "the 0x26 segment is self-padding, so the path stays word-aligned"
+                );
+            }
+            // A peer that really did serve instances that high would answer with a page; the cursor
+            // must then still be honoured verbatim rather than masked back into the 16-bit space.
+            Ok((records, next)) => {
+                println!("  32-bit cursor {start:#010X}: {} record(s), next={next:?}", records.len());
+                assert!(
+                    records.iter().all(|s| s.instance_id >= start),
+                    "a 32-bit cursor is not masked: {:?}",
+                    records.iter().map(|s| s.instance_id).collect::<Vec<_>>()
+                );
+            }
+            Err(other) => panic!(
+                "the 0x26 instance segment must reach the peer as a well-formed request; \
+                 got a non-CIP failure: {other:?}"
+            ),
+        }
+    }
+
+    // The 32-bit requests did not wedge the session: the reference walk still answers.
+    let (records, _) = client
+        .list_tags(0, &Scope::Controller)
+        .await
+        .expect("the session survives a 32-bit-cursor request");
+    assert_eq!(records.len(), all.len(), "the tag set is unchanged after the 32-bit probes");
+
+    client.close().await;
+    println!("== live_ethernetipsharp browse cursor: PASS (exactly-once walk + live 0x26 segment) ==");
 }

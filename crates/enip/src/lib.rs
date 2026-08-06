@@ -142,8 +142,9 @@ pub use logix::{parse_tag_list, Scope, SymbolInfo, SymbolType, TagReadResult};
 
 pub use io::{
     AssemblyPath, ConsumeOutcome, DirectionSpec, DropReason, ForwardOpenService, IoConnection,
-    IoConnectionHandle, IoConnectionParams, IoConnectionSpec, IoEvent, IoFrame, IoManager, IoStats,
-    IoUpdate, LostReason, RealTimeFormat, SendOutcome, IO_UDP_PORT,
+    IoConnectionHandle, IoConnectionParams, IoConnectionSpec, IoEvent, IoEventReceiver, IoFrame,
+    IoManager, IoStats, IoUpdate, LostReason, RealTimeFormat, SendOutcome, TryRecvError,
+    IO_UDP_PORT,
 };
 
 pub use assembly::{AssemblyError, AssemblyLayout, FieldSpec};

@@ -135,7 +135,7 @@ performed, by this work).
 | **D-EIP-4** | **Naming: repo/crate/bin `ethernet-ip-adapter`; component `com.mbreissi.edgecommons.EthernetIpAdapter`; UNS component token `ethernet-ip-adapter` (via the config `component.token` override); `device.adapter` = `"ethernet-ip"`.** | Matches the sibling kebab convention (`modbus-adapter`, `opcua-adapter`). The CLI mangled the crate name to `ethernetipadapter` with no override (CLI-DOGFOODING #1/#2); the current tree still carries that name in `Cargo.toml`/`Dockerfile`/`recipe.yaml`/`compose.yaml`/`supervisor/` — renaming them all is implementation slice S1. `component.token` is a shipped core feature (`config/identity.rs`: `configured_component_token` overrides the PascalCase short name), so the UNS token is `ethernet-ip-adapter` without renaming the Greengrass component. |
 | **D-EIP-5** | **Writes are allow-listed and secure-by-default: empty `writes.allow[]` ⇒ ALL writes refused, matched on the stable `signal.id`.** | Keeps the template's gate verbatim (checked in the command handler before the write reaches the device task) and the D-U16 convention. Deliberately *not* Modbus's legacy boolean `write.enabled` — the allow-list is the target contract (`SOUTHBOUND.md` §2.2) and strictly stronger. |
 | **D-EIP-6** | **Two live simulators, both EXTERNAL containers, one per mode: cpppo (AB tag server, :44818) for POLL; an OpENer target container for PUSH.** No embedded/in-crate test server anywhere (user decision). The in-process sim backend stays and is extended to model both. | Unit tests reach 90% with no PLC and no network — the protocol crate's session/connection logic is driven over in-memory `tokio::io::duplex` byte-stream fixtures (PROTOCOL-DESIGN D-ENIP-14) and the adapter backend over the sim backend / a mock `DeviceSession`; E2E and sim-gated integration tests talk to the real wire (§11). cpppo cannot serve class-1 implicit I/O, so push needs a real target: OpENer is the independent-implementation conformance peer (§11.5). Push integration gates on the external OpENer container exactly as poll gates on cpppo — there is no our-code-to-our-code CI fallback. Coverage: the pure logic (protocol codec/state machines + adapter gating) is unit-testable and inside the 90% gate; the live-infra loop drivers (the `data()`/socket-driving seams) are refactored into thin excluded files, validated by these live suites + the S9 deployed regression (§12.2). |
-| **D-EIP-7** | **Signals are declared explicitly in config poll groups; `sb/browse` is on-demand discovery, not subscription matching.** | Modbus-style declaration (no regex include/exclude like OPC UA — that model belongs to a subscription protocol). `sb/browse` uses the Logix tag-list service (Get Instance Attribute List, `EipClient::list_tags`) so a console can discover tags; generic CIP devices may not implement it ⇒ `BROWSE_UNSUPPORTED` (§7.3, §14.4). |
+| **D-EIP-7** | **Signals are declared explicitly in config poll groups; `sb/browse` is on-demand discovery, not subscription matching.** | Modbus-style declaration (no regex include/exclude like OPC UA — that model belongs to a subscription protocol). `sb/browse` uses the Logix tag-list service (Get Instance Attribute List, `EipClient::list_tags`) so a console can discover tags; generic CIP devices may not implement it ⇒ `BROWSE_UNSUPPORTED` (§7.3, §14.4). *The paging contract that discovery rides — cursor validation, truthful `max`, and the walk's termination guards — is D-EIP-29.* |
 | **D-EIP-8** | **Poll mode: `connection.connected: false` is the default (unconnected explicit messaging); `true` opens a class-3 CIP connected session (ForwardOpen).** | Unconnected is the simplest path and what cpppo serves. Connected class-3 (PROTOCOL-DESIGN §7.6) allocates a connection for higher-rate polling against real PLCs — supported, config-selected, validated in the lab (not against cpppo). Push mode always uses its own class-1 ForwardOpen and ignores this key. |
 | **D-EIP-9** | **`signal.id` = the configured `tagPath`, verbatim (case-sensitive).** | One instance = one device, so the tag path is unique within the instance and stable across restarts — no synthetic prefix needed (`u<unit>/…` exists in Modbus because unit id is real addressing there; slot is connection routing, not identity, so it stays out of the id and inside `signal.address`). The UNS topic channel comes from the config `name` (lower-kebab), NOT from the id — §5.3/§6.1. |
 | **D-EIP-10** | **Quality: per-signal read failure ⇒ published `BAD` sample with the CIP status in `qualityRaw`; connection-level failure ⇒ leave the poll loop and reconnect; `UNCERTAIN` for scale/coercion anomalies.** | Keeps the template's "a failed read is published, not swallowed" rule and the §3 normalization table (§5.4). |
@@ -157,6 +157,7 @@ performed, by this work).
 | **D-EIP-26** | **Core 0.5.0 adoption — declared verb scope + keepalive instance state (D-SC-1..9).** The pin moves to `rust-lib/v0.5.0` (a14a328). `register_scoped` is removed from the library: all nine verbs re-register as `commands.register(verb, CommandScope::Instance, command_handler(…))`, every handler taking `(request, addressed_instance)`. Each verb acts on exactly one device, so none declares `Component` or `Both`. The library now owns addressing entirely — topic-token and `body.instance` extraction plus the conflict-first `BAD_ARGS`, all before dispatch — so `scope_body` is **deleted** and `Commander::resolve` takes the resolved `Option<&str>` instead of reading the body (D-SC-4): it keeps only the optional-iff-one configured default and `NO_SUCH_INSTANCE`. Consequence: a malformed (non-object) body at an instance-addressed delivery is no longer a routing `BAD_ARGS` — it reaches the verb, which reports its own per-verb refusal. The companion D-SC-7 keepalive state needs no code change here: `connectivity_of` has carried the `ONLINE`/`CONNECTING`/`BACKOFF`/`PAUSED` token from the single `Health` model since §9.2 — the wave adds an assertion on the **published** element (`InstanceConnectivity::to_json`, public since 0.5.0). | The breaking model makes "a handler blind to the addressing" structurally impossible and removes an entire class of per-adapter topic-parsing code; keeping the configured-default/existence policy adapter-side is exactly where configuration knowledge lives. `describe` now advertises each verb's `scope`, which the console renders as instance-selector affordance. |
 | **D-EIP-27** | **Coordinated, deadline-bounded shutdown (§10.3).** One app-wide root `CancellationToken` with a per-instance child token; every spawned task's `JoinHandle` is held in the live `DeviceRegistry` (`lifecycle.rs`); each task closes its OWN session on the way out (poll: UnRegisterSession via `EipClient::close`; push: ForwardClose + I/O socket release), because the session is `!Sync` and owned there. The whole teardown runs under ONE absolute stop budget composed from the Phase-1 per-session bounds (in-flight request + worst close + grace) and clamped to **[1 s, 10 s]**; a task still running at the deadline is `abort()`ed and counted, never waited on unboundedly. Cancelled exits (`PollExit::Stopped` / `PushExit::Stopped` / `DisconnectedWait::Stopped`) raise no `device-unreachable` alarm and never back off. | The pre-Phase-2 supervisor discarded both `JoinHandle`s and returned straight from `shutdown_signal()`, so the loops were killed with the runtime and the closes §10.3 promised never reached the wire. Alternatives considered: a `JoinSet` (no per-instance token grouping — the same tree has to stop one instance for a configuration change, not just all of them), and a hand-rolled `watch`-channel token (re-implements `CancellationToken`'s child semantics, including the born-cancelled child the drain loop depends on, with subtle races). `tokio-util` was already a workspace dependency via the `enip` crate, so this adds a dependency edge, not a lock entry. The clamp keeps shutdown inside a supervisor's grace period; the abort keeps a wedged peer from hanging the process. |
 | **D-EIP-28** | **Transactional instance-diff configuration reload (§10.4).** The adapter registers ONE `ConfigurationApplyListener` (`reload.rs`), which core prepares and commits before it publishes a candidate snapshot. Granularity is **instance-diff restart**: added, removed, and changed instances restart; untouched instances keep their session, facades, `Arc<GlobalConfig>`, and in-memory pause state. The restart-**all** trigger is **any change outside `component.instances`** — `component.global` and the library sections (`topic`, `hierarchy`/`identity`, `tags`, `credentials`, `metricEmission`, …) — because facades, UNS identity, and `DeviceMetrics` bind those at spawn from the configuration snapshot. Startup and every reload derive their instance set through the SAME `reload::parse_instances` (declaration order, duplicate ids first-wins as `Config::instance` resolves them, id-less entries invisible) and construct each instance through the SAME `RuntimeLauncher::launch` — one rule, so an id is launched once and stopping it stops all of it. Skip-bad-instance is preserved verbatim; the reload-time mapping of fail-only-if-zero-valid is that a candidate with **no valid instance is rejected** and the running generation keeps operating (startup, with nothing running, still refuses to start). **Accepted consequence: in-memory pause is LOST on a restarted instance** (the D-EIP-14 corollary) and survives only on untouched ones. | The alternative granularities both fail the bar: restart-everything on any change makes a one-instance edit a fleet outage, and per-key hot-patching would have to re-derive every spawn-time binding (facade identity, metric dimensions, engine schedules) in place — far more surface for a silent mismatch than a bounded restart of the affected instance. The widened restart-all trigger is the honest reading of "a global change restarts all": an instance kept across a `topic`/`identity` change would publish on stale topics with a stale identity, which is worse than a restart. The core apply-listener contract is what makes it atomic — prepare is I/O-free and changes nothing, commit is self-bounded (it reuses D-EIP-27's stop engine and bounds its two operator notifications, which core requires because it deliberately never cancels a commit), and a failed commit is followed by a fully-awaited rollback that relaunches the prior set against the prior snapshot core is keeping. |
+| **D-EIP-29** | **`sb/browse` cursors are validated resume points, `max` is honoured truthfully, and every browse form terminates on the adapter's own guards.** One cursor contract across the three forms (§7.5): the cursor is opaque to the client and passed back verbatim; an uncursored request starts at the bottom of the space it walks — symbol instance **0** on the poll path, index 0 on the push path; a page cut short by `max` resumes from the **last record actually returned**, never the backend's own cursor; a cursor the adapter cannot read is refused (`BROWSE_FAILED` on the poll path, `BAD_ARGS` on the push path, which owns its own cursor format) instead of restarting the walk; poll cursors are full-width symbol-instance ids (PROTOCOL-DESIGN D-ENIP-19) and push cursors are indexes into the flat configured field list. The hierarchical form, the only one driven to completion, additionally stops on a non-advancing cursor, a non-numeric cursor, and `MAX_BROWSE_PAGES` (1024). | Three independent defects composed into one: `max` truncated the page but returned the device's cursor, so every record past the cut was skipped **forever**; an unreadable cursor silently restarted at the beginning, so a client that lost its place re-served the whole walk as if it were new data; and the push form ignored `cursor`/`max` outright. None was observable from a single request — a truthful-looking page came back every time — which is precisely why the contract is stated once here and enforced identically by both backends (the simulator shares the poll path's cursor parser, so it cannot mask an adapter paging bug). The start of the walk belongs to the same defect class and is fixed the same way: symbol instance ids are the device's to assign, so beginning an uncursored poll walk at 1 drops a symbol sitting at instance 0 silently and forever, and EthernetIPSharp — the bench's only real `0x55` server — serves its enumeration *only* from the class-level start instance 0 and answers 1 with CIP `0x16`, so a walk that began at 1 could not browse it at all (§11.7). Instance 0 it is, on both backends. The hierarchical guards are defence in depth over the protocol crate's own ascending-order check rather than a duplicate of it: they also bound a non-CIP backend, and the failure they replace was a command handler that never returned, which no error code can express after the fact. `BROWSE_FAILED`/`BAD_ARGS` are reused rather than extended — the messages name the offending cursor, and a new error variant on the control channel would buy nothing a client can act on differently. |
 
 ---
 
@@ -724,6 +725,7 @@ Via the `events()` facade only (verified signatures: `emit`, `raise_alarm`, `cle
 | `adapter-paused` | emit, Warning | `sb/pause` took effect | `{instance, by: <requester identity path if present>}` |
 | `adapter-resumed` | emit, Info | `sb/resume` took effect | `{instance}` |
 | `write-audit` | emit, Info (success) / Warning (failure or refusal) | every `sb/write` entry, INCLUDING allow-list refusals | `{instance, signalId, ok, value, error?}` |
+| `io-redirect-refused` | emit, Warning | push instances: the ForwardOpen reply pointed the O→T stream at a foreign address (PROTOCOL-DESIGN D-ENIP-17). The address is refused and only the sockaddr's port honoured, so a device that *requires* the redirect never receives its outputs while still looking healthy. One-shot per ForwardOpen: the `record_io_stats` latch re-arms on every path that ends the connection — `on_io_lost` for a watchdog expiry or peer close, `on_io_link_replaced` for an explicit `sb/reconnect` (which is not counted as an `ioTimeouts`) — so a reconnect that is refused again re-reports, including the reconnect an operator asks for while investigating | `{refusedRedirects}` |
 | `tls-handshake-failed` | emit, Warning | a `mode: tls` connect handshake failed (bad cert / no cipher overlap / protocol mismatch), fired on the transition into failing (D-EIP-21) | `{instance, security: "tls"}` |
 | `tls-peer-unverified` | emit, Warning | a TLS session connected with `verifyPeer: false` (device cert not verified) | `{instance}` |
 | `cert-rotated` | emit, Info | Phase 2b (D-EIP-23): the vault's client cert / trust store changed and the adapter reconnected to apply it | `{instance, security: "tls", serial, notAfter}` |
@@ -810,8 +812,9 @@ and no `target`.
 
 A push instance answers the same shape plus an `io` object:
 `"io": { "o2tApiMs": 100, "t2oApiMs": 100, "run": true, "peerRun": true,
-"framesConsumed": {...}, "staleDropped": {...}, "sequenceGaps": {...} }` (negotiated APIs from
-the ForwardOpen reply, run/idle both directions, and the §8.8 counters).
+"framesConsumed": {...}, "staleDropped": {...}, "sequenceGaps": {...}, "sendErrors": {...},
+"recvErrors": {...}, "refusedRedirects": {...} }` (negotiated APIs from the ForwardOpen reply,
+run/idle both directions, and the §8.8 counters as `{interval, total}` pairs).
 
 `connected`/`state`/`paused` come from the SAME shared Health/Paused state the connectivity
 provider reads — ask or watch, same answer. (The universal `status` built-in already returns
@@ -913,7 +916,7 @@ clarification; D-EIP-14 + D-EIP-20):
 | Verb | Request | Reply / behavior |
 |---|---|---|
 | `sb/signals` | `{ "instance"? }` | `{ "id", "mode", "signals": [ { "name", "id", "address", "pollGroup"?, "pollIntervalMs"?, "direction"?, "publishMode", "writable": bool, "deadband"? } ] }` — the resolved config view, `writable` = allow-list membership. Poll entries carry `pollGroup`/`pollIntervalMs`; push entries carry `direction: "input"\|"output"` instead. No device I/O. |
-| `sb/browse` | `{ "instance"?, "cursor"?, "max"? (default 200, cap 1000) }` | Paged CIP tag discovery via Get Instance Attribute List (`EipClient::list_tags`): `{ "id", "tags": [ { "name", "type", "arrayDim"?, "configured": bool, "supported": bool } ], "cursor"? }` (`cursor` absent on the last page; `configured` marks tags already in config; `supported` = decodable per §5.1 — structs/strings/multi-dim report `false` via the typed SymbolType). Works for push instances too when the device is a Logix family (a short-lived explicit session); devices without the tag service ⇒ `BROWSE_UNSUPPORTED`; mid-browse failures ⇒ `BROWSE_FAILED`. **Hierarchical panel mode:** presence of `"ref"` selects the `treeBrowser` form over the SAME inventory (poll: the device tag list; push: the configured assembly layout) — `{ "ref", "depth"? (clamp 1..4), "maxRefs"? (clamp 1..1000) }` → `{ "id", "mode": "hierarchical", "root": { nodeId, name, nodeClass, dataType, refs[] }, "refCount", "depth", "truncated" }`; `"root"` is the device node whose `contains` refs are the inventory, a tag/field id is a leaf, an unknown ref is `BAD_ARGS`. Mixing `ref`/`depth`/`maxRefs` with `cursor`/`max`, or `depth`/`maxRefs` without `ref`, is `BAD_ARGS`. |
+| `sb/browse` | `{ "instance"?, "cursor"?, "max"? (default 200, cap 1000) }` | Paged discovery, one page per request, same reply shape in both modes: `{ "id", "tags": [ … ], "cursor"? }`, `cursor` present only while entries remain. **Poll** = CIP tag discovery via Get Instance Attribute List (`EipClient::list_tags`), tags `{ "name", "type", "arrayDim"?, "configured": bool, "supported": bool }` (`configured` marks tags already in config; `supported` = decodable per §5.1 — structs/strings/multi-dim report `false` via the typed SymbolType). **Push** = the configured assembly layout (§4.6), tags `{ "name", "id", "type", "direction", "configured": true, "supported": true }` (a configured layout field is by construction both), no device round-trip. Works for push instances against a Logix-family device too when the tag list is what is wanted (a short-lived explicit session); devices without the tag service ⇒ `BROWSE_UNSUPPORTED`; mid-browse failures ⇒ `BROWSE_FAILED`. **Cursor contract (both modes):** the cursor is opaque to clients — pass back the previous page's value verbatim. Poll cursors are decimal symbol-instance resume points carried at full `u32` width (PROTOCOL-DESIGN §7.3 / D-ENIP-19); push cursors are decimal indexes into the flat field list (inputs in declaration order, then outputs). A request with no cursor starts the poll walk at symbol instance **0** and the push walk at index 0 — both at the bottom of their space, so an entry that sits there is enumerated rather than skipped. `max` is honoured truthfully: when a device page exceeds `max` the reply is cut to `max` and the cursor resumes from the **last record actually returned**, so a client that follows cursors sees every tag exactly once. A cursor the adapter cannot read is refused rather than restarted from the top — poll: `BROWSE_FAILED` naming the cursor; push: `BAD_ARGS` (the command layer owns that cursor format, so it can be precise). **Hierarchical panel mode:** presence of `"ref"` selects the `treeBrowser` form over the SAME inventory (poll: the device tag list; push: the configured assembly layout) — `{ "ref", "depth"? (clamp 1..4), "maxRefs"? (clamp 1..1000) }` → `{ "id", "mode": "hierarchical", "root": { nodeId, name, nodeClass, dataType, refs[] }, "refCount", "depth", "truncated" }`; `"root"` is the device node whose `contains` refs are the inventory, a tag/field id is a leaf, an unknown ref is `BAD_ARGS`. Mixing `ref`/`depth`/`maxRefs` with `cursor`/`max`, or `depth`/`maxRefs` without `ref`, is `BAD_ARGS`. This is the one form the adapter drives to completion, so its termination is the adapter's own property, not the backend's: a backend cursor that does not advance past the one already followed, one that is not a number, and a walk past `MAX_BROWSE_PAGES` (1024) are each `BROWSE_FAILED` rather than a handler that never returns. |
 | `reconnect` | `{ "instance"? }` | Drop + re-establish, one bounded attempt (control message to the device task): poll = session re-register; push = ForwardClose + ForwardOpen. `{ "id", "connected": bool }`; failure ⇒ `RECONNECT_FAILED` (the task then continues normal backoff). Works while paused (does not resume). |
 | `repoll` | `{ "instance"? }` | Poll instances only: force an immediate poll of ALL groups now: `{ "id", "polled": <signals read> }`. Refused while paused with `PAUSED` (§7.4.7); refused for push instances with `BAD_ARGS` (`"push instance - data arrives cyclically"`). |
 
@@ -1079,21 +1082,34 @@ Dimensions: `instance`. Sourced from the engine plus the protocol crate's per-co
 
 | Measure | Unit | Res |
 |---|---|---|
-| `ioConnectionState` | Count | 1 (gauge: 1 = class-1 connection open) |
+| `ioConnectionState` | Count | 1 (gauge: 1 = class-1 connection open. Drops to 0 the moment the connection ends — watchdog/peer close **or** a deliberate `sb/reconnect` — and returns to 1 only on the next ForwardOpen, so it never reads "connected" while the adapter is reconnecting) |
 | `forwardOpensTotal` / `forwardOpensInterval` | Count | 60 |
 | `forwardOpenFailuresTotal` / `forwardOpenFailuresInterval` | Count | 60 (rejections, typed) |
 | `framesConsumedTotal` / `framesConsumedInterval` | Count | 60 (accepted T→O frames) |
 | `framesProducedTotal` / `framesProducedInterval` | Count | 60 (O→T frames sent, incl. heartbeat) |
 | `staleFramesDroppedTotal` / `staleFramesDroppedInterval` | Count | 60 (sequence-window rejects: dup/out-of-order) |
-| `sequenceGapsTotal` / `sequenceGapsInterval` | Count | 60 (missed frames inferred from forward jumps) |
+| `sequenceGapsTotal` / `sequenceGapsInterval` | Count | 60 (missed frames inferred from forward jumps **within one connection**: the inference state is dropped when a connection ends, so a replacement connection restarting its sequence is never counted as missed frames) |
 | `sizeMismatchDroppedTotal` / `sizeMismatchDroppedInterval` | Count | 60 |
 | `malformedFramesTotal` / `malformedFramesInterval` | Count | 60 (CPF/decode rejects) |
 | `ioTimeoutsTotal` / `ioTimeoutsInterval` | Count | 60 (watchdog expiries → reconnect) |
 | `produceOverrunsTotal` / `produceOverrunsInterval` | Count | 60 (missed O→T ticks) |
 | `sendErrorsTotal` / `sendErrorsInterval` | Count | 60 (O→T datagram send failures) |
 | `recvErrorsTotal` / `recvErrorsInterval` | Count | 60 (socket receive errors) |
-| `interFrameMs` | Milliseconds | 1 (gauge: last observed T→O inter-arrival — the lived RPI) |
+| `refusedRedirectsTotal` / `refusedRedirectsInterval` | Count | 60 (ForwardOpen replies whose foreign O→T sockaddr address was refused — 0 or 1 per connection; also fires the one-shot `io-redirect-refused` event, §6.3, PROTOCOL-DESIGN D-ENIP-17) |
+| `interFrameMs` | Milliseconds | 1 (gauge: last observed T→O inter-arrival **within one connection** — the lived RPI. An interval spanning a reconnect is not a lived RPI and is never recorded as one) |
 | `runMode` | Count | 1 (gauge: 1 = we produce Run; 0 = Idle) |
+
+**Known observability gap — event-queue eviction is not surfaced.** The protocol crate counts
+`overflowed_events` per connection (PROTOCOL-DESIGN §8.6: a `Data` event arriving at the queue's
+capacity evicts the oldest queued one, latest-wins), but that counter stops at the crate boundary:
+there is no `IoLinkStats` field, `eip/live.rs`'s `map_io_stats` does not copy it, and no
+`EtherNetIpIo` measure carries it. Only `enip`'s own `handle.stats()` — inside the crate, and the
+live suite — can see it. So routine eviction pressure, which is what a consumer falling behind looks
+like, is invisible to an operator. It is recorded rather than wired because latest-wins makes
+eviction benign for the thing telemetry cares about: what the adapter publishes is always the
+freshest frame, and a consumer that never keeps up is already visible as publish latency and
+`sequenceGaps`. Wiring it through the seam is a metric-surface decision on its own evidence, not a
+side effect of the queue change.
 
 ---
 
@@ -1165,7 +1181,9 @@ backend overrides per this table (which is the adapter's normative behavior):
 | ForwardOpen rejected (`ForwardOpenRejected`) — class-3 (poll `connected: true`) or class-1 (push) | `Transient` | reconnect ladder; the typed extended status is logged (duplicate connection 0x0100, out of connections 0x0113, bad path 0x0315 …); after 3 consecutive rejections log a mode-specific hint (poll: try `connected: false`; push: check assembly instances/sizes against the device) |
 | Class-1 watchdog timeout / peer stops producing (`IoEvent::Lost`) | `Transient` | leave push loop → reconnect (ForwardClose best-effort first); `ioTimeouts` counter + `device-unreachable` alarm |
 | Malformed/hostile peer traffic (`Malformed`, `ProtocolViolation`) | `Permanent`-leaning: surface loudly, backoff at ceiling | a peer that breaks the protocol will keep breaking it; per-frame UDP garbage is dropped+counted by the stack without touching the link |
-| Browse service unsupported (`Cip` 0x08 on the tag-list service) | `Unsupported` | `BROWSE_UNSUPPORTED` reply; never affects the link |
+| Browse service unsupported (`Cip` 0x08 on the tag-list service, **start instance 0**) | `Unsupported` | `BROWSE_UNSUPPORTED` reply; never affects the link |
+| Browse resume refused (`Cip` 0x08 on the tag-list service, **non-zero start instance**) | `Permanent` | `BROWSE_FAILED` naming the refused instance; never affects the link. The device answered a page already, so the service exists — only the mid-set start is refused (the EthernetIPSharp shape, §11.7), and `BROWSE_UNSUPPORTED` would misreport it as a device that cannot browse at all |
+| Browse page out of order or repeating an instance id (`ProtocolViolation` from `list_tags`) | `Permanent` | `BROWSE_FAILED`; the page is refused rather than paged over, because the resume point follows its last record and anything behind that record would be skipped forever (PROTOCOL-DESIGN D-ENIP-19) |
 
 ### 10.2 Reconnect
 
@@ -1447,14 +1465,21 @@ live-slave gating). Each has its own default port (overridable by env var) so it
 own sim is up. Covered live paths:
 
 - **`live_cpppo.rs`** (poll, `:44818`): connect; scalar/array/DINT reads with exact seeded values;
-  write + readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD; and
+  write + readback of `FILL_SETPOINT`; per-tag BAD on a nonexistent tag while others stay GOOD;
   that browse (`0x55`) is *typed-refused* — cpppo does not implement the tag-list service (§11.1), so
-  the client surfaces the refusal as a typed error, never a panic.
+  the client surfaces the refusal as a typed error, never a panic; and the class-3 inactivity
+  keepalive across a 75 s idle (PROTOCOL-DESIGN §7.6) — the second peer for that leg, so it stands as
+  long as either peer serves a class-3 connection. A peer that refuses the class-3 ForwardOpen prints
+  a bench gap rather than faking the result.
 - **`live_opener.rs`** (push, `:44819`): ForwardOpen against the OpENer sample assemblies (§11.5);
   cyclic consume ≥ N frames with an advancing class-1 sequence; O→T produce observed via OpENer's
   sample output→input **mirror** (`AfterAssemblyDataReceived` copies the consumed output assembly into
   the produced input assembly, so a value we produce reappears in the next consumed frame); watchdog
-  `IoEvent::Lost { Timeout }` when the target is silenced.
+  `IoEvent::Lost { Timeout }` when the target is silenced; the class-3 inactivity keepalive across a
+  75 s idle on defaults (2 s RPI × ×16 ⇒ a 32 s window, probes every 24 s — PROTOCOL-DESIGN §7.6);
+  and latest-wins overflow (PROTOCOL-DESIGN §8.6) under a 10 ms-RPI flood the consumer ignores for
+  10 s, where the first sample it then reads sits past the evicted prefix instead of at the start of
+  the run.
 - **`live_ab_server.rs`** (poll, `:44820`, §11.6): the same read/write surface as cpppo but reached
   through a real Unconnected_Send (`0x52`) **route wrapper** (`ClientOptions.route =
   RoutePath::backplane_slot(0)`) — the backplane path cpppo never exercises; browse is typed-refused
@@ -1462,7 +1487,10 @@ own sim is up. Covered live paths:
 - **`live_ethernetipsharp.rs`** (poll + browse, `:44821`, §11.7): read/write cross-check against a
   third independent implementation, plus the **browse gap-closer** — a real `0x55`
   Get-Instance-Attribute-List reply paged to completion and decoded by `enip::list_tags`, asserting
-  the enumerated tags' symbol types (scalars value-supported, the REAL[8] array value-unsupported).
+  the enumerated tags' symbol types (scalars value-supported, the REAL[8] array value-unsupported);
+  and the **browse-cursor leg** — the exactly-once ascending walk, plus a >`0xFFFF` cursor emitting
+  the 32-bit instance segment (`0x26`) that this independent decoder parses and answers at the CIP
+  layer.
 
 All four are excluded from the coverage denominator (§12.2). *(The protocol crate's own
 `duplex`-fixture state-machine tests — PROTOCOL-DESIGN §12.2 — need no container, are NOT gated, and
@@ -1610,8 +1638,65 @@ per-tag CIP error (`0x05`) while a real tag stays GOOD
 gap-closer:** `enip::list_tags` pages a real Get-Instance-Attribute-List reply to completion and
 decodes it correctly — the seven defined tags enumerate with their symbol-type words (REAL `0x00CA`,
 DINT `0x00C4`, REAL[8] `0x20CA`), scalars value-supported and the array value-unsupported (array
-dims), exactly as `SymbolType` decodes them (`sharp_live_tag_browse_enumerates`). **No `enip` change
-was needed** — the `0x55` request encoding and page decode were already correct.
+dims), exactly as `SymbolType` decodes them (`sharp_live_tag_browse_enumerates`). S8's scope was the
+single-page request/decode, and for that **no `enip` change was needed** — the `0x55` request
+encoding and page decode were already correct. The *cursor* contract was changed later (D-ENIP-19,
+below); S8 validated neither the cursor width nor the paging rules.
+
+**Confirmed live (PR-4 / F7 browse cursors)**
+(`sharp_live_browse_cursor_walk_and_32bit_instance_segment`):
+
+* **Exactly-once enumeration.** The walk pages from the start of the instance space on the reply's
+  own status: 7 tags over 1 page, instance ids `[2,3,4,5,6,7,8]`, strictly ascending, no name twice,
+  terminating because the reply says so rather than because a caller-side page cap fired.
+* **The 32-bit logical instance segment on the wire.** `list_tags(0x0001_0000)` and
+  `list_tags(u32::MAX)` emit the `0x26` form (`26 00 00 00 01 00`) where a small cursor emits
+  `24 xx`. EthernetIPSharp parses both and answers at the CIP layer — general status `0x16`, "no such
+  instance" — not `PathSegmentError` (`0x04`) and not `InvalidPathSize` (`0x26`), and without
+  dropping the session (a following full walk still returns the same seven tags). **This is the
+  independent-implementation validation of the `0x26` encoding**, which no container sim can
+  otherwise exercise because none serves more than 65 535 symbol instances; the golden vectors
+  (PROTOCOL-DESIGN §12.4) pin the bytes, and this proves a foreign decoder reads them.
+
+**Recorded peer limit — mid-set cursor resume is not bench-provable here.** EthernetIPSharp serves
+the enumeration only from the class-level start instance (`0x24 0x00`): it returns its whole symbol
+table in one page with no cursor, answers `ServiceNotSupported` (`0x08`) for a start instance that
+exists, and `0x16` for one that does not. So *resuming a real `0x55` server mid-set* has no peer on
+this bench, and joins the §14.6 lab-hardware row alongside the 32-bit multi-page walk. The live test
+asserts the peer's actual answer in either branch — a correct resumed page, or a **typed** CIP
+refusal — so it can never pass by silently observing nothing.
+
+**The adapter-layer `sb/browse` path reaches this peer — for one page.** `EipSession::browse` starts
+an uncursored browse at symbol instance **0** — the bottom of the instance space, and the only start
+instance EthernetIPSharp's Symbol object serves. Measured through the real client: `list_tags(0)` ⇒ 7 records,
+`list_tags(1)` ⇒ `Err(Cip(Unknown(0x16)))` with `is_transient() == false`, which the adapter would
+map to `BROWSE_FAILED`. Starting at 1 would therefore have made `sb/browse` fail outright against the
+bench's only real `0x55` server, and on any device would have skipped a symbol sitting at instance 0
+— the same silent-skip class as a truncated page returning the device's own cursor (D-EIP-29). This
+is why the paging spec's `None ⇒ 1` default was overridden on the evidence:
+`eip::session::parse_browse_cursor(None) == 0`, guarded by
+`an_uncursored_browse_starts_at_instance_zero` (§12.3), and the simulator inherits it through the
+same parser.
+
+**The obtainable adapter-layer leg is page 1, and it is captured.** `sb/browse` with no cursor and
+`max: 2` against this peer answers `["LINE_SPEED", "FILL_TEMP"]` with `next = Some("4")`. That single
+page proves both halves of the cursor contract on a real device page: the walk starts at instance 0
+(the peer serves nothing else), and the truncation cursor resumes from the last record actually
+**returned** — instance 3 ⇒ `"4"` — not from the device's own cursor over the full seven-record page.
+
+**Page 2 is not obtainable against this peer, so the multi-page adapter-layer walk is not bench
+evidence.** Sending `"4"` back is refused: EthernetIPSharp serves the enumeration only from the
+class-level start instance and refuses every non-zero start — CIP `0x08` for a start instance that
+exists (the cursor case), `0x16` for one that does not. The peer has no resume capability at all, so
+an `sb/browse` walk over more than one page cannot be run here, at `max: 2` or any other page size.
+The refusal is what the `start != 0` branch of `EipSession::browse` reports as `BROWSE_FAILED` naming
+the refused instance rather than `BROWSE_UNSUPPORTED` (§10.1): the service demonstrably exists —
+page 1 came from it. (The run that measured this predated that branch and saw the misleading
+`BROWSE_UNSUPPORTED`; the mapping split is covered by
+`browse_refused_on_a_resume_is_a_failed_page_not_an_unsupported_device`.) The multi-page
+adapter-layer walk stays on the §14.6 real-Logix lab row alongside mid-set resume and the 32-bit
+multi-page walk, and is claimed nowhere as proven. The enip-layer legs above already drive
+`list_tags` from 0 directly.
 
 All device sims are external containers (no in-crate CI fallback, user decision). ab_server and
 EthernetIPSharp are bare TCP/CIP targets (no class-1 UDP), so unlike OpENer they run correctly under
@@ -1711,16 +1796,17 @@ a ship blocker.
 
 | Area | Representative tests |
 |---|---|
-| `crates/enip` (the protocol crate) | its own suite per PROTOCOL-DESIGN §12: codec round-trips, golden conformance vectors, truncation sweeps, `duplex`-fixture state-machine tests (correlation, quarantine, watchdog, sequence windows), fuzz targets |
+| `crates/enip` (the protocol crate) | its own suite per PROTOCOL-DESIGN §12: codec round-trips, golden conformance vectors, truncation sweeps, `duplex`-fixture state-machine tests (correlation, quarantine, watchdog, sequence windows), fuzz targets; the class-3 keepalive (§7.6) end-to-end on scripted bytes under `start_paused` time (`tests/class3_keepalive.rs`: the ¾-window probe, traffic deferring it, the reply-API-derived window and its fallback, task exit on client-drop and on `close`, a CIP-error probe still counting) and the latest-wins event queue (§8.6) as pure policy plus real senders/receivers; the tag-enumeration cursor rules (§7.3, D-ENIP-19) over the same fixtures (`tests/tag_paging.rs`: a cursor crossing the 16-bit boundary intact with the `0x26` request path asserted byte-exact, the non-advancing page and the out-of-order / duplicate-instance page each as a typed `ProtocolViolation`, and `u32::MAX` ending the walk) plus the hand-assembled 32-bit-instance golden vectors |
+| `crates/enip` manager select loop | `manager_select_loop_end_to_end_consume_produce_watchdog` drives the `select!` that composes the unit-proven parts over a real loopback UDP pair: recv → route → deliver, tick → produce → `send_to`, watchdog → `Lost` → remove, plus the D-ENIP-17 port-honouring path on a live socket. **Declared residual:** injecting a socket-fatal `recv_from` error through that loop is not covered — there is no cross-platform way to make a bound UDP socket fail that way on demand without a socket trait seam whose only consumer would be the test, which would make the seam itself the untested wiring. The error policy (`recv_error_policy_matrix`) and the fan-out (`fan_out_lost_delivers_io_to_every_connection_and_drains_registry`) stay unit-proven, and their composition rests on review plus this happy-path glue |
 | `config.rs` | precedence chain (signal ▸ group ▸ device ▸ global ▸ built-in); duplicate name/tagPath rejection; `string` type rejection; unknown-key rejection (template `deny_unknown_fields` kept); allow-list parse; slot range; mode/block cross-validation (`poll`+`io` rejected, `push`+`pollGroups` rejected); push layout validation (field beyond `sizeBytes`, `bit` on non-bool, output signals on a heartbeat connection — all rejected at startup) |
 | `eip/types.rs` codec | every §5.1 row round-trip JSON⇄typed; array length checks; scale/offset incl. inverse-on-write and out-of-range refusal; non-finite ⇒ UNCERTAIN |
 | `poll.rs` | deadband none/absolute/percent/non-numeric/array-any-element; onChange vs always; batch window flush (tokio `start_paused` time control); stale accounting incl. pause suspension; overrun detection |
 | `push.rs` | field-change gating (deadband + `sampleMs` floor under `start_paused` time control); idle-frame ⇒ UNCERTAIN samples; pause = consume-but-don't-publish (snapshot advances, zero publishes); resume re-basing (§7.4.8 — no stale-change burst); Lost ⇒ reconnect path; output-write serialization |
-| `sim.rs` + session behavior | per-signal BAD not swallowed; probe; browse paging incl. unsupported marker; scripted push frames (values, idle, stop-producing) |
+| `sim.rs` + session behavior | per-signal BAD not swallowed; probe; scripted push frames (values, idle, stop-producing); browse paging incl. the unsupported marker — both backends walk a `max`-limited page sequence to exactly-once coverage over the shared cursor parser, an uncursored walk asks the device for symbol instance 0 so a symbol sitting there is returned rather than skipped (`an_uncursored_browse_starts_at_instance_zero`), a truncated page resumes from the last record it actually returned (not the device's cursor), a 32-bit cursor rides back as a `0x26` path, an unreadable cursor is a permanent error rather than a silent restart at the top of the set, and a CIP `0x08` refusal is `BROWSE_UNSUPPORTED` only when it answers the *first* page — the same refusal of a resume is a failed page naming the refused instance (`browse_refused_at_the_first_page_is_an_unsupported_device` / `browse_refused_on_a_resume_is_a_failed_page_not_an_unsupported_device`) |
 | `app.rs` supervisor | backoff math (template tests kept); connectivity tokens incl. PAUSED and break-while-paused, for both modes; provider/metric/token single-source invariants; the disconnected-wait exit classification (`Elapsed`/`Reconnect`/`Stopped`) — a cancelled or channel-closed instance leaves the backoff immediately, under `start_paused` time control |
-| `lifecycle.rs` (§10.3, D-EIP-27) | `stop_budget` composition and its [1 s, 10 s] clamp; `stop_tasks` joining cooperative tasks and aborting a straggler at the **absolute** deadline (`start_paused`); `shutdown_all`'s drain loop reaping a runtime inserted after the root was cancelled; registry insertion order, remove-by-id, drain, and the connectivity/generation views |
+| `lifecycle.rs` (§10.3, D-EIP-27) | the targeted routing accessors (`handle(id)` cloning exactly the addressed instance and `sole_handle()` distinguishing none/one/several from a single locked scan, with the clone sharing the live `Health` the device task writes); `stop_budget` composition and its [1 s, 10 s] clamp; `stop_tasks` joining cooperative tasks and aborting a straggler at the **absolute** deadline (`start_paused`); `shutdown_all`'s drain loop reaping a runtime inserted after the root was cancelled; registry insertion order, remove-by-id, drain, and the connectivity/generation views |
 | `reload.rs` (§10.4, D-EIP-28) | the pure diff: keep/start/stop/restart dispositions, the restart-all trigger (`component.global` **and** any other non-instances change), object-key-order insensitivity, skip-bad + zero-valid + invalid-global rejection, duplicate-id first-wins, and the previously-skipped-instance case; the shared startup/reload instance set (`parse_instances` deduping first-wins, and re-applying the startup document moving nothing); the transaction over a launcher double: stop→swap→launch proven by the **interleaving** (each stub task journals its own cancellation, so launch-before-stop fails), commit-path launches pinned to the candidate snapshot and global, kept-runtime identity (`Arc::ptr_eq` on `Health` — the pause-survival contract), the shutdown gate, self-boundedness when a stopping task wedges *and* when the broker wedges (`start_paused`), alarm clearing for removed instances ordered **after** their stop, `config-applied` (incl. a launch failure reported as a skip) + `repoll` availability, a second reload diffing against the generation the first one installed, and commit-failure ⇒ rollback restoring the prior set bound to the **prior** snapshot |
-| `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default tracked from the live count (incl. the empty-registry window answering `DEVICE_UNAVAILABLE`); write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused (`PAUSED`) and repoll-on-push (`BAD_ARGS`) refusals; browse error mapping; push sb/read snapshot incl. `NO_FRAME` |
+| `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default tracked from the live count (incl. the empty-registry window answering `DEVICE_UNAVAILABLE`); write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused (`PAUSED`) and repoll-on-push (`BAD_ARGS`) refusals; browse error mapping; the paged walk over a cursor-honouring mock device enumerating every tag exactly once at `max: 2`, push-layout paging and its `BAD_ARGS` cursor refusal, and all three hierarchical-walk terminations (a cursor that repeats, one that is not a number, one that advances forever) as `BROWSE_FAILED` — the first of which would otherwise be a handler that never returns; push sb/read snapshot incl. `NO_FRAME` |
 | `metrics.rs` | Total/Interval pair semantics (interval resets, total doesn't); per-dimension definition set matches §8 exactly incl. `EtherNetIpIo` (this test IS the parity contract's executable form) |
 | wire shape | `DataFacade::build_body` output for a §4.5 signal AND a §4.6 push field asserted field-by-field against §5.2 (id/address/device/quality/serverTs-present/sourceTs-absent) |
 
@@ -1731,14 +1817,15 @@ a ship blocker.
 | Unit + coverage gate (workspace: protocol crate + adapter) | local (Linux-authoritative) + CI | **in scope** (P-slices + S7) |
 | Decoder fuzzing (D-EIP-19) | Linux (CI/WSL — libFuzzer) | **in scope** (P4; PR smoke budget in CI) |
 | Live protocol + E2E (§11.4, both modes) | local Docker: EMQX + cpppo + OpENer | **in scope** (S7/S9) |
-| Live protocol: 2nd/3rd independent poll peers + Unconnected_Send route + browse `0x55` | local Docker: ab_server (§11.6) + EthernetIPSharp (§11.7) | **in scope** (S8): read/write cross-checked on two more independent impls; the `0x52` route wrapper exercised via ab_server; `enip::list_tags` browse validated against EthernetIPSharp's real `0x55`. No `enip` change needed. |
+| Live protocol: 2nd/3rd independent poll peers + Unconnected_Send route + browse `0x55` | local Docker: ab_server (§11.6) + EthernetIPSharp (§11.7) | **in scope** (S8): read/write cross-checked on two more independent impls; the `0x52` route wrapper exercised via ab_server; `enip::list_tags` browse validated against EthernetIPSharp's real `0x55` — single-page request/decode, which needed no `enip` change. |
+| Live protocol: browse cursors — exactly-once walk + the 32-bit instance segment | local Docker: EthernetIPSharp (§11.7) | **in scope**: the walk enumerates every tag once in ascending instance order, and an independent decoder parses the `0x26` segment a >`0xFFFF` cursor emits (answering at the CIP layer, not with a path error). The adapter-layer leg this peer supports is **page 1**, captured: `sb/browse` with no cursor at `max: 2` ⇒ `["LINE_SPEED", "FILL_TEMP"]`, `next = Some("4")` — the instance-0 start and the resume-from-the-last-*returned*-record cut, both on a real device page (§11.7). A **multi-page** adapter walk is **not obtainable here**: the peer refuses every non-zero start instance, so it has no resume capability and page 2 cannot be served at any page size. Multi-page paging and mid-set cursor resume — at both layers — have no container peer and stay on the §14.6 lab row. |
 | CIP Security Phase 1: poll over TLS (mutual X.509) + negative matrix | local Docker: `test-infra/enip-tls/` stunnel (OpenSSL) fronting cpppo on `:2221` (+ CBC-only `:2223`) | **in scope**: `crates/enip/tests/live_tls.rs` drives real `enip::connect_tls` — mutual-TLS read/write over TLS, wrong-CA `PeerUnverified`, missing-client-cert rejection, and CBC-only `NoCipherOverlap`, against an independent TLS + EtherNet/IP pair at exactly the changed layer (DESIGN-cip-security.md §5.2). |
 | CIP Security Phase 2a: posture reads (0x5D/0x5E/0x5F) | local Docker: `test-infra/opener-cipsecurity/` OpENer `CIPSecurity` branch on `:44822` | **in scope**: `crates/enip/tests/live_cip_security.rs` drives real `enip::read_security_posture` — decodes CIP Security state/profiles, EtherNet/IP Security cipher-suite lists + flags, and the Certificate Management summary against an independent implementation of the three objects (DESIGN-cip-security.md §4.1). Duplex-fixture decoder tests (`tests/security_posture.rs`) + fuzz (`fuzz_security_attrs`) cover the decoders in-gate. |
 | CIP Security against a **certified Vol 8 device** (44818-closed port policy, Vol-8-exact suite lists, `Send Certificate Chain` / `Verify Client Certificate` corner semantics, device-side commissioning; **EST enrollment against a real plant/device pull-model PKI**, Phase 2c) | lab CIP-Security PLC (none on the bench) | **deferred to lab hardware** (§14.6) — the stunnel terminator + globalsign/est `estserver` cover the changed *layers* faithfully (independent TLS/EtherNet/IP + independent RFC 7030 server) but neither is a real CIP-Security device. Acquire a CompactLogix 5380 / ControlLogix 5580 v32+ or a 1756-EN4TR (commissioned with FactoryTalk Policy Manager) when CIP Security becomes a shipping claim (DESIGN-cip-security.md §5.2/§6.3). |
 | HOST/dual-MQTT smoke | local | **in scope** (S9) |
 | Kubernetes | kind cluster, `k8s/` manifests + cpppo & OpENer as cluster services (UDP :2222 pod-to-pod for push) | **in scope** (S9, smoke: pod Ready, data on bus both modes, probes green) |
 | Greengrass deployed regression | `lab-5950x` (build via WSL `--features greengrass`, `greengrass-cli` local deploy) | **required before the component is "done"** (org rule: new capability ⇒ deployed GG regression). Scheduled S9; if the lab is unreachable in a session, report a **blocking validation gap** — do not claim completion. |
-| True `slot`/backplane **routing semantics** + connected class-3 messaging + real-Logix browse (hundreds of tags, UDT/`RECIPE` `supported:false` on real Rockwell symbol types) + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6. `enip` now *emits* a well-formed Unconnected_Send route (validated vs ab_server, §11.6) and *decodes* a real `0x55` browse page (validated vs EthernetIPSharp, §11.7), but ab_server ignores the route content (no real slot-routing) and sim browse is a handful of atomic tags — so plant-grade backplane routing and real-Logix browse semantics still need a physical controller; push conformance beyond OpENer likewise stays sim-grade. |
+| True `slot`/backplane **routing semantics** + connected class-3 messaging (incl. whether a real Logix Connection Manager enforces the class-3 idle window the §7.6 keepalive covers) + real-Logix browse (hundreds of tags, UDT/`RECIPE` `supported:false` on real Rockwell symbol types) + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6. `enip` now *emits* a well-formed Unconnected_Send route (validated vs ab_server, §11.6) and *decodes* a real `0x55` browse page (validated vs EthernetIPSharp, §11.7), but ab_server ignores the route content (no real slot-routing) and sim browse is a handful of atomic tags — so plant-grade backplane routing and real-Logix browse semantics still need a physical controller; push conformance beyond OpENer likewise stays sim-grade. |
 
 CI: `.github/workflows/ci.yml` calls the org reusable
 `edgecommons/.github/.github/workflows/component-ci.yml@main` (`language: RUST`,
@@ -1832,7 +1919,18 @@ language) in the user-facing docs where relevant.
    cert fires the event). **Roadmap (Phase 2c, not built):** EST enrollment of the adapter's own
    certificate; and DTLS on the implicit path. See DESIGN-cip-security.md §4/§6 for the phase gates.
 6. **Lab-hardware-only validation paths, declared:** the `slot`/backplane routing path,
-   connected class-3 messaging, **multicast T→O consume**, push against a real PLC/remote-I/O
+   connected class-3 messaging — including **idle-window keepalive semantics against real Logix**
+   (whether a genuine ControlLogix Connection Manager enforces the inactivity watchdog the ¾-window
+   keepalive keeps the session off, PROTOCOL-DESIGN §7.6 / D-ENIP-18; the bench proves the probes
+   are well-formed, flow on cadence, and survive a multi-window idle against OpENer/cpppo) —
+   **browse pagination on a controller-sized tag set** (multi-page `0x55` walks — at the `enip` layer
+   and at the adapter's `sb/browse` layer alike — mid-set cursor resume, and 32-bit instance cursors
+   beyond 65 535 symbols — PROTOCOL-DESIGN §7.3 / D-ENIP-19; the bench proves the exactly-once walk,
+   that an independent implementation parses the `0x26` segment, and one real `sb/browse` page with a
+   truthful truncation cursor, but EthernetIPSharp serves its whole symbol table in one page and
+   refuses every non-zero start instance, so nothing past page 1 has a container peer at either
+   layer, §11.7) —
+   **multicast T→O consume**, push against a real PLC/remote-I/O
    device, and **CIP Security against a certified Vol 8 device** (port policy with 44818 closed,
    Vol-8-exact suite lists, `Send Certificate Chain`/`Verify Client Certificate` corner semantics) —
    cpppo has no chassis/class-1, OpENer exercises P2P direct connections, and the CIP Security Phase-1

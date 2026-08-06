@@ -5,7 +5,13 @@
 //! request timeout becomes a **BAD [`Reading`]** (the session lives — one dead tag must not blind the
 //! other ninety-nine, §5.4), while a connection-level failure returns `Err` so the supervisor
 //! reconnects (§10.1). `write_signal` coerces + Write Tag (confirmed). `browse` pages Get Instance
-//! Attribute List (`Unsupported` ⇒ `BROWSE_UNSUPPORTED`). `probe` is the cheapest real round-trip.
+//! Attribute List, honouring `max` truthfully: an uncursored walk starts at symbol instance 0 so
+//! nothing at the bottom of the instance space is skipped ([`parse_browse_cursor`]), a page cut
+//! short resumes from the last record it actually returned ([`paginate_browse`]), and a cursor that
+//! is not a symbol-instance id is a caller error, not a silent restart. A CIP `0x08` refusal of the
+//! *first* page is a device with no tag-list service (`Unsupported` ⇒ `BROWSE_UNSUPPORTED`); the
+//! same refusal of a **resume** is a failed page (`BROWSE_FAILED`), not a missing service.
+//! `probe` is the cheapest real round-trip.
 //!
 //! **Defensive seam (the vetting mitigations).** Even though the `enip` stack is internally
 //! deadline-bounded and panic-free, every op here is additionally wrapped in a generous
@@ -146,6 +152,63 @@ fn symbol_type_name(st: enip::SymbolType) -> String {
     }
 }
 
+/// The resume instance for a browse request (§7.3). No cursor ⇒ **instance 0**: the symbol
+/// enumeration is walked from the beginning of the instance space, because instance ids are the
+/// device's to assign and starting at 1 skips any symbol that sits at instance 0 — silently, and
+/// forever, which is the same defect class as a truncated page that returns the device's cursor.
+/// Starting at 0 is also what a real `0x55` server wants: EthernetIPSharp serves its symbol table
+/// only from the class-level start instance `0` and answers instance 1 with CIP `0x16`, so a walk
+/// that began at 1 could not enumerate it at all (DESIGN §11.7). A cursor must be the decimal
+/// symbol-instance id a previous page returned; anything else is a **caller error** — never a silent
+/// restart at the beginning, which would re-serve (and duplicate) the whole walk.
+///
+/// Shared with the simulator backend ([`crate::sim`]) so both backends page identically and the sim
+/// cannot mask an adapter paging bug.
+///
+/// # Errors
+///
+/// [`DeviceError::Permanent`] when `cursor` is not a decimal `u32` (the command layer surfaces it as
+/// `BROWSE_FAILED` naming the offending cursor).
+pub(crate) fn parse_browse_cursor(cursor: Option<&str>) -> Result<u32> {
+    match cursor {
+        None => Ok(0),
+        Some(c) => c.trim().parse::<u32>().map_err(|_| {
+            DeviceError::Permanent(anyhow::anyhow!(
+                "invalid browse cursor `{c}` (expected the numeric cursor from the previous page)"
+            ))
+        }),
+    }
+}
+
+/// Honour `max` truthfully (§7.3).
+///
+/// The device's own cursor follows the **last record of the page it sent**. When that page is longer
+/// than `max`, everything past the cut is discarded and must be re-served, so the resume point is
+/// the last record actually **returned** (`+1`) — passing the device's cursor through here would
+/// skip the discarded records forever. An untruncated page keeps the device's cursor (it is the
+/// authority on whether more records exist). `max == 0` clamps to 1 so a walk always progresses, and
+/// a last record at `u32::MAX` ends the walk rather than wrapping.
+///
+/// Cutting at the last returned record is only exactly-once because the page is strictly ascending,
+/// and that is the protocol crate's guarantee, not an assumption made here: `list_tags` walks each
+/// decoded page and rejects an out-of-order or duplicated instance id as a `ProtocolViolation`
+/// (PROTOCOL-DESIGN §7.3 / D-ENIP-19), so a page reaching this function cannot hide a record behind
+/// the cut.
+fn paginate_browse(
+    mut records: Vec<enip::SymbolInfo>,
+    device_next: Option<u32>,
+    max: usize,
+) -> (Vec<enip::SymbolInfo>, Option<u32>) {
+    let max = max.max(1);
+    if records.len() > max {
+        records.truncate(max);
+        let next = records.last().and_then(|s| s.instance_id.checked_add(1));
+        (records, next)
+    } else {
+        (records, device_next)
+    }
+}
+
 /// The CIP elementary type's spelling (uppercase, as a Logix browse reports it).
 fn cip_type_name(ty: enip::CipType) -> &'static str {
     match ty {
@@ -213,13 +276,13 @@ impl DeviceSession for EipSession {
     }
 
     async fn browse(&mut self, cursor: Option<String>, max: usize) -> Result<BrowsePage> {
-        let start = cursor.as_deref().and_then(|c| c.parse::<u16>().ok()).unwrap_or(1);
+        let start = parse_browse_cursor(cursor.as_deref())?;
         let list = self.client.list_tags(start, &enip::Scope::Controller);
         match tokio::time::timeout(self.defensive(), list).await {
-            Ok(Ok((records, next))) => {
-                let tags = records
+            Ok(Ok((records, device_next))) => {
+                let (page, next) = paginate_browse(records, device_next, max);
+                let tags = page
                     .into_iter()
-                    .take(max.max(1))
                     .map(|s| BrowsedTag {
                         name: s.name,
                         type_name: symbol_type_name(s.symbol_type),
@@ -232,11 +295,32 @@ impl DeviceSession for EipSession {
                     next_cursor: next.map(|n| n.to_string()),
                 })
             }
-            // The tag-list service is not implemented by this device (§7.3, §10.1).
+            // `ServiceNotSupported` (`0x08`) means two different things depending on where the walk
+            // asked to start, and only one of them is "this device has no tag list" (§7.3, §10.1).
+            //
+            // At the bottom of the instance space the device is answering the enumeration itself:
+            // there is no tag-list service here, which is the generic-CIP-device path ⇒
+            // `BROWSE_UNSUPPORTED`.
+            //
+            // On a **resume** the device has already served a page (that is where the cursor came
+            // from), so the service demonstrably exists and it is the mid-set *start instance* that
+            // is refused — EthernetIPSharp answers `0x08` for every non-zero start instance, serving
+            // its symbol table only from the class-level start (DESIGN §11.7). Reporting that as
+            // `BROWSE_UNSUPPORTED` would tell a console the device cannot browse at all, right after
+            // it browsed. It is a failure of this page, named as one: `BROWSE_FAILED`, permanent
+            // because retrying the same cursor is refused identically.
             Ok(Err(enip::EnipError::Cip(status)))
                 if status.general == enip::GeneralStatus::ServiceNotSupported =>
             {
-                Err(DeviceError::Unsupported("BROWSE_UNSUPPORTED"))
+                if start == 0 {
+                    Err(DeviceError::Unsupported("BROWSE_UNSUPPORTED"))
+                } else {
+                    Err(DeviceError::Permanent(anyhow::anyhow!(
+                        "device refused to resume the tag list at symbol instance {start} \
+                         (CIP 0x08): it serves the enumeration only from the start of the \
+                         instance space"
+                    )))
+                }
             }
             Ok(Err(e)) => Err(map_enip_error(e)),
             Err(_elapsed) => Err(DeviceError::Transient(anyhow::anyhow!(
@@ -274,6 +358,8 @@ mod tests {
     use bytes::Bytes;
     use enip::{Command, Cpf, CpfItem, EncapFrame, EncapHeader, ItemType};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     fn spec(name: &str, tag: &str, ty: &str, array: Option<u32>) -> SignalSpec {
@@ -338,6 +424,53 @@ mod tests {
         v.extend_from_slice(name.as_bytes());
         v.extend_from_slice(&sym.to_le_bytes());
         v
+    }
+
+    /// A synthetic [`enip::SymbolInfo`] for the pure paging unit tests.
+    fn sym(instance_id: u32) -> enip::SymbolInfo {
+        enip::SymbolInfo {
+            instance_id,
+            name: format!("TAG_{instance_id}"),
+            symbol_type: enip::SymbolType(0x00CA), // REAL
+        }
+    }
+
+    /// The start instance the mock device was asked to resume from, plus the EPATH logical-segment
+    /// byte that carried it (`0x24` 8-bit / `0x25` 16-bit / `0x26` 32-bit) — so a test can assert the
+    /// cursor reached the wire in the right width. `mr` is a Message Request:
+    /// `service, path_size_words, path…, data…`.
+    fn requested_instance(mr: &[u8]) -> (u32, u8) {
+        let path_len = mr[1] as usize * 2;
+        let path = &mr[2..2 + path_len];
+        let mut i = 0usize;
+        let mut found = (0u32, 0u8);
+        while i < path.len() {
+            match path[i] {
+                0x20 => i += 2,                                    // 8-bit class
+                0x21 => i += 4,                                    // 16-bit class
+                0x24 => {
+                    found = (u32::from(path[i + 1]), 0x24);
+                    i += 2;
+                }
+                0x25 => {
+                    found = (u32::from(u16::from_le_bytes([path[i + 2], path[i + 3]])), 0x25);
+                    i += 4;
+                }
+                0x26 => {
+                    found = (
+                        u32::from_le_bytes([path[i + 2], path[i + 3], path[i + 4], path[i + 5]]),
+                        0x26,
+                    );
+                    i += 6;
+                }
+                other => panic!("unexpected EPATH segment 0x{other:02X}"),
+            }
+        }
+        found
+    }
+
+    fn names(page: &BrowsePage) -> Vec<String> {
+        page.tags.iter().map(|t| t.name.clone()).collect()
     }
 
     /// Spawn a mock device that answers RegisterSession then delegates each CIP request to `handler`
@@ -462,6 +595,249 @@ mod tests {
         assert_eq!(page.tags[0].type_name, "REAL");
         assert_eq!(page.tags[1].type_name, "DINT");
         assert!(page.next_cursor.is_none());
+    }
+
+    /// The F7 headline (§4.1/§4.3): when `max` cuts a device page short, the returned cursor must
+    /// resume from the last record **actually returned** — not the device's own cursor, which follows
+    /// the last record of the FULL page and would skip everything discarded by the cut. The mock is a
+    /// device that never pages itself: every reply carries the whole tag set from the requested
+    /// instance onward with status `0x00`, so all truncation is the adapter's. Its symbols occupy
+    /// instances 1..=5, so the uncursored start (instance 0, one below the first symbol) simply
+    /// yields the whole set.
+    #[tokio::test]
+    async fn browse_truncation_resumes_from_the_last_returned_record() {
+        let (client_half, server_half) = tokio::io::duplex(8192);
+        spawn_device(server_half, |_idx, service, mr| {
+            assert_eq!(service, 0x55, "get instance attribute list");
+            let (start, _seg) = requested_instance(mr);
+            let mut data = Vec::new();
+            for inst in start.max(1)..=5 {
+                data.extend_from_slice(&tag_record(inst, &format!("TAG_{inst}"), 0x00CA));
+            }
+            (0x00, data)
+        });
+        let mut session = connect(client_half).await;
+
+        let p1 = session.browse(None, 2).await.unwrap();
+        assert_eq!(names(&p1), ["TAG_1", "TAG_2"]);
+        assert_eq!(
+            p1.next_cursor.as_deref(),
+            Some("3"),
+            "resume after the last RETURNED record, not after the device's page"
+        );
+
+        let p2 = session.browse(p1.next_cursor.clone(), 2).await.unwrap();
+        assert_eq!(names(&p2), ["TAG_3", "TAG_4"]);
+        assert_eq!(p2.next_cursor.as_deref(), Some("5"));
+
+        let p3 = session.browse(p2.next_cursor.clone(), 2).await.unwrap();
+        assert_eq!(names(&p3), ["TAG_5"]);
+        assert!(p3.next_cursor.is_none(), "the last, untruncated page ends the walk");
+
+        // Exactly-once: the union across the pages is the whole set, with no repeats and no skips.
+        let walked: Vec<String> = [p1, p2, p3].iter().flat_map(names).collect();
+        assert_eq!(walked, ["TAG_1", "TAG_2", "TAG_3", "TAG_4", "TAG_5"]);
+    }
+
+    /// A cursor the adapter cannot read is the caller's error (§4.3) — restarting the walk at the
+    /// bottom of the instance space would silently re-serve every tag already delivered. No request
+    /// reaches the device.
+    #[tokio::test]
+    async fn browse_invalid_cursor_is_an_error_not_a_restart() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        spawn_device(server_half, move |_idx, _service, _mr| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            (0x00, Vec::new())
+        });
+        let mut session = connect(client_half).await;
+
+        let err = session.browse(Some("banana".to_string()), 10).await.unwrap_err();
+        assert!(!err.is_transient(), "a corrupt cursor never fixes itself by reconnecting");
+        assert!(
+            err.to_string().contains("invalid browse cursor"),
+            "the error names the cause: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no tag-list request is issued at all");
+    }
+
+    /// A symbol instance above the 16-bit space survives the round trip: the cursor is reported
+    /// verbatim and rides back to the device as a 32-bit (`0x26`) logical instance segment.
+    #[tokio::test]
+    async fn browse_passes_the_32bit_cursor_through() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let asked = Arc::new(Mutex::new(Vec::<(u32, u8)>::new()));
+        let record = Arc::clone(&asked);
+        spawn_device(server_half, move |idx, service, mr| {
+            assert_eq!(service, 0x55);
+            record.lock().unwrap().push(requested_instance(mr));
+            match idx {
+                // `0x06` = more data: one record whose instance id is past 0xFFFF.
+                0 => (0x06, tag_record(0x0001_0000, "BIG_TAG", 0x00CA)),
+                _ => (0x00, Vec::new()),
+            }
+        });
+        let mut session = connect(client_half).await;
+
+        let page = session.browse(None, 100).await.unwrap();
+        assert_eq!(page.tags[0].instance_id, 0x0001_0000);
+        assert_eq!(page.next_cursor.as_deref(), Some("65537"), "no 16-bit mask, no wrap");
+
+        let next = session.browse(page.next_cursor.clone(), 100).await.unwrap();
+        assert!(next.tags.is_empty());
+        assert!(next.next_cursor.is_none());
+
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked[0], (0, 0x24), "the first page starts at instance 0, 8-bit form");
+        assert_eq!(asked[1], (65_537, 0x26), "a 32-bit cursor rides the 0x26 segment");
+    }
+
+    /// The regression guard for the start of the walk: an uncursored `sb/browse` enumerates from
+    /// symbol instance **0**, so a device whose first symbol sits there has it returned on the first
+    /// page. Starting at 1 — as the paging spec originally pinned — drops that record silently and
+    /// forever, the same defect class as a truncated page that returns the device's own cursor. The
+    /// mock is a device that serves every symbol from the requested instance onward: with a start of
+    /// 0 it answers `TAG_0`, with a start of 1 it cannot.
+    #[tokio::test]
+    async fn an_uncursored_browse_starts_at_instance_zero() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let asked = Arc::new(Mutex::new(Vec::<(u32, u8)>::new()));
+        let record = Arc::clone(&asked);
+        spawn_device(server_half, move |_idx, service, mr| {
+            assert_eq!(service, 0x55, "get instance attribute list");
+            let (start, seg) = requested_instance(mr);
+            record.lock().unwrap().push((start, seg));
+            let mut data = Vec::new();
+            for inst in start..=2 {
+                data.extend_from_slice(&tag_record(inst, &format!("TAG_{inst}"), 0x00CA));
+            }
+            (0x00, data)
+        });
+        let mut session = connect(client_half).await;
+
+        let page = session.browse(None, 100).await.unwrap();
+        assert_eq!(
+            names(&page),
+            ["TAG_0", "TAG_1", "TAG_2"],
+            "a symbol at instance 0 is part of the enumeration, never skipped"
+        );
+        assert_eq!(page.tags[0].instance_id, 0);
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [(0, 0x24)],
+            "the uncursored walk asks the device to start at instance 0"
+        );
+    }
+
+    /// A device that answers the very first page with `ServiceNotSupported` has no tag list at all —
+    /// the generic-CIP-device path (§10.1). That, and only that, is `BROWSE_UNSUPPORTED`.
+    #[tokio::test]
+    async fn browse_refused_at_the_first_page_is_an_unsupported_device() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |_idx, service, _mr| {
+            assert_eq!(service, 0x55);
+            (0x08, Vec::new()) // ServiceNotSupported
+        });
+        let mut session = connect(client_half).await;
+
+        let err = session.browse(None, 100).await.unwrap_err();
+        assert!(
+            matches!(err, DeviceError::Unsupported("BROWSE_UNSUPPORTED")),
+            "no tag-list service at the bottom of the instance space: {err}"
+        );
+    }
+
+    /// The same CIP `0x08` answering a **resume** is a different fact and must not be reported as the
+    /// same one: the device already served a page (that is where the cursor came from), so it plainly
+    /// has the service — what it refuses is the mid-set start instance. This mock is the measured
+    /// EthernetIPSharp shape (DESIGN §11.7): the whole symbol table from the class-level start
+    /// instance 0, `ServiceNotSupported` for every non-zero start. Page 1 at `max: 2` succeeds; the
+    /// resume is a failed page (`BROWSE_FAILED`, permanent) naming the instance that was refused —
+    /// never `BROWSE_UNSUPPORTED`, which would tell a console the device cannot browse at all
+    /// immediately after it browsed.
+    #[tokio::test]
+    async fn browse_refused_on_a_resume_is_a_failed_page_not_an_unsupported_device() {
+        let (client_half, server_half) = tokio::io::duplex(8192);
+        spawn_device(server_half, |_idx, service, mr| {
+            assert_eq!(service, 0x55);
+            let (start, _seg) = requested_instance(mr);
+            if start != 0 {
+                return (0x08, Vec::new()); // ServiceNotSupported — resume refused
+            }
+            let mut data = Vec::new();
+            for (inst, name) in [(2u32, "LINE_SPEED"), (3, "FILL_TEMP"), (4, "PRODUCT_COUNT")] {
+                data.extend_from_slice(&tag_record(inst, name, 0x00CA));
+            }
+            (0x00, data)
+        });
+        let mut session = connect(client_half).await;
+
+        let p1 = session.browse(None, 2).await.unwrap();
+        assert_eq!(names(&p1), ["LINE_SPEED", "FILL_TEMP"]);
+        assert_eq!(p1.next_cursor.as_deref(), Some("4"));
+
+        let err = session.browse(p1.next_cursor.clone(), 2).await.unwrap_err();
+        assert!(
+            !matches!(err, DeviceError::Unsupported(_)),
+            "the service exists — page 1 came from it: {err}"
+        );
+        assert!(!err.is_transient(), "the same cursor is refused identically on retry");
+        assert!(
+            err.to_string().contains("refused to resume the tag list at symbol instance 4"),
+            "the failure names what was refused: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_browse_cursor_defaults_to_zero_and_rejects_garbage() {
+        assert_eq!(
+            parse_browse_cursor(None).unwrap(),
+            0,
+            "an uncursored browse walks from the start of the instance space, not from 1"
+        );
+        assert_eq!(parse_browse_cursor(Some("0")).unwrap(), 0);
+        assert_eq!(parse_browse_cursor(Some("42")).unwrap(), 42);
+        assert_eq!(parse_browse_cursor(Some("  65537  ")).unwrap(), 65_537);
+        assert_eq!(parse_browse_cursor(Some("4294967295")).unwrap(), u32::MAX);
+        for bad in ["banana", "-1", "4294967296", "", "3.5", "0x10"] {
+            let err = parse_browse_cursor(Some(bad)).unwrap_err();
+            assert!(!err.is_transient(), "cursor `{bad}` is a caller error");
+            assert!(err.to_string().contains("invalid browse cursor"), "cursor `{bad}`");
+        }
+    }
+
+    #[test]
+    fn paginate_browse_resumes_from_the_last_returned_record_only_when_truncated() {
+        let recs = |ids: &[u32]| ids.iter().copied().map(sym).collect::<Vec<_>>();
+
+        // Truncated: the device's cursor (14) is discarded — records 12, 13 must be re-served.
+        let (page, next) = paginate_browse(recs(&[10, 11, 12, 13]), Some(14), 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(next, Some(12));
+
+        // `max == 0` clamps to 1, so a walk still progresses instead of standing still.
+        let (page, next) = paginate_browse(recs(&[10, 11]), Some(12), 0);
+        assert_eq!(page.len(), 1);
+        assert_eq!(next, Some(11));
+
+        // `len == max` is NOT a truncation: the device is the authority on what follows.
+        let (page, next) = paginate_browse(recs(&[10, 11]), Some(99), 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(next, Some(99));
+
+        // A short page, and an empty one, pass the device's verdict through unchanged.
+        let (page, next) = paginate_browse(recs(&[10]), None, 5);
+        assert_eq!(page.len(), 1);
+        assert_eq!(next, None);
+        let (page, next) = paginate_browse(recs(&[]), Some(7), 5);
+        assert!(page.is_empty());
+        assert_eq!(next, Some(7));
+
+        // End of the instance space: the walk ends rather than wrapping to 0.
+        let (page, next) = paginate_browse(recs(&[u32::MAX, 7]), Some(8), 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(next, None);
     }
 
     /// Browse over the full elementary-type spread plus a structure and an unknown code, exercising the

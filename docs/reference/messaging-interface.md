@@ -86,7 +86,7 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 
 | Code | When |
 |------|------|
-| `BAD_ARGS` | Malformed body; a request that addresses no instance with ≥ 2 devices running; a body `instance` that disagrees with the topic's instance token; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, or an unknown browse `ref`. |
+| `BAD_ARGS` | Malformed body; a request that addresses no instance with ≥ 2 devices running; a body `instance` that disagrees with the topic's instance token; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, an unknown browse `ref`, or a push `sb/browse` `cursor` that is not one a previous page returned. |
 | `PAUSED` | `repoll` on a paused instance — resume first. |
 | `NO_SUCH_INSTANCE` | The addressed instance names no running device. |
 | `WRITE_NOT_ALLOWED` | Every `sb/write` entry was refused by the allow-list. |
@@ -94,8 +94,8 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 | `READ_FAILED` | A live `sb/read` (poll) failed at the link. |
 | `DEVICE_UNAVAILABLE` | The device task could not be reached (e.g. `repoll` mid-outage), or the request named no instance while none is running (a configuration change restarting every instance). |
 | `RECONNECT_FAILED` | `reconnect`'s single bounded attempt did not connect. |
-| `BROWSE_UNSUPPORTED` | The device has no CIP tag-list service (poll browse). |
-| `BROWSE_FAILED` | A mid-browse link failure. |
+| `BROWSE_UNSUPPORTED` | The device refuses the CIP tag-list service at the start of the walk, so it has no tag list to browse (poll browse). |
+| `BROWSE_FAILED` | A mid-browse link failure; a device that serves a first page and then refuses to resume from the cursor it issued; a poll `sb/browse` `cursor` that is not one a previous page returned; a device whose page repeats or reorders symbol instances; or a device whose paging does not terminate — a cursor that repeats or moves backwards, a cursor that is not a number, or a hierarchical walk that runs past 1024 pages. |
 
 ## Signal references
 
@@ -181,9 +181,11 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
 - **`sb/status`** → `{ id, mode, connected, state ("ONLINE"|"BACKOFF"|"PAUSED"|…), paused, endpoint,
   adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} },
   security: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
-  framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors }` — `sendErrors` counts O→T
-  datagrams that failed to send and `recvErrors` counts receive failures on the class-1 socket, each
-  as an `{interval, total}` pair like the other `io` counters.
+  framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors, refusedRedirects }` —
+  `sendErrors` counts O→T datagrams that failed to send, `recvErrors` counts receive failures on the
+  class-1 socket, and `refusedRedirects` counts connections whose device asked for its outputs at a
+  foreign address (the adapter refuses the address and keeps the device's own), each as an
+  `{interval, total}` pair like the other `io` counters.
 - **`security`** — the connection's security posture. A plaintext instance reports
   `{ mode: "plaintext" }`; a TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified,
   peer, clientCertNotAfter, clientCertSerial, clientCertExpiryDays,
@@ -212,9 +214,14 @@ rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emit
   id, address, pollGroup, pollIntervalMs, publishMode, writable, deadband }] }`. Push: `{ id,
   mode:"push", signals:[{ name, id, address, direction ("input"|"output"), publishMode, writable,
   deadband? }] }`.
-- **`sb/browse`** → poll: `{ id, tags:[{ name, type, configured, supported, arrayDim? }], cursor? }` —
-  page with the returned `cursor`. Push: `{ id, tags:[{ name, id, type, direction, configured:true,
-  supported:true }] }` (the configured layout, no round-trip).
+- **`sb/browse`** → poll: `{ id, tags:[{ name, type, configured, supported, arrayDim? }], cursor? }`.
+  Push: `{ id, tags:[{ name, id, type, direction, configured:true, supported:true }], cursor? }` (the
+  configured layout, no round-trip). Both modes page the same way: a request without a cursor starts at
+  the beginning of the inventory, `max` bounds the page, `cursor` appears only while entries remain, and
+  passing it back verbatim continues from where the page stopped — so a walk that follows cursors to
+  their absence sees every entry exactly once. The cursor
+  is opaque; a value the adapter did not issue is an error (`BROWSE_FAILED` on poll, `BAD_ARGS` on
+  push), not a restart from the beginning.
   **Hierarchical form:** a body with `ref` selects the tree mode over the same inventory —
   `{ instance?, ref, depth? (clamped 1..4), maxRefs? (clamped 1..1000) }` →
   `{ id, mode:"hierarchical", root:{ nodeId, name, nodeClass, dataType, refs:[{ referenceType:
@@ -249,6 +256,7 @@ Published through the library's `events()` facade: severity **derives** the chan
 | `evt/info/adapter-resumed` | Info | `sb/resume` moved the instance back to running. |
 | `evt/info/write-audit` | Info | An `sb/write` entry succeeded. `context` carries `{instance, signalId, ok, value}`. |
 | `evt/warning/write-audit` | Warning | An `sb/write` entry failed or was refused. `context` adds `error`. |
+| `evt/warning/io-redirect-refused` | Warning | A push instance's device answered the class-1 connection request by pointing the outbound (O→T) stream at a foreign address. The adapter refuses that address and keeps sending to the device's own, honouring only the port the device named. A device that requires the redirect does not receive the adapter's outputs, so check its socket configuration. Fired once per connection; `context` carries `{refusedRedirects}`. |
 | `evt/warning/tls-handshake-failed` | Warning | A TLS instance's handshake failed (bad certificate, no cipher overlap, protocol mismatch) — fired on the transition into failing. `context` carries `{instance, security:"tls"}`. |
 | `evt/warning/tls-peer-unverified` | Warning | A TLS instance connected with `verifyPeer:false` (the device certificate was not verified). |
 | `evt/info/cert-rotated` | Info | The adapter's client certificate or trust store rotated in the vault; the adapter reconnected to apply it. `context` carries `{instance, security:"tls", serial, notAfter}`. |

@@ -374,6 +374,9 @@ pub struct IoLinkStats {
     pub send_errors: u64,
     /// Socket-wide receive errors — `recvErrors` (§8.8).
     pub recv_errors: u64,
+    /// `refusedRedirects` (§8.8) — the ForwardOpen reply named a foreign O→T address; the address
+    /// was refused and only its port honoured. Outputs may not reach a device that required it.
+    pub refused_redirects: u64,
 }
 
 /// A live **push** (class-1 implicit I/O) session to one device. **This is the trait a push backend

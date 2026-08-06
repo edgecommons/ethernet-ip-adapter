@@ -104,7 +104,11 @@ cargo run -p ethernet-ip-adapter -- \
 ```
 
 Now the `line-speed`/`tank-level`/`zone-temps` samples come off the wire, decoded from real CIP replies.
-Try `sb/browse` — cpppo answers the tag-list service, so you get the device's tag inventory back.
+
+Reads and writes are all cpppo serves: it has no Logix tag-list service, so `sb/browse` against it
+answers with an error rather than an inventory. Tag discovery is a Logix-family capability, not
+something every CIP device offers — see [Browse a device's
+tags](how-to-guides.md#browse-a-devices-tags).
 
 ## 8. Consume a class-1 I/O (push) stream (OpENer)
 

@@ -126,7 +126,12 @@ impl DeviceRegistry {
         std::mem::take(&mut self.inner.write().unwrap().devices)
     }
 
-    /// An order-preserving snapshot of the routing views, for the command surface.
+    /// An order-preserving snapshot of **every** routing view — the whole ordered set.
+    ///
+    /// Per-request routing does not use this: [`Self::handle`] and [`Self::sole_handle`] clone at
+    /// most one [`DeviceHandle`] (each of which carries a full `DeviceConfig`), where this clones
+    /// them all. Reach for it only where the ordered set itself is the answer.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn handles(&self) -> Vec<DeviceHandle> {
         self.inner
             .read()
@@ -135,6 +140,35 @@ impl DeviceRegistry {
             .iter()
             .map(|rt| rt.handle.clone())
             .collect()
+    }
+
+    /// The routing view of ONE instance — a single-handle clone, so per-request routing does not
+    /// deep-clone the whole snapshot ([`crate::commands::Commander::resolve`]'s hot path).
+    ///
+    /// Takes the read lock once, scans in insertion order (single-digit instance counts), and clones
+    /// at most one handle; the lock is dropped before returning, so no verb holds it across an
+    /// `.await`.
+    pub fn handle(&self, id: &str) -> Option<DeviceHandle> {
+        self.inner
+            .read()
+            .unwrap()
+            .devices
+            .iter()
+            .find(|rt| rt.handle.cfg.id == id)
+            .map(|rt| rt.handle.clone())
+    }
+
+    /// The unaddressed-request routing outcome (D-EIP-13): the sole running instance, or why there
+    /// is not one — so the caller can answer `DEVICE_UNAVAILABLE` (nothing running) and `BAD_ARGS`
+    /// (several running) from the same single-lock scan, cloning at most one handle.
+    pub fn sole_handle(&self) -> SoleHandle {
+        let state = self.inner.read().unwrap();
+        let mut devices = state.devices.iter();
+        match (devices.next(), devices.next()) {
+            (Some(rt), None) => SoleHandle::One(rt.handle.clone()),
+            (Some(_), Some(_)) => SoleHandle::Many,
+            (None, _) => SoleHandle::None,
+        }
     }
 
     /// The live instance ids, in configuration order.
@@ -210,6 +244,25 @@ impl DeviceRegistry {
     pub fn is_empty(&self) -> bool {
         self.inner.read().unwrap().devices.is_empty()
     }
+}
+
+/// What [`DeviceRegistry::sole_handle`] found: the one running instance, none, or several.
+///
+/// The three outcomes are exactly the three answers the command surface owes an unaddressed request
+/// (D-EIP-13), which is why the distinction is made under the registry lock rather than by counting
+/// a cloned snapshot afterwards.
+// The `One` variant is a whole `DeviceHandle` (a `DeviceConfig` among other things), so the enum is
+// as large as one. Boxing it — clippy's suggestion — would put a heap allocation on the very path
+// this accessor exists to make cheaper, to save moving a few hundred bytes of an already-owned
+// handle exactly once per request. The value is constructed, matched, and unwrapped immediately.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum SoleHandle {
+    /// Exactly one instance is running — it answers the request.
+    One(DeviceHandle),
+    /// No instance is running (the stop stage of a configuration change that restarts everything).
+    None,
+    /// Several instances are running, so the request has to name one.
+    Many,
 }
 
 /// The stop report — pure accounting, asserted by the tests and logged by the supervisor.
@@ -674,6 +727,60 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert!(registry.is_empty());
         assert!(registry.take_all().is_empty(), "a second drain is a no-op");
+    }
+
+    /// The targeted routing accessors the command surface resolves through: `handle` clones exactly
+    /// the addressed instance (`None` for an id the registry does not run), and `sole_handle`
+    /// distinguishes the three unaddressed outcomes (D-EIP-13) — none running, exactly one, several
+    /// — from a single scan. Against `handles()` the same answers cost a clone of every running
+    /// instance's `DeviceConfig`.
+    #[test]
+    fn handle_and_sole_handle_return_single_clones() {
+        let registry = DeviceRegistry::default();
+
+        // Nothing running: no id resolves, and the unaddressed outcome is `None`.
+        assert!(registry.handle("plc-a").is_none());
+        assert!(matches!(registry.sole_handle(), SoleHandle::None));
+
+        let (rt, _rx_a) = inert_runtime(poll_device("plc-a"), json!({ "id": "plc-a" }));
+        let health_a = Arc::clone(&rt.handle.health);
+        registry.insert(rt);
+
+        // One running: the addressed lookup and the sole-instance default find the same instance,
+        // and the clone shares the live `Health` the device task writes (it is a handle clone, not a
+        // detached copy).
+        let addressed = registry.handle("plc-a").expect("plc-a is live");
+        assert_eq!(addressed.cfg.id, "plc-a");
+        assert!(Arc::ptr_eq(&addressed.health, &health_a));
+        match registry.sole_handle() {
+            SoleHandle::One(h) => {
+                assert_eq!(h.cfg.id, "plc-a");
+                assert!(Arc::ptr_eq(&h.health, &health_a));
+            }
+            _ => panic!("exactly one instance is running"),
+        }
+        // An id the registry does not run never falls back to "the only device".
+        assert!(registry.handle("ghost").is_none());
+
+        // Several running: the addressed lookup still resolves each one; the unaddressed outcome is
+        // `Many`, and insertion order does not make the first one a default.
+        let (rt, _rx_b) = inert_runtime(poll_device("plc-b"), json!({ "id": "plc-b" }));
+        registry.insert(rt);
+        assert_eq!(registry.handle("plc-a").map(|h| h.cfg.id.clone()).as_deref(), Some("plc-a"));
+        assert_eq!(registry.handle("plc-b").map(|h| h.cfg.id.clone()).as_deref(), Some("plc-b"));
+        assert!(matches!(registry.sole_handle(), SoleHandle::Many));
+
+        // Back to one: the survivor answers unaddressed requests again.
+        registry.remove("plc-a").expect("plc-a is live");
+        match registry.sole_handle() {
+            SoleHandle::One(h) => assert_eq!(h.cfg.id, "plc-b"),
+            _ => panic!("the survivor is the sole instance"),
+        }
+        assert!(registry.handle("plc-a").is_none(), "a stopped instance stops routing");
+
+        // Drained: `None` again.
+        registry.take_all();
+        assert!(matches!(registry.sole_handle(), SoleHandle::None));
     }
 
     /// The connectivity provider reads the SAME `Health` the device task writes, so flipping the
