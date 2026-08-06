@@ -180,9 +180,18 @@ publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/browse
        "cursor": "…" } }
 ```
 
-Pass the returned `cursor` back to page. The tag-list service is a Logix-family capability; a generic CIP
-device (e.g. a plain I/O adapter) answers `BROWSE_UNSUPPORTED`. On a **push** instance `sb/browse`
-returns the configured assembly layout (input + output fields) with no device round-trip.
+A request without a cursor starts at the beginning of the device's tag list. Pass the returned `cursor`
+back to page. `max` bounds each page and the `cursor` resumes exactly where that page stopped, so
+following cursors until the reply has none lists every tag once. Treat the cursor
+as opaque and send it back unchanged — a value the adapter did not issue is refused (`BROWSE_FAILED`)
+rather than silently starting the walk over. The tag-list service is a Logix-family capability; a
+generic CIP device (e.g. a plain I/O adapter) answers `BROWSE_UNSUPPORTED`. Some devices serve their
+whole tag list only from the start of the list and refuse a cursor that resumes mid-list; that page
+answers `BROWSE_FAILED` naming the refused resume, and the pages already returned stand.
+
+On a **push** instance `sb/browse` returns the configured assembly layout (input + output fields) with
+no device round-trip, paged by the same `cursor`/`max` contract — so one client loop walks either mode.
+A push cursor the adapter did not issue is `BAD_ARGS`.
 
 A body carrying `ref` selects the **hierarchical** form over the same inventory — the shape the
 edge-console tree browser drives. `ref: "root"` answers the device node with one `contains` ref per

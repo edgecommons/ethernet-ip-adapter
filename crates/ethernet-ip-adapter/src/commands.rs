@@ -42,7 +42,7 @@ use tokio::sync::oneshot;
 use crate::app::{BrowseError, DeviceControl, EventSink, Health, LinkState, WriteRequest};
 use crate::config::{DeviceConfig, DeviceMode, EipType, IoConfig, IoFieldSpec, SignalSpec};
 use crate::device::{BrowsePage, Quality, Reading};
-use crate::lifecycle::DeviceRegistry;
+use crate::lifecycle::{DeviceRegistry, SoleHandle};
 use crate::metrics::{CommandTally, DeviceMetrics};
 
 /// The per-device handles the command surface needs: the config (routing, allow-list, address view),
@@ -228,6 +228,14 @@ pub struct Commander {
 
 type Reply = std::result::Result<Option<Value>, CommandError>;
 
+/// The cap on how many pages the hierarchical browse follows before giving up (§7.5).
+///
+/// The hierarchical mode is the one browse form the adapter drives to completion, so a backend that
+/// keeps issuing fresh, strictly-advancing cursors would otherwise hold a command handler open
+/// forever. 1024 pages of up to 1000 records is far past any real controller's symbol table, so
+/// hitting it means the backend is misbehaving — answered as `BROWSE_FAILED`, not as a hang.
+const MAX_BROWSE_PAGES: usize = 1024;
+
 impl Commander {
     fn new(registry: Arc<DeviceRegistry>) -> Self {
         Self { registry }
@@ -242,30 +250,35 @@ impl Commander {
     ///
     /// The lookup reads the registry per request, so it follows the running configuration rather
     /// than a startup snapshot (D-EIP-28), and it hands back an owned handle so no registry lock is
-    /// held across the verb's `.await`s. That costs a clone of the routing snapshot — every running
-    /// device's handle, not just the addressed one — per request: the control plane is low-rate by
-    /// construction, and the alternative (a lock held across device I/O) would serialize the whole
-    /// surface behind one instance.
+    /// held across the verb's `.await`s — the alternative (a lock held across device I/O) would
+    /// serialize the whole surface behind one instance.
+    ///
+    /// It resolves through the registry's targeted accessors, so a request clones exactly the one
+    /// [`DeviceHandle`] that answers it (each carries a full `DeviceConfig`) instead of the whole
+    /// routing snapshot: [`DeviceRegistry::handle`] for an addressed instance,
+    /// [`DeviceRegistry::sole_handle`] for the unaddressed default, both a single locked scan.
     fn resolve(&self, addressed: Option<&str>) -> std::result::Result<DeviceHandle, CommandError> {
-        let mut running = self.registry.handles();
         match addressed {
-            Some(id) => running
-                .into_iter()
-                .find(|h| h.cfg.id == id)
+            Some(id) => self
+                .registry
+                .handle(id)
                 .ok_or_else(|| CommandError::new("NO_SUCH_INSTANCE", format!("no configured device `{id}`"))),
             // Exactly one running instance answers an unaddressed request.
-            None if running.len() == 1 => Ok(running.remove(0)),
-            // No instance is running: the registry is empty for the length of the stop stage of a
-            // configuration change that restarts every instance. Addressing one would only earn a
-            // `NO_SUCH_INSTANCE`, so say what is actually true instead of asking for an address.
-            None if running.is_empty() => Err(CommandError::new(
-                "DEVICE_UNAVAILABLE",
-                "no device is running; a configuration change is being applied",
-            )),
-            None => Err(CommandError::new(
-                "BAD_ARGS",
-                "the request must address an instance when multiple devices are configured",
-            )),
+            None => match self.registry.sole_handle() {
+                SoleHandle::One(h) => Ok(h),
+                // No instance is running: the registry is empty for the length of the stop stage of
+                // a configuration change that restarts every instance. Addressing one would only
+                // earn a `NO_SUCH_INSTANCE`, so say what is actually true instead of asking for an
+                // address.
+                SoleHandle::None => Err(CommandError::new(
+                    "DEVICE_UNAVAILABLE",
+                    "no device is running; a configuration change is being applied",
+                )),
+                SoleHandle::Many => Err(CommandError::new(
+                    "BAD_ARGS",
+                    "the request must address an instance when multiple devices are configured",
+                )),
+            },
         }
     }
 
@@ -672,8 +685,9 @@ impl Commander {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // sb/browse (§7.5) — poll = paged list_tags; push = the configured assembly layout. `ref`
-    // additionally selects the hierarchical `treeBrowser` panel mode over the same inventory.
+    // sb/browse (§7.5) — poll = paged list_tags; push = the configured assembly layout, paged the
+    // same way. `ref` additionally selects the hierarchical `treeBrowser` panel mode over the same
+    // inventory.
     // ---------------------------------------------------------------------------------------------
     async fn browse(&self, addressed: Option<&str>, body: &Value) -> Reply {
         let h = self.resolve(addressed)?;
@@ -715,7 +729,7 @@ impl Commander {
         let max = body.get("max").and_then(|v| v.as_u64()).unwrap_or(200).clamp(1, 1000) as usize;
 
         let result: std::result::Result<Value, CommandError> = if matches!(h.cfg.mode, DeviceMode::Push) {
-            Ok(browse_push_layout(&h))
+            browse_push_layout(&h, cursor.as_deref(), max)
         } else {
             let (tx, rx) = oneshot::channel();
             h.control
@@ -752,6 +766,14 @@ impl Commander {
     /// `depth` and `maxRefs` are clamped to 1..4 / 1..1000 (the same convention as the paged `max`);
     /// the tag inventory is flat, so a deeper `depth` finds no grandchildren — it is still validated
     /// and echoed.
+    ///
+    /// Poll mode collects the whole tag list by following the backend's cursors, so this is the one
+    /// browse form whose termination depends on the backend. Two guards make that termination the
+    /// adapter's own property rather than the device's: a cursor that does not advance past the one
+    /// already followed, and a walk that exceeds [`MAX_BROWSE_PAGES`], are both `BROWSE_FAILED`;
+    /// so is a cursor that is not a number, which no backend of this adapter issues. They are
+    /// defence in depth over the protocol crate's own ascending-order check — they also bound a
+    /// misbehaving non-CIP backend — and they turn "the handler never returns" into a typed error.
     async fn browse_hierarchical(&self, h: &DeviceHandle, body: &Value) -> Reply {
         let Some(ref_id) = body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()) else {
             return Err(CommandError::new("BAD_ARGS", "`ref` must be a non-empty string"));
@@ -782,7 +804,19 @@ impl Commander {
                     h.cfg.signals().map(|s| s.tag_path.clone()).collect();
                 let mut out = Vec::new();
                 let mut cursor: Option<String> = None;
+                // Anti-loop guards on a walk this adapter drives to completion (the paged form
+                // returns after one page; this one keeps asking until the device says it is done).
+                // `prev_start` is the last resume point followed, `pages` the request count.
+                let mut prev_start: u64 = 0;
+                let mut pages: usize = 0;
                 loop {
+                    pages += 1;
+                    if pages > MAX_BROWSE_PAGES {
+                        return Err(CommandError::new(
+                            "BROWSE_FAILED",
+                            "browse exceeded the page cap without completing",
+                        ));
+                    }
                     let (tx, rx) = oneshot::channel();
                     h.control
                         .send(DeviceControl::Browse { cursor: cursor.clone(), max: 1000, reply: tx })
@@ -805,9 +839,23 @@ impl Commander {
                         }
                         out.push((t.name.clone(), t.name.clone(), json!(t.type_name), extra));
                     }
-                    match page.next_cursor {
-                        Some(next) => cursor = Some(next),
-                        None => break,
+                    if let Some(next) = &page.next_cursor {
+                        let n: u64 = next.parse().map_err(|_| {
+                            CommandError::new(
+                                "BROWSE_FAILED",
+                                format!("device returned a non-numeric browse cursor `{next}`"),
+                            )
+                        })?;
+                        if n <= prev_start {
+                            return Err(CommandError::new(
+                                "BROWSE_FAILED",
+                                "browse cursor did not advance",
+                            ));
+                        }
+                        prev_start = n;
+                        cursor = Some(next.clone());
+                    } else {
+                        break;
                     }
                 }
                 out
@@ -1149,20 +1197,59 @@ fn browse_page_json(h: &DeviceHandle, page: BrowsePage) -> Value {
 }
 
 /// The `sb/browse` reply for a push instance (§7.5): the configured assembly layout (input + output
-/// fields), no device round-trip.
-fn browse_push_layout(h: &DeviceHandle) -> Value {
-    let mut tags = Vec::new();
+/// fields), no device round-trip — paged with the same `cursor`/`max` contract as the poll form, so
+/// one client loop walks either mode.
+///
+/// The cursor is the 0-based index into the flat field list (inputs in declaration order, then
+/// outputs). That list is the parsed configuration, so it is stable for the life of the generation
+/// and an index is a faithful resume point; a configuration change replaces the instance, which
+/// ends the walk with `NO_SUCH_INSTANCE` rather than serving a page from a different layout.
+/// The reply carries `cursor` only while entries remain, so a walk terminates on its absence.
+///
+/// # Errors
+/// `BAD_ARGS` when the cursor is not one this form issued — the command layer owns this cursor
+/// format (no device is consulted), so it can say so precisely instead of resuming from the top and
+/// silently re-serving the whole layout.
+fn browse_push_layout(
+    h: &DeviceHandle,
+    cursor: Option<&str>,
+    max: usize,
+) -> std::result::Result<Value, CommandError> {
+    let start = parse_push_browse_cursor(cursor)?;
+    let mut all = Vec::new();
     if let Some(io) = h.cfg.io.as_ref() {
         for f in &io.input.signals {
-            tags.push(layout_tag(f, io.assemblies.input, "input"));
+            all.push(layout_tag(f, io.assemblies.input, "input"));
         }
         if let Some(out) = io.output.as_ref() {
             for f in &out.signals {
-                tags.push(layout_tag(f, io.assemblies.output, "output"));
+                all.push(layout_tag(f, io.assemblies.output, "output"));
             }
         }
     }
-    json!({ "id": h.cfg.id, "tags": tags })
+    let total = all.len();
+    let tags: Vec<Value> = all.into_iter().skip(start).take(max.max(1)).collect();
+    let end = start.saturating_add(tags.len());
+    let mut out = json!({ "id": h.cfg.id, "tags": tags });
+    if end < total {
+        out["cursor"] = json!(end.to_string());
+    }
+    Ok(out)
+}
+
+/// The resume index for a push `sb/browse` page: no cursor ⇒ the start of the layout, else the
+/// decimal index a previous page returned. Anything else is a caller error — never a silent restart
+/// at 0, which would duplicate the whole layout in the middle of a walk.
+fn parse_push_browse_cursor(cursor: Option<&str>) -> std::result::Result<usize, CommandError> {
+    match cursor {
+        None => Ok(0),
+        Some(c) => c.trim().parse::<usize>().map_err(|_| {
+            CommandError::new(
+                "BAD_ARGS",
+                format!("invalid browse cursor `{c}` (expected the numeric cursor from the previous page)"),
+            )
+        }),
+    }
 }
 
 /// A hierarchical-browse inventory entry for one configured push I/O field (§7.5):
@@ -1297,8 +1384,20 @@ mod tests {
     #[derive(Clone)]
     enum BrowseKind {
         Tags(Vec<(&'static str, &'static str)>),
-        /// A page carrying an array-dim tag and a next-cursor (§7.5 paging).
+        /// A page carrying an array-dim tag and a next-cursor (§7.5 paging). The cursor is the
+        /// constant `"42"`, so a walk that follows it revisits the same page — a device that pages
+        /// in a circle.
         Paged,
+        /// A tag set served the way a real backend pages it: the cursor is the symbol instance to
+        /// resume from, a page carries at most `min(max, <device page size>)` records — the device
+        /// picks its own page size, which is why the hierarchical walk has to follow cursors at all
+        /// — and a truncated page resumes after its last record.
+        PagedSet(Vec<(&'static str, &'static str)>, usize),
+        /// A backend whose cursors advance forever — every page reports one more record and a
+        /// strictly larger cursor, so only the page cap ends the walk.
+        EndlessAdvancing,
+        /// A backend that hands back a cursor the adapter never issued (not a number).
+        NonNumericCursor,
         Unsupported,
         /// A mid-browse link failure ⇒ BROWSE_FAILED.
         Failed,
@@ -1399,12 +1498,66 @@ mod tests {
                     DeviceControl::Repoll { reply } => {
                         let _ = reply.send(if opts.repoll_ok { Ok(7) } else { Err("link error".into()) });
                     }
-                    DeviceControl::Browse { reply, .. } => match &opts.browse {
+                    DeviceControl::Browse { cursor, max, reply } => match &opts.browse {
                         BrowseKind::Unsupported => {
                             let _ = reply.send(Err(BrowseError::Unsupported));
                         }
                         BrowseKind::Failed => {
                             let _ = reply.send(Err(BrowseError::Failed("mid-browse link error".into())));
+                        }
+                        BrowseKind::PagedSet(all, page) => {
+                            // The §7.3 backend contract, mirrored: the cursor is the symbol instance
+                            // to resume from and no cursor means instance **0**, the bottom of the
+                            // instance space (`None` ⇒ 0), the page carries at most `min(max, page)`
+                            // records, and a truncated page's cursor follows its LAST RETURNED
+                            // record — so no record between the cut and the end of the device page
+                            // is skipped. This mock numbers its own symbols from 1, so a walk that
+                            // starts at 0 simply returns all of them.
+                            let start: u32 = match cursor.as_deref() {
+                                None => 0,
+                                Some(c) => c.trim().parse().unwrap_or_else(|_| {
+                                    panic!("the adapter must not send a non-numeric cursor: `{c}`")
+                                }),
+                            };
+                            let remaining: Vec<BrowsedTag> = all
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (n, ty))| BrowsedTag {
+                                    name: (*n).to_string(),
+                                    type_name: (*ty).to_string(),
+                                    array_dim: None,
+                                    instance_id: i as u32 + 1,
+                                })
+                                .filter(|t| t.instance_id >= start)
+                                .collect();
+                            let total = remaining.len();
+                            let limit = max.max(1).min(*page);
+                            let tags: Vec<BrowsedTag> = remaining.into_iter().take(limit).collect();
+                            let next = if tags.len() < total {
+                                tags.last().map(|t| (t.instance_id + 1).to_string())
+                            } else {
+                                None
+                            };
+                            let _ = reply.send(Ok(BrowsePage { tags, next_cursor: next }));
+                        }
+                        BrowseKind::EndlessAdvancing => {
+                            // Each page advances (so the non-advancing guard never fires) and never
+                            // ends: only the page cap can stop the walk.
+                            let start: u32 = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(1);
+                            let tags = vec![BrowsedTag {
+                                name: format!("TAG_{start}"),
+                                type_name: "DINT".to_string(),
+                                array_dim: None,
+                                instance_id: start,
+                            }];
+                            let _ = reply
+                                .send(Ok(BrowsePage { tags, next_cursor: Some((start + 1).to_string()) }));
+                        }
+                        BrowseKind::NonNumericCursor => {
+                            let _ = reply.send(Ok(BrowsePage {
+                                tags: Vec::new(),
+                                next_cursor: Some("not-a-number".into()),
+                            }));
                         }
                         BrowseKind::Paged => {
                             // An array tag + a next-cursor exercise the arrayDim + cursor reply keys.
@@ -1529,15 +1682,27 @@ mod tests {
     /// stopped is `NO_SUCH_INSTANCE`, and one it starts routes as soon as it is inserted. Against a
     /// `Commander` holding its own startup map, the second assertion cannot fail and the third
     /// cannot pass.
+    ///
+    /// The whole `resolve` matrix runs over the registry's targeted accessors, so every outcome —
+    /// addressed hit, addressed miss, and the three unaddressed ones — is asserted here through
+    /// them.
     #[tokio::test]
     async fn resolve_follows_the_live_registry() {
         let registry = registry_of(vec![bare_handle(poll_device()), bare_handle(second_device())]);
         let commander = Commander::new(Arc::clone(&registry));
         assert_eq!(ok(commander.status(Some("second"), &json!({})).await)["id"], json!("second"));
+        // Several running: an unaddressed request has to name one.
+        assert_eq!(err_code(commander.status(None, &json!({})).await), "BAD_ARGS");
 
         // The configuration no longer runs `second`.
         registry.remove("second").expect("second was running");
         assert_eq!(err_code(commander.status(Some("second"), &json!({})).await), "NO_SUCH_INSTANCE");
+        // …which makes the survivor the sole instance, so it answers unaddressed requests.
+        assert_eq!(ok(commander.status(None, &json!({})).await)["id"], json!("filler-plc"));
+
+        // Nothing running: the truthful answer, not a request to address an instance.
+        registry.take_all();
+        assert_eq!(err_code(commander.status(None, &json!({})).await), "DEVICE_UNAVAILABLE");
 
         // A configuration change starts it again — same registrations, routable immediately.
         registry.insert(runtime(bare_handle(second_device())));
@@ -1789,6 +1954,101 @@ mod tests {
         assert!(!out["tags"].as_array().unwrap().is_empty());
     }
 
+    /// The paged walk's contract (§7.5): `max` is honoured truthfully and the cursor resumes where
+    /// the page stopped, so a client that follows the cursors sees every tag **exactly once**.
+    /// Before F7 the first page came back with no cursor at all and the rest of the tag space was
+    /// unreachable.
+    #[tokio::test]
+    async fn browse_paged_walk_enumerates_every_tag_exactly_once() {
+        let all = vec![
+            ("LINE_SPEED", "REAL"),
+            ("FILL_SETPOINT", "REAL"),
+            ("RECIPE", "SSTRING"),
+            ("ZONE_TEMPS", "REAL"),
+            ("MOTOR_RUN", "BOOL"),
+        ];
+        // The device would serve all five in one page; `max` is what cuts them into three.
+        let h = harness(poll_device(), MockOpts { browse: BrowseKind::PagedSet(all.clone(), 100), ..MockOpts::default() });
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let body = match &cursor {
+                Some(c) => json!({ "cursor": c, "max": 2 }),
+                None => json!({ "max": 2 }),
+            };
+            let out = ok(h.commander.browse(None, &body).await);
+            pages += 1;
+            assert!(pages <= 10, "the walk must terminate");
+            let tags = out["tags"].as_array().unwrap();
+            assert!(tags.len() <= 2, "`max` is honoured truthfully: {}", tags.len());
+            for t in tags {
+                seen.push(t["name"].as_str().unwrap().to_string());
+            }
+            match out.get("cursor") {
+                Some(c) => cursor = Some(c.as_str().unwrap().to_string()),
+                None => break,
+            }
+        }
+
+        assert_eq!(pages, 3, "5 tags at max 2 = 3 pages");
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "no tag is served twice: {seen:?}");
+        assert_eq!(
+            unique,
+            {
+                let mut want: Vec<String> = all.iter().map(|(n, _)| (*n).to_string()).collect();
+                want.sort_unstable();
+                want
+            },
+            "and none is skipped"
+        );
+    }
+
+    /// A push instance pages its configured layout with the same `cursor`/`max` contract, and its
+    /// cursor is validated: the command layer owns this cursor format, so a corrupt one is
+    /// `BAD_ARGS` rather than a silent restart that would re-serve the whole layout mid-walk.
+    #[tokio::test]
+    async fn browse_push_layout_pages_the_configured_layout_and_validates_its_cursor() {
+        let h = harness(push_device(), MockOpts::default());
+
+        // The whole layout is one input + one output field; `max: 1` cuts it in two pages.
+        let first = ok(h.commander.browse(None, &json!({ "max": 1 })).await);
+        let first_tags = first["tags"].as_array().unwrap();
+        assert_eq!(first_tags.len(), 1);
+        assert_eq!(first_tags[0]["direction"], json!("input"));
+        assert_eq!(first["cursor"], json!("1"), "the resume index of the next field");
+
+        let second = ok(h.commander.browse(None, &json!({ "cursor": "1", "max": 1 })).await);
+        let second_tags = second["tags"].as_array().unwrap();
+        assert_eq!(second_tags.len(), 1);
+        assert_eq!(second_tags[0]["direction"], json!("output"));
+        assert!(second.get("cursor").is_none(), "the last page ends the walk");
+        assert_ne!(first_tags[0]["id"], second_tags[0]["id"], "each field once");
+
+        // An unpaged request still returns the whole layout with no cursor.
+        let whole = ok(h.commander.browse(None, &json!({})).await);
+        assert_eq!(whole["tags"].as_array().unwrap().len(), 2);
+        assert!(whole.get("cursor").is_none());
+
+        // A cursor past the end is an empty final page, not a wrap.
+        let past = ok(h.commander.browse(None, &json!({ "cursor": "9" })).await);
+        assert_eq!(past["tags"].as_array().unwrap().len(), 0);
+        assert!(past.get("cursor").is_none());
+
+        // A cursor this form never issued is refused.
+        let err = h
+            .commander
+            .browse(None, &json!({ "cursor": "banana" }))
+            .await
+            .expect_err("a corrupt cursor is refused");
+        assert_eq!(err.code, "BAD_ARGS");
+        assert!(err.message.contains("invalid browse cursor"), "{}", err.message);
+    }
+
     // --- sb/browse hierarchical (the treeBrowser panel mode) --------------------------------------
 
     #[tokio::test]
@@ -1830,6 +2090,66 @@ mod tests {
         assert_eq!(refs[0]["target"]["direction"], json!("input"));
         let out = ok(hp.commander.browse(None, &json!({ "ref": "a150/0/real" })).await);
         assert_eq!(out["root"]["nodeClass"], json!("signal"));
+    }
+
+    /// The hierarchical walk is the one browse form the adapter drives to completion, so its
+    /// termination must not depend on the backend. A device that pages in a circle (this mock
+    /// answers the same cursor forever) is `BROWSE_FAILED`, not a handler that never returns —
+    /// which is exactly what this test would do before the guard landed.
+    #[tokio::test]
+    async fn browse_hierarchical_refuses_a_cursor_that_does_not_advance() {
+        let h = harness(poll_device(), MockOpts { browse: BrowseKind::Paged, ..MockOpts::default() });
+        let err = h
+            .commander
+            .browse(None, &json!({ "ref": "root" }))
+            .await
+            .expect_err("a repeating cursor cannot complete a walk");
+        assert_eq!(err.code, "BROWSE_FAILED");
+        assert!(err.message.contains("did not advance"), "{}", err.message);
+    }
+
+    /// A backend cursor that is not one this adapter's backends issue is refused rather than fed
+    /// back to the device.
+    #[tokio::test]
+    async fn browse_hierarchical_refuses_a_non_numeric_device_cursor() {
+        let h = harness(poll_device(), MockOpts { browse: BrowseKind::NonNumericCursor, ..MockOpts::default() });
+        let err = h
+            .commander
+            .browse(None, &json!({ "ref": "root" }))
+            .await
+            .expect_err("a non-numeric backend cursor is refused");
+        assert_eq!(err.code, "BROWSE_FAILED");
+        assert!(err.message.contains("non-numeric browse cursor"), "{}", err.message);
+    }
+
+    /// The second guard, for a backend whose cursors advance honestly but never end: the walk stops
+    /// at [`MAX_BROWSE_PAGES`] with a typed error instead of running forever.
+    #[tokio::test]
+    async fn browse_hierarchical_stops_at_the_page_cap() {
+        let h = harness(poll_device(), MockOpts { browse: BrowseKind::EndlessAdvancing, ..MockOpts::default() });
+        let err = h
+            .commander
+            .browse(None, &json!({ "ref": "root" }))
+            .await
+            .expect_err("an endless walk is capped");
+        assert_eq!(err.code, "BROWSE_FAILED");
+        assert!(err.message.contains("page cap"), "{}", err.message);
+    }
+
+    /// A backend that pages legitimately is walked to completion by the hierarchical mode: every
+    /// page's records join the one inventory, and the walk ends when the backend stops issuing
+    /// cursors.
+    #[tokio::test]
+    async fn browse_hierarchical_follows_legitimate_cursors_to_completion() {
+        let all = vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING"), ("ZONE_TEMPS", "REAL")];
+        // The device pages two at a time, so the hierarchical walk must follow a cursor to see all
+        // three — the `max: 1000` this mode asks for does not stop the device from paging.
+        let h = harness(poll_device(), MockOpts { browse: BrowseKind::PagedSet(all, 2), ..MockOpts::default() });
+        let out = ok(h.commander.browse(None, &json!({ "ref": "root" })).await);
+        let refs = out["root"]["refs"].as_array().unwrap();
+        assert_eq!(refs.len(), 3, "every page's records reached the inventory");
+        assert_eq!(out["refCount"], json!(3));
+        assert_eq!(out["truncated"], json!(false));
     }
 
     #[tokio::test]

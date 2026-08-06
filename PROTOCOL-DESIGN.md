@@ -144,6 +144,7 @@ throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.
 | **D-ENIP-16** | **ForwardOpen success replies are verified before use** — originator echo quad equality (T→O connection id, connection serial, vendor id, originator serial) plus, for class-1, an API range of [100 µs, 600 s]; failure ⇒ best-effort ForwardClose + typed error. | An unvalidated reply API of 0 previously livelocked the produce scheduler; an unverified echo can bind a connection to the wrong identity. The target-assigned O→T id is excluded because the request sends 0 and the choice is the target's. |
 | **D-ENIP-17** | **A ForwardOpen reply cannot steer our class-1 traffic.** (a) The O→T Sockaddr Info item retargets the **port only**: the transmit address is always the target's own. A sockaddr naming `0.0.0.0` contributes its port; one naming the target's address is honoured as written; one naming any other address — foreign unicast, broadcast, multicast, loopback — has its address **refused** (warned, naming the address) and only its port kept. With no known target address a redirect is unresolvable and the open fails. (b) The T→O multicast group is joined **only** when the ForwardOpen requested `ConnType::Multicast` for T→O; a multicast T→O sockaddr answering any other request is a `ProtocolViolation` whose detail names the type that was requested (`"multicast T→O sockaddr on a point-to-point request"`, `"multicast T→O sockaddr on a null (reconfigure) request"`) — the adapter only ever requests P2P, but the crate API accepts either, and a violation must not misreport which one it refused. A requested-multicast connection whose reply carries a unicast or absent T→O sockaddr consumes unicast. Both paths keep the D-ENIP-16 teardown invariant (best-effort ForwardClose before the typed error). Strict by default, with no opt-out knob. | Honouring a concrete foreign address let any target aim our cyclic O→T stream at a third party — a reflection/amplification primitive driven entirely by an attacker-controlled reply — and a multicast offer subscribed our socket to an arbitrary group on a connection we asked to keep point-to-point. The address is the one field the originator already knows (it opened the TCP session); the port is the only field a target legitimately needs to move, which is why the split is address-refuse/port-honour rather than reject-the-reply — real targets that relocate the port keep working. No config knob ships: a strict default needs none, and if field interop ever demands honouring a foreign redirect, that is a `ClientOptions` opt-in to be argued on evidence, not a hedge built in advance. **The refusal is observable, not just logged:** it increments `refused_redirects` on the connection (`enip::IoStats`, 0 or 1 per connection), and the adapter surfaces it as the `refusedRedirects` measure (DESIGN §8.8) plus a one-shot `io-redirect-refused` warning event per ForwardOpen. That closes the one narrow silent failure mode the address-refusal leaves: a device that both *requires* the redirect to receive O→T **and** never enforces its own O→T inactivity watchdog keeps producing inputs while its outputs are dead, and the local `send_to` still succeeds — so `sendErrors` cannot catch it and the adapter would otherwise report the link healthy. |
 | **D-ENIP-18** | **The class-3 inactivity keepalive is crate-owned and window-derived, with no adapter knob.** A class-3 ForwardOpen arms an inactivity watchdog on the target (`timeout_multiplier × O→T API`), so the crate keeps the connection off it: when no request has flowed for **¾ of the window** the session sends a connected `Get_Attribute_Single` of the Identity object (`0x01`, instance 1, attribute 4 = Revision). The window comes from the negotiated values — the reply's actual O→T API when it lies in [100 µs, 600 s], else the clamped requested RPI — and the requested pair is `ClientOptions.class3_rpi` / `class3_timeout_multiplier` (defaults 2 s / ×16, the values the crate previously hard-coded, so a caller that changes nothing emits a byte-identical ForwardOpen). An implausible reply API falls back; it never fails the open (§7.6). Any completed exchange, CIP-error replies included, counts as activity; `ClientStats.keepalives_sent` is the observable face. **No adapter config-schema key is added.** | Feeding the connection's own watchdog is a protocol obligation of the connection's owner, and the owner is this crate — an adapter that has to remember to poll fast enough is a defect waiting for the first paused instance or slow poll group (the adapter's only idle traffic is a `ListIdentity` encapsulation command, which never rides the connected path and so cannot feed the watchdog at any cadence). Deriving the window from the negotiated values rather than a constant means a target that shortens the interval is honoured instead of outlived. The values become options because they are what arms the watchdog and a field device may need them moved; they stay out of the adapter's schema because nothing about a correct default needs operator attention, and the adapter's `keepaliveProbeIntervalMs` is a different surface entirely (paused-state health reporting) that stays as it is. |
+| **D-ENIP-19** | **Tag-enumeration cursors are full 32-bit symbol-instance ids, never masked, and the walk is bounded by the crate.** `list_tags(start_instance: u32, ..) -> (Vec<SymbolInfo>, Option<u32>)` carries the cursor at the same width as `SymbolInfo.instance_id`, and `Segment::Instance` widens to the 32-bit logical form (`0x26`, §6.2) so the request can address it. Three crate-side rules bound the walk regardless of the peer: the records of one page must be **strictly ascending** in instance id or the page is `ProtocolViolation { detail: "tag list page is not in ascending instance order" }`; a `0x06` page whose derived resume point does not advance past `start_instance` is `ProtocolViolation { detail: "tag list page did not advance" }`; and a last record at `u32::MAX` ends the enumeration rather than wrapping (§7.3). | The 16-bit cursor was not a capacity limit but a **liveness** bug: real Logix controllers exceed 65 535 symbol instances, and masking the resume point back into 16 bits sent a caller that pages to completion around the same pages forever — the adapter's hierarchical browse did exactly that, so the observable failure was a command handler that never returned. Widening alone would have left the loop reachable from a merely non-compliant peer, so the ordering the reply already promises is checked instead of trusted — **both** of the things that ordering buys, not just one: the *resume point* must move forward (or the walk revisits pages, the hang), and the page's *own records* must ascend (or every resume point derived from the last one — this crate's `last_id + 1` and any page size a caller cuts to on top of it — silently strands whatever sat behind it, the exact defect the truthful-`max` contract exists to kill, DESIGN D-EIP-29). Each costs one comparison per record and converts a hang or a silent skip into a typed error at the layer that can name the cause. The `0x26` form is the ODVA-defined third width of the same logical segment (the `Element` segment already emitted its `0x2A` analogue), so nothing new is invented on the wire — and because no container sim serves instances that high, it is pinned by hand-assembled golden vectors (§12.4) and cross-checked live against EthernetIPSharp, which parses the segment and answers at the CIP layer (DESIGN §11.7). |
 
 ---
 
@@ -403,6 +404,7 @@ extended-status list is kept in full (`SmallVec<u16>`); the first word is the pr
 | Class, 16-bit | `0x21` | `0x21, 0x00(pad), u16le` |
 | Instance, 8-bit | `0x24` | `0x24, u8` |
 | Instance, 16-bit | `0x25` | `0x25, 0x00, u16le` |
+| Instance, 32-bit | `0x26` | `0x26, 0x00, u32le` (browse cursors above `0xFFFF` — §7.3) |
 | Attribute, 8-bit | `0x30` | `0x30, u8` |
 | Attribute, 16-bit | `0x31` | `0x31, 0x00, u16le` |
 | Member/element, 8-bit | `0x28` | `0x28, u8` |
@@ -509,9 +511,11 @@ separate modules (`logix.rs` vs `cm.rs`) so the constants never cross.
 
 ### 7.3 Tag enumeration — Get Instance Attribute List (0x55)
 
-Request: EPATH `[0x20 0x6B (Symbol class), 0x25 start_instance]`, data
-`u16 attr_count = 2, u16 attr 1 (name), u16 attr 2 (type)`. Program-scoped enumeration prefixes
-the program's symbolic segment (`0x91 "Program:MainProgram"`) before the class path.
+Request: EPATH `[0x20 0x6B (Symbol class), <instance segment> start_instance]`, data
+`u16 attr_count = 2, u16 attr 1 (name), u16 attr 2 (type)`. The instance segment is the smallest
+form that addresses the cursor — `0x24` / `0x25` / `0x26` by magnitude (§6.2). Program-scoped
+enumeration prefixes the program's symbolic segment (`0x91 "Program:MainProgram"`) before the class
+path.
 
 Reply data = repeating, cursor-decoded records:
 
@@ -521,10 +525,46 @@ u16 name_length      name_length bytes (checked UTF-8; ≤ remaining)
 u16 symbol_type      (§7.4 word)
 ```
 
-Status `0x06` ⇒ more instances exist: re-issue with `start_instance = last_id + 1`. The crate
-exposes one **page** per call (`list_tags(start_instance) → (Vec<SymbolInfo>, Option<next>)`) —
-paging policy (page size to the console, cursors) stays in the adapter. A record that fails to
+Status `0x06` ⇒ more instances exist: re-issue with `start_instance = last_id + 1`. A full enumeration
+begins at `start_instance = 0`, the bottom of the instance space: instance ids are the device's to
+assign, so starting anywhere above 0 skips whatever sits below the chosen start (and some servers —
+EthernetIPSharp among them — serve the enumeration *only* from the class-level start instance 0). The
+crate exposes one **page** per call —
+
+```rust
+list_tags(start_instance: u32, scope: &Scope) -> Result<(Vec<SymbolInfo>, Option<u32>)>
+```
+
+— and paging policy (page size to the console, cursors) stays in the adapter. A record that fails to
 decode fails the page (`Malformed`), never a partial silent success.
+
+**The cursor is a full `u32` and is never masked.** It is the same width as `SymbolInfo.instance_id`,
+because a Logix controller routinely serves symbol instances above `0xFFFF`; narrowing the resume
+point to 16 bits would send the walk back into pages it already served, forever. Addressing those
+instances is what the 32-bit logical instance segment (`0x26`) exists for.
+
+Three rules bound the walk on the crate side, so a caller that pages to completion sees every symbol
+exactly once and terminates whatever the peer does:
+
+* **Ordering guard.** The records of one page must be **strictly ascending** in instance id, checked
+  in one pass over the decoded page before any cursor is derived from it. Every resume point is taken
+  from the page's *last* record — `last_id + 1` here, and whatever a caller derives after cutting the
+  page to its own page size — which is only a safe summary of the page if nothing behind that record
+  was left unserved. A page `[10, 2, 3]` cut to one record returns instance 10 and resumes at 11:
+  instances 2 and 3 are skipped silently and forever. A repeated instance id strands a record the
+  same way. Neither is legal `0x55` output, so both are
+  `ProtocolViolation { detail: "tag list page is not in ascending instance order" }` rather than data
+  loss at the caller.
+* **Advance guard.** A compliant `0x55` reply pages in ascending instance order, so a `0x06` page
+  whose derived resume point (`last_id + 1`) does not advance past `start_instance` could only
+  revisit itself. That is a broken or hostile peer, and it is
+  `ProtocolViolation { detail: "tag list page did not advance" }` — not a loop the caller has to
+  detect. (An empty `0x06` page has no resume point at all and simply ends the enumeration.)
+* **End of the instance space.** A last record at `u32::MAX` has no representable resume point, so
+  the next cursor is `None` and the enumeration ends rather than wrapping to the start.
+
+All three are decode-side rules over already-decoded values; none is a timer input, so a hostile
+field costs a browse walk and nothing else.
 
 ### 7.4 The symbol-type word
 
@@ -957,7 +997,8 @@ let tag = TagAddress::parse("ZONE_TEMPS")?;
 let v: TagReadResult = client.read_tag(&tag, /*elements*/ 8).await?;
 //    TagReadResult { value: CipValue, wire_type: CipType, fragmented: bool }
 client.write_tag(&tag2, CipType::Real, &CipValue::Real(55.5)).await?;      // Ok = CIP-acked
-let (symbols, next) = client.list_tags(start_instance, Scope::Controller).await?;
+let (symbols, next): (Vec<SymbolInfo>, Option<u32>) =
+    client.list_tags(/*start_instance*/ 0u32, &Scope::Controller).await?;   // §7.3 u32 cursor
 let raw = client.get_attribute_single(0x01, 1, 7).await?;                  // generic CIP
 let ident = client.identity().await?;                                      // ListIdentity over the session
 client.close().await;
@@ -1042,6 +1083,14 @@ gone) and through its real sender/receiver pair (the counted overflow, `Lost` su
 terminal-after-drain, wakeup and cancel-safety), with the manager's `select!` glue driven end to end
 over a loopback UDP pair.
 
+**Tag-enumeration paging** (§7.3, D-ENIP-19) rides the same fixtures (`tests/tag_paging.rs`): a
+scripted `0x55` reply whose record sits above `0xFFFF` yields a cursor above `0xFFFF` and the request
+that carried it is asserted byte-exact as the 32-bit instance segment (`20 6B 26 00 00 00 01 00`);
+a `0x06` page that resumes before where it started is the typed `ProtocolViolation`; an out-of-order
+page (`[10, 2, 3]`, whose last record still derives an advancing cursor) and a page repeating an
+instance id are the typed ordering `ProtocolViolation`, the second on a *final* page so the guard is
+shown not to be gated on `0x06`; and a last record at `u32::MAX` ends the enumeration.
+
 ### 12.3 Fuzzing (the safety claim, made executable)
 
 `crates/enip/fuzz/` (cargo-fuzz/libFuzzer, run on Linux/WSL/CI) with one target per hostile
@@ -1078,7 +1127,13 @@ bytes; decode produces exactly the struct). Sources, in order of authority:
    both directions, ForwardClose.
 3. **Hand-assembled from the ODVA layouts** in §5–§8 for paths with no live producer (extended
    status forms, LargeForwardOpen, sockaddr items, encap error statuses) — cross-checked against
-   both reference implementations' encoders during authoring (study, not import).
+   both reference implementations' encoders during authoring (study, not import). This is also
+   where the **32-bit logical instance segment** (§6.2) is pinned, because no bench peer serves more
+   than 65 535 symbol instances: `epath_instance_32bit` (`26 00 00 00 01 00`, the bare segment via
+   `EPath::encode`) and `get_instance_attribute_list_request_32bit_instance`
+   (`55 04 20 6B 26 00 00 00 01 00 02 00 01 00 02 00`, the whole §7.3 browse request at
+   `start_instance = 0x0001_0000`). Both are assembled byte by byte from the segment-type-byte
+   layout rather than generated from this crate's encoder, which would make them circular.
 
 The vector suite is the regression net that lets us refactor codecs fearlessly; a vector may only
 change with a spec citation in the commit.

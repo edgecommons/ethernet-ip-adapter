@@ -351,11 +351,29 @@ impl EipClient {
     /// Enumerate one page of tags (§7.3): Get Instance Attribute List (`0x55`) starting at
     /// `start_instance`. Returns the page's [`SymbolInfo`] records and, when the reply signalled more
     /// (`0x06`), the next start instance (`last_id + 1`). Paging policy stays with the caller.
+    ///
+    /// The cursor is a full **`u32`** symbol-instance id — the same width as
+    /// [`SymbolInfo::instance_id`] — and is never masked: a Logix controller routinely serves symbol
+    /// instances above `0xFFFF`, and the request path widens to the 32-bit logical instance segment
+    /// (`0x26`, §6.2) to address them.
+    ///
+    /// Three crate-side rules bound the walk:
+    /// * **Ordering guard** — the records of one page must be **strictly ascending** in instance id.
+    ///   The resume point follows the page's *last* record, so a page that is out of order, or that
+    ///   repeats an id, lets a caller which cuts the page to its own page size resume past records it
+    ///   never returned — skipping them silently and forever. That is
+    ///   [`EnipError::ProtocolViolation`], checked in one pass over the decoded page.
+    /// * **Advance guard** — a compliant `0x55` reply pages in ascending instance order, so a page
+    ///   whose derived resume point does not advance past `start_instance` could only revisit itself.
+    ///   That is a broken or hostile peer, and is [`EnipError::ProtocolViolation`] rather than an
+    ///   infinite loop in the caller.
+    /// * **End of the instance space** — a last record of `u32::MAX` yields `None` (the enumeration
+    ///   ends) instead of wrapping back to the start.
     pub async fn list_tags(
         &self,
-        start_instance: u16,
+        start_instance: u32,
         scope: &Scope,
-    ) -> Result<(Vec<SymbolInfo>, Option<u16>)> {
+    ) -> Result<(Vec<SymbolInfo>, Option<u32>)> {
         let mut path = match scope {
             Scope::Controller => EPath::new(),
             Scope::Program(name) => EPath::new().symbol(format!("Program:{name}")),
@@ -377,12 +395,39 @@ impl EipClient {
 
         let records = parse_tag_list(&reply.data)?;
 
+        // Ordering guard: one O(n) strictly-ascending pass over the page, before any cursor is
+        // derived from it. Every resume point — this crate's `last_id + 1` and any page size the
+        // caller applies on top of it — is taken from the LAST record, which is only a safe summary
+        // of the page if nothing behind that record was left unserved. A page like `[10, 2, 3]` cut
+        // to one record returns instance 10 and resumes at 11: 2 and 3 are skipped silently and
+        // forever. A repeated id skips the same way. Neither is legal `0x55` output, so both are
+        // typed violations here rather than data loss at the caller.
+        let mut previous: Option<u32> = None;
+        for record in &records {
+            if previous.is_some_and(|prev| record.instance_id <= prev) {
+                return Err(EnipError::ProtocolViolation {
+                    detail: "tag list page is not in ascending instance order",
+                });
+            }
+            previous = Some(record.instance_id);
+        }
+
         let next = if more {
-            records
+            let n = records
                 .last()
                 .map(|s| s.instance_id)
-                .and_then(|id| u16::try_from(id & 0xFFFF).ok())
-                .and_then(|id| id.checked_add(1))
+                .and_then(|id| id.checked_add(1));
+            // Anti-loop guard: a compliant 0x55 reply pages in ascending instance order. A page whose
+            // derived resume point does not advance past where it started can only revisit itself —
+            // a broken or hostile peer, never a timer/paging input.
+            if n.is_some_and(|n| n <= start_instance) {
+                return Err(EnipError::ProtocolViolation {
+                    detail: "tag list page did not advance",
+                });
+            }
+            // `None` (last id == u32::MAX, or an empty `0x06` page) ⇒ the enumeration ends rather
+            // than wrapping.
+            n
         } else {
             None
         };

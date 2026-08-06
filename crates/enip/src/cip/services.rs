@@ -30,7 +30,7 @@ impl EipClient {
     ) -> Result<Bytes> {
         let path = EPath::new()
             .class(class)
-            .instance(instance)
+            .instance(u32::from(instance))
             .attribute(attribute);
         let mr = MessageRequest::new(SERVICE_GET_ATTRIBUTE_SINGLE, path, Bytes::new());
         let reply = self.send_cip(mr, "get_attribute_single").await?;
@@ -52,7 +52,7 @@ impl EipClient {
     ) -> Result<()> {
         let path = EPath::new()
             .class(class)
-            .instance(instance)
+            .instance(u32::from(instance))
             .attribute(attribute);
         let mr = MessageRequest::new(SERVICE_SET_ATTRIBUTE_SINGLE, path, data);
         let reply = self.send_cip(mr, "set_attribute_single").await?;
@@ -67,7 +67,7 @@ impl EipClient {
     /// `Get_Attribute_All` (§7.5) against `(class, instance)` — returns the concatenated attribute
     /// block for the caller to slice per the object definition.
     pub async fn get_attribute_all(&self, class: u16, instance: u16) -> Result<Bytes> {
-        let path = EPath::new().class(class).instance(instance);
+        let path = EPath::new().class(class).instance(u32::from(instance));
         let mr = MessageRequest::new(SERVICE_GET_ATTRIBUTE_ALL, path, Bytes::new());
         let reply = self.send_cip(mr, "get_attribute_all").await?;
         reply.expect_service(SERVICE_GET_ATTRIBUTE_ALL)?;

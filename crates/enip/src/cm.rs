@@ -89,7 +89,7 @@ pub fn connection_manager_path() -> EPath {
 pub fn io_connection_path(config: Option<u16>, output: u16, input: u16) -> EPath {
     let mut p = EPath::new().class(0x04);
     if let Some(config) = config {
-        p = p.instance(config);
+        p = p.instance(u32::from(config));
     }
     p.connection_point(output).connection_point(input)
 }
