@@ -1,5 +1,10 @@
 name: ci
 
+# paths-ignore keeps docs-only work out of CI. Two consequences worth knowing before you conclude
+# a branch is broken: a push carrying no file changes at all (an --allow-empty commit) matches
+# nothing outside the ignore list and so runs nothing, and a manual workflow_dispatch bypasses the
+# filter entirely but reports live-sims and fuzz-smoke as skipped, because both are pull_request-only.
+# The live-peer gate can therefore only be exercised by a pull request.
 on:
   push:
     paths-ignore: ['**.md', 'docs/**']
