@@ -134,7 +134,7 @@ performed, by this work).
 | **D-EIP-3** | **`sb/pause` / `sb/resume` are a deliberate southbound-contract EXTENSION.** | Neither reference adapter has them; `SOUTHBOUND.md` §2.2 does not list them. They are designed fully here (§7.4, §9) and are a **candidate for promotion into core `SOUTHBOUND.md`** as a poll-adapter convention — but this work does NOT edit core. Surfaced up front per the fidelity contract. *Resolved: `SOUTHBOUND.md` §2.2 (core 0.4.0) now ships `sb/pause`/`sb/resume`/`reconnect`/`repoll` as the standard instance-control family — see D-EIP-25.* |
 | **D-EIP-4** | **Naming: repo/crate/bin `ethernet-ip-adapter`; component `com.mbreissi.edgecommons.EthernetIpAdapter`; UNS component token `ethernet-ip-adapter` (via the config `component.token` override); `device.adapter` = `"ethernet-ip"`.** | Matches the sibling kebab convention (`modbus-adapter`, `opcua-adapter`). The CLI mangled the crate name to `ethernetipadapter` with no override (CLI-DOGFOODING #1/#2); the current tree still carries that name in `Cargo.toml`/`Dockerfile`/`recipe.yaml`/`compose.yaml`/`supervisor/` — renaming them all is implementation slice S1. `component.token` is a shipped core feature (`config/identity.rs`: `configured_component_token` overrides the PascalCase short name), so the UNS token is `ethernet-ip-adapter` without renaming the Greengrass component. |
 | **D-EIP-5** | **Writes are allow-listed and secure-by-default: empty `writes.allow[]` ⇒ ALL writes refused, matched on the stable `signal.id`.** | Keeps the template's gate verbatim (checked in the command handler before the write reaches the device task) and the D-U16 convention. Deliberately *not* Modbus's legacy boolean `write.enabled` — the allow-list is the target contract (`SOUTHBOUND.md` §2.2) and strictly stronger. |
-| **D-EIP-6** | **Two live simulators, both EXTERNAL containers, one per mode: cpppo (AB tag server, :44818) for POLL; an OpENer target container for PUSH.** No embedded/in-crate test server anywhere (user decision). The in-process sim backend stays and is extended to model both. | Unit tests reach 90% with no PLC and no network — the protocol crate's session/connection logic is driven over in-memory `tokio::io::duplex` byte-stream fixtures (PROTOCOL-DESIGN D-ENIP-14) and the adapter backend over the sim backend / a mock `DeviceSession`; E2E and sim-gated integration tests talk to the real wire (§11). cpppo cannot serve class-1 implicit I/O, so push needs a real target: OpENer is the independent-implementation conformance peer (§11.5). Push integration gates on the external OpENer container exactly as poll gates on cpppo — there is no our-code-to-our-code CI fallback. Coverage: the pure logic (protocol codec/state machines + adapter gating) is unit-testable and inside the 90% gate; the live-infra loop drivers (the `data()`/socket-driving seams) are refactored into thin excluded files, validated by these live suites + the S9 deployed regression (§12.2). |
+| **D-EIP-6** | **Two live simulators, both EXTERNAL containers, one per mode: cpppo (AB tag server, :44818) for POLL; an OpENer target container for PUSH.** No embedded/in-crate test server anywhere (user decision). The in-process sim backend stays and is extended to model both. | Unit tests reach 90% with no PLC and no network — the protocol crate's session/connection logic is driven over in-memory `tokio::io::duplex` byte-stream fixtures (PROTOCOL-DESIGN D-ENIP-14) and the adapter backend over the sim backend / a mock `DeviceSession`; E2E and sim-gated integration tests talk to the real wire (§11). cpppo cannot serve class-1 implicit I/O, so push needs a real target: OpENer is the independent-implementation conformance peer (§11.5). Push integration gates on the external OpENer container exactly as poll gates on cpppo — there is no our-code-to-our-code CI fallback. Coverage: no product file is excluded from the 90% gate — the loop drivers take their live dependencies through injected seams (`Publisher`, `DeviceBackend`/`DeviceSession`/`PushSession`, `EventSink`) and the EtherNet/IP backend through a loopback peer, so they are unit-tested too; these live suites are the independent-implementation conformance evidence, which is a separate question from coverage (§12.2). |
 | **D-EIP-7** | **Signals are declared explicitly in config poll groups; `sb/browse` is on-demand discovery, not subscription matching.** | Modbus-style declaration (no regex include/exclude like OPC UA — that model belongs to a subscription protocol). `sb/browse` uses the Logix tag-list service (Get Instance Attribute List, `EipClient::list_tags`) so a console can discover tags; generic CIP devices may not implement it ⇒ `BROWSE_UNSUPPORTED` (§7.3, §14.4). *The paging contract that discovery rides — cursor validation, truthful `max`, and the walk's termination guards — is D-EIP-29.* |
 | **D-EIP-8** | **Poll mode: `connection.connected: false` is the default (unconnected explicit messaging); `true` opens a class-3 CIP connected session (ForwardOpen).** | Unconnected is the simplest path and what cpppo serves. Connected class-3 (PROTOCOL-DESIGN §7.6) allocates a connection for higher-rate polling against real PLCs — supported, config-selected, validated in the lab (not against cpppo). Push mode always uses its own class-1 ForwardOpen and ignores this key. |
 | **D-EIP-9** | **`signal.id` = the configured `tagPath`, verbatim (case-sensitive).** | One instance = one device, so the tag path is unique within the instance and stable across restarts — no synthetic prefix needed (`u<unit>/…` exists in Modbus because unit id is real addressing there; slot is connection routing, not identity, so it stays out of the id and inside `signal.address`). The UNS topic channel comes from the config `name` (lower-kebab), NOT from the id — §5.3/§6.1. |
@@ -177,24 +177,51 @@ crates/
                             specified there; it ships no in-crate test server)
   ethernet-ip-adapter/      the adapter binary crate:
     src/
-      main.rs        entry point (kept; binary renamed ethernet-ip-adapter, S1)
-      app.rs         supervisor (kept + extended): per-device task spawn (poll OR push engine
-                     per instance mode), connectivity provider, command wiring, pause plumbing,
-                     health emit cadence
+      main.rs        entry point: build the EdgeCommons runtime from the CLI contract, hand off
+                     to supervisor::App
+      supervisor.rs  runtime CONSTRUCTION glue: App (config parse, registry, cancellation root,
+                     coordinator install, connectivity + sb/* surfaces), RuntimeLauncher (the
+                     production DeviceLauncher: facades, metric identity, control channel,
+                     tasks), FacadeEventSink / DroppedEvents. Makes no runtime decision of its
+                     own — every decision it wires lives in a tested module below
+      app.rs         the supervisor primitives the tasks share: Backoff math, LinkState /
+                     connectivity tokens, Health, EventSink, DeviceControl, connect_reason,
+                     rand01, serve_control_disconnected, apply_pause
+      reconnect.rs   the reconnect ladders (§10.2): backend_for + run_device / run_push —
+                     connect within the deadline, drive the mode's engine, alarm/backoff/
+                     reconnect, the §7.5 reconnect reply, the ForwardClose on every exit path.
+                     Backend + Publisher are injected, so the ladders run under unit test
+      poll_driver.rs the POLL loop driver: the read → gate → batch → publish select-loop and the
+                     sb/* control channel served in line with it, over the DeviceSession /
+                     Publisher / EventSink seams
+      push_driver.rs the PUSH loop driver: the class-1 IoUpdate consume → gate → batch → publish
+                     loop and its control channel, over the PushSession / Publisher / EventSink
+                     seams
       device.rs      the protocol seam (kept + extended): DeviceBackend / DeviceSession /
                      PushSession traits, Reading, IoUpdate, Quality, DeviceError
       sim.rs         SimBackend / SimSession / SimPushSession (moved out of device.rs; models
                      the cpppo tag layout AND a scripted input-assembly producer + failure
                      injection hooks)
       eip/
-        mod.rs       EipBackend: DeviceBackend impl (connect → EipSession / open_push →
-                     EipPushSession) over the enip crate's EipClient / IoManager
+        mod.rs       the enip-facing backend module: client_options + the §10.1 EnipError →
+                     DeviceError classification
+        live.rs      the live-socket drivers: EipBackend's TCP connect / ForwardOpen open_push
+                     and the class-1 EipPushSession + IoEvent translator task, driven under
+                     unit test against a scripted peer on loopback TCP/UDP sockets
         session.rs   EipSession: DeviceSession impl — poll reads, subset reads, writes, browse,
                      close; per-read CIP error → BAD Reading; EnipError → DeviceError mapping
-        push.rs      EipPushSession: PushSession impl — forward_open from config, IoEvent →
-                     IoUpdate translation, output-buffer writes, close
+        push.rs      the pure class-1 translators: assembly_to_readings, map_lost_reason
         types.rs     EipType enum + JSON ⇄ CipValue codec (scale/offset, arrays, write
                      coercion) — shared by both modes
+        tls.rs       CIP Security: the config model, the rustls ClientConfig builder from vault
+                     material, and the negotiated-security status (D-EIP-21/22)
+        rotation.rs  CertWatcher: the pure rotation / expiry-threshold decisions (D-EIP-23)
+        est.rs       the RFC 7030 EST client + renew-window scheduler (D-EIP-24)
+      security_lifecycle.rs
+                     the per-TLS-instance cert-lifecycle driver: enroll/renew (EST), watch the
+                     vault for rotated material and expiry crossings, emit the events/metrics,
+                     request the reconnect — over an injected CredentialService (§4.2/§4.3 of
+                     DESIGN-cip-security.md)
       config.rs      typed component config: GlobalConfig, DeviceConfig, PollGroup, SignalSpec,
                      IoSpec (push: assemblies, RPIs, layout fields), DeadbandSpec, Writes —
                      parse + validate + precedence resolution
@@ -203,20 +230,28 @@ crates/
       push.rs        the per-device PUSH engine: IoUpdate consumption, per-field change/deadband
                      + sample-floor gating, batching, stale/timeout tracking, pause gate,
                      output-write serialization
-      publish.rs     SignalUpdate assembly (data() facade calls), publish-latency measurement
-                     — mode-agnostic (both engines feed it)
+      publish.rs     the Publisher seam, SignalUpdate assembly, and publish_via (assemble +
+                     publish + measure the latency) — mode-agnostic (both engines feed it)
+      publish_sink.rs
+                     FacadePublisher: the production Publisher over the data() facade — the one
+                     .await on a live broker, and nothing else
       metrics.rs     Health (southbound_health) + the six EtherNetIp* families (§8)
       commands.rs    the sb/* verb handlers + panel descriptors (§7)
       lifecycle.rs   the live DeviceRegistry, the root/child cancellation tree, and the
                      deadline-bounded stop engine (stop_budget / stop_tasks / stop_runtimes /
                      shutdown_all) — §10.3, D-EIP-27
-      reload.rs      the configuration transaction: the pure instance diff (plan), the
-                     DeviceLauncher seam, and the ReloadCoordinator / ReloadTransaction that
-                     core prepares, commits, and rolls back — §10.4, D-EIP-28
-    tests/
-      live_cpppo.rs  sim-gated POLL integration suite (self-skipping on a 44818 probe, §11.3)
-      live_opener.rs sim-gated PUSH integration suite (self-skipping, §11.5)
+      reload.rs      what to launch, for BOTH paths: the shared instance set (parse_instances,
+                     first-wins dedup) that startup and reload use, plus the configuration
+                     transaction — the pure instance diff (plan), the DeviceLauncher seam, and
+                     the ReloadCoordinator / ReloadTransaction core prepares, commits, and rolls
+                     back — §10.4, D-EIP-28
+      testutil.rs    #[cfg(test)]-only recording doubles (Publisher / DeviceSession /
+                     PushSession / EventSink / metrics) + the throwaway PKI and in-process EST
+                     responder (testutil::pki)
 ```
+
+(The six live-peer conformance suites are `crates/enip/tests/live_*.rs`, §11.3; the two in-source
+live tests — TLS client-cert rotation and EST enrollment — sit in `eip/tls.rs` and `eip/est/tests.rs`.)
 
 ### 3.2 The loop, and where everything hooks in
 
@@ -1710,80 +1745,83 @@ is a **blocking validation gap**, reported as such.
 ### 12.1 Gate
 
 **90% line coverage, workspace-wide** (the protocol crate AND the adapter — D-EIP-17 folded them
-into one denominator), met on the **unit-testable surface**, same bar as the sibling adapters:
+into one denominator), with **no product file excluded from the denominator**, same bar as the
+sibling adapters:
 
 ```bash
 cargo llvm-cov --workspace \
-  --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls|cip_security)\.rs|testutil\.rs|fuzz[/\\])' \
+  --ignore-filename-regex '(tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls|cip_security)\.rs|testutil\.rs|fuzz[/\\])' \
   --fail-under-lines 90
 ```
 
 (plus `--cobertura --output-path target/cobertura.xml` in CI for artifacts). Windows undercounts
 Rust statements ([org gotcha]) — the authoritative run is Linux (CI / WSL); the current WSL number
-is **93.5%**.
+is **94.93%** (21,054 lines, 1,068 missed; the Windows run of the same tree reads 94.91%).
 
-### 12.2 Coverage denominator exclusions (the file-replicator approach)
+### 12.2 Coverage denominator exclusions
 
-This adapter has genuinely untestable code: the async loops that drive a live broker / socket — the
-`data()` publish facade, the `DeviceSession` / `PushSession` seam, the supervisor's task-spawning and
-`DeviceBackend` connect. That code cannot run without live infrastructure, so following the
-`file-replicator` discipline (which excludes its thin `dest/*/client.rs` I/O seams), those **loop
-drivers are refactored into dedicated, as-thin-as-possible seam files** and excluded from the
-denominator — while the **pure gating/decision logic they compose stays in the covered files and is
-unit-tested**. A file-level exclusion therefore excludes *only* untestable I/O glue and never launders
-tested logic. Excluded, with the reason pinned here:
+**No product file is excluded.** Every driver, every loop, and every live-socket backend in this
+repo is inside the denominator and unit-tested, because each one takes its live dependency through an
+injected seam rather than reaching for it:
 
-- `src/supervisor.rs` — the connect → poll/consume → reconnect drivers (`App::run`, `run_device`,
-  `run_push`, `FacadeEventSink`); they `.await` a live `EdgeCommons` runtime, a live `DeviceBackend`
-  socket, and the `data()` facade. The backoff math, connectivity token, `apply_pause`,
-  `serve_control_disconnected`, `connect_reason`, and `rand01` stay in `app.rs` and are unit-tested.
-- `src/poll_driver.rs` — `poll_until_disconnected` + the `repoll` / publish glue: the select-loop that
-  drives a live `DeviceSession` read and `data.publish().await`. The deadband/change/batch/stale
-  gating (`poll::process_group`, the `publish::Engine`/`Batcher` primitives) lives in `poll.rs` /
-  `publish.rs` and is unit-tested.
-- `src/push_driver.rs` — `consume_push` + the publish glue: the loop that drives a live class-1
-  `PushSession` update stream and `data.publish().await`. Its per-frame gating (`push::process_frame`)
-  lives in `push.rs` and is unit-tested.
-- `src/publish_sink.rs` — the one-function `publish()` seam that drives `data.publish().await` on the
-  live broker. Its pure assembly (`publish::build_update`) lives in `publish.rs` and is unit-tested.
-- `src/eip/live.rs` — the EtherNet/IP live-socket drivers: `EipBackend`'s TCP `connect` / ForwardOpen
-  `open_push`, and the class-1 `EipPushSession` + `enip::IoEvent` translator task. The pure translators
-  (`eip::push::assembly_to_readings` / `map_lost_reason`), the error classification
-  (`eip::map_enip_error`), the `client_options` builder, and the JSON⇄CIP codec (`eip::types`) stay in
-  covered files and are unit-tested (over `duplex` fixtures / a mock session, no container).
-- `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs`,
-  `crates/enip/tests/live_ab_server.rs`, `crates/enip/tests/live_ethernetipsharp.rs`,
-  `crates/enip/tests/live_tls.rs`, `crates/enip/tests/live_cip_security.rs` — the sim-gated live suites
-  (§11.3), self-skipping on a port probe.
-  (The `tls` connect surfaces themselves are NOT excluded: `enip/client/tls.rs`'s `connect_tls_over` +
-  error mapping + session-info capture are unit-tested over a rustls-acceptor duplex, and the adapter's
-  `eip/tls.rs` ClientConfig-builder/config-parse/validation are unit-tested — only the thin
-  `connect_tls` TCP-socket wrapper is uncovered, consistent with `client/mod.rs`'s `connect`. The
-  CIP-Security **posture decoders** (`enip/cip/security.rs`) and the `read_security_posture`
-  orchestration are unit-tested over duplex fixtures (`tests/security_posture.rs`) and are counted in
-  the gate; only the adapter's on-connect posture read in `eip/live.rs` is in the excluded seam.)
-- `crates/enip/fuzz/` — fuzz harnesses (they *exercise* covered code; they are not product code).
-- `src/testutil.rs` — `#[cfg(test)]`-only recording test doubles.
+| Seam | Production | Under test |
+|---|---|---|
+| `publish::Publisher` | `publish_sink::FacadePublisher` over the `data()` facade | a recording publisher with a settable failure flag |
+| `device::DeviceBackend` / `DeviceSession` / `PushSession` | `eip::live::EipBackend` over the `enip` stack | scripted sessions (queued read outcomes, write journal, close counter) |
+| `app::EventSink` | `supervisor::FacadeEventSink` over the `evt` surface | a recording sink |
+| `metrics::DeviceMetrics` / `Health` | a `MetricService`-backed instance | the same types over a recording metric service |
+| `credentials::CredentialService` | the component's vault | a `LocalVault` + `FileKeyProvider` in a tempdir |
 
-These five adapter seams are validated by the **live cpppo/OpENer integration suites (§11)** and the
-**S9 deployed regression** — exactly the paths that cover them — not by unit tests.
+So `poll_driver.rs`, `push_driver.rs`, `reconnect.rs`, `security_lifecycle.rs`, `lifecycle.rs`, and
+`reload.rs` all run as ordinary unit tests — on a paused clock wherever the behaviour is a cadence, a
+deadline, or a backoff; on real time only where the leg does real loopback TLS I/O (the EST
+enroll/renew legs). `eip/live.rs` runs against a scripted EtherNet/IP peer on a loopback
+`TcpListener` (plaintext and TLS) plus a test-owned UDP socket standing in for the class-1 target —
+no container, no device, no fixed port, Windows and Linux alike (§12.3).
 
-**Nothing else is excluded.** `src/lifecycle.rs` and `src/reload.rs` are inside the gate **by
-design**: the stop engine, the registry, the instance diff, and the whole commit/rollback transaction
-are pure decisions, tested hermetically over a launcher double, and `supervisor.rs` keeps only the
-thin wiring (`RuntimeLauncher`, the loop drivers). The exclusion list above is therefore unchanged by
-the shutdown and reload work. The protocol crate's own live-socket runtime — `enip/io.rs`'s class-1
-UDP `IoManager`/`manager_task`/`IoConnectionHandle`, `client/io_service.rs`, and `client/mod.rs`'s TCP
-connect — is validated by the live OpENer/cpppo suites but is **left inside the denominator, counted
-against the gate**, not laundered out: the crate's well-tested codec (state machines, framing, golden
-vectors, fuzz — PROTOCOL-DESIGN §12.2) keeps the aggregate comfortably over 90% without excluding it.
-The binary entry `src/main.rs` likewise stays counted. Do NOT reintroduce exclusions to dodge the
-gate; add tests.
+Two disciplines make those paused-clock tests mean something. **Every deadline is measured on the
+runtime clock** (`tokio::time::Instant`) rather than the system clock, so a wait that is serviced
+part-way through — a control verb arriving inside a backoff window — resumes its remaining time
+instead of silently re-arming; only sample capture instants stay on `std::time::Instant`, because
+they are wall-clock evidence about a frame. And **where a backoff rung is the claim**, the test pins
+the full-jitter fraction (`testutil::JitterGuard`) so the wait is exactly that rung's cap: an
+unpinned `wait ≤ cap` assertion is one-sided, and would pass a ladder that stopped resetting its
+attempt counter on most runs.
 
-The earlier claim that the *entire* adapter — including the publish loops — was offline-`duplex`-
-testable was wrong: the loops that drive `data.publish().await` and the live sockets need real
-infrastructure. Only the pure logic underneath them is offline-testable, and that is what the gate
-measures; the loop drivers are the thin excluded seams named above.
+The exclusion list is therefore three **non-product** categories:
+
+- `crates/enip/tests/live_{cpppo,opener,ab_server,ethernetipsharp,tls,cip_security}.rs` — the six
+  live-peer conformance suites (§11.3). Each probes its peer's port and self-skips when the container
+  is down, so where the peers are absent they are dead test code rather than evidence about product
+  code. They exist to check this stack against **independent implementations** — cpppo, OpENer,
+  libplctag `ab_server`, EthernetIPSharp, an OpenSSL TLS terminator, and OpENer's `CIPSecurity`
+  branch — which is conformance evidence, a different question from coverage.
+- `crates/enip/fuzz/` — libFuzzer harnesses. They *exercise* covered product code; they are not
+  product code. (Also a separate workspace, so the coverage job does not even build them.)
+- `src/testutil.rs` — `#[cfg(test)]`-only recording doubles, the throwaway PKI / in-process EST
+  responder they share, and the backoff-jitter pin, compiled out of the shipped binary.
+
+**What stays inside the denominator and reads uncovered**, counted against the gate rather than
+laundered out of it:
+
+- `src/supervisor.rs` (185 instrumented lines) — the EdgeCommons construction glue: `App`,
+  `RuntimeLauncher`, `FacadeEventSink`, `DroppedEvents`. Every path needs an `Arc<EdgeCommons>`, and
+  the core library's offline test constructor is `pub(crate)`, so a dependent crate cannot build a
+  runtime in a unit test. It makes no runtime decision of its own — what to launch, stop, or keep is
+  decided in `reload.rs`, how a teardown is bounded in `lifecycle.rs`, and what a running instance
+  does in `reconnect.rs` / `security_lifecycle.rs` / the two drivers, all of them tested.
+- `src/publish_sink.rs` (3 lines) — `FacadePublisher::publish_update`, the single `.await` on the
+  `data()` facade. The `DataFacade` has the same offline-construction problem.
+- `src/main.rs` (16 lines) — the binary entry.
+- The bodies of the two **in-source** live tests — `eip/tls.rs`'s client-cert-rotation test against
+  the `:2221` stunnel terminator and `eip/est/tests.rs`'s enrollment test against the `:8443`
+  globalsign/est server — read uncovered on a bench with those containers down.
+- The protocol crate's own live-socket runtime — `enip/io.rs`'s class-1 UDP
+  `IoManager`/`manager_task`/`IoConnectionHandle`, `client/io_service.rs`, and `client/mod.rs`'s TCP
+  connect — validated by the live OpENer/cpppo suites, and still counted here.
+
+Those uncovered paths are exercised by the HOST / full-system E2E and the deployed regression
+(§12.4). Do NOT add exclusions to dodge the gate; add tests.
 
 ### 12.2b Fuzzing (D-EIP-19)
 
@@ -1792,7 +1830,7 @@ target per hostile decode surface; no-panic/no-OOM invariant; corpus + crash reg
 in). Adapter CI runs the short-budget fuzz smoke on every PR (Linux); a reproducible finding is
 a ship blocker.
 
-### 12.3 Unit-test surface (reaches 90% with no PLC, no network)
+### 12.3 Unit-test surface (reaches the gate with no PLC and no container)
 
 | Area | Representative tests |
 |---|---|
@@ -1800,14 +1838,20 @@ a ship blocker.
 | `crates/enip` manager select loop | `manager_select_loop_end_to_end_consume_produce_watchdog` drives the `select!` that composes the unit-proven parts over a real loopback UDP pair: recv → route → deliver, tick → produce → `send_to`, watchdog → `Lost` → remove, plus the D-ENIP-17 port-honouring path on a live socket. **Declared residual:** injecting a socket-fatal `recv_from` error through that loop is not covered — there is no cross-platform way to make a bound UDP socket fail that way on demand without a socket trait seam whose only consumer would be the test, which would make the seam itself the untested wiring. The error policy (`recv_error_policy_matrix`) and the fan-out (`fan_out_lost_delivers_io_to_every_connection_and_drains_registry`) stay unit-proven, and their composition rests on review plus this happy-path glue |
 | `config.rs` | precedence chain (signal ▸ group ▸ device ▸ global ▸ built-in); duplicate name/tagPath rejection; `string` type rejection; unknown-key rejection (template `deny_unknown_fields` kept); allow-list parse; slot range; mode/block cross-validation (`poll`+`io` rejected, `push`+`pollGroups` rejected); push layout validation (field beyond `sizeBytes`, `bit` on non-bool, output signals on a heartbeat connection — all rejected at startup) |
 | `eip/types.rs` codec | every §5.1 row round-trip JSON⇄typed; array length checks; scale/offset incl. inverse-on-write and out-of-range refusal; non-finite ⇒ UNCERTAIN |
+| `eip/live.rs` (local sockets) | a `MockPlc` on a loopback `TcpListener` speaking encapsulation through the `enip` public API, plus a test-owned UDP socket as the class-1 target, drives the whole backend with no container: `connect_plaintext_without_posture_yields_a_bare_session` and `connect_plaintext_with_posture_yields_secure_session_and_warns_on_factory_default` (the §4.1 unprovisioned-device WARN), `connect_refusal_maps_via_map_enip_error`, `connect_tls_negotiates_and_reports_security_status` (rcgen certs → a tokio-rustls acceptor → the negotiated version/suite/peer fields), `open_push_forward_open_up_and_data_flow` (spec assembly from the `io` block, sockaddr port advertisement, `IoUpdate::Up`, `assembly_to_readings` on a real frame), `translator_latest_wins_collapses_a_burst_and_never_drops_up_or_lost` (§8.6), `last_input_snapshot_stays_live_and_io_stats_map` (push `sb/read` source + `map_io_stats` field-for-field), `set_output_encodes_and_rides_the_next_o2t_frame` (asserted on the datagram bytes observed at the target socket), `close_performs_forward_close_and_is_safe_twice`, and `watchdog_silence_maps_lost_reason` on a real timeout |
 | `poll.rs` | deadband none/absolute/percent/non-numeric/array-any-element; onChange vs always; batch window flush (tokio `start_paused` time control); stale accounting incl. pause suspension; overrun detection |
 | `push.rs` | field-change gating (deadband + `sampleMs` floor under `start_paused` time control); idle-frame ⇒ UNCERTAIN samples; pause = consume-but-don't-publish (snapshot advances, zero publishes); resume re-basing (§7.4.8 — no stale-change burst); Lost ⇒ reconnect path; output-write serialization |
+| `poll_driver.rs` (the poll loop) | the whole select-loop over scripted seams on a paused clock: `cancel_closes_the_session_and_returns_stopped` and `control_channel_close_is_stopped_not_link_lost` (a shutdown must never read as a link failure), `read_error_closes_session_and_returns_link_lost_with_error_cycle_recorded`, `groups_poll_on_their_own_cadence_and_rearm_without_catchup_storm` (the `(deadline+interval).max(now)` re-arm), `batch_windows_flush_before_the_next_poll_and_attribute_from_batch` (§8.5 `fromBatch` attribution), `paused_loop_probes_keepalive_and_probe_failure_reconnects` (§7.4.3), `pause_resume_rebase_deadlines_and_staleness` (§7.4.5/§9.3), `sample_snapshot_delta_attributes_cycle_counts` (§8.4), `metrics_emit_on_interval_and_stale_count_suspended_while_paused` (§8.7), `publish_failure_records_result_error_and_success_records_latency`, and one test per control verb — `write_verb_journals_and_failure_counts_write_errors`, `read_now_error_is_link_lost`, `browse_unsupported_maps_to_browse_error`, `repoll_while_paused_refused`, `push_verbs_answered_defensively`, `reconnect_verb_closes_session_and_carries_reply` (the §7.5 reply must not leak) |
+| `push_driver.rs` (the push loop) | `up_event_emits_connected_and_clears_alarm` (§8.8 + the alarm pairing), `data_frames_gate_publish_but_consumption_continues_while_paused` (D-EIP-14: snapshot and sequence stay live, zero publishes), `lost_and_stream_end_both_return_link_lost_with_io_lost_bookkeeping` (a translator that dies without a `Lost` is still a recorded loss), `resume_rebases_engine_from_last_snapshot` (§7.4.8), `io_stats_fold_fires_redirect_event_once_per_forward_open` (the D-ENIP-17 `refusedRedirects` latch), `write_output_stages_field_and_failure_counts`, `snapshot_verb_answers_last_input_even_paused` (§7.2), `batch_flush_and_metrics_cadence`, `cancelled_returns_stopped_without_alarm`, `control_channel_close_is_stopped_not_link_lost` (a shutdown carries none of the loss bookkeeping), and `poll_verbs_answered_defensively` (the poll-only verbs answered rather than dropped — a dropped reply hangs the `sb/*` caller until its command timeout) |
+| `reconnect.rs` (§10.2, the ladders) | `backend_for_maps_sim_ethernet_ip_and_unknown` (a typo'd adapter token fails the launch instead of idling a task), `connect_success_publishes_connected_event_and_clears_alarm`, `link_lost_raises_alarm_backs_off_and_reconnects`, `permanent_connect_failure_backs_off_at_the_ceiling`, `transient_failures_backoff_exponentially_and_reset_on_success` (the fraction is pinned, so the climb and the reset are equalities on the wait rather than one-sided bounds), `stop_or_reconnect_during_the_poll_backoff_is_honoured_immediately`, `cancel_during_connect_returns_without_alarm_or_reconnect`, `explicit_reconnect_reply_fulfilled_after_next_connect_success_and_failure` (§7.5 across the connect boundary), `tls_instance_permanent_failure_fires_handshake_event_on_the_transition_only` (the §3.4 edge latch + `tlsHandshakeFailures`), `security_status_lands_in_health_and_cert_gauge_on_connect`, `tls_peer_unverified_session_emits_the_warning` (§3.3), and the push ladder — `push_open_failure_counts_forward_open_and_backs_off`, `push_permanent_open_failure_holds_the_ceiling_and_serves_control`, `push_session_close_runs_on_every_exit_path` (no ForwardClose leak on LinkLost/Reconnect/Stopped), `push_reconnect_rebases_stack_counters_not_io_lost` (D-ENIP-17) |
+| `security_lifecycle.rs` (CIP Security 2b/2c) | over a `LocalVault` + `FileKeyProvider` in a tempdir and the in-process rustls EST responder: `not_tls_or_watch_disabled_without_est_returns_immediately` (no spinning no-op task per plaintext instance), `rotation_emits_cert_rotated_and_requests_reconnect`, `expiring_then_expired_events_fire_on_transitions_and_gauge_updates` (§4.2 threshold edges, on rcgen certs minted with near/past `notAfter`), `vault_read_error_is_ignored_and_the_loop_continues` (offline-first), `est_enroll_success_updates_status_events_and_the_same_tick_watcher_reconnects` (the enroll-then-observe sequencing, end to end), `est_failure_emits_enroll_failed_and_respects_retry_backoff` (§4.3 — no retry storm against a down EST server), `device_task_gone_ends_the_lifecycle_task`, `cancel_stops_at_the_tick_boundary` |
 | `sim.rs` + session behavior | per-signal BAD not swallowed; probe; scripted push frames (values, idle, stop-producing); browse paging incl. the unsupported marker — both backends walk a `max`-limited page sequence to exactly-once coverage over the shared cursor parser, an uncursored walk asks the device for symbol instance 0 so a symbol sitting there is returned rather than skipped (`an_uncursored_browse_starts_at_instance_zero`), a truncated page resumes from the last record it actually returned (not the device's cursor), a 32-bit cursor rides back as a `0x26` path, an unreadable cursor is a permanent error rather than a silent restart at the top of the set, and a CIP `0x08` refusal is `BROWSE_UNSUPPORTED` only when it answers the *first* page — the same refusal of a resume is a failed page naming the refused instance (`browse_refused_at_the_first_page_is_an_unsupported_device` / `browse_refused_on_a_resume_is_a_failed_page_not_an_unsupported_device`) |
-| `app.rs` supervisor | backoff math (template tests kept); connectivity tokens incl. PAUSED and break-while-paused, for both modes; provider/metric/token single-source invariants; the disconnected-wait exit classification (`Elapsed`/`Reconnect`/`Stopped`) — a cancelled or channel-closed instance leaves the backoff immediately, under `start_paused` time control |
+| `app.rs` (the shared supervisor primitives) | backoff math (template tests kept); connectivity tokens incl. PAUSED and break-while-paused, for both modes; provider/metric/token single-source invariants; the disconnected-wait exit classification (`Elapsed`/`Reconnect`/`Stopped`) — a cancelled or channel-closed instance leaves the backoff immediately, under `start_paused` time control |
 | `lifecycle.rs` (§10.3, D-EIP-27) | the targeted routing accessors (`handle(id)` cloning exactly the addressed instance and `sole_handle()` distinguishing none/one/several from a single locked scan, with the clone sharing the live `Health` the device task writes); `stop_budget` composition and its [1 s, 10 s] clamp; `stop_tasks` joining cooperative tasks and aborting a straggler at the **absolute** deadline (`start_paused`); `shutdown_all`'s drain loop reaping a runtime inserted after the root was cancelled; registry insertion order, remove-by-id, drain, and the connectivity/generation views |
 | `reload.rs` (§10.4, D-EIP-28) | the pure diff: keep/start/stop/restart dispositions, the restart-all trigger (`component.global` **and** any other non-instances change), object-key-order insensitivity, skip-bad + zero-valid + invalid-global rejection, duplicate-id first-wins, and the previously-skipped-instance case; the shared startup/reload instance set (`parse_instances` deduping first-wins, and re-applying the startup document moving nothing); the transaction over a launcher double: stop→swap→launch proven by the **interleaving** (each stub task journals its own cancellation, so launch-before-stop fails), commit-path launches pinned to the candidate snapshot and global, kept-runtime identity (`Arc::ptr_eq` on `Health` — the pause-survival contract), the shutdown gate, self-boundedness when a stopping task wedges *and* when the broker wedges (`start_paused`), alarm clearing for removed instances ordered **after** their stop, `config-applied` (incl. a launch failure reported as a skip) + `repoll` availability, a second reload diffing against the generation the first one installed, and commit-failure ⇒ rollback restoring the prior set bound to the **prior** snapshot |
 | `commands.rs` | every verb: happy path, `BAD_ARGS`, `NO_SUCH_INSTANCE`, single-instance default tracked from the live count (incl. the empty-registry window answering `DEVICE_UNAVAILABLE`); write gate order (refusal before device I/O — assert via a recording session); confirmed-write ack path (poll) and `applied: next-frame` (push); input-field write refusal; pause idempotence; repoll-while-paused (`PAUSED`) and repoll-on-push (`BAD_ARGS`) refusals; browse error mapping; the paged walk over a cursor-honouring mock device enumerating every tag exactly once at `max: 2`, push-layout paging and its `BAD_ARGS` cursor refusal, and all three hierarchical-walk terminations (a cursor that repeats, one that is not a number, one that advances forever) as `BROWSE_FAILED` — the first of which would otherwise be a handler that never returns; push sb/read snapshot incl. `NO_FRAME` |
 | `metrics.rs` | Total/Interval pair semantics (interval resets, total doesn't); per-dimension definition set matches §8 exactly incl. `EtherNetIpIo` (this test IS the parity contract's executable form) |
+| `publish.rs` | the `Publisher` seam end of the publish path: `publish_via_reports_latency_and_passes_the_assembled_update_through` asserts the update handed to the sink equals `build_update`'s output and that the measured latency is the wall time of the `publish_update().await` |
 | wire shape | `DataFacade::build_body` output for a §4.5 signal AND a §4.6 push field asserted field-by-field against §5.2 (id/address/device/quality/serverTs-present/sourceTs-absent) |
 
 ### 12.4 Where each path is validated (org matrix mapping)
@@ -1979,7 +2023,7 @@ Section references are the acceptance spec. **P-slices build the protocol crate*
 | **S4 — Poll & push engines + publish** | `poll.rs` + `push.rs` + `publish.rs` per §3.2, §6.2: per-group tickers / IoUpdate consumption, deadband+`sampleMs` gates, batch windows, stale tracking, BAD-passes-gate, snapshot + re-basing, publish latency; wire both into `run_device` by `mode`. | §12.3 poll- and push-row tests green under `tokio::time` control; wire-shape test asserts the exact §5.2 body for both id forms; sim-backed `cargo run` publishes per-group cadences AND gated push updates. |
 | **S5 — Metrics** | `metrics.rs` per §8 in full: health set (the eight SOUTHBOUND §5 measures incl. `signalsSubscribed`), **six** families incl. `EtherNetIpIo`, Total/Interval pairs, dimension pre-definition, cadence + `emit_metric_now` transitions (incl. push up/lost). | The §12.3 "definition set matches §8 exactly" test enumerates every family/measure/dimension from this doc and passes — this test is the executable parity contract. |
 | **S6 — Command surface + pause/resume + panels** | `commands.rs` per §7: all 9 verbs with mode-aware behaviors (§7.2 snapshot reads, §7.3 `applied: next-frame`, §7.5 refusals), instance routing, gate order, control channel into the device task, pause semantics §7.4 both modes (probe poll-only, D-EIP-20 push), events §6.3, panels §7.6. | Every §7 verb has request/reply/error tests per §12.3 incl. the push-specific rows; pause flips all three reflection surfaces in one test per mode; `describe` lists all 9 verbs + 3 panels; allow-list refusal is proven to happen before any device I/O. |
-| **S7 — Simulators, live tests, CI & coverage** | `compose.yaml` both sim services §11.2 + the OpENer `test-infra/opener/Dockerfile` §11.5; `tests/live_cpppo.rs` + `tests/live_opener.rs` §11.3; `.github/workflows/ci.yml` (org reusable + §12.1 workspace gate + P4 fuzz smoke); coverage regex §12.2. | `cargo llvm-cov --workspace … --fail-under-lines 90` passes locally (Linux/WSL, 93.5%) with the §12.2 regex excluding only the thin live-infra seam files (`supervisor`/`poll_driver`/`push_driver`/`publish_sink`/`eip/live`) + live suites + fuzz + test doubles; both live suites pass with their sim up and self-skip with it down. |
+| **S7 — Simulators, live tests, CI & coverage** | `compose.yaml` both sim services §11.2 + the OpENer `test-infra/opener/Dockerfile` §11.5; `tests/live_cpppo.rs` + `tests/live_opener.rs` §11.3; `.github/workflows/ci.yml` (org reusable + §12.1 workspace gate + P4 fuzz smoke); coverage regex §12.2. | `cargo llvm-cov --workspace … --fail-under-lines 90` passes locally (Linux/WSL, 94.93%) with the §12.2 regex excluding no product file — only the live-peer suites, the fuzz workspace, and the `#[cfg(test)]` doubles; both live suites pass with their sim up and self-skip with it down. |
 | **S8 — Docs** | Diátaxis `docs/{tutorial,how-to-guides,explanation,sample-configurations}.md` + `docs/reference/{configuration,messaging-interface,metrics,data-types}.md`; rewrite `README.md` for the real adapter — **covering both modes as equal citizens**. User-docs rules apply: current behavior only, present tense, no roadmap/status; limitations §14 stated as plain facts (incl. the push-write §14.1 honesty note). | Reference pages enumerate exactly the §4 config keys (incl. §4.6), §7 verbs/error codes, §8 measures (incl. §8.8), §5.1 types — no drift from this doc; docs-site sync compatibility (front-matter per sibling adapters). |
 | **S9 — Deployment packs & full validation** | §13 pack finalization (workspace builds, UDP :2222 note); run §11.4 E2E (HOST, both modes incl. the push failure drill); kind smoke (both sims in-cluster); WSL `--features greengrass` build; **lab-5950x deployed Greengrass regression**; registry entry. | Every §11.4 step observed and logged; k8s pod Ready with data on the bus from both instances; GG deployment RUNNING with data + commands over IPC — or the gap is reported as blocking. Completion is claimed ONLY with design fidelity confirmed against this document AND `PROTOCOL-DESIGN.md`, separately from "tests green". |
 

@@ -1,39 +1,34 @@
-//! # The supervisor loop drivers (§3.2, §10.2) — the live-infra seam (excluded from coverage, §12.2)
+//! # Runtime construction (§3.2, §10.3) — the EdgeCommons wiring an instance is built from
 //!
-//! This module is a **thin driver seam**: it wires the already-unit-tested pieces (the [`crate::app`]
-//! backoff math, connectivity token, `apply_pause`, `serve_control_disconnected`, `connect_reason`,
-//! the [`crate::poll`] / [`crate::push`] gating engines, the [`crate::metrics`] recorder) onto a live
-//! [`EdgeCommons`] runtime, a live [`DeviceBackend`] connection, and the `data()` publish facade — then
-//! runs the connect → poll/consume → reconnect loops. Everything here `.await`s a socket, a broker, or
-//! a spawned task, so it cannot run without live infrastructure; it carries **no branching that is not
-//! driven by that I/O** (the reconnect-ladder decisions are validated by the live cpppo/OpENer
-//! integration suites (§11) and the S9 deployed regression, exactly as `file-replicator` validates its
-//! `dest/*/client.rs` seams). The pure decisions it composes are tested in their home modules.
+//! This module is the component's **construction glue**: [`App`] parses the component configuration,
+//! builds the live [`crate::lifecycle::DeviceRegistry`] and the cancellation root, installs the single
+//! configuration-application coordinator, and publishes the connectivity + `sb/*` surfaces;
+//! [`RuntimeLauncher`] is the production body of [`crate::reload::DeviceLauncher`] — the one place an
+//! instance's facades, metric identity, control channel, and tasks are constructed — and
+//! [`FacadeEventSink`] / [`DroppedEvents`] are the `evt`-surface bindings. It makes **no runtime
+//! decision of its own**: what to launch, stop, or keep is decided in [`crate::reload`], how a
+//! teardown is bounded in [`crate::lifecycle`], and what a running instance does in
+//! [`crate::reconnect`] / [`crate::security_lifecycle`] / the poll+push drivers — every one of them
+//! inside the coverage gate and unit-tested against injected seams.
 //!
-//! The same rule governs the two lifecycle seams it hosts: [`App`] holds the live
-//! [`crate::lifecycle::DeviceRegistry`] and cancellation root but delegates every teardown decision
-//! to `lifecycle.rs`, and [`RuntimeLauncher`] is the production body of
-//! [`crate::reload::DeviceLauncher`] — the facade/metric/task construction an instance needs, with no
-//! decision of its own. What to launch, stop, or keep is decided in `reload.rs`, in the gate.
+//! This file is inside the gate too, and reads **uncovered**: every path here needs an
+//! `Arc<EdgeCommons>`, and the core library's offline test constructor is `pub(crate)`, so a
+//! dependent crate cannot build a runtime in a unit test. It is exercised by the HOST / full-system
+//! E2E and the deployed regression instead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
 
 use edgecommons::prelude::*;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{
-    connect_reason, rand01, serve_control_disconnected, Backoff, DeviceControl, DisconnectedWait,
-    EventSink, Health, LinkState,
-};
+use crate::app::{DeviceControl, EventSink, Health};
 use crate::config::{DeviceConfig, DeviceMode, GlobalConfig};
-use crate::device::DeviceBackend;
 use crate::lifecycle::{DeviceRegistry, DeviceRuntime};
 use crate::metrics::DeviceMetrics;
+use crate::publish::Publisher;
 use crate::reload::{DeviceLauncher, PriorGeneration, ReloadCoordinator};
-use crate::sim::SimBackend;
 
 pub struct App {
     /// The startup configuration snapshot — the generation the first instances bind to. A reload
@@ -154,19 +149,42 @@ impl App {
         Ok(())
     }
 
-    /// Launch every configured instance into the registry, then publish the two surfaces that read
-    /// it (the connectivity provider and the `sb/*` command surface) and open the reload gate.
+    /// Launch every launchable instance into the registry, then publish the two surfaces that read
+    /// it (the connectivity provider and the `sb/*` command surface) and open the reload gate. The
+    /// launch pass and its skip-bad rule are [`crate::reload::launch_startup_set`]; this is its
+    /// wiring.
     ///
     /// Fallible, and deliberately *only* fallible: whatever it has already launched is live by the
     /// time it can fail, so its `Err` is routed through
     /// [`crate::lifecycle::stop_on_startup_error`] rather than returned to the caller directly.
     fn start_instances(&self, gg: &EdgeCommons) -> anyhow::Result<()> {
-        for (device, raw) in &self.devices {
-            // The same call a configuration change makes — one construction path, one behavior.
-            let runtime = self
-                .launcher
-                .launch(device, raw, &self.global, &self.config)?;
+        // The same launcher a configuration change calls — one construction path, one behavior —
+        // under the launch-time skip-bad rule (§10.4): a bad adapter token costs that instance, not
+        // the healthy ones beside it, and startup fails only when nothing at all is launchable.
+        let outcome = crate::reload::launch_startup_set(
+            self.launcher.as_ref(),
+            &self.devices,
+            &self.global,
+            &self.config,
+        );
+        // Register FIRST, including on the fatal path: whatever started is live, and only the
+        // registry gets it into the bounded teardown (D-EIP-27).
+        let launched = outcome.launched.len();
+        for runtime in outcome.launched {
             self.registry.insert(runtime);
+        }
+        if let Some(e) = outcome.fatal {
+            return Err(e);
+        }
+        if !outcome.skipped.is_empty() {
+            // The component is running a SUBSET of what was configured — one summary line beside the
+            // per-instance warnings, so an operator scanning the startup log sees it at a glance.
+            tracing::warn!(
+                launched,
+                skipped = outcome.skipped.len(),
+                instances = %outcome.skipped.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", "),
+                "started without every configured instance"
+            );
         }
 
         // ONE provider, TWO surfaces: the library pushes this sample into the `state` keepalive's
@@ -222,6 +240,19 @@ impl DeviceLauncher for RuntimeLauncher {
             .gg
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("the runtime is shutting down"))?;
+
+        // Resolve the backend BEFORE anything is built or spawned: an adapter token nothing
+        // implements is a bad instance, and refusing the launch here is what turns it into a
+        // *skipped* instance on both paths (§10.4) instead of one that never connects and never says
+        // why. The refusal is typed, so the caller can tell it apart from a real construction
+        // failure; the warning belongs to the caller, which knows whether it skipped or gave up.
+        let Some(backend) = crate::reconnect::backend_for(&cfg.adapter, global, self.creds.clone())
+        else {
+            return Err(anyhow::Error::new(crate::reconnect::UnknownAdapter {
+                instance: cfg.id.clone(),
+                adapter: cfg.adapter.clone(),
+            }));
+        };
 
         // Facades bound to THIS snapshot, not to whatever core's current snapshot happens to be:
         // during a commit the candidate has not been published yet, and the instance must already
@@ -286,7 +317,7 @@ impl DeviceLauncher for RuntimeLauncher {
                 .flatten()
                 .is_some_and(|s| s.is_tls());
         if tls_poll {
-            tasks.push(tokio::spawn(security_lifecycle_inner(
+            tasks.push(tokio::spawn(crate::security_lifecycle::run_security_lifecycle(
                 cfg.clone(),
                 self.creds.clone(),
                 control_tx,
@@ -297,15 +328,15 @@ impl DeviceLauncher for RuntimeLauncher {
             )));
         }
 
-        tasks.push(tokio::spawn(run_device(
+        tasks.push(tokio::spawn(crate::reconnect::run_device(
             cfg.clone(),
             Arc::clone(global),
-            instance.data(),
+            backend,
+            Arc::new(crate::publish_sink::FacadePublisher(instance.data())) as Arc<dyn Publisher>,
             events,
             dm,
             health,
             control_rx,
-            self.creds.clone(),
             cancel.clone(),
         )));
 
@@ -364,631 +395,5 @@ impl EventSink for FacadeEventSink {
     }
     async fn clear_alarm(&self, severity: Severity, event_type: &str, context: Option<serde_json::Value>) {
         let _ = self.0.clear_alarm(severity, event_type.to_string(), context).await;
-    }
-}
-
-/// One device's lifecycle: connect, poll, publish, reconnect — now also servicing the device's
-/// [`DeviceControl`] channel so every `sb/*` verb serializes with the engine loop (§7).
-///
-/// The connect loop and the poll loop are nested on purpose. A read failure that breaks the link
-/// drops out of the poll loop and back into connect — which is the only place that knows how to
-/// back off. An explicit `reconnect` short-circuits the backoff; `pause`/`resume` are serviced in
-/// both the loop and the backoff wait, so they take effect whether the device is up or reconnecting.
-///
-/// `cancel` is this instance's child of the app root token (§10.3): every wait selects on it, and
-/// the driver closes the session before returning, so a teardown reaches the wire (UnRegisterSession
-/// / ForwardClose) instead of dropping the socket. A cancelled exit raises no alarm, emits no event,
-/// and never backs off — the link did not fail, the instance was stopped.
-#[allow(clippy::too_many_arguments)]
-async fn run_device(
-    cfg: DeviceConfig,
-    global: Arc<GlobalConfig>,
-    data: DataFacade,
-    events: Arc<dyn EventSink>,
-    dm: Arc<DeviceMetrics>,
-    health: Arc<Health>,
-    mut control: tokio::sync::mpsc::Receiver<DeviceControl>,
-    creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
-    cancel: CancellationToken,
-) {
-    let backend: Box<dyn DeviceBackend> = match cfg.adapter.as_str() {
-        // The in-process simulator — `cargo run` works with no PLC / no OpENer (the runnable configs
-        // select this; it stands in for both poll reads and class-1 push frames).
-        "sim" => Box::new(SimBackend),
-        // The real EtherNet/IP backend over the owned `enip` stack (poll + push). Selected against a
-        // live cpppo / ControlLogix / OpENer target; the on-container validation is slice S7. The
-        // credentials vault (when present) sources TLS material for `mode: tls` connections.
-        "ethernet-ip" => {
-            Box::new(crate::eip::EipBackend::new(global.timeouts.clone()).credentials(creds))
-        }
-        other => {
-            tracing::error!(instance = %cfg.id, adapter = %other, "unknown adapter");
-            return;
-        }
-    };
-    let backoff = Backoff::from_timeouts(&global.timeouts);
-    let connect_timeout = Duration::from_millis(global.timeouts.connect_ms.max(1));
-    let keepalive_ms = global.health_thresholds.keepalive_probe_interval_ms;
-    // Whether this instance runs over TLS (CIP Security Phase 1) — drives the handshake-failure
-    // metric/event on the connect path.
-    let tls_instance = crate::eip::tls::SecurityConfig::from_connection(&cfg.connection)
-        .ok()
-        .flatten()
-        .is_some_and(|s| s.is_tls());
-
-    // Push (class-1 implicit I/O) has its own connect → consume → reconnect loop over the
-    // `PushSession` seam; it never enters the poll loop (a push device has no poll groups).
-    if matches!(cfg.mode, DeviceMode::Push) {
-        run_push(
-            &cfg,
-            &global,
-            backend.as_ref(),
-            &data,
-            events.as_ref(),
-            &dm,
-            &health,
-            backoff,
-            connect_timeout,
-            &mut control,
-            &cancel,
-        )
-        .await;
-        return;
-    }
-
-    let mut attempt: u32 = 0;
-    // A pending explicit-`reconnect` reply: fulfilled after the *next* connect attempt resolves.
-    let mut pending_reconnect: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>> =
-        None;
-
-    loop {
-        // Connect within the configured deadline (§4.1 connectMs).
-        dm.on_connect_attempt();
-        let started = Instant::now();
-        // No session is open yet, so a cancel here has nothing to close: drop the connect future and
-        // leave (the enip connect is itself deadline-bounded; the half-open socket dies with RAII).
-        let outcome = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            o = tokio::time::timeout(connect_timeout, backend.connect(&cfg.connection)) => o,
-        };
-
-        match outcome {
-            Ok(Ok(session)) => {
-                attempt = 0;
-                let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                dm.on_connected(latency_ms, Instant::now());
-                // Capture the negotiated security posture for the sb/status/state surface (§3.4), and
-                // clear any prior handshake-failing state.
-                let security = session.security();
-                health.set_security(security.clone());
-                // Phase 2b: surface the connected cert's days-to-expiry as a gauge immediately, even
-                // before the lifecycle task's first re-read (§4.2).
-                if let Some(days) = security.as_ref().and_then(|s| s.client_cert_expiry_days) {
-                    dm.set_cert_expiry_days(days);
-                }
-                health
-                    .tls_handshake_failing
-                    .store(false, Ordering::Relaxed);
-                health.set_link(LinkState::Online);
-                // A transition: flush southbound_health + connection immediately (§8.7).
-                dm.emit_now().await;
-                let mut connected_ctx = json!({ "instance": cfg.id, "adapter": backend.kind() });
-                if let Some(sec) = &security {
-                    connected_ctx["security"] = json!(if sec.tls { "tls" } else { "plaintext" });
-                    if !sec.peer_verified && sec.tls {
-                        // A no-verify TLS session is a loud, commissioning/debug posture (§3.3).
-                        events
-                            .emit(
-                                Severity::Warning,
-                                "tls-peer-unverified",
-                                Some(format!(
-                                    "connected to {} over TLS WITHOUT peer verification (verifyPeer:false)",
-                                    cfg.connection.endpoint
-                                )),
-                                Some(json!({ "instance": cfg.id })),
-                            )
-                            .await;
-                    }
-                }
-                events
-                    .emit(
-                        Severity::Info,
-                        "device-connected",
-                        Some(format!("connected to {}", cfg.connection.endpoint)),
-                        Some(connected_ctx),
-                    )
-                    .await;
-                // A raised alarm is cleared by the SAME wire type, so the pair rides one channel.
-                events
-                    .clear_alarm(Severity::Critical, "device-unreachable", None)
-                    .await;
-                // An explicit reconnect that asked for this connect: it succeeded.
-                if let Some(reply) = pending_reconnect.take() {
-                    let _ = reply.send(Ok(()));
-                }
-
-                let exit = crate::poll_driver::poll_until_disconnected(
-                    &cfg,
-                    &global,
-                    session,
-                    &data,
-                    &dm,
-                    &health,
-                    backend.kind(),
-                    &mut control,
-                    events.as_ref(),
-                    keepalive_ms,
-                    &cancel,
-                )
-                .await;
-
-                dm.on_connection_dropped(Instant::now());
-                health.set_security(None);
-                match exit {
-                    // The driver already closed the session on its way out — nothing to reconnect.
-                    crate::poll_driver::PollExit::Stopped => return,
-                    crate::poll_driver::PollExit::LinkLost => {
-                        health.set_link(LinkState::Backoff);
-                        health.reconnects.fetch_add(1, Ordering::Relaxed);
-                        dm.emit_now().await;
-                        events
-                            .raise_alarm(
-                                Severity::Critical,
-                                "device-unreachable",
-                                Some(format!("lost the link to {}", cfg.connection.endpoint)),
-                                Some(json!({ "instance": cfg.id })),
-                            )
-                            .await;
-                        let wait = backoff.delay(attempt, rand01());
-                        match serve_control_disconnected(
-                            &mut control, &cfg, &health, &dm, events.as_ref(), wait, &cancel,
-                        )
-                        .await
-                        {
-                            DisconnectedWait::Stopped => return,
-                            DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
-                            DisconnectedWait::Elapsed => {}
-                        }
-                        attempt = attempt.saturating_add(1);
-                    }
-                    // An explicit reconnect: no alarm, no backoff — straight back to connect, carrying
-                    // the reply to fulfill after the next connect resolves (§7.5).
-                    crate::poll_driver::PollExit::Reconnect(reply) => {
-                        health.set_link(LinkState::Connecting);
-                        pending_reconnect = Some(reply);
-                    }
-                }
-            }
-
-            // Connect failed (Err) or timed out (Elapsed). A permanent failure will fail identically
-            // forever, so back off to the ceiling immediately.
-            other => {
-                dm.on_connect_failure();
-                health.set_link(LinkState::Backoff);
-                let reason = connect_reason(&other, connect_timeout);
-                // An explicit reconnect that asked for this connect: it failed → RECONNECT_FAILED.
-                if let Some(reply) = pending_reconnect.take() {
-                    let _ = reply.send(Err(reason.clone()));
-                }
-                let permanent = matches!(&other, Ok(Err(e)) if !e.is_transient());
-                // A permanent connect failure on a TLS instance is a cert/suite/protocol handshake
-                // failure (a transient TCP hiccup or pre-handshake IO is not) — count it and fire the
-                // `tls-handshake-failed` event on the transition into failing (§3.4).
-                if tls_instance && permanent {
-                    dm.on_tls_handshake_failure();
-                    dm.emit_now().await;
-                    if !health.tls_handshake_failing.swap(true, Ordering::Relaxed) {
-                        events
-                            .emit(
-                                Severity::Warning,
-                                "tls-handshake-failed",
-                                Some(format!("TLS handshake to {} failed: {reason}", cfg.connection.endpoint)),
-                                Some(json!({ "instance": cfg.id, "security": "tls" })),
-                            )
-                            .await;
-                    }
-                }
-                let wait = if permanent {
-                    Duration::from_millis(backoff.max_ms)
-                } else {
-                    backoff.delay(attempt, rand01())
-                };
-                tracing::warn!(
-                    instance = %cfg.id, error = %reason, permanent,
-                    wait_ms = wait.as_millis() as u64, "connect failed"
-                );
-                attempt = attempt.saturating_add(1);
-                match serve_control_disconnected(
-                    &mut control, &cfg, &health, &dm, events.as_ref(), wait, &cancel,
-                )
-                .await
-                {
-                    DisconnectedWait::Stopped => return,
-                    DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
-                    DisconnectedWait::Elapsed => {}
-                }
-            }
-        }
-    }
-}
-
-/// The CIP Security Phase-2b cert-lifecycle driver (§4.2/§4.3) — the thin live-infra seam over the
-/// pure [`crate::eip::rotation`] logic. On the `reloadIntervalSecs` cadence it re-reads the vault's
-/// current TLS material, and:
-///
-/// * on a **rotation** (the client cert and/or a trust-store CA changed) it bumps `certReloads`, emits
-///   `cert-rotated`, and sends a `reconnect` so the next handshake uses the fresh material (the connect
-///   path always rebuilds the `ClientConfig` from the latest vault contents);
-/// * on the transition into **near-expiry** (`renewBeforeDays`) it emits `cert-expiring`, and into
-///   **expired** it emits `cert-expired`;
-/// * every tick it refreshes the `certExpiryDays` gauge.
-///
-/// It never blocks polling: a vault-read error is logged and the loop continues on the current
-/// material (offline-first). All decisions are made by [`crate::eip::rotation::CertWatcher`]; this
-/// driver only performs the I/O.
-/// The lifecycle body (Phase 2b rotation/expiry + Phase 2c EST enroll/renew), parameterized on an
-/// optional shared [`crate::app::Health`] so the EST state can be surfaced on `sb/status.security.est`.
-///
-/// `cancel` ends the task at the tick boundary (§10.3). A cancel landing **mid-EST-exchange** (itself
-/// bounded at 20 s) is deliberately not selected against; that task is instead reaped by
-/// [`crate::lifecycle::stop_tasks`]'s abort at the end of the teardown budget. That is safe: the EST
-/// client holds no device session, its vault write is atomic in the credential service, and
-/// enrollment is idempotent — an interrupted exchange simply re-enrolls on the next start.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn security_lifecycle_inner(
-    cfg: DeviceConfig,
-    creds: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
-    control: tokio::sync::mpsc::Sender<crate::app::DeviceControl>,
-    events: Arc<dyn EventSink>,
-    dm: Arc<crate::metrics::DeviceMetrics>,
-    health: Option<Arc<crate::app::Health>>,
-    cancel: CancellationToken,
-) {
-    use crate::eip::est::{enroll_once, next_renew_rfc3339, EstDecision, EstScheduler, EstStatus};
-    use crate::eip::rotation::{read_reload_state, CertWatcher, WatchAction};
-    use crate::eip::tls::{SecurityConfig, DEFAULT_RELOAD_INTERVAL_SECS, DEFAULT_RENEW_BEFORE_DAYS};
-
-    let Some(sec) = SecurityConfig::from_connection(&cfg.connection)
-        .ok()
-        .flatten()
-        .filter(SecurityConfig::is_tls)
-    else {
-        return;
-    };
-    let interval_secs = sec.reload_interval_secs.unwrap_or(DEFAULT_RELOAD_INTERVAL_SECS);
-
-    // CIP Security Phase 2c: EST enrollment/renewal (off unless `est.enabled`).
-    let est = sec.est_enabled().cloned();
-    let est_renew_days = est.as_ref().map_or(DEFAULT_RENEW_BEFORE_DAYS, |e| e.renew_before_days(&sec));
-    let est_backoff = est.as_ref().map_or(Duration::from_secs(3600), |e| e.retry_backoff());
-    // A generous fixed deadline for the whole EST exchange (connect + handshake + request/reply); EST
-    // is a background provisioning step, never on the polling hot path.
-    let connect_timeout = Duration::from_secs(20);
-    let mut est_last_attempt: Option<Instant> = None;
-    if let (Some(e), Some(h)) = (&est, &health) {
-        h.set_est(Some(EstStatus {
-            enabled: true,
-            server: e.server.clone(),
-            ..EstStatus::default()
-        }));
-    }
-
-    // With EST disabled and rotation-watching disabled, there is nothing to do.
-    if interval_secs == 0 && est.is_none() {
-        // Rotation is then picked up only on a natural reconnect (the connect path rebuilds anyway).
-        return;
-    }
-    // When only EST is on but the reload watcher is disabled, still tick (default cadence) to enroll.
-    let tick_secs = if interval_secs == 0 { DEFAULT_RELOAD_INTERVAL_SECS } else { interval_secs };
-    let renew_before_days = sec
-        .client
-        .as_ref()
-        .and_then(|c| c.renew_before_days)
-        .map_or(DEFAULT_RENEW_BEFORE_DAYS, i64::from);
-
-    let mut watcher = CertWatcher::default();
-    let mut ticker = tokio::time::interval(Duration::from_secs(tick_secs));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            _ = ticker.tick() => {}
-        }
-        let now = time::OffsetDateTime::now_utc();
-
-        // ---- Phase 2c: EST enrollment/renewal, BEFORE the rotation re-read so a fresh enrollment's
-        // vault write is observed by the watcher this same tick (⇒ Rotated ⇒ reconnect). ----
-        if let Some(e) = &est {
-            // The current cert's days-to-expiry drives the enroll decision (None ⇒ initial enroll).
-            let current_days = read_reload_state(&sec, creds.as_ref(), now)
-                .ok()
-                .and_then(|s| s.client.map(|c| c.expiry_days))
-                .filter(|d| *d != i64::MAX);
-            let since = est_last_attempt.map(|t| t.elapsed());
-            if let EstDecision::Enroll { reenroll } =
-                EstScheduler::decide(current_days, est_renew_days, since, est_backoff)
-            {
-                est_last_attempt = Some(Instant::now());
-                match enroll_once(e, &sec, creds.as_ref(), reenroll, connect_timeout).await {
-                    Ok(out) => {
-                        dm.on_est_enrollment(true);
-                        let next_renew =
-                            next_renew_rfc3339(out.not_after.as_deref(), est_renew_days);
-                        if let Some(h) = &health {
-                            let prev = h.est().unwrap_or_default();
-                            h.set_est(Some(EstStatus {
-                                enabled: true,
-                                server: e.server.clone(),
-                                last_enroll: now
-                                    .format(&time::format_description::well_known::Rfc3339)
-                                    .ok(),
-                                next_renew,
-                                last_error: None,
-                                enrollments: prev.enrollments + 1,
-                                failures: prev.failures,
-                            }));
-                        }
-                        events
-                            .emit(
-                                Severity::Info,
-                                "cert-enrolled",
-                                Some(format!(
-                                    "EST {} succeeded for {} — wrote the new certificate to `{}`",
-                                    if reenroll { "re-enrollment" } else { "enrollment" },
-                                    cfg.connection.endpoint,
-                                    out.written_to
-                                )),
-                                Some(json!({
-                                    "instance": cfg.id, "security": "tls",
-                                    "serial": out.serial, "notAfter": out.not_after,
-                                    "reenroll": reenroll
-                                })),
-                            )
-                            .await;
-                    }
-                    Err(err) => {
-                        dm.on_est_enrollment(false);
-                        if let Some(h) = &health {
-                            let prev = h.est().unwrap_or_default();
-                            h.set_est(Some(EstStatus {
-                                enabled: true,
-                                server: e.server.clone(),
-                                last_enroll: prev.last_enroll,
-                                next_renew: prev.next_renew,
-                                last_error: Some(err.clone()),
-                                enrollments: prev.enrollments,
-                                failures: prev.failures + 1,
-                            }));
-                        }
-                        events
-                            .emit(
-                                Severity::Warning,
-                                "cert-enroll-failed",
-                                Some(format!(
-                                    "EST enrollment for {} failed: {err} — keeping the current \
-                                     certificate; will retry",
-                                    cfg.connection.endpoint
-                                )),
-                                Some(json!({ "instance": cfg.id, "security": "tls" })),
-                            )
-                            .await;
-                    }
-                }
-            }
-        }
-
-        // ---- Phase 2b: rotation / expiry watch (also picks up a fresh EST enrollment's vault write). ----
-        let state = match read_reload_state(&sec, creds.as_ref(), now) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(instance = %cfg.id, error = %e, "cert-lifecycle re-read failed (ignored)");
-                continue;
-            }
-        };
-        let outcome = watcher.observe(&state, renew_before_days);
-        if let Some(days) = outcome.expiry_days {
-            dm.set_cert_expiry_days(days);
-        }
-        for action in outcome.actions {
-            match action {
-                WatchAction::Rotated { serial, not_after } => {
-                    dm.on_cert_reload();
-                    events
-                        .emit(
-                            Severity::Info,
-                            "cert-rotated",
-                            Some(format!(
-                                "client certificate / trust store rotated for {} — reconnecting to \
-                                 apply the new material",
-                                cfg.connection.endpoint
-                            )),
-                            Some(json!({
-                                "instance": cfg.id, "security": "tls",
-                                "serial": serial, "notAfter": not_after
-                            })),
-                        )
-                        .await;
-                    // Trigger a graceful reconnect (the reply is not needed here).
-                    let (reply, _rx) = tokio::sync::oneshot::channel();
-                    if control
-                        .send(crate::app::DeviceControl::Reconnect { reply })
-                        .await
-                        .is_err()
-                    {
-                        // The device task ended — nothing left to serve.
-                        return;
-                    }
-                }
-                WatchAction::Expiring { days, not_after } => {
-                    events
-                        .emit(
-                            Severity::Warning,
-                            "cert-expiring",
-                            Some(format!(
-                                "adapter client certificate expires in {days} day(s) — rotate it \
-                                 (e.g. ec-secrets) before it lapses"
-                            )),
-                            Some(json!({
-                                "instance": cfg.id, "security": "tls",
-                                "daysRemaining": days, "notAfter": not_after
-                            })),
-                        )
-                        .await;
-                }
-                WatchAction::Expired { days, not_after } => {
-                    events
-                        .emit(
-                            Severity::Warning,
-                            "cert-expired",
-                            Some(format!(
-                                "adapter client certificate EXPIRED {} day(s) ago — TLS connects will \
-                                 fail until it is rotated",
-                                -days
-                            )),
-                            Some(json!({
-                                "instance": cfg.id, "security": "tls", "notAfter": not_after
-                            })),
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-}
-
-/// One push device's lifecycle: open the class-1 connection, consume the [`crate::device::IoUpdate`]
-/// stream through the push engine ([`crate::push_driver::consume_push`]) — servicing the control
-/// channel — and reconnect on loss with the same backoff ladder as poll (§10.2).
-#[allow(clippy::too_many_arguments)]
-async fn run_push(
-    cfg: &DeviceConfig,
-    global: &GlobalConfig,
-    backend: &dyn DeviceBackend,
-    data: &DataFacade,
-    events: &dyn EventSink,
-    dm: &Arc<DeviceMetrics>,
-    health: &Arc<Health>,
-    backoff: Backoff,
-    connect_timeout: Duration,
-    control: &mut tokio::sync::mpsc::Receiver<DeviceControl>,
-    cancel: &CancellationToken,
-) {
-    let Some(io) = cfg.io.clone() else {
-        tracing::error!(instance = %cfg.id, "push device has no io block");
-        return;
-    };
-    let mut attempt: u32 = 0;
-    let mut pending_reconnect: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>> =
-        None;
-
-    loop {
-        health.set_link(LinkState::Connecting);
-        dm.on_connect_attempt();
-        let started = Instant::now();
-        // No class-1 connection is open yet, so a cancel here has nothing to ForwardClose.
-        let outcome = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            o = tokio::time::timeout(connect_timeout, backend.open_push(&cfg.connection, &io)) => o,
-        };
-        match outcome {
-            Ok(Ok(mut session)) => {
-                attempt = 0;
-                // The class-1 ForwardOpen succeeded (§8.8 forwardOpens; §8.2 sessionConnected).
-                dm.on_forward_open(true);
-                let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                dm.on_connected(latency_ms, Instant::now());
-                if let Some(reply) = pending_reconnect.take() {
-                    let _ = reply.send(Ok(()));
-                }
-
-                let exit = crate::push_driver::consume_push(
-                    cfg,
-                    global,
-                    session.as_mut(),
-                    data,
-                    events,
-                    dm,
-                    health,
-                    backend.kind(),
-                    control,
-                    cancel,
-                )
-                .await;
-                // Unconditional, and therefore also the teardown path: ForwardClose + the class-1
-                // socket release happen before this task returns.
-                session.close().await;
-
-                dm.on_connection_dropped(Instant::now());
-                match exit {
-                    crate::push_driver::PushExit::Stopped => return,
-                    crate::push_driver::PushExit::LinkLost => {
-                        health.set_link(LinkState::Backoff);
-                        health.reconnects.fetch_add(1, Ordering::Relaxed);
-                        dm.emit_now().await;
-                        events
-                            .raise_alarm(
-                                Severity::Critical,
-                                "device-unreachable",
-                                Some(format!("lost the class-1 link to {}", cfg.connection.endpoint)),
-                                Some(json!({ "instance": cfg.id })),
-                            )
-                            .await;
-                        let wait = backoff.delay(attempt, rand01());
-                        match serve_control_disconnected(
-                            control, cfg, health, dm, events, wait, cancel,
-                        )
-                        .await
-                        {
-                            DisconnectedWait::Stopped => return,
-                            DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
-                            DisconnectedWait::Elapsed => {}
-                        }
-                        attempt = attempt.saturating_add(1);
-                    }
-                    crate::push_driver::PushExit::Reconnect(reply) => {
-                        health.set_link(LinkState::Connecting);
-                        // The class-1 connection just closed and a fresh ForwardOpen follows, so the
-                        // §8.8 stack-counter baselines belong to a connection that no longer exists:
-                        // rebase them, and with them the per-connection latches, so a redirect that is
-                        // refused again on the new connection re-reports (D-ENIP-17). Deliberately NOT
-                        // `on_io_lost` — a requested reconnect is not a watchdog timeout.
-                        dm.on_io_link_replaced();
-                        pending_reconnect = Some(reply);
-                    }
-                }
-            }
-            other => {
-                // The ForwardOpen was refused / timed out (§8.8 forwardOpenFailures; §8.2 connectFailures).
-                dm.on_forward_open(false);
-                dm.on_connect_failure();
-                health.set_link(LinkState::Backoff);
-                let reason = connect_reason(&other, connect_timeout);
-                if let Some(reply) = pending_reconnect.take() {
-                    let _ = reply.send(Err(reason.clone()));
-                }
-                let permanent = matches!(&other, Ok(Err(e)) if !e.is_transient());
-                let wait = if permanent {
-                    Duration::from_millis(backoff.max_ms)
-                } else {
-                    backoff.delay(attempt, rand01())
-                };
-                tracing::warn!(
-                    instance = %cfg.id, error = %reason, permanent,
-                    wait_ms = wait.as_millis() as u64, "push open failed"
-                );
-                attempt = attempt.saturating_add(1);
-                match serve_control_disconnected(control, cfg, health, dm, events, wait, cancel)
-                    .await
-                {
-                    DisconnectedWait::Stopped => return,
-                    DisconnectedWait::Reconnect(reply) => pending_reconnect = Some(reply),
-                    DisconnectedWait::Elapsed => {}
-                }
-            }
-        }
     }
 }

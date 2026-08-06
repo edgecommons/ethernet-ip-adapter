@@ -1,13 +1,18 @@
 //! # The publish path + the shared publish-gate primitives (§6.1, §6.2)
 //!
 //! Both engines — poll ([`crate::poll`]) and push ([`crate::push`]) — feed the *same* publish path
-//! here: [`publish`] assembles a `SouthboundSignalUpdate` through the `data()` facade builder and
-//! measures the publish latency. Neither engine ever hand-builds a topic or a body — the facade mints
-//! the topic (channel = the config `name`, §5.3) and stamps identity. `serverTs` is the **capture**
-//! time (the four-slot timestamp model): each engine captures the UTC timestamp at read completion
-//! (poll) / frame receipt (push) and stamps every sample explicitly, so the facade's
-//! `serverTs`-defaults-to-publish-time rule never fires — under `batchMs` coalescing a publish-time
-//! stamp would drift by up to the whole batch window (§6.2).
+//! here: [`publish_via`] assembles a `SouthboundSignalUpdate` through the `data()` facade builder,
+//! hands it to a [`Publisher`], and measures the publish latency. Neither engine ever hand-builds a
+//! topic or a body — the facade mints the topic (channel = the config `name`, §5.3) and stamps
+//! identity. `serverTs` is the **capture** time (the four-slot timestamp model): each engine captures
+//! the UTC timestamp at read completion (poll) / frame receipt (push) and stamps every sample
+//! explicitly, so the facade's `serverTs`-defaults-to-publish-time rule never fires — under `batchMs`
+//! coalescing a publish-time stamp would drift by up to the whole batch window (§6.2).
+//!
+//! [`Publisher`] is the **publish seam**: the one `.await` on a live broker the engines perform.
+//! Production is [`crate::publish_sink::FacadePublisher`] over the `data()` facade; the driver tests
+//! inject [`crate::testutil::RecordingPublisher`], which is what lets the poll/push loops be ordinary
+//! unit-tested code instead of live-infra glue.
 //!
 //! This module also owns the **mode-agnostic gate primitives** both engines share:
 //!
@@ -72,7 +77,7 @@ pub(crate) fn sample_of(
 }
 
 /// Assemble the `SouthboundSignalUpdate` for a batch of samples (§6.2). Exposed (not just used by
-/// [`publish`]) so the wire-shape test can assert the body the adapter hands the facade
+/// [`publish_via`]) so the wire-shape test can assert the body the adapter hands the facade
 /// field-by-field, for both id forms.
 #[must_use]
 pub(crate) fn build_update(
@@ -94,9 +99,36 @@ pub(crate) fn build_update(
         .build()
 }
 
-// The single `publish()` call that drives `data.publish().await` lives in the excluded live-broker
-// seam [`crate::publish_sink`]; the pure assembly ([`build_update`]) + gate primitives below are what
-// the unit tests drive.
+// =====================================================================================
+// The publish seam (§6.1) — the one `.await` on a live broker, behind a trait.
+// =====================================================================================
+
+/// The publish half of the driver seam (§6.1) — the ONE `.await` on a live broker the engines
+/// perform. Production is [`crate::publish_sink::FacadePublisher`] over the `data()` facade;
+/// tests inject a recorder ([`crate::testutil::RecordingPublisher`]).
+#[async_trait::async_trait]
+pub(crate) trait Publisher: Send + Sync {
+    /// Publish one assembled update. `Err` carries the facade error's display string.
+    async fn publish_update(&self, update: SignalUpdate) -> std::result::Result<(), String>;
+}
+
+/// Assemble (via [`build_update`]) and publish one signal's samples, measuring the publish
+/// latency — the wall time of `publish_update().await` (§6.2, recorded into
+/// `southbound_health.publishLatencyMs` / `EtherNetIpPublish.publishLatencyMs`).
+pub(crate) async fn publish_via(
+    sink: &dyn Publisher,
+    stable_id: &str,
+    name: &str,
+    address: Value,
+    device: &DeviceParts<'_>,
+    samples: Vec<Sample>,
+) -> (std::result::Result<(), String>, Duration) {
+    let update = build_update(stable_id, name, address, device, samples);
+    let start = Instant::now();
+    let res = sink.publish_update(update).await;
+    let latency = start.elapsed();
+    (res, latency)
+}
 
 // =====================================================================================
 // The publish gate (§4.4 / §6.2) — shared by both engines, mode-agnostic and pure.
@@ -373,6 +405,57 @@ mod tests {
 
     fn db(kind: DeadbandKind, value: f64) -> DeadbandSpec {
         DeadbandSpec { kind, value }
+    }
+
+    // ---- the publish seam ----
+
+    /// [`publish_via`] hands the [`Publisher`] exactly what [`build_update`] assembled (the wire
+    /// shape itself is pinned by `build_update`'s own tests), reports the **measured** wall time of
+    /// the `.await` as the publish latency, and surfaces a sink failure as its display string.
+    #[tokio::test]
+    async fn publish_via_reports_latency_and_passes_the_assembled_update_through() {
+        let sink = crate::testutil::RecordingPublisher::default();
+        let device = DeviceParts {
+            adapter: "ethernet-ip",
+            instance: "plc-1",
+            endpoint: "127.0.0.1:44818",
+        };
+        let address = json!({ "tagPath": "LINE_SPEED", "type": "real" });
+        let samples = vec![sample_of(
+            json!(12.5),
+            Quality::Good,
+            Some("0x00"),
+            Some("2026-08-06T10:00:00Z".into()),
+        )];
+        let expected = build_update(
+            "LINE_SPEED",
+            "line-speed",
+            address.clone(),
+            &device,
+            samples.clone(),
+        );
+
+        sink.set_delay(Duration::from_millis(20));
+        let (res, latency) =
+            publish_via(&sink, "LINE_SPEED", "line-speed", address.clone(), &device, samples.clone())
+                .await;
+
+        assert!(res.is_ok());
+        let published = sink.updates();
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0], expected,
+            "the sink receives build_update's output verbatim — no second assembly path"
+        );
+        assert!(
+            latency >= Duration::from_millis(15),
+            "the reported latency is the wall time of the publish await, got {latency:?}"
+        );
+
+        // A sink failure comes back as its display string, and is still measured.
+        sink.set_fail(true);
+        let (res, _) = publish_via(&sink, "LINE_SPEED", "line-speed", address, &device, samples).await;
+        assert_eq!(res.unwrap_err(), "recording publisher: scripted failure");
     }
 
     // ---- should_publish: publishMode + BAD-passes-gate ----

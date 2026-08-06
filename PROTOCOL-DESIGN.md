@@ -1045,8 +1045,7 @@ live-socket **runtime** — the class-1 UDP `IoManager`/`manager_task`/`IoConnec
 `client/io_service.rs`, and the TCP connect in `client/mod.rs` — needs a real peer, so it is exercised
 by the live OpENer/cpppo suites (§12.4) rather than offline; it stays **counted against the gate**
 (not carved out), and the well-tested codec keeps the crate over the bar without excluding it. (The
-adapter applies the same discipline to its own live-loop drivers, but there it isolates them into thin
-excluded seam files — see DESIGN §12.2.)
+adapter holds the same line: no product file of its own is excluded either — see DESIGN §12.2.)
 
 ### 12.1 Unit tests (per codec, no I/O)
 

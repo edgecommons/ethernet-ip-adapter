@@ -9,7 +9,8 @@
 //! * [`types`] — the pure JSON ⇄ `CipValue` codec (§5.1, fully unit-tested).
 //! * [`session`] — [`session::EipSession`]: the poll [`DeviceSession`] over `EipClient`.
 //! * [`push`] — the pure class-1 translators ([`push::assembly_to_readings`] / [`push::map_lost_reason`]).
-//! * [`live`] — the excluded live-socket seam: `EipBackend`'s connect/ForwardOpen + the `EipPushSession`.
+//! * [`live`] — the live-socket drivers: `EipBackend`'s connect/ForwardOpen + the `EipPushSession`,
+//!   driven under unit test against a scripted peer on loopback sockets.
 //!
 //! **Error classification (§10.1).** [`map_enip_error`] implements the normative `EnipError →
 //! DeviceError` table: `EnipError::is_transient()` is the default, overridden per row (a peer that
@@ -87,8 +88,8 @@ pub(crate) fn client_options(conn: &ConnectionConfig, timeouts: &Timeouts) -> en
     }
 }
 
-// The `impl DeviceBackend for EipBackend` (live TCP connect / ForwardOpen) lives in the excluded
-// live-socket seam [`live`]; the pure error-classification below is what the unit tests drive.
+// The `impl DeviceBackend for EipBackend` (live TCP connect / ForwardOpen) lives in [`live`], which
+// drives it over loopback sockets; the pure error-classification below is shared by both.
 
 /// Classify an `enip` error into the seam's [`DeviceError`] per the §10.1 table (the adapter's
 /// normative reconnect behavior). Only connection-level failures reach here — per-tag CIP statuses

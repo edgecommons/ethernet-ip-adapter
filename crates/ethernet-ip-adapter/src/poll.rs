@@ -21,9 +21,9 @@ use crate::device::{Quality, Reading};
 use crate::publish::{self, Engine, Publish};
 
 // The per-cycle `SampleSnapshot` (the shared-counter deltas), the scheduled read → gate → batch →
-// publish select-loop (`poll_until_disconnected`) and the
-// `repoll` / publish glue live in the excluded live-infra seam [`crate::poll_driver`]; the pure
-// gating/counting/overrun logic below is what the unit tests drive.
+// publish select-loop (`poll_until_disconnected`), and the `repoll` / publish glue live in
+// [`crate::poll_driver`], which drives them against the session/publisher/event seams under its own
+// paused-clock tests; the pure gating/counting/overrun logic below is what the unit tests here drive.
 
 /// Gate + count + batch one group's readings (§4.4, §6.2). Returns the samples to publish **now**
 /// (batchMs == 0); anything buffered flushes later via [`Engine::take_due`]. Bumps the S5 counters on

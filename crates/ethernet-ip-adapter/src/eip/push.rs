@@ -2,8 +2,8 @@
 //!
 //! The class-1 field-extraction and loss-mapping the push backend uses, unit-tested with no socket
 //! (§12.3). The live-socket driver — [`EipPushSession`](super::live::EipPushSession),
-//! `open`/ForwardOpen, and the `enip::IoEvent` translator task — lives in the excluded live seam
-//! [`super::live`]; it composes these pure pieces:
+//! `open`/ForwardOpen, and the `enip::IoEvent` translator task — lives in [`super::live`] (tested
+//! there against a loopback peer) and composes these pure pieces:
 //!
 //! * [`assembly_to_readings`] — one accepted assembly frame → one [`Reading`] per configured input
 //!   field per §5 (Idle run/idle ⇒ UNCERTAIN; non-finite scale ⇒ UNCERTAIN; type mismatch ⇒ BAD). Also
