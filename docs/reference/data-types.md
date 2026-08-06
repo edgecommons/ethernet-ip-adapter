@@ -89,5 +89,8 @@ Each `SouthboundSignalUpdate` / read result carries:
 - **Push** uses CIP **class-1 implicit I/O** — the device produces its input assembly cyclically at the
   RPI; the adapter maps configured byte-offset fields to signals. There is no wire-discoverable field
   map; the layout is configuration.
-- **Security** — EtherNet/IP here is plaintext (TCP `44818`, class-1 UDP `2222`); there is no CIP
-  Security / TLS. Secure the network segment instead.
+- **Security** — poll instances support TLS (CIP Security) on the explicit-messaging path via
+  `connection.security` (mutual X.509, TCP `2221`; AEAD suites only — TLS 1.3, and TLS 1.2 ECDHE with
+  AES-GCM or ChaCha20-Poly1305). Plaintext TCP `44818` is the default; class-1 implicit I/O is plaintext
+  UDP `2222` (a push instance configured with TLS is rejected at startup). Secure the network segment
+  for plaintext deployments.

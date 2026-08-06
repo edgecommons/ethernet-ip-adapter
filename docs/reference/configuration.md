@@ -115,7 +115,7 @@ configured with `security.mode: tls` is rejected at startup.
 | `verifyPeer` | boolean | `true` | `true` verifies the device certificate against the trust anchors; `false` accepts any device certificate (a commissioning/debug posture that raises a `tls-peer-unverified` event). |
 | `serverName` | string | endpoint host | The verification / SNI name. An IP literal is verified against the device certificate's IP SAN. |
 | `checkExpiration` | boolean | `true` | `false` tolerates an expired / not-yet-valid device certificate (for devices without a real-time clock). With `true`, an already-expired **client** certificate is refused at connect rather than attempted. |
-| `cipherSuites` | string[] | GCM + TLS 1.3 | An optional cipher-suite allow-list (IANA / rustls names). Only GCM-based and TLS 1.3 suites are supported. |
+| `cipherSuites` | string[] | all AEAD suites | An optional cipher-suite allow-list (IANA / rustls names) that narrows the negotiated set. Only AEAD suites are available: TLS 1.3, and TLS 1.2 ECDHE with AES-GCM or ChaCha20-Poly1305. |
 | `client.renewBeforeDays` | integer | `30` | Fire a `cert-expiring` event this many days before the client certificate's `notAfter`. |
 | `reloadIntervalSecs` | integer | `300` | How often (seconds) to re-read the vault for a rotated client certificate / trust store. A detected change reconnects so the new material takes effect without a restart. `0` disables the re-read (material is then reloaded only on a natural reconnect). |
 
@@ -152,8 +152,9 @@ config. Add `"field": "<key>"` to read one JSON field of the secret (for example
 ```
 
 `mode: tls` requires a client identity (any one style); with `verifyPeer: true` it also requires trust
-anchors (any one `ca` style, or a `certSecret` bundle that carries `caPem`). Devices that offer only
-CBC-based cipher suites are not supported — enable GCM-based suites on the device. See the how-to guide
+anchors (any one `ca` style, or a `certSecret` bundle that carries `caPem`). Only AEAD cipher suites are
+negotiated — TLS 1.3, and TLS 1.2 ECDHE with AES-GCM or ChaCha20-Poly1305 — so a device that offers only
+CBC, NULL, or PSK suites has no overlap; enable an AEAD suite on the device. See the how-to guide
 "Connect to a CIP Security device."
 
 ##### `connection.security.est` (automatic enrollment / renewal)
@@ -335,17 +336,20 @@ and skipped instance ids (see the [messaging interface](messaging-interface.md#e
   Structures/UDTs, Logix `STRING`, and multi-dimensional arrays are rejected at config-parse time.
 - **One mode per instance** — a device needing both poll and push telemetry is two instances.
 - **TLS (CIP Security)** — poll (explicit-messaging) instances can run over TLS with mutual X.509
-  (`connection.security`, above). Only GCM-based and TLS 1.3 cipher suites are supported; devices that
-  offer only CBC-based suites are not. Class-1 implicit I/O (`mode: push`) runs over plaintext UDP
-  `2222` — a push instance configured with TLS is rejected at startup.
+  (`connection.security`, above). Only AEAD cipher suites are negotiated — TLS 1.3, and TLS 1.2 ECDHE
+  with AES-GCM or ChaCha20-Poly1305; a device that offers only CBC, NULL, or PSK suites has no cipher
+  overlap. Class-1 implicit I/O (`mode: push`) runs over plaintext UDP `2222` — a push instance
+  configured with TLS is rejected at startup.
 - **Managed trust store and certificate rotation** — the CA trust anchors are a set of roots
   (`ca.trustStore` / `ca.list`), and a CA rollover's old and new roots are trusted together while both
   are live. The adapter re-reads the vault on the `reloadIntervalSecs` cadence and, when the client
   certificate or trust store rotates (for example via `ec-secrets`), reconnects so the new material
   takes effect without a restart. It monitors the client certificate's expiry: a `cert-expiring` event
   fires within `client.renewBeforeDays` of `notAfter`, a `cert-expired` event fires when it lapses, and
-  an already-expired client certificate is refused at connect. Direct EST enrollment of the adapter's
-  own certificate is not part of this adapter; provision the client certificate through the vault.
+  an already-expired client certificate is refused at connect. The client certificate itself comes from
+  the vault or from files; automatic enrollment and renewal (`connection.security.est`, above) writes
+  the enrolled material to a vault secret, so a file-only client identity needs an explicit `est.into`
+  destination.
 - **Security posture reporting** — on connect the adapter reads the target's CIP Security objects and
   reports the device's posture (state, security profiles, allowed/available cipher suites, client-cert
   and expiration policy, and a certificate summary) on `sb/status` under `security.target`, with

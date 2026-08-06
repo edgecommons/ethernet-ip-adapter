@@ -79,8 +79,13 @@ Full docs live under [`docs/`](docs/) (synced to
   multi-dimensional arrays are not supported.
 - **Poll** uses CIP explicit messaging (one request per signal per cycle); **push** uses class-1
   implicit I/O.
-- **Security:** EtherNet/IP here is plaintext (TCP `44818`, class-1 UDP `2222`); there is no CIP
-  Security / TLS. Deploy on an isolated OT network segment.
+- **Security:** poll (explicit-messaging) instances can run over **EtherNet/IP over TLS** (CIP Security,
+  TCP `2221`) with mutual X.509 authentication — configured per connection via `connection.security`
+  (see the [configuration reference](docs/reference/configuration.md)). Plaintext (TCP `44818`) is the
+  default. Only AEAD cipher suites are negotiated — TLS 1.3, and TLS 1.2 ECDHE with AES-GCM or
+  ChaCha20-Poly1305; CBC, NULL, and PSK suites are not available. Class-1 implicit I/O (`mode: push`)
+  runs over plaintext UDP `2222`; a push instance configured with TLS is rejected at startup. On
+  plaintext instances the network segment is the protection — deploy on an isolated OT segment.
 
 ## License
 

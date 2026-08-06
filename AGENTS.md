@@ -8,12 +8,14 @@ infra, local-dev sibling override).
 
 ## What it is
 
-The Rust reference **EtherNet/IP** adapter — CIP explicit messaging over TCP (Allen-Bradley
-ControlLogix / CompactLogix and generic CIP devices). It is **poll-based**: it reads config-declared
-signals on scheduled poll groups (structurally the closest sibling is the Python `modbus-adapter`,
-not the subscribe-based Java `opcua-adapter`), normalizes each read to a `SouthboundSignalUpdate`
-with quality, and publishes it on the `data` class via the library's `data()` facade. It serves
-confirmed, allow-listed writes and the `sb/*` command family, and reports per-instance connectivity.
+The Rust reference **EtherNet/IP** adapter — CIP explicit messaging over TCP and class-1 implicit
+I/O over UDP (Allen-Bradley ControlLogix / CompactLogix and generic CIP devices). It reads
+config-declared signals on scheduled poll groups (`mode: poll`, CIP explicit messaging —
+structurally the closest sibling is the Python `modbus-adapter`) **and** consumes class-1 implicit
+I/O (`mode: push`) at the negotiated RPI, per instance; both paths normalize every reading to a
+`SouthboundSignalUpdate` with quality and publish on the `data` class via the library's `data()`
+facade. It serves confirmed, allow-listed writes and the `sb/*` command family, and reports
+per-instance connectivity.
 Runs HOST / GREENGRASS / KUBERNETES via edgecommons (no platform branching).
 
 One component instance (`component.instances[]` entry) = **one device** (one PLC / CIP endpoint),
@@ -21,7 +23,7 @@ each with its own task, session, and connection lifecycle.
 
 ## Authoritative design
 
-**`DESIGN.md` is the design-fidelity contract** (v1.0). Build to it, re-read it before implementing,
+**`DESIGN.md` is the design-fidelity contract** (v2.0). Build to it, re-read it before implementing,
 and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md` records where the
 `edgecommons` CLI / generated base fell short (internal dev note, not synced to the docs site).
 
