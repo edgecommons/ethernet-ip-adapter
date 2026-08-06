@@ -5,7 +5,8 @@
 //! `crl2pkcs7`), the enroll-response interpreter, the renew-window scheduler, the vault write-back,
 //! and — the key end-to-end handoff — `enroll_once` against an **in-process rustls EST responder**
 //! proving the enrolled cert lands in the vault so Phase 2b's [`crate::eip::rotation`] watcher reloads
-//! it. The live suite (`tests/live_est.rs`) runs the same flow against a real EST server.
+//! it. The live test at the bottom of this file runs the same flow against the real globalsign/est
+//! server (`test-infra/est/`) when that container is up.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -14,9 +15,13 @@ use edgecommons::credentials::{
     CredentialService, DefaultCredentialService, FileKeyProvider, KeyProvider, LocalVault, PutOptions,
 };
 use serde_json::json;
-use std::net::{IpAddr, Ipv4Addr};
 
 use crate::device::ConnectionConfig;
+// The throwaway PKI + the in-process rustls EST responder live with the other test doubles
+// (`testutil::pki`), because the cert-lifecycle driver's tests enroll against the same responder.
+use crate::testutil::pki::{
+    est_http_200, mint_certs, spawn_est_server, GOLDEN_PKCS7_B64, GOLDEN_SERIAL,
+};
 
 // ---- helpers -----------------------------------------------------------------------------------
 
@@ -37,50 +42,6 @@ fn vault(seed: u8) -> (Arc<dyn CredentialService>, tempfile::TempDir) {
     let v = LocalVault::open(dir.path().join("vault"), provider, 3).unwrap();
     (Arc::new(DefaultCredentialService::new(v)), dir)
 }
-
-struct Certs {
-    ca_pem: String,
-    ca_der: CertificateDer<'static>,
-    server_chain: Vec<CertificateDer<'static>>,
-    server_key: rustls::pki_types::PrivateKeyDer<'static>,
-    client_cert_pem: String,
-    client_key_pem: String,
-}
-
-/// Mint a CA, a server leaf with an IP SAN for 127.0.0.1, and a client (bootstrap) identity.
-fn mint_certs() -> Certs {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType};
-    let mut ca_params = CertificateParams::new(vec![]).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_key = KeyPair::generate().unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    let mut sp = CertificateParams::new(vec![]).unwrap();
-    sp.subject_alt_names = vec![SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST))];
-    let server_key = KeyPair::generate().unwrap();
-    let server_cert = sp.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
-
-    let cp = CertificateParams::new(vec!["eip-bootstrap".to_string()]).unwrap();
-    let client_key = KeyPair::generate().unwrap();
-    let client_cert = cp.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
-
-    Certs {
-        ca_pem: ca_cert.pem(),
-        ca_der: ca_cert.der().clone(),
-        server_chain: vec![server_cert.der().clone()],
-        server_key: rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
-        client_cert_pem: client_cert.pem(),
-        client_key_pem: client_key.serialize_pem(),
-    }
-}
-
-// A GOLDEN certs-only PKCS#7 (DER, base64), produced with OpenSSL:
-//   openssl crl2pkcs7 -nocrl -certfile <CN=eip-originator, serial 540D9C…> -outform DER
-// This is the exact `application/pkcs7-mime` shape an EST /simpleenroll returns.
-const GOLDEN_PKCS7_B64: &str = "MIIBpwYJKoZIhvcNAQcCoIIBmDCCAZQCAQExADALBgkqhkiG9w0BBwGgggF8MIIBeDCCAR6gAwIBAgIUVA2cqvkfkRI6mkS7lfUe/n7qwnUwCgYIKoZIzj0EAwIwGzEZMBcGA1UEAwwQRVNUIFRlc3QgUm9vdCBDQTAeFw0yNjA3MTkxNzA1MTBaFw0yODEwMjExNzA1MTBaMBkxFzAVBgNVBAMMDmVpcC1vcmlnaW5hdG9yMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZIXphvHufMQQMj/LVXTIEOgjhpGP9iVOqqpgVpiivTB74trvg7nwmWnH5ETuvBg91Fy7wnQg+X5tQxDkXBEGe6NCMEAwHQYDVR0OBBYEFJz8r/HNFFu8ncEoCEI2Fj/Bvgp4MB8GA1UdIwQYMBaAFMbbMncP1I7iT1e0SvnldGXjuYofMAoGCCqGSM49BAMCA0gAMEUCIQDI6CbYr5yNThMcllSXBotG12/m/I4Ki1OQ7jvHfm4BqwIgCzwdSZZr2Z2rWxH41m9ddKPsZ+CaxxEt+J1CBA43sk4xAA==";
-// The leaf certificate's serial (uppercase hex) inside the golden vector.
-const GOLDEN_SERIAL: &str = "540D9CAAF91F91123A9A44BB95F51EFE7EEAC275";
 
 fn golden_pkcs7_der() -> Vec<u8> {
     base64::engine::general_purpose::STANDARD.decode(GOLDEN_PKCS7_B64).unwrap()
@@ -618,59 +579,6 @@ fn resolve_auth_bootstrap_sources_the_identity() {
 // issued cert, and WRITES it to the vault; and Phase 2b's rotation watcher detects the vault change
 // (⇒ it would reconnect with the new material). It also exercises `EstClient`/`request`/`cacerts`.
 
-/// Spawn a one-shot TLS EST responder on 127.0.0.1 that returns `response_bytes` for any request.
-/// Returns the bound port.
-async fn spawn_est_server(certs: &Certs, response_bytes: Vec<u8>) -> u16 {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(certs.ca_der.clone()).unwrap();
-    let server_cfg = Arc::new(
-        rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(certs.server_chain.clone(), certs.server_key.clone_key())
-            .unwrap(),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
-        if let Ok((tcp, _)) = listener.accept().await {
-            if let Ok(mut tls) = acceptor.accept(tcp).await {
-                // Read the request headers (until the terminator) so the client's write completes.
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 1024];
-                for _ in 0..64 {
-                    match tls.read(&mut chunk).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            buf.extend_from_slice(&chunk[..n]);
-                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let _ = tls.write_all(&response_bytes).await;
-                let _ = tls.flush().await;
-                let _ = tls.shutdown().await;
-            }
-        }
-    });
-    port
-}
-
-fn est_http_200(body_b64: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/pkcs7-mime\r\nContent-Transfer-Encoding: base64\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body_b64.len(),
-        body_b64
-    )
-    .into_bytes()
-}
-
 #[tokio::test]
 async fn enroll_once_writes_the_issued_cert_and_2b_reloads_it() {
     let certs = mint_certs();
@@ -743,7 +651,8 @@ async fn est_client_cacerts_fetches_the_ca_bag() {
 // server + mock CA, mutual-TLS, over a real socket. Runs only when the container is up:
 //   docker compose up --build est-server         (or: docker run -p 8443:8443 ec-est-server)
 // and is SILENTLY SKIPPED otherwise (matching the inline live tests in tls.rs), so the normal suite
-// stays green with no live infra. It is excluded from the coverage gate via the `live_est` regex.
+// stays green with no live infra. Nothing here is excluded from the coverage gate — this file is
+// inside the denominator, and on a bench with no EST container the body below reads uncovered.
 
 const EST_CERT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-infra/est/certs");
 

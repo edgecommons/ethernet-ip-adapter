@@ -31,7 +31,8 @@ agent tool. It is imported here in full:
     -c FILE ./crates/ethernet-ip-adapter/test-configs/config.json -t my-thing
   ```
 - **Coverage gate**: 90% line, **workspace-wide**, Linux-authoritative (Windows undercounts Rust
-  statements). The protocol crate is inside the gate (D-EIP-17); only live-hardware suites
-  (sim-gated) are excluded.
+  statements). The protocol crate is inside the gate (D-EIP-17), and so is every adapter product
+  file; the sim-gated live suites, the fuzz harness workspace, and the `#[cfg(test)]` test doubles
+  are the only exclusions (DESIGN §12.2).
 - Always unsubscribe / handle SIGTERM before exit (RAII on the `EdgeCommons` runtime handles it) so a
   run does not leak subscriptions and trip the shared-connection quota.

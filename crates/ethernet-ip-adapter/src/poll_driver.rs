@@ -1,27 +1,39 @@
-//! # The poll loop driver (§3.2, §6) — the live-infra seam (excluded from coverage, §12.2)
+//! # The poll loop driver (§3.2, §6) — the scheduled read → gate → batch → publish composition
 //!
-//! A **thin driver seam**: [`poll_until_disconnected`] owns one poll-mode device's session and runs
-//! the scheduled read → gate → batch → publish select-loop, servicing the `sb/*` control channel in
-//! line with it. Every branch here is driven by a `.await` on the [`DeviceSession`] seam (a live socket
-//! against cpppo / ControlLogix) or the `data()` publish facade (a live broker); the **pure decisions**
-//! it composes — the deadband/change/batch/stale gating ([`crate::poll::process_group`]), the overrun
-//! accounting ([`crate::poll::record_cycle`]), the [`crate::publish`] gate primitives — are unit-tested
-//! in their home modules. The loop itself is validated by the live cpppo suite (§11) and the S9 deployed
-//! regression, exactly as `file-replicator` validates its `dest/*/client.rs` seams.
+//! [`poll_until_disconnected`] owns one poll-mode device's session and runs the scheduled read → gate
+//! → batch → publish select-loop, servicing the `sb/*` control channel in line with it. It is the
+//! poll mode's *composition logic*, not I/O glue: the wake computation, the group re-arm, the
+//! batch-flush ordering, the paused keepalive, the metric attribution, and every control verb's
+//! contract are decided here, over three injected seams — [`DeviceSession`] (the wire),
+//! [`crate::publish::Publisher`] (the broker), and [`EventSink`] (the `evt` surface). The pure
+//! decisions it composes — the deadband/change/batch/stale gating
+//! ([`crate::poll::process_group`]), the overrun accounting ([`crate::poll::record_cycle`]), the
+//! [`crate::publish`] gate primitives — live in their own modules.
+//!
+//! The loop therefore runs under unit test against scripted seams (`#[cfg(test)] mod tests` below,
+//! on a paused clock); the live cpppo suite (§11) and the deployed regression validate it against a
+//! real device, which is conformance evidence rather than coverage evidence.
+//!
+//! **Clock:** the loop schedules on [`tokio::time::Instant`] — the same wall clock as
+//! `std::time::Instant` at runtime (tokio reads the system clock unless the runtime is paused), and
+//! the *simulated* clock under `#[tokio::test(start_paused = true)]`, which is what makes the
+//! cadence/flush/keepalive/metric-interval behaviour deterministically testable. The pure engine
+//! primitives keep taking `std::time::Instant`; the conversion happens at the call boundary.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use edgecommons::prelude::{DataFacade, Sample};
+use edgecommons::prelude::Sample;
+use tokio::time::Instant;
 
 use crate::app::{apply_pause, DeviceControl, EventSink, Health, LinkState};
 use crate::config::{DeviceConfig, GlobalConfig, PollGroup, PublishMode, SignalSpec};
 use crate::device::DeviceSession;
 use crate::metrics::{DeviceMetrics, RESULT_ERROR, RESULT_SUCCESS};
 use crate::poll::{process_group, record_cycle};
-use crate::publish::{self, Engine};
+use crate::publish::{self, Engine, Publisher};
 
 /// How [`poll_until_disconnected`] left the poll loop (§7.5, §10.2, §10.3). The supervisor
 /// ([`crate::supervisor`]) reconnects on `LinkLost` and `Reconnect` — but an explicit `reconnect`
@@ -91,7 +103,7 @@ pub(crate) async fn poll_until_disconnected(
     cfg: &DeviceConfig,
     global: &GlobalConfig,
     mut session: Box<dyn DeviceSession>,
-    data: &DataFacade,
+    sink: &dyn Publisher,
     dm: &Arc<DeviceMetrics>,
     health: &Arc<Health>,
     adapter: &str,
@@ -127,7 +139,7 @@ pub(crate) async fn poll_until_disconnected(
     let keepalive = Duration::from_millis(keepalive_ms.max(1));
 
     let start = Instant::now();
-    let mut engine = Engine::new(start);
+    let mut engine = Engine::new(start.into_std());
     let mut deadlines: Vec<Instant> = intervals.iter().map(|d| start + *d).collect();
     let mut since_health = start;
     let mut since_keepalive = start;
@@ -143,7 +155,7 @@ pub(crate) async fn poll_until_disconnected(
         } else {
             wake = wake.min(*deadlines.iter().min().expect("at least one poll group"));
             if let Some(bd) = engine.next_batch_deadline(batch_ms) {
-                wake = wake.min(bd);
+                wake = wake.min(Instant::from_std(bd));
             }
         }
         let wait = wake.saturating_duration_since(Instant::now());
@@ -206,7 +218,7 @@ pub(crate) async fn poll_until_disconnected(
                         let changed = apply_pause(cfg, health, dm, events, false, None).await;
                         if changed {
                             // Re-base staleness so the paused span doesn't count (§7.4.5/§9.3).
-                            engine.rebase_stale(Instant::now());
+                            engine.rebase_stale(Instant::now().into_std());
                             // Re-arm group deadlines from now so a paused span isn't a catch-up storm.
                             let base = Instant::now();
                             for (i, d) in deadlines.iter_mut().enumerate() {
@@ -226,7 +238,7 @@ pub(crate) async fn poll_until_disconnected(
                         } else {
                             match repoll_all_groups(
                                 &cfg.poll_groups, &modes, &mode_of, batch_ms, &mut engine, &mut session,
-                                data, cfg, dm, health, adapter,
+                                sink, cfg, dm, health, adapter,
                             ).await {
                                 Ok(count) => {
                                     let _ = reply.send(Ok(count));
@@ -285,9 +297,9 @@ pub(crate) async fn poll_until_disconnected(
             }
         } else {
             // 1. Flush any batch windows that closed (a coalescing-window flush → EtherNetIpPublish, §8.5).
-            for p in engine.take_due(batch_ms, now) {
+            for p in engine.take_due(batch_ms, now.into_std()) {
                 let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| PublishMode::OnChange.as_str());
-                publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, true).await;
+                publish_by_id(sink, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, true).await;
             }
 
             // 2. Poll the earliest due group (there may be none — we woke for a flush/health tick).
@@ -324,10 +336,10 @@ pub(crate) async fn poll_until_disconnected(
                 health.poll_latency_ms.store(elapsed_ms, Ordering::Relaxed);
                 record_cycle(elapsed, intervals[idx], health);
 
-                let now2 = Instant::now();
+                let now2 = Instant::now().into_std();
                 for p in process_group(&mut engine, group, modes[idx], batch_ms, &readings, now2, &server_ts, health) {
                     let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| modes[idx].as_str());
-                    publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
+                    publish_by_id(sink, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
                 }
 
                 // Attribute this cycle's samples to its (pollGroup, success) combo (§8.4).
@@ -353,7 +365,7 @@ pub(crate) async fn poll_until_disconnected(
             let stale = if paused {
                 0
             } else {
-                engine.count_stale(cfg.signals().map(|s| s.tag_path.as_str()), stale_secs, now)
+                engine.count_stale(cfg.signals().map(|s| s.tag_path.as_str()), stale_secs, now.into_std())
             };
             health.stale_signals.store(stale, Ordering::Relaxed);
             dm.emit_periodic().await;
@@ -372,7 +384,7 @@ async fn repoll_all_groups(
     batch_ms: u64,
     engine: &mut Engine,
     session: &mut Box<dyn DeviceSession>,
-    data: &DataFacade,
+    sink: &dyn Publisher,
     cfg: &DeviceConfig,
     dm: &DeviceMetrics,
     health: &Health,
@@ -387,10 +399,10 @@ async fn repoll_all_groups(
         // Capture time (four-slot timestamp model): stamped at read completion, as on the timer.
         let server_ts = publish::now_iso();
         polled += group.signals.len() as u64;
-        let now = Instant::now();
+        let now = Instant::now().into_std();
         for p in process_group(engine, group, modes[idx], batch_ms, &readings, now, &server_ts, health) {
             let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| modes[idx].as_str());
-            publish_by_id(data, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
+            publish_by_id(sink, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
         }
     }
     Ok(polled)
@@ -401,7 +413,7 @@ async fn repoll_all_groups(
 /// counters on `dm` (§8.5). `from_batch` marks a coalescing-window flush.
 #[allow(clippy::too_many_arguments)]
 async fn publish_by_id(
-    data: &DataFacade,
+    sink: &dyn Publisher,
     cfg: &DeviceConfig,
     adapter: &str,
     signal_id: &str,
@@ -414,13 +426,13 @@ async fn publish_by_id(
     let Some(spec) = cfg.find_signal(signal_id) else {
         return;
     };
-    publish_samples(data, cfg, adapter, spec, samples, health, dm, publish_mode, from_batch).await;
+    publish_samples(sink, cfg, adapter, spec, samples, health, dm, publish_mode, from_batch).await;
 }
 
-/// Publish one signal's samples through the mode-agnostic [`crate::publish_sink`] path.
+/// Publish one signal's samples through the mode-agnostic [`crate::publish::publish_via`] path.
 #[allow(clippy::too_many_arguments)]
 async fn publish_samples(
-    data: &DataFacade,
+    sink: &dyn Publisher,
     cfg: &DeviceConfig,
     adapter: &str,
     spec: &SignalSpec,
@@ -431,8 +443,8 @@ async fn publish_samples(
     from_batch: bool,
 ) {
     let n = samples.len() as u64;
-    let (res, latency) = crate::publish_sink::publish(
-        data,
+    let (res, latency) = publish::publish_via(
+        sink,
         &spec.tag_path,
         &spec.name,
         spec.address_json(&cfg.connection),
@@ -455,5 +467,674 @@ async fn publish_samples(
             tracing::warn!(instance = %cfg.id, tag_path = %spec.tag_path, error = %e, "publish failed");
             dm.record_publish(publish_mode, n, from_batch, latency_ms, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The poll loop, driven against scripted seams on a **paused clock**: a
+    //! [`ScriptedSession`] for the wire, a [`RecordingPublisher`] for the broker, a
+    //! [`RecordingEvents`] for the `evt` surface, and a [`RecordingMetrics`]-backed
+    //! [`DeviceMetrics`]. No socket, no broker, no PLC — every branch below is the loop's own
+    //! composition logic (§3.2, §7, §8).
+    //!
+    //! Time is simulated: each test spawns its stimuli on timers, so the runtime advances its clock
+    //! to whichever deadline comes next (the driver's or the test's) and the interleaving is
+    //! deterministic.
+
+    use super::*;
+    use crate::app::{BrowseError, WriteRequest};
+    use crate::device::{BrowsePage, BrowsedTag, DeviceError, Quality, Reading};
+    use crate::metrics::{HEALTH, POLL, PUBLISH};
+    use crate::testutil::{
+        device_metrics_with, reading, RecordingEvents, RecordingMetrics, RecordingPublisher,
+        ScriptedSession,
+    };
+    use serde_json::{json, Value};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
+
+    fn poll_device(v: Value) -> DeviceConfig {
+        DeviceConfig::from_value(&v).expect("a valid device config")
+    }
+
+    fn global(v: Value) -> GlobalConfig {
+        GlobalConfig::from_value(&v).expect("a valid global config")
+    }
+
+    /// One group, one `real` signal, at `poll_ms` in `mode`.
+    fn one_group(poll_ms: u64, mode: &str) -> Value {
+        json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "127.0.0.1:44818" },
+            "pollGroups": [ {
+                "id": "fast", "pollIntervalMs": poll_ms, "publishMode": mode,
+                "signals": [ { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" } ]
+            } ]
+        })
+    }
+
+    /// Everything one driver run needs. The session/publisher/events/metrics handles stay with the
+    /// test while the driver owns its `Box<dyn DeviceSession>` and its `&dyn` seams.
+    struct Rig {
+        cfg: DeviceConfig,
+        global: GlobalConfig,
+        health: Arc<Health>,
+        metrics: Arc<RecordingMetrics>,
+        dm: Arc<DeviceMetrics>,
+        events: Arc<RecordingEvents>,
+        sink: Arc<RecordingPublisher>,
+        session: Arc<ScriptedSession>,
+        tx: Option<mpsc::Sender<DeviceControl>>,
+        rx: mpsc::Receiver<DeviceControl>,
+        cancel: CancellationToken,
+    }
+
+    impl Rig {
+        fn new(cfg: DeviceConfig, global: GlobalConfig, repeat: Vec<Reading>) -> Self {
+            let health = Arc::new(Health::default());
+            let (metrics, dm) = device_metrics_with(cfg.clone(), &global, Arc::clone(&health));
+            let (tx, rx) = mpsc::channel(32);
+            Self {
+                cfg,
+                global,
+                health,
+                metrics,
+                dm,
+                events: Arc::new(RecordingEvents::default()),
+                sink: Arc::new(RecordingPublisher::default()),
+                session: ScriptedSession::new(repeat),
+                tx: Some(tx),
+                rx,
+                cancel: CancellationToken::new(),
+            }
+        }
+
+        /// The default rig: one group at `poll_ms` in `mode`, one GOOD reading per poll.
+        fn simple(poll_ms: u64, mode: &str, value: Value) -> Self {
+            Self::new(
+                poll_device(one_group(poll_ms, mode)),
+                global(json!({})),
+                vec![reading("LINE_SPEED", value, Quality::Good)],
+            )
+        }
+
+        fn control(&self) -> mpsc::Sender<DeviceControl> {
+            self.tx.clone().expect("the control sender is still open")
+        }
+
+        /// Close the control channel (the component shutting down).
+        fn close_control(&mut self) {
+            self.tx = None;
+        }
+
+        fn cancel_after(&self, d: Duration) {
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                cancel.cancel();
+            });
+        }
+
+        fn send_after(&self, d: Duration, msg: DeviceControl) {
+            let tx = self.control();
+            tokio::spawn(async move {
+                tokio::time::sleep(d).await;
+                let _ = tx.send(msg).await;
+            });
+        }
+
+        async fn run(&mut self) -> PollExit {
+            // A far-future backstop, so a loop that wedges fails loudly instead of hanging the suite.
+            self.cancel_after(Duration::from_secs(600));
+            poll_until_disconnected(
+                &self.cfg,
+                &self.global,
+                Box::new(Arc::clone(&self.session)),
+                self.sink.as_ref(),
+                &self.dm,
+                &self.health,
+                "ethernet-ip",
+                &mut self.rx,
+                self.events.as_ref(),
+                self.global.health_thresholds.keepalive_probe_interval_ms,
+                &self.cancel,
+            )
+            .await
+        }
+
+        /// How many times a given `signal.id` was published.
+        fn published(&self, signal_id: &str) -> usize {
+            self.sink.ids().iter().filter(|id| *id == signal_id).count()
+        }
+    }
+
+    // ---- teardown ----
+
+    /// §10.3 / D-EIP-27: a cancelled instance closes its own session (UnRegisterSession reaches the
+    /// wire) and leaves as `Stopped` — no alarm, and the supervisor must not reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_closes_the_session_and_returns_stopped() {
+        let mut rig = Rig::simple(100, "always", json!(1.0));
+        rig.cancel_after(Duration::from_millis(250));
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::Stopped), "a cancel is a stop, not a lost link");
+        assert_eq!(rig.session.closed(), 1, "the cancel path closes the session on the wire");
+        assert_eq!(rig.session.reads_done(), 2, "it polled until the cancel, then stopped");
+        assert!(!rig.events.has("device-unreachable"), "a stop raises no alarm");
+    }
+
+    /// A closed control channel is the component going down, not a link failure: `Stopped`, session
+    /// closed, no alarm — otherwise shutdown looks like an outage and the supervisor reconnects.
+    #[tokio::test(start_paused = true)]
+    async fn control_channel_close_is_stopped_not_link_lost() {
+        let mut rig = Rig::simple(60_000, "always", json!(1.0));
+        rig.close_control();
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::Stopped));
+        assert_eq!(rig.session.closed(), 1, "the session still closes cleanly");
+        assert!(!rig.events.has("device-unreachable"));
+    }
+
+    // ---- the read path ----
+
+    /// A connection-level read failure must not be swallowed: the session closes, the loop reports
+    /// `LinkLost` so the ladder backs off, `readErrors` counts, and the cycle is attributed as an
+    /// **error** poll cycle (§8.4 result=error) rather than vanishing.
+    #[tokio::test(start_paused = true)]
+    async fn read_error_closes_session_and_returns_link_lost_with_error_cycle_recorded() {
+        let mut rig = Rig::simple(50, "always", json!(1.0));
+        rig.session
+            .push_read_err(DeviceError::Transient(anyhow::anyhow!("connection reset")));
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::LinkLost));
+        assert_eq!(rig.session.closed(), 1, "the broken session is closed before backing off");
+        assert_eq!(rig.health.read_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(rig.sink.count(), 0, "a failed read publishes nothing");
+
+        rig.dm.emit_periodic().await;
+        assert_eq!(
+            rig.metrics.sum(POLL, "pollCyclesTotal"),
+            1.0,
+            "the failed cycle is still counted (result=error), not dropped"
+        );
+        assert_eq!(
+            rig.metrics.sum(POLL, "tagReadsTotal"),
+            1.0,
+            "the attempted tag reads are attributed to the error cycle"
+        );
+    }
+
+    /// Each group keeps its own cadence, and a cycle that overran its interval re-arms to `now`
+    /// (`(deadline+interval).max(now)`) instead of replaying every missed tick as a burst.
+    #[tokio::test(start_paused = true)]
+    async fn groups_poll_on_their_own_cadence_and_rearm_without_catchup_storm() {
+        let cfg = poll_device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "127.0.0.1:44818" },
+            "pollGroups": [
+                { "id": "fast", "pollIntervalMs": 100, "publishMode": "always",
+                  "signals": [ { "name": "fast-sig", "tagPath": "FAST", "type": "real" } ] },
+                { "id": "slow", "pollIntervalMs": 500, "publishMode": "always",
+                  "signals": [ { "name": "slow-sig", "tagPath": "SLOW", "type": "real" } ] }
+            ]
+        }));
+        let mut rig = Rig::new(
+            cfg,
+            global(json!({})),
+            vec![
+                reading("FAST", json!(1.0), Quality::Good),
+                reading("SLOW", json!(2.0), Quality::Good),
+            ],
+        );
+        // The first cycle takes 450 ms — 4.5 fast intervals' worth of missed ticks.
+        rig.session.push_read_delay(Duration::from_millis(450));
+        rig.cancel_after(Duration::from_millis(1_100));
+
+        rig.run().await;
+
+        assert_eq!(
+            rig.published("SLOW"),
+            2,
+            "the slow group keeps its own 500 ms cadence, unaffected by the fast group"
+        );
+        let fast = rig.published("FAST");
+        assert!(
+            (5..=8).contains(&fast),
+            "the 450 ms stall costs at most ONE catch-up poll, not a replay of every missed \
+             100 ms tick (got {fast} fast polls in 1.1 s)"
+        );
+
+        rig.dm.emit_periodic().await;
+        assert_eq!(
+            rig.metrics.sum(POLL, "pollOverrunsTotal"),
+            1.0,
+            "exactly the stalled cycle is flagged as an overrun"
+        );
+    }
+
+    /// The loop flushes closed batch windows **before** polling, so a flush that coincides with a
+    /// poll carries the samples of the window that just closed — not the sample the imminent poll is
+    /// about to produce — and every such publish is attributed `from_batch` (§8.5).
+    #[tokio::test(start_paused = true)]
+    async fn batch_windows_flush_before_the_next_poll_and_attribute_from_batch() {
+        let cfg = poll_device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "127.0.0.1:44818" },
+            "defaults": { "batchMs": 200 },
+            "pollGroups": [ {
+                "id": "fast", "pollIntervalMs": 100, "publishMode": "always",
+                "signals": [ { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" } ]
+            } ]
+        }));
+        let mut rig = Rig::new(
+            cfg,
+            global(json!({})),
+            vec![reading("LINE_SPEED", json!(1.0), Quality::Good)],
+        );
+        rig.cancel_after(Duration::from_millis(650));
+
+        rig.run().await;
+
+        let updates = rig.sink.updates();
+        assert_eq!(updates.len(), 2, "two 200 ms windows closed in the run");
+        assert_eq!(rig.sink.samples(), 4, "no sample was lost or duplicated across the windows");
+        for u in &updates {
+            assert_eq!(
+                u.samples.len(),
+                2,
+                "the window that closed at a poll deadline carries its OWN two samples — the \
+                 coincident poll's sample belongs to the next window"
+            );
+        }
+
+        rig.dm.emit_periodic().await;
+        assert_eq!(rig.metrics.sum(PUBLISH, "dataMessagesPublishedTotal"), 2.0);
+        assert_eq!(
+            rig.metrics.sum(PUBLISH, "batchFlushesTotal"),
+            2.0,
+            "every publish here is a coalescing-window flush"
+        );
+        assert_eq!(rig.metrics.all(PUBLISH)[0]["batchSize"], 2.0);
+    }
+
+    // ---- pause / resume ----
+
+    /// §7.4.3: while paused no polls flow, so a cheap keepalive probe keeps `connected` truthful —
+    /// and a probe failure drives the normal reconnect path instead of leaving a stale `connected`.
+    #[tokio::test(start_paused = true)]
+    async fn paused_loop_probes_keepalive_and_probe_failure_reconnects() {
+        let mut rig = Rig::new(
+            poll_device(one_group(100, "always")),
+            global(json!({ "healthThresholds": { "keepaliveProbeIntervalMs": 200 } })),
+            vec![reading("LINE_SPEED", json!(1.0), Quality::Good)],
+        );
+        // The first probe answers; the second fails.
+        rig.session.push_probe(Ok(()));
+        rig.session
+            .push_probe(Err(DeviceError::Transient(anyhow::anyhow!("no route to host"))));
+        let (reply, paused) = oneshot::channel();
+        rig.send_after(
+            Duration::from_millis(10),
+            DeviceControl::Pause { by: Some("site/op".into()), reply },
+        );
+
+        let exit = rig.run().await;
+
+        assert!(paused.await.expect("the pause was acknowledged"));
+        assert!(matches!(exit, PollExit::LinkLost), "a dead keepalive is a lost link");
+        assert_eq!(rig.session.closed(), 1);
+        assert_eq!(rig.health.read_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(rig.session.reads_done(), 0, "no polls flow while paused (D-EIP-14)");
+        assert!(rig.events.has("adapter-paused"));
+    }
+
+    /// §7.4.5 / §9.3: resuming re-arms every group deadline from *now* (no catch-up storm for the
+    /// paused span) and re-bases the staleness clock (a paused signal is paused, not stale).
+    #[tokio::test(start_paused = true)]
+    async fn pause_resume_rebase_deadlines_and_staleness() {
+        let mut rig = Rig::new(
+            poll_device(one_group(100, "always")),
+            global(json!({
+                "metricsIntervalSecs": 1,
+                "healthThresholds": { "staleSignalSecs": 1, "keepaliveProbeIntervalMs": 60000 }
+            })),
+            vec![reading("LINE_SPEED", json!(1.0), Quality::Good)],
+        );
+        let (p_tx, p_rx) = oneshot::channel();
+        rig.send_after(Duration::from_millis(250), DeviceControl::Pause { by: None, reply: p_tx });
+        let (r_tx, r_rx) = oneshot::channel();
+        rig.send_after(Duration::from_millis(3_000), DeviceControl::Resume { reply: r_tx });
+        rig.cancel_after(Duration::from_millis(3_250));
+
+        rig.run().await;
+
+        assert!(p_rx.await.unwrap() && r_rx.await.unwrap(), "both transitions changed state");
+        assert_eq!(
+            rig.session.reads_done(),
+            4,
+            "2 polls before the pause + 2 after the resume — the 2.75 s paused span is NOT \
+             replayed as ~27 catch-up polls"
+        );
+        let rows = rig.metrics.all(HEALTH);
+        assert!(rows.len() >= 3, "the health cadence kept emitting while paused");
+        assert!(
+            rows.iter().all(|v| v["staleSignals"] == 0.0),
+            "staleness is suspended while paused and re-based on resume, so the 2.75 s quiet \
+             span never counts against a 1 s threshold"
+        );
+        assert!(rig.events.has("adapter-paused") && rig.events.has("adapter-resumed"));
+    }
+
+    // ---- the control verbs (§7) ----
+
+    /// `sb/write` is confirmed: the value reaches the session, the ack carries the outcome, and a
+    /// rejected write counts against `southbound_health.writeErrors` (§8.1).
+    #[tokio::test(start_paused = true)]
+    async fn write_verb_journals_and_failure_counts_write_errors() {
+        let mut rig = Rig::simple(60_000, "always", json!(1.0));
+        let spec = rig.cfg.signals().next().unwrap().clone();
+        let (ok_tx, ok_rx) = oneshot::channel();
+        let (bad_tx, bad_rx) = oneshot::channel();
+        let tx = rig.control();
+        tx.send(DeviceControl::Write(WriteRequest {
+            signal: spec.clone(),
+            value: json!(42.0),
+            ack: ok_tx,
+        }))
+        .await
+        .unwrap();
+        // The device starts rejecting writes, then a second one arrives.
+        let session = Arc::clone(&rig.session);
+        let later = rig.control();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            session.fail_writes("CIP 0x0C: object state conflict");
+            later
+                .send(DeviceControl::Write(WriteRequest {
+                    signal: spec,
+                    value: json!(7.0),
+                    ack: bad_tx,
+                }))
+                .await
+                .unwrap();
+        });
+        drop(tx);
+        rig.close_control();
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::Stopped));
+        assert!(ok_rx.await.unwrap().is_ok(), "the confirmed write is acked");
+        let err = bad_rx.await.unwrap().expect_err("the rejected write is acked as a failure");
+        assert!(err.contains("object state conflict"), "the device's reason reaches the caller");
+        assert_eq!(
+            rig.session.writes(),
+            vec![
+                ("LINE_SPEED".to_string(), json!(42.0)),
+                ("LINE_SPEED".to_string(), json!(7.0)),
+            ],
+            "both writes reached the wire, in order"
+        );
+        assert_eq!(rig.health.write_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// §7.2: an on-demand read serializes with the loop — and a connection-level failure on it is a
+    /// lost link (the caller gets the reason; the ladder backs off).
+    #[tokio::test(start_paused = true)]
+    async fn read_now_error_is_link_lost() {
+        let mut rig = Rig::simple(60_000, "always", json!(1.0));
+        let specs: Vec<_> = rig.cfg.signals().cloned().collect();
+        rig.session
+            .push_read_err(DeviceError::Transient(anyhow::anyhow!("session timed out")));
+        let (tx, rx) = oneshot::channel();
+        rig.control()
+            .send(DeviceControl::ReadNow { specs, reply: tx })
+            .await
+            .unwrap();
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::LinkLost));
+        assert!(rx.await.unwrap().unwrap_err().contains("session timed out"));
+        assert_eq!(rig.session.closed(), 1);
+        assert_eq!(rig.health.read_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// §7.5: browse answers a page, maps an `Unsupported` backend to `BROWSE_UNSUPPORTED`, and maps
+    /// any other failure to `BROWSE_FAILED` — **without** breaking the link.
+    #[tokio::test(start_paused = true)]
+    async fn browse_unsupported_maps_to_browse_error() {
+        let mut rig = Rig::simple(60_000, "always", json!(1.0));
+        rig.session.push_browse(Ok(BrowsePage {
+            tags: vec![BrowsedTag {
+                name: "LINE_SPEED".into(),
+                type_name: "REAL".into(),
+                array_dim: None,
+                instance_id: 1,
+            }],
+            next_cursor: None,
+        }));
+        rig.session
+            .push_browse(Err(DeviceError::Unsupported("no tag-list service")));
+        rig.session
+            .push_browse(Err(DeviceError::Transient(anyhow::anyhow!("browse timed out"))));
+
+        let tx = rig.control();
+        let (a_tx, a_rx) = oneshot::channel();
+        let (b_tx, b_rx) = oneshot::channel();
+        let (c_tx, c_rx) = oneshot::channel();
+        for reply in [a_tx, b_tx, c_tx] {
+            tx.send(DeviceControl::Browse { cursor: None, max: 50, reply }).await.unwrap();
+        }
+        drop(tx);
+        rig.close_control();
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::Stopped), "a browse failure never breaks the link");
+        assert_eq!(a_rx.await.unwrap().ok().map(|p| p.tags.len()), Some(1));
+        assert!(matches!(b_rx.await.unwrap(), Err(BrowseError::Unsupported)));
+        assert!(
+            matches!(c_rx.await.unwrap(), Err(BrowseError::Failed(m)) if m.contains("browse timed out"))
+        );
+    }
+
+    /// §7.5: `repoll` is refused while paused (it would publish through a deliberately quiet
+    /// instance) and polls every group once when running.
+    #[tokio::test(start_paused = true)]
+    async fn repoll_while_paused_refused() {
+        let mut rig = Rig::simple(60_000, "always", json!(1.0));
+        let tx = rig.control();
+        let (p_tx, _p_rx) = oneshot::channel();
+        tx.send(DeviceControl::Pause { by: None, reply: p_tx }).await.unwrap();
+        let (r1_tx, r1_rx) = oneshot::channel();
+        tx.send(DeviceControl::Repoll { reply: r1_tx }).await.unwrap();
+        let (res_tx, _res_rx) = oneshot::channel();
+        tx.send(DeviceControl::Resume { reply: res_tx }).await.unwrap();
+        let (r2_tx, r2_rx) = oneshot::channel();
+        tx.send(DeviceControl::Repoll { reply: r2_tx }).await.unwrap();
+        drop(tx);
+        rig.close_control();
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::Stopped));
+        assert!(
+            r1_rx.await.unwrap().unwrap_err().contains("paused"),
+            "a paused instance refuses repoll and says why"
+        );
+        assert_eq!(r2_rx.await.unwrap().unwrap(), 1, "the resumed repoll read the group's signal");
+        assert_eq!(rig.published("LINE_SPEED"), 1, "and published it");
+    }
+
+    /// Push-only verbs never route to a poll task; if one arrives it is answered, not dropped — a
+    /// dropped reply hangs the caller until its command timeout.
+    #[tokio::test(start_paused = true)]
+    async fn push_verbs_answered_defensively() {
+        let mut rig = Rig::simple(60_000, "always", json!(1.0));
+        let field = crate::config::IoFieldSpec {
+            name: "motor-run".into(),
+            offset: 0,
+            eip_type: crate::config::EipType::Udint,
+            bit: None,
+            array_count: None,
+            scale: None,
+            value_offset: None,
+            deadband: None,
+        };
+        let tx = rig.control();
+        let (s_tx, s_rx) = oneshot::channel();
+        tx.send(DeviceControl::Snapshot { reply: s_tx }).await.unwrap();
+        let (w_tx, w_rx) = oneshot::channel();
+        tx.send(DeviceControl::WriteOutput { field, value: json!(1), reply: w_tx }).await.unwrap();
+        drop(tx);
+        rig.close_control();
+
+        let exit = rig.run().await;
+
+        assert!(matches!(exit, PollExit::Stopped));
+        assert!(s_rx.await.unwrap().is_none(), "a poll instance has no input snapshot");
+        assert!(w_rx.await.unwrap().unwrap_err().contains("not a push instance"));
+    }
+
+    /// §7.5: an explicit `reconnect` closes the session and **carries its reply out** of the loop,
+    /// so the connect ladder can fulfil it after the next attempt resolves. A dropped reply leaves
+    /// the `sb/reconnect` caller hanging.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_verb_closes_session_and_carries_reply() {
+        let mut rig = Rig::simple(60_000, "always", json!(1.0));
+        let (tx, rx) = oneshot::channel();
+        rig.control().send(DeviceControl::Reconnect { reply: tx }).await.unwrap();
+
+        let exit = rig.run().await;
+
+        let PollExit::Reconnect(reply) = exit else {
+            panic!("an explicit reconnect must exit as Reconnect, carrying its reply");
+        };
+        assert_eq!(rig.session.closed(), 1, "the session is dropped before re-establishing");
+        // The ladder fulfils it after the next connect resolves — the channel is still live.
+        reply.send(Ok(())).expect("the reply sender survived the exit");
+        assert!(rx.await.unwrap().is_ok());
+    }
+
+    // ---- publish accounting (§8.5) ----
+
+    /// A publish failure is accounted as a failure (and does NOT count as published signals); a
+    /// success records the sample count and the measured publish latency.
+    #[tokio::test(start_paused = true)]
+    async fn publish_failure_records_result_error_and_success_records_latency() {
+        let mut rig = Rig::simple(100, "always", json!(1.0));
+        let sink = Arc::clone(&rig.sink);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            sink.set_fail(true);
+        });
+        rig.cancel_after(Duration::from_millis(250));
+
+        rig.run().await;
+
+        assert_eq!(rig.sink.count(), 2, "both publishes were attempted");
+        assert_eq!(
+            rig.health.signals_published.load(Ordering::Relaxed),
+            1,
+            "only the successful publish counts as published"
+        );
+
+        rig.dm.emit_periodic().await;
+        let row = rig.metrics.all(PUBLISH).remove(0);
+        assert_eq!(row["dataMessagesPublishedTotal"], 2.0);
+        assert_eq!(row["samplesPublishedTotal"], 1.0, "a failed publish contributes no samples");
+        assert_eq!(row["publishFailuresTotal"], 1.0);
+        assert!(row.contains_key("publishLatencyMs"), "the success recorded a latency");
+    }
+
+    /// §8.4: each cycle attributes the *delta* of the shared sample counters, so a second cycle adds
+    /// its own counts rather than re-reporting the running totals.
+    #[tokio::test(start_paused = true)]
+    async fn sample_snapshot_delta_attributes_cycle_counts() {
+        let cfg = poll_device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "127.0.0.1:44818" },
+            "pollGroups": [ {
+                "id": "mixed", "pollIntervalMs": 100, "publishMode": "always",
+                "signals": [
+                    { "name": "good-sig", "tagPath": "GOOD", "type": "real" },
+                    { "name": "bad-sig", "tagPath": "BAD", "type": "real" }
+                ]
+            } ]
+        }));
+        let mut rig = Rig::new(
+            cfg,
+            global(json!({})),
+            // Cycle 2 onwards: one signal goes BAD.
+            vec![
+                reading("GOOD", json!(1.0), Quality::Good),
+                reading("BAD", Value::Null, Quality::Bad),
+            ],
+        );
+        // Cycle 1: both signals read GOOD — so the two cycles have DIFFERENT counts, and a snapshot
+        // that reported running totals instead of deltas would show it.
+        rig.session.push_read(vec![
+            reading("GOOD", json!(1.0), Quality::Good),
+            reading("BAD", json!(2.0), Quality::Good),
+        ]);
+        rig.cancel_after(Duration::from_millis(250));
+
+        rig.run().await;
+        rig.dm.emit_periodic().await;
+
+        assert_eq!(rig.metrics.sum(POLL, "pollCyclesTotal"), 2.0);
+        assert_eq!(
+            rig.metrics.sum(POLL, "samplesGoodTotal"),
+            3.0,
+            "2 GOOD in the first cycle + 1 in the second — each cycle contributes its own delta"
+        );
+        assert_eq!(rig.metrics.sum(POLL, "samplesBadTotal"), 1.0);
+        assert_eq!(
+            rig.metrics.sum(POLL, "tagReadErrorsTotal"),
+            1.0,
+            "a BAD read is also a failed CIP read"
+        );
+        assert_eq!(rig.metrics.sum(POLL, "tagReadsTotal"), 4.0, "2 signals × 2 cycles");
+    }
+
+    /// §8.7 cadence + §9.3: the family set emits on `metricsIntervalSecs`, and the stale count is
+    /// suspended while paused (it reports 0, not "everything is stale").
+    #[tokio::test(start_paused = true)]
+    async fn metrics_emit_on_interval_and_stale_count_suspended_while_paused() {
+        // A 60 s poll interval: nothing is ever read, so the single signal goes stale after 1 s.
+        let mut rig = Rig::new(
+            poll_device(one_group(60_000, "always")),
+            global(json!({
+                "metricsIntervalSecs": 1,
+                "healthThresholds": { "staleSignalSecs": 1, "keepaliveProbeIntervalMs": 60000 }
+            })),
+            vec![reading("LINE_SPEED", json!(1.0), Quality::Good)],
+        );
+        let (p_tx, _p_rx) = oneshot::channel();
+        rig.send_after(Duration::from_millis(1_500), DeviceControl::Pause { by: None, reply: p_tx });
+        rig.cancel_after(Duration::from_millis(2_500));
+
+        rig.run().await;
+
+        let rows = rig.metrics.all(HEALTH);
+        assert!(rows.len() >= 3, "one emit per second, plus the pause-transition flush");
+        assert_eq!(
+            rows[0]["staleSignals"], 1.0,
+            "a signal with no GOOD read for staleSignalSecs is stale while running"
+        );
+        assert_eq!(
+            rows[rows.len() - 1]["staleSignals"],
+            0.0,
+            "…and the count is suspended once paused — a paused signal is paused, not stale"
+        );
+        assert!(rig.metrics.emits(POLL) >= 1, "the poll family emits on the same cadence");
     }
 }

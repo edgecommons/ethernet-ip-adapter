@@ -20,9 +20,9 @@ use crate::config::{DeadbandSpec, PublishMode};
 use crate::device::{Quality, Reading};
 use crate::publish::{self, Engine, Publish};
 
-// The consume loop (`consume_push`), its `PushExit`/`Woke` types, and the publish glue live in the
-// excluded live-infra seam [`crate::push_driver`]; the pure per-frame gating logic below is what the
-// unit tests drive.
+// The consume loop (`consume_push`), its `PushExit`/`Woke` types, and the publish glue live in
+// [`crate::push_driver`], which drives them against the push-session/publisher/event seams under its
+// own paused-clock tests; the pure per-frame gating logic below is what the unit tests here drive.
 
 /// Gate + count + batch one consumed frame's readings (§4.6, §6.2). The **`sampleMs` floor** throttles
 /// GOOD samples to at most one per window per field; a non-GOOD sample (BAD / IDLE) bypasses both the

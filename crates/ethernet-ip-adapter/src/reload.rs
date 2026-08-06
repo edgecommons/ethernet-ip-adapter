@@ -160,6 +160,77 @@ pub(crate) fn parse_instances(raw: &Value) -> (Vec<ParsedInstance>, Vec<SkippedI
     (valid, skipped)
 }
 
+/// The outcome of startup's launch pass ([`launch_startup_set`]).
+pub(crate) struct StartupLaunch {
+    /// Every instance runtime that started, in declaration order. Returned **even when `fatal` is
+    /// set**, so the caller registers them first and the bounded teardown
+    /// ([`crate::lifecycle::stop_on_startup_error`]) still reaches their sessions (D-EIP-27) instead
+    /// of leaving them polling behind a dropped handle.
+    pub launched: Vec<DeviceRuntime>,
+    /// `(instance id, why)` per instance skipped because no backend implements its adapter.
+    pub skipped: Vec<SkippedInstance>,
+    /// A construction failure that is *not* a bad instance — fatal to startup.
+    pub fatal: Option<anyhow::Error>,
+}
+
+/// Launch the startup instance set through `launcher`, applying **skip-bad at launch time** (§10.4).
+///
+/// This is the launch-time sibling of [`parse_instances`], and it applies the same rule to the same
+/// class of defect: an instance whose `adapter` token no backend implements is a *bad instance*,
+/// exactly like one whose subtree does not parse. It is skipped with a warning and the healthy
+/// instances beside it keep running — one typo in a ten-device document must not cost nine live PLC
+/// connections. Startup and reload therefore agree about this error class; the reload path already
+/// reports a refused launch as a skip.
+///
+/// Two things are deliberately *not* skipped:
+///
+/// * **Any other construction failure** (a UNS-token violation in the instance id, a runtime already
+///   shutting down) — those say the runtime cannot build instances at all, so they stay fatal rather
+///   than quietly degrading the component to a subset of what was configured.
+/// * **The degenerate case**: if nothing at all launched, startup fails, mirroring the zero-valid
+///   rule `App::new` applies after parse-time skip-bad. A component serving no instance is not a
+///   running component.
+pub(crate) fn launch_startup_set(
+    launcher: &dyn DeviceLauncher,
+    devices: &[ParsedInstance],
+    global: &Arc<GlobalConfig>,
+    snapshot: &Arc<Config>,
+) -> StartupLaunch {
+    let mut launched = Vec::new();
+    let mut skipped = Vec::new();
+    let mut fatal = None;
+
+    for (cfg, raw) in devices {
+        match launcher.launch(cfg, raw, global, snapshot) {
+            Ok(runtime) => launched.push(runtime),
+            Err(e) if crate::reconnect::UnknownAdapter::is_cause(&e) => {
+                tracing::warn!(
+                    instance = %cfg.id, error = %e,
+                    "skipping device that could not be launched; the other instances keep running"
+                );
+                skipped.push((cfg.id.clone(), e.to_string()));
+            }
+            Err(e) => {
+                fatal = Some(e);
+                break;
+            }
+        }
+    }
+
+    if fatal.is_none() && launched.is_empty() {
+        let why = skipped
+            .iter()
+            .map(|(id, e)| format!("`{id}`: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        fatal = Some(anyhow::anyhow!(
+            "no launchable devices in component.instances[] — every instance was skipped ({why})"
+        ));
+    }
+
+    StartupLaunch { launched, skipped, fatal }
+}
+
 /// Why a candidate cannot be planned at all — the candidate is rejected and the running generation
 /// keeps operating untouched.
 #[derive(Debug, PartialEq, Eq)]
@@ -297,8 +368,9 @@ pub(crate) trait DeviceLauncher: Send + Sync {
     /// Launch `cfg` (raw subtree `raw`) against `global` and configuration `snapshot`.
     ///
     /// # Errors
-    /// Whatever construction failed — a UNS-token violation in the instance id, or the runtime
-    /// already shutting down. A failure is skipped-with-a-warning by the caller, never fatal.
+    /// Whatever construction failed — an adapter token no backend implements, a UNS-token violation
+    /// in the instance id, or the runtime already shutting down. On this (reload) path a failure is
+    /// skipped-with-a-warning and joins the plan's skip report, never failing the transaction.
     fn launch(
         &self,
         cfg: &DeviceConfig,
@@ -827,6 +899,9 @@ mod tests {
         events: Arc<RecordingEvents>,
         /// Instance ids whose launch must fail (launch-time skip-bad / rollback-failure paths).
         fail: Mutex<Vec<String>>,
+        /// Instance ids whose launch must fail the way an unresolvable `adapter` token does — a bad
+        /// instance, not a broken runtime.
+        bad_adapter: Mutex<Vec<String>>,
         /// Stub tasks that ignore their cancellation token — the wedged-task case.
         wedge: Mutex<Vec<String>>,
         /// Every event sink this launcher hands out never completes a publish — the wedged-broker
@@ -844,6 +919,7 @@ mod tests {
                 journal: Arc::new(Mutex::new(Journal::default())),
                 events: Arc::new(RecordingEvents::default()),
                 fail: Mutex::new(Vec::new()),
+                bad_adapter: Mutex::new(Vec::new()),
                 wedge: Mutex::new(Vec::new()),
                 stalled: AtomicBool::new(false),
                 sinks: Mutex::new(std::collections::HashMap::new()),
@@ -861,6 +937,11 @@ mod tests {
 
         fn fail_instance(&self, id: &str) {
             self.fail.lock().unwrap().push(id.to_string());
+        }
+
+        /// Make `id`'s launch fail the way a typo'd `adapter` token does (`"*"` ⇒ every instance).
+        fn bad_adapter_instance(&self, id: &str) {
+            self.bad_adapter.lock().unwrap().push(id.to_string());
         }
 
         fn wedge_instance(&self, id: &str) {
@@ -937,6 +1018,14 @@ mod tests {
             global: &Arc<GlobalConfig>,
             snapshot: &Arc<Config>,
         ) -> anyhow::Result<DeviceRuntime> {
+            let bad = self.bad_adapter.lock().unwrap();
+            if bad.iter().any(|f| f == "*" || *f == cfg.id) {
+                return Err(anyhow::Error::new(crate::reconnect::UnknownAdapter {
+                    instance: cfg.id.clone(),
+                    adapter: cfg.adapter.clone(),
+                }));
+            }
+            drop(bad);
             let fail = self.fail.lock().unwrap();
             if fail.iter().any(|f| f == "*" || *f == cfg.id) {
                 anyhow::bail!("launch refused for `{}`", cfg.id);
@@ -1147,6 +1236,97 @@ mod tests {
             "the parse error names the offending key: {}",
             p.skipped[0].1
         );
+    }
+
+    // =============================================================================================
+    // Startup's launch pass: skip-bad at launch time, fail only if zero launched
+    // =============================================================================================
+
+    /// Build the startup instance set (parsed + raw) from a document, as `App::new` does.
+    fn startup_set(doc: &Value) -> (Vec<ParsedInstance>, Arc<GlobalConfig>, Arc<Config>) {
+        let (devices, skipped) = parse_instances(doc);
+        assert!(skipped.is_empty(), "these fixtures parse");
+        let snap = snapshot(doc);
+        let global = Arc::new(GlobalConfig::from_value(snap.global()).unwrap());
+        (devices, global, snap)
+    }
+
+    /// **The convention, at launch time** (§10.4): one instance whose `adapter` token no backend
+    /// implements is skipped with a warning, and every healthy instance beside it still starts. A
+    /// single typo in a ten-device document must not cost nine live PLC connections.
+    #[tokio::test]
+    async fn startup_skips_an_unknown_adapter_and_launches_the_healthy_instances() {
+        let doc = document(
+            json!({}),
+            vec![
+                poll_instance("plc-1", 500),
+                poll_instance("typo", 500),
+                push_instance("io-1"),
+            ],
+        );
+        let (devices, global, snap) = startup_set(&doc);
+        let launcher = FakeLauncher::new();
+        launcher.bad_adapter_instance("typo");
+
+        let out = launch_startup_set(launcher.as_ref(), &devices, &global, &snap);
+
+        assert!(out.fatal.is_none(), "one bad instance is not a startup failure");
+        assert_eq!(out.launched.len(), 2, "the healthy instances started");
+        let started: Vec<String> = out.launched.iter().map(|r| r.handle.cfg.id.clone()).collect();
+        assert_eq!(started, vec!["plc-1".to_string(), "io-1".to_string()]);
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].0, "typo");
+        assert!(
+            out.skipped[0].1.contains("unknown adapter"),
+            "the skip report says what to fix: {}",
+            out.skipped[0].1
+        );
+    }
+
+    /// The degenerate case, mirroring `App::new`'s zero-valid rule after parse-time skip-bad: a
+    /// configuration where NOTHING is launchable is not a running component, so startup fails —
+    /// loudly, naming every instance it skipped.
+    #[tokio::test]
+    async fn startup_fails_when_every_instance_has_an_unlaunchable_adapter() {
+        let doc = document(
+            json!({}),
+            vec![poll_instance("plc-1", 500), poll_instance("plc-2", 500)],
+        );
+        let (devices, global, snap) = startup_set(&doc);
+        let launcher = FakeLauncher::new();
+        launcher.bad_adapter_instance("*");
+
+        let out = launch_startup_set(launcher.as_ref(), &devices, &global, &snap);
+
+        assert!(out.launched.is_empty());
+        assert_eq!(out.skipped.len(), 2);
+        let e = out.fatal.expect("a component that can serve nothing must not start").to_string();
+        assert!(e.contains("plc-1") && e.contains("plc-2"), "it names what it skipped: {e}");
+    }
+
+    /// A construction failure that is NOT a bad instance (a UNS-token violation, a runtime already
+    /// shutting down) stays fatal — and what already started still comes back, so the caller can
+    /// register it and the bounded teardown reaches its session instead of leaking it (D-EIP-27).
+    #[tokio::test]
+    async fn a_construction_failure_stays_fatal_and_still_yields_what_started() {
+        let doc = document(
+            json!({}),
+            vec![poll_instance("plc-1", 500), poll_instance("plc-2", 500)],
+        );
+        let (devices, global, snap) = startup_set(&doc);
+        let launcher = FakeLauncher::new();
+        launcher.fail_instance("plc-2");
+
+        let out = launch_startup_set(launcher.as_ref(), &devices, &global, &snap);
+
+        assert!(out.skipped.is_empty(), "a broken runtime is not a bad instance");
+        assert!(out.fatal.is_some(), "it is fatal to startup");
+        assert_eq!(
+            out.launched.len(),
+            1,
+            "the instance that already started is handed back for registration + teardown"
+        );
+        assert_eq!(out.launched[0].handle.cfg.id, "plc-1");
     }
 
     /// Fail-only-if-zero-valid, mapped for reload: the CANDIDATE is rejected (the running generation

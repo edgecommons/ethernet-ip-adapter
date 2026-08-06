@@ -1,4 +1,4 @@
-//! # The EtherNet/IP live-socket drivers (§3.4, §4.6) — the live-infra seam (excluded, §12.2)
+//! # The EtherNet/IP live-socket drivers (§3.4, §4.6)
 //!
 //! A **thin driver seam** analogous to `file-replicator`'s `dest/*/client.rs`: it opens live sockets to
 //! a device over the owned `enip` stack and drives them. It holds no branching that is not driven by a
@@ -11,8 +11,16 @@
 //!
 //! The pure pieces it composes — the JSON⇄CIP codec ([`super::types`]), the field-extraction
 //! ([`super::push::assembly_to_readings`]), the error classification ([`super::map_enip_error`]), the
-//! loss mapping ([`super::push::map_lost_reason`]) — are unit-tested in their home modules. This seam is
-//! validated by the live OpENer/cpppo integration suites (§11) and the S9 deployed regression.
+//! loss mapping ([`super::push::map_lost_reason`]) — are unit-tested in their home modules.
+//!
+//! **How the driver itself is tested (§12.2).** The `tests` module below drives every path here over
+//! **local sockets**: a scripted EtherNet/IP peer on a loopback `TcpListener` speaking encapsulation
+//! (plaintext and TLS) plus a test-owned UDP socket standing in for the class-1 target. Connect, the
+//! Phase-2a posture read, the TLS arm, ForwardOpen, the translator, `set_output`, `io_stats`, the
+//! inactivity watchdog, and `close` all execute under an ordinary `cargo test` — no container, no
+//! device, no fixed port, Windows and Linux alike. The live OpENer/cpppo/EthernetIPSharp suites (§11)
+//! remain the *conformance* evidence against independent implementations, and the deployed regression
+//! (§12.4) the on-device evidence.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -454,3 +462,1312 @@ impl PushSession for EipPushSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! # Local-socket tests for the live seam (§12.2)
+    //!
+    //! Everything here runs against **loopback sockets bound to ephemeral ports** — no container, no
+    //! device, no fixed port, no network peer — so the whole seam executes on Windows and Linux alike:
+    //!
+    //! * [`MockPlc`] is a scripted EtherNet/IP peer on a `tokio::net::TcpListener`. It answers
+    //!   RegisterSession, the Phase-2a CIP Security posture reads (0x5D/0x5E/0x5F), the class-1
+    //!   ForwardOpen (crafting the success reply the way `enip`'s own `io.rs` fixture does), and
+    //!   ForwardClose. Given a `rustls::ServerConfig` it speaks the same protocol inside TLS, which is
+    //!   how the CIP Security arm of `connect` is driven.
+    //! * A test-owned `tokio::net::UdpSocket` is the class-1 target: it produces T→O frames into the
+    //!   port the originator advertises in the ForwardOpen request, and receives the O→T frames the
+    //!   reply's sockaddr item points at.
+    //!
+    //! **No test sleeps for a fixed span.** Every wait is either a bounded `tokio::time::timeout` on a
+    //! real event or a retry loop with an attempt cap, so a slow scheduler makes a test slower, never
+    //! red.
+
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
+
+    use super::*;
+
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use bytes::Bytes;
+    use enip::{
+        Command, Cpf, CpfItem, EncapFrame, EncapHeader, ItemType, NetworkConnectionParams,
+        SequencedAddress, SockAddrInfo,
+    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use serde_json::json;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
+
+    use crate::config::GlobalConfig;
+    use crate::device::Quality;
+
+    /// `Get_Attribute_Single` (§7.5) — the service the posture reads ride.
+    const GET_ATTRIBUTE_SINGLE: u8 = enip::cip::services::SERVICE_GET_ATTRIBUTE_SINGLE;
+
+    // ---- config fixtures -------------------------------------------------------------------------
+
+    fn timeouts() -> Timeouts {
+        GlobalConfig::from_value(&json!({
+            "timeouts": { "connectMs": 4000, "requestTimeoutMs": 2000 }
+        }))
+        .unwrap()
+        .timeouts
+    }
+
+    fn conn_of(v: serde_json::Value) -> ConnectionConfig {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The push `io` block used by the class-1 tests: an 8-byte T→O input (UDINT + REAL) and a 4-byte
+    /// O→T output (one REAL). `rpiMs`/`o2tRpiMs` differ on purpose so the two `DirectionSpec`s cannot
+    /// be confused for one another.
+    fn io_of(rpi_ms: u64, o2t_rpi_ms: u64, multiplier: u32) -> IoConfig {
+        serde_json::from_value(json!({
+            "rpiMs": rpi_ms,
+            "o2tRpiMs": o2t_rpi_ms,
+            "timeoutMultiplier": multiplier,
+            "assemblies": { "config": 151, "output": 150, "input": 100 },
+            "input": {
+                "sizeBytes": 8,
+                "realTimeFormat": "modeless",
+                "signals": [
+                    { "name": "din-word", "offset": 0, "type": "udint" },
+                    { "name": "line-speed", "offset": 4, "type": "real" }
+                ]
+            },
+            "output": {
+                "sizeBytes": 4,
+                "realTimeFormat": "header32",
+                "signals": [ { "name": "setpoint", "offset": 0, "type": "real" } ]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// An 8-byte T→O input assembly: UDINT `din` at offset 0, REAL `speed` at offset 4.
+    fn input_frame(din: u32, speed: f32) -> Vec<u8> {
+        let mut v = din.to_le_bytes().to_vec();
+        v.extend_from_slice(&speed.to_le_bytes());
+        v
+    }
+
+    /// A whole class-1 T→O datagram (CPF: sequenced address + connected data) for `cid`, carrying a
+    /// modeless frame (`[u16 sequence][data]`).
+    fn t2o_datagram(cid: u32, encap_seq: u32, sequence: u16, data: &[u8]) -> Vec<u8> {
+        let mut payload = sequence.to_le_bytes().to_vec();
+        payload.extend_from_slice(data);
+        Cpf::from_items(vec![
+            CpfItem::new(
+                ItemType::SequencedAddress,
+                SequencedAddress { connection_id: cid, encap_sequence: encap_seq }.encode(),
+            ),
+            CpfItem::connected_data(Bytes::from(payload)),
+        ])
+        .encode()
+        .unwrap()
+        .to_vec()
+    }
+
+    // ---- the scripted peer -----------------------------------------------------------------------
+
+    /// What [`MockPlc`] answers. Every field is a *script*, never a timing knob. The default is a
+    /// generic CIP device: no security objects, a ForwardOpen it accepts, no O→T redirect.
+    #[derive(Clone, Default)]
+    struct PlcScript {
+        /// The CIP Security Object state (0x5D/1/1) the target reports. `None` ⇒ a generic CIP device
+        /// that refuses every posture read with `0x05 path destination unknown`.
+        posture_state: Option<u8>,
+        /// CIP general status for the ForwardOpen reply (`0x00` = success).
+        forward_open_status: u8,
+        /// The UDP port named in the reply's O→T sockaddr item — the test's class-1 target socket.
+        /// `sin_addr` is always `0.0.0.0`, so only the port is honoured (D-ENIP-17).
+        o2t_port: Option<u16>,
+        /// Actual packet intervals (µs) the reply names. `None` echoes the requested RPIs back, the
+        /// way a well-behaved target does.
+        apis_us: Option<(u32, u32)>,
+        /// Answer RegisterSession with session handle `0` — a protocol violation the client refuses.
+        bad_register: bool,
+        /// Accept the TCP connection and hang up without answering anything.
+        hang_up: bool,
+        /// Answer RegisterSession, then hang up — the session opens and the very next request (the
+        /// Phase-2a posture read) dies at the connection level.
+        drop_after_register: bool,
+        /// Speak TLS on the accepted socket (the CIP Security explicit path).
+        tls: Option<Arc<rustls::ServerConfig>>,
+    }
+
+    impl PlcScript {
+        /// A device implementing the CIP Security objects, reporting `state`.
+        fn with_posture(mut self, state: u8) -> Self {
+            self.posture_state = Some(state);
+            self
+        }
+        /// A class-1 target that points its O→T stream at `port` (the test's UDP socket).
+        fn with_io_target(mut self, port: u16) -> Self {
+            self.o2t_port = Some(port);
+            self
+        }
+        fn refusing_forward_open(mut self, status: u8) -> Self {
+            self.forward_open_status = status;
+            self
+        }
+    }
+
+    /// The decoded class-1 ForwardOpen request the peer received (§8.2 field order).
+    #[derive(Clone, Debug)]
+    struct OpenRecord {
+        service: u8,
+        t2o_cid: u32,
+        connection_serial: u16,
+        vendor_id: u16,
+        originator_serial: u32,
+        timeout_multiplier_code: u8,
+        o2t_rpi_us: u32,
+        o2t_params: u16,
+        t2o_rpi_us: u32,
+        t2o_params: u16,
+        transport_class_trigger: u8,
+        connection_path: Vec<u8>,
+        /// The UDP port the originator advertised for T→O frames (the request's `SockAddrTtoO` item).
+        advertised_port: u16,
+    }
+
+    impl OpenRecord {
+        fn parse(service: u8, data: &[u8], request_cpf: &Cpf) -> Option<Self> {
+            fn u16at(data: &[u8], i: usize) -> Option<u16> {
+                Some(u16::from_le_bytes([*data.get(i)?, *data.get(i + 1)?]))
+            }
+            fn u32at(data: &[u8], i: usize) -> Option<u32> {
+                Some(u32::from_le_bytes([
+                    *data.get(i)?,
+                    *data.get(i + 1)?,
+                    *data.get(i + 2)?,
+                    *data.get(i + 3)?,
+                ]))
+            }
+            let u16at = |i: usize| u16at(data, i);
+            let u32at = |i: usize| u32at(data, i);
+            let path_words = usize::from(*data.get(35)?);
+            let advertised_port = request_cpf
+                .find(ItemType::SockAddrTtoO)
+                .and_then(|i| SockAddrInfo::decode(&i.data).ok())
+                .map_or(0, |s| s.sin_port);
+            Some(Self {
+                service,
+                t2o_cid: u32at(6)?,
+                connection_serial: u16at(10)?,
+                vendor_id: u16at(12)?,
+                originator_serial: u32at(14)?,
+                timeout_multiplier_code: *data.get(18)?,
+                o2t_rpi_us: u32at(22)?,
+                o2t_params: u16at(26)?,
+                t2o_rpi_us: u32at(28)?,
+                t2o_params: u16at(32)?,
+                transport_class_trigger: *data.get(34)?,
+                connection_path: data.get(36..36 + path_words * 2)?.to_vec(),
+                advertised_port,
+            })
+        }
+    }
+
+    /// Everything the peer observed, readable from the test.
+    #[derive(Clone, Default)]
+    struct PlcLog {
+        /// `(class, instance, attribute)` of every `Get_Attribute_Single` asked for.
+        attribute_reads: Vec<(u16, u16, u16)>,
+        /// Every CIP service code the peer answered, in order.
+        services: Vec<u8>,
+        /// The decoded class-1 ForwardOpen, once one arrives.
+        open: Option<OpenRecord>,
+        /// Whether the client sent UnRegisterSession.
+        unregistered: bool,
+    }
+
+    /// A scripted EtherNet/IP peer on `127.0.0.1:0`.
+    struct MockPlc {
+        addr: SocketAddr,
+        log: Arc<Mutex<PlcLog>>,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for MockPlc {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl MockPlc {
+        async fn start(script: PlcScript) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let log = Arc::new(Mutex::new(PlcLog::default()));
+            let task_log = Arc::clone(&log);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _peer)) = listener.accept().await else { return };
+                    if script.hang_up {
+                        drop(tcp);
+                        continue;
+                    }
+                    match script.tls.clone() {
+                        Some(cfg) => {
+                            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                            if let Ok(tls) = acceptor.accept(tcp).await {
+                                serve(tls, &script, &task_log).await;
+                            }
+                        }
+                        None => serve(tcp, &script, &task_log).await,
+                    }
+                }
+            });
+            Self { addr, log, task }
+        }
+
+        /// The `host:port` the adapter's `connection.endpoint` points at.
+        fn endpoint(&self) -> String {
+            self.addr.to_string()
+        }
+
+        fn log(&self) -> PlcLog {
+            self.log.lock().unwrap().clone()
+        }
+
+        /// The `127.0.0.1:<port>` the originator advertised for T→O frames — where the test's UDP
+        /// socket must produce.
+        fn t2o_target(&self) -> SocketAddr {
+            let port = self.log().open.expect("a ForwardOpen was recorded").advertised_port;
+            assert_ne!(port, 0, "the ForwardOpen must advertise the originator's UDP receive port");
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        }
+
+        /// The T→O connection id the target was told to stamp on the frames it produces.
+        fn t2o_cid(&self) -> u32 {
+            self.log().open.expect("a ForwardOpen was recorded").t2o_cid
+        }
+    }
+
+    async fn read_frame<S: AsyncRead + Unpin>(s: &mut S) -> Option<EncapFrame> {
+        let mut header = [0u8; 24];
+        s.read_exact(&mut header).await.ok()?;
+        let h = EncapHeader::decode(&header).ok()?;
+        let mut data = vec![0u8; h.length as usize];
+        if !data.is_empty() {
+            s.read_exact(&mut data).await.ok()?;
+        }
+        let mut whole = header.to_vec();
+        whole.extend_from_slice(&data);
+        EncapFrame::decode(&whole).ok()
+    }
+
+    async fn write_frame<S: AsyncWrite + Unpin>(s: &mut S, frame: &EncapFrame) -> Option<()> {
+        let bytes = frame.encode().ok()?;
+        s.write_all(&bytes).await.ok()?;
+        s.flush().await.ok()
+    }
+
+    /// A Message-Router reply: `reply_service, reserved, status, ext_words(0), data`.
+    fn mr_reply(service: u8, status: u8, data: &[u8]) -> Bytes {
+        let mut v = vec![service | 0x80, 0x00, status, 0x00];
+        v.extend_from_slice(data);
+        Bytes::from(v)
+    }
+
+    /// Wrap a Message-Router reply in the `SendRRData` frame the client expects. The correlation
+    /// context **and the session handle** are echoed from the request: the session actor discards a
+    /// reply whose handle does not match the one it registered (§10.3).
+    fn rr_frame(request: &EncapFrame, mr: Bytes, extra: Vec<CpfItem>) -> EncapFrame {
+        let mut items = vec![CpfItem::null_address(), CpfItem::unconnected_data(mr)];
+        items.extend(extra);
+        let cpf = Cpf::from_items(items).encode().unwrap();
+        let mut data = Vec::with_capacity(6 + cpf.len());
+        data.extend_from_slice(&0u32.to_le_bytes()); // interface handle
+        data.extend_from_slice(&0u16.to_le_bytes()); // timeout
+        data.extend_from_slice(&cpf);
+        EncapFrame::new(
+            EncapHeader::request(
+                Command::SendRRData,
+                0,
+                request.header.session_handle,
+                request.header.sender_context,
+            ),
+            Bytes::from(data),
+        )
+    }
+
+    /// The `(class, instance, attribute)` a `Get_Attribute_Single` EPATH addresses.
+    fn parse_attr_path(path: &[u8]) -> (u16, u16, u16) {
+        let (mut class, mut instance, mut attribute) = (0u16, 0u16, 0u16);
+        let mut i = 0usize;
+        while i < path.len() {
+            match path[i] {
+                0x20 => {
+                    class = u16::from(path[i + 1]);
+                    i += 2;
+                }
+                0x21 => {
+                    class = u16::from_le_bytes([path[i + 2], path[i + 3]]);
+                    i += 4;
+                }
+                0x24 => {
+                    instance = u16::from(path[i + 1]);
+                    i += 2;
+                }
+                0x25 => {
+                    instance = u16::from_le_bytes([path[i + 2], path[i + 3]]);
+                    i += 4;
+                }
+                0x30 => {
+                    attribute = u16::from(path[i + 1]);
+                    i += 2;
+                }
+                0x31 => {
+                    attribute = u16::from_le_bytes([path[i + 2], path[i + 3]]);
+                    i += 4;
+                }
+                other => panic!("unexpected EPATH segment 0x{other:02X}"),
+            }
+        }
+        (class, instance, attribute)
+    }
+
+    /// The attribute bytes a CIP-Security-capable target answers, or `None` to refuse the read (which
+    /// is what a generic CIP device does for every one of them).
+    fn posture_attribute(state: u8, class: u16, instance: u16, attribute: u16) -> Option<Vec<u8>> {
+        Some(match (class, instance, attribute) {
+            // CIP Security Object (0x5D): state + supported/configured profile bitmaps.
+            (0x5D, 1, 1) => vec![state],
+            (0x5D, 1, 2) => 0x0003u16.to_le_bytes().to_vec(), // Integrity | Confidentiality
+            (0x5D, 1, 3) => 0x0002u16.to_le_bytes().to_vec(), // Confidentiality
+            // EtherNet/IP Security Object (0x5E).
+            (0x5E, 1, 1) => vec![2],
+            (0x5E, 1, 2) => 0x0000_0001u32.to_le_bytes().to_vec(),
+            (0x5E, 1, 3) => vec![2, 0xC0, 0x2B, 0x13, 0x01], // available: ECDHE-GCM + TLS1.3
+            (0x5E, 1, 4) => vec![1, 0xC0, 0x2B],             // allowed: ECDHE-GCM only
+            (0x5E, 1, 9) => vec![1],                         // verifyClientCertificate
+            (0x5E, 1, 10) => vec![1],                        // sendCertificateChain
+            (0x5E, 1, 11) => vec![0],                        // checkExpiration
+            // Certificate Management Object (0x5F).
+            (0x5F, 0, 8) => 0x0000_0003u32.to_le_bytes().to_vec(), // push + pull
+            (0x5F, 1, 1) => {
+                let name = b"device-cert";
+                let mut v = vec![name.len() as u8];
+                v.extend_from_slice(name);
+                v
+            }
+            (0x5F, 1, 2) => vec![3], // Verified
+            (0x5F, 1, 5) => vec![0], // PEM
+            _ => return None,
+        })
+    }
+
+    /// The ForwardOpen success reply body (§8.2) — the same shape `enip`'s own `io.rs` fixture crafts.
+    fn forward_open_success(rec: &OpenRecord, script: &PlcScript) -> (Vec<u8>, Vec<CpfItem>) {
+        let (o2t_api, t2o_api) = script
+            .apis_us
+            .unwrap_or((rec.o2t_rpi_us, rec.t2o_rpi_us));
+        let mut w = Vec::new();
+        w.extend_from_slice(&0xAABB_CCDDu32.to_le_bytes()); // O→T id: target-assigned
+        w.extend_from_slice(&rec.t2o_cid.to_le_bytes());
+        w.extend_from_slice(&rec.connection_serial.to_le_bytes());
+        w.extend_from_slice(&rec.vendor_id.to_le_bytes());
+        w.extend_from_slice(&rec.originator_serial.to_le_bytes());
+        w.extend_from_slice(&o2t_api.to_le_bytes());
+        w.extend_from_slice(&t2o_api.to_le_bytes());
+        w.push(0); // application reply words
+        w.push(0); // reserved
+        let extra = script
+            .o2t_port
+            .map(|port| {
+                vec![CpfItem::new(
+                    ItemType::SockAddrOtoT,
+                    SockAddrInfo::ipv4(0, port).encode(),
+                )]
+            })
+            .unwrap_or_default();
+        (w, extra)
+    }
+
+    /// Answer one `SendRRData`. `None` ends the connection (a request the script has no answer for).
+    fn answer_rr(frame: &EncapFrame, script: &PlcScript, log: &Arc<Mutex<PlcLog>>) -> Option<EncapFrame> {
+        let cpf = Cpf::decode(frame.data.get(6..)?).ok()?;
+        let mr = cpf.find(ItemType::UnconnectedData)?.data.clone();
+        let service = *mr.first()?;
+        let path_end = 2 + usize::from(*mr.get(1)?) * 2;
+        let path = mr.get(2..path_end)?.to_vec();
+        let data = mr.get(path_end..)?.to_vec();
+        log.lock().unwrap().services.push(service);
+
+        let (status, body, extra) = match service {
+            enip::cm::service::FORWARD_OPEN | enip::cm::service::LARGE_FORWARD_OPEN => {
+                let rec = OpenRecord::parse(service, &data, &cpf)?;
+                let answer = if script.forward_open_status == 0 {
+                    let (body, extra) = forward_open_success(&rec, script);
+                    (0u8, body, extra)
+                } else {
+                    // A refusal carries the ForwardRequestFail body: remaining path size + reserved.
+                    (script.forward_open_status, vec![0u8, 0u8], Vec::new())
+                };
+                log.lock().unwrap().open = Some(rec);
+                answer
+            }
+            enip::cm::service::FORWARD_CLOSE => {
+                // §8.8 success reply: connection serial, vendor id, originator serial, echoed back.
+                let mut w = Vec::new();
+                w.extend_from_slice(data.get(2..10)?);
+                w.push(0); // application reply words
+                w.push(0); // reserved
+                (0u8, w, Vec::new())
+            }
+            GET_ATTRIBUTE_SINGLE => {
+                let (class, instance, attribute) = parse_attr_path(&path);
+                log.lock().unwrap().attribute_reads.push((class, instance, attribute));
+                match script
+                    .posture_state
+                    .and_then(|s| posture_attribute(s, class, instance, attribute))
+                {
+                    Some(bytes) => (0u8, bytes, Vec::new()),
+                    // 0x05 path destination unknown — what a device without the object answers.
+                    None => (0x05u8, Vec::new(), Vec::new()),
+                }
+            }
+            // 0x08 service not supported.
+            _ => (0x08u8, Vec::new(), Vec::new()),
+        };
+        Some(rr_frame(frame, mr_reply(service, status, &body), extra))
+    }
+
+    /// Serve one encapsulation session (plaintext or inside TLS — the byte stream is all that differs).
+    async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+        mut s: S,
+        script: &PlcScript,
+        log: &Arc<Mutex<PlcLog>>,
+    ) {
+        let Some(reg) = read_frame(&mut s).await else { return };
+        if !matches!(reg.header.command, Command::RegisterSession) {
+            return;
+        }
+        let handle = if script.bad_register { 0 } else { 0x1234_5678 };
+        let reply = EncapFrame::new(
+            EncapHeader::request(Command::RegisterSession, 0, handle, reg.header.sender_context),
+            Bytes::from(vec![1, 0, 0, 0]), // protocol version 1, options 0
+        );
+        if write_frame(&mut s, &reply).await.is_none() || script.drop_after_register {
+            return;
+        }
+
+        loop {
+            let Some(frame) = read_frame(&mut s).await else { return };
+            match frame.header.command {
+                Command::SendRRData => {
+                    let Some(reply) = answer_rr(&frame, script, log) else { return };
+                    if write_frame(&mut s, &reply).await.is_none() {
+                        return;
+                    }
+                }
+                Command::UnRegisterSession => {
+                    log.lock().unwrap().unregistered = true;
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    // ---- throwaway PKI for the TLS arm -----------------------------------------------------------
+
+    struct TestPki {
+        ca_pem: String,
+        ca_der: CertificateDer<'static>,
+        server_chain: Vec<CertificateDer<'static>>,
+        server_key: PrivateKeyDer<'static>,
+        client_cert_pem: String,
+        client_key_pem: String,
+    }
+
+    /// Mint a CA, a server leaf (CN `mock-plc`, IP SAN `127.0.0.1`) and a client identity — in memory,
+    /// pure Rust, nothing on disk but the tempdir the adapter reads its PEMs from.
+    fn mint_pki() -> TestPki {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose, SanType,
+        };
+        let mut ca_params = CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "eip local-socket test CA");
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut sp = CertificateParams::new(vec![]).unwrap();
+        sp.subject_alt_names = vec![SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST))];
+        sp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        sp.distinguished_name.push(DnType::CommonName, "mock-plc");
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = sp.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+
+        let mut cp = CertificateParams::new(vec![]).unwrap();
+        cp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        cp.distinguished_name
+            .push(DnType::CommonName, "eip-originator");
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = cp.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+
+        TestPki {
+            ca_pem: ca_cert.pem(),
+            ca_der: ca_cert.der().clone(),
+            server_chain: vec![server_cert.der().clone()],
+            server_key: PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
+    }
+
+    impl TestPki {
+        /// A mutual-TLS server config: the device leaf, and a client verifier over the same CA — so
+        /// the handshake only completes if the adapter really presented its client certificate.
+        fn server_config(&self) -> Arc<rustls::ServerConfig> {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut client_roots = rustls::RootCertStore::empty();
+            client_roots.add(self.ca_der.clone()).unwrap();
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(client_roots),
+                provider.clone(),
+            )
+            .build()
+            .unwrap();
+            Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(self.server_chain.clone(), self.server_key.clone_key())
+                    .unwrap(),
+            )
+        }
+    }
+
+    // ---- WARN capture ----------------------------------------------------------------------------
+
+    /// A `tracing` subscriber that records WARN-level event messages on the current thread, so the
+    /// §4.1 unprovisioned-device warning is asserted as a fact rather than assumed.
+    #[derive(Clone, Default)]
+    struct WarnLog(Arc<Mutex<Vec<String>>>);
+
+    impl WarnLog {
+        fn contains(&self, needle: &str) -> bool {
+            self.0.lock().unwrap().iter().any(|m| m.contains(needle))
+        }
+        fn is_empty(&self) -> bool {
+            self.0.lock().unwrap().is_empty()
+        }
+    }
+
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnLog {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            *meta.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // ---- shared drivers --------------------------------------------------------------------------
+
+    /// Produce T→O frames from `peer` until the seam reports `Up`, returning the negotiated APIs and
+    /// the sequence that got there. Deliberately a bounded retry, not a sleep: a datagram that lands
+    /// before the connection is registered is dropped as unknown and nothing redelivers it, and that
+    /// ordering is not part of the contract under test.
+    async fn drive_up(
+        session: &mut dyn PushSession,
+        peer: &UdpSocket,
+        target: SocketAddr,
+        cid: u32,
+        data: &[u8],
+    ) -> (u32, u32, u16) {
+        let mut seq: u16 = 0;
+        loop {
+            seq += 1;
+            assert!(
+                seq <= 60,
+                "the seam never reported Up after {seq} T→O frames — the ForwardOpen did not arm the \
+                 connection, or the translator is not running"
+            );
+            peer.send_to(&t2o_datagram(cid, u32::from(seq), seq, data), target)
+                .await
+                .unwrap();
+            match tokio::time::timeout(Duration::from_millis(25), session.updates().recv()).await {
+                Ok(Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms })) => {
+                    return (o2t_api_ms, t2o_api_ms, seq)
+                }
+                Ok(other) => panic!("expected Up as the first seam update, got {other:?}"),
+                Err(_elapsed) => {}
+            }
+        }
+    }
+
+    /// The next `Data` update, or a panic naming what arrived instead.
+    async fn next_data(session: &mut dyn PushSession) -> (Vec<crate::device::Reading>, u16, bool) {
+        match tokio::time::timeout(Duration::from_secs(5), session.updates().recv()).await {
+            Ok(Some(IoUpdate::Data { readings, sequence, run_mode, .. })) => {
+                (readings, sequence, run_mode)
+            }
+            other => panic!("expected a Data update, got {other:?}"),
+        }
+    }
+
+    /// A push session against a fresh scripted target: the peer socket the class-1 traffic flows
+    /// over, the peer itself (for its request log), and the open session.
+    async fn open_push_session(io: &IoConfig) -> (MockPlc, UdpSocket, Box<dyn PushSession>) {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let plc = MockPlc::start(PlcScript::default().with_io_target(port)).await;
+        let backend = EipBackend::new(timeouts());
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        let session = backend.open_push(&conn, io).await.unwrap();
+        (plc, peer, session)
+    }
+
+    // ==== connect (poll) ==========================================================================
+
+    /// A generic CIP device implements none of the 0x5D/0x5E/0x5F objects, so the Phase-2a posture
+    /// read comes back refused — and `connect` must *still* succeed, handing back a bare plaintext
+    /// session. A regression that let the refusal fail the connect would take every non-CIP-Security
+    /// device offline.
+    #[tokio::test]
+    async fn connect_plaintext_without_posture_yields_a_bare_session() {
+        let plc = MockPlc::start(PlcScript::default()).await;
+        let backend = EipBackend::new(timeouts());
+        assert_eq!(backend.kind(), "ethernet-ip");
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+
+        let mut session = backend.connect(&conn).await.unwrap();
+        assert!(
+            session.security().is_none(),
+            "no posture ⇒ the bare `EipSession::new` arm, reported as `{{\"mode\":\"plaintext\"}}`"
+        );
+
+        // Every object was probed and every refusal swallowed — the session survived all three, which
+        // is what distinguishes "the device has no posture" from "the posture read broke the link".
+        let reads = plc.log().attribute_reads;
+        for probe in [(0x5D, 1, 1), (0x5E, 1, 1), (0x5F, 0, 8)] {
+            assert!(reads.contains(&probe), "connect probes {probe:?}: {reads:?}");
+        }
+        session.close().await;
+
+        // The posture is a diagnostic surface, not a liveness gate: a read that dies at the
+        // *connection* level is swallowed the same way, so a link hiccup during the probe can never
+        // turn a reachable device into a failed connect.
+        let plc = MockPlc::start(PlcScript { drop_after_register: true, ..PlcScript::default() }).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        let session = backend.connect(&conn).await.unwrap();
+        assert!(session.security().is_none(), "a broken posture read is swallowed, not surfaced");
+    }
+
+    /// A CIP Security device's posture is decoded onto the seam type field for field, and a device
+    /// found in `Factory Default` while being polled gets the §4.1 WARN — an unprovisioned device on
+    /// a secured path is exactly the condition an operator must see.
+    #[tokio::test]
+    async fn connect_plaintext_with_posture_yields_secure_session_and_warns_on_factory_default() {
+        let plc = MockPlc::start(PlcScript::default().with_posture(0)).await; // 0 = Factory Default
+        let backend = EipBackend::new(timeouts());
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+
+        let warns = WarnLog::default();
+        let session = {
+            let _guard = tracing::subscriber::set_default(warns.clone());
+            backend.connect(&conn).await.unwrap()
+        };
+
+        let sec = session.security().expect("a posture-carrying session reports security");
+        assert!(!sec.tls, "the session is plaintext; only the target's posture was read");
+        let target = sec.target.expect("the target's posture");
+        assert_eq!(target.state.as_deref(), Some("Factory Default"));
+        assert_eq!(
+            target.profiles,
+            vec!["EtherNet/IP Integrity", "EtherNet/IP Confidentiality"]
+        );
+        assert_eq!(
+            target.allowed_cipher_suites,
+            vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"]
+        );
+        assert_eq!(
+            target.available_cipher_suites,
+            vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"]
+        );
+        assert_eq!(target.verify_client, Some(true));
+        assert_eq!(target.send_certificate_chain, Some(true));
+        assert_eq!(target.check_expiration, Some(false));
+        let cert = target.certificate.expect("the Certificate Management summary");
+        assert_eq!(cert.name.as_deref(), Some("device-cert"));
+        assert_eq!(cert.state.as_deref(), Some("Verified"));
+        assert_eq!(cert.encoding.as_deref(), Some("PEM"));
+        assert_eq!(cert.push_supported, Some(true));
+        assert_eq!(cert.pull_supported, Some(true));
+        assert!(
+            warns.contains("Factory Default"),
+            "an unprovisioned device must be warned about: {:?}",
+            warns.0.lock().unwrap()
+        );
+
+        // The other polarity: a provisioned device reports the same surface without the warning.
+        let plc = MockPlc::start(PlcScript::default().with_posture(2)).await; // 2 = Configured
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        let quiet = WarnLog::default();
+        let session = {
+            let _guard = tracing::subscriber::set_default(quiet.clone());
+            backend.connect(&conn).await.unwrap()
+        };
+        let target = session.security().unwrap().target.unwrap();
+        assert_eq!(target.state.as_deref(), Some("Configured"));
+        assert!(quiet.is_empty(), "a provisioned device is not warned about");
+    }
+
+    /// The §10.1 classification on the open edge, both polarities and both entry points: a link that
+    /// dies is `Transient` (reconnect), a peer that breaks the protocol shape is `Permanent` (back off
+    /// at the ceiling rather than hammer a misconfiguration).
+    #[tokio::test]
+    async fn connect_refusal_maps_via_map_enip_error() {
+        let backend = EipBackend::new(timeouts());
+
+        // A peer that accepts the TCP connection and hangs up: a link-level failure ⇒ retry.
+        let plc = MockPlc::start(PlcScript { hang_up: true, ..PlcScript::default() }).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        match backend.connect(&conn).await.map(|_| ()) {
+            Err(DeviceError::Transient(_)) => {}
+            other => panic!("a dropped session must be transient, got {other:?}"),
+        }
+
+        // A peer that answers RegisterSession with session handle 0 — a protocol violation that will
+        // repeat forever, so it must NOT be retried as if it were a hiccup.
+        let plc = MockPlc::start(PlcScript { bad_register: true, ..PlcScript::default() }).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        match backend.connect(&conn).await.map(|_| ()) {
+            Err(DeviceError::Permanent(_)) => {}
+            other => panic!("a protocol violation must be permanent, got {other:?}"),
+        }
+
+        // The same table on the class-1 edge: a ForwardOpen refused for a resource reason is
+        // transient, one refused as unsupported is permanent.
+        let io = io_of(500, 20, 16);
+        for (status, transient) in [(0x02u8, true), (0x08u8, false)] {
+            let plc = MockPlc::start(PlcScript::default().refusing_forward_open(status)).await;
+            let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+            let outcome = backend.open_push(&conn, &io).await.map(|_| ());
+            match (&outcome, transient) {
+                (Err(DeviceError::Transient(_)), true) | (Err(DeviceError::Permanent(_)), false) => {}
+                _ => panic!("forward-open status 0x{status:02X}: unexpected {outcome:?}"),
+            }
+        }
+    }
+
+    /// The CIP Security explicit path end to end over a loopback socket: the adapter builds its
+    /// `ClientConfig` from file-sourced PEMs, negotiates mutual TLS against the scripted device (whose
+    /// verifier rejects a client that does not present a certificate), reads the target's posture
+    /// *inside* the TLS session, and reports the negotiated facts on the seam.
+    #[tokio::test]
+    async fn connect_tls_negotiates_and_reports_security_status() {
+        let pki = mint_pki();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_file = dir.path().join("client.pem");
+        let key_file = dir.path().join("client.key");
+        let ca_file = dir.path().join("ca.pem");
+        std::fs::write(&cert_file, &pki.client_cert_pem).unwrap();
+        std::fs::write(&key_file, &pki.client_key_pem).unwrap();
+        std::fs::write(&ca_file, &pki.ca_pem).unwrap();
+
+        let script = PlcScript { tls: Some(pki.server_config()), ..PlcScript::default() }.with_posture(2);
+        let plc = MockPlc::start(script).await;
+        let backend = EipBackend::new(timeouts());
+        let conn = conn_of(json!({
+            "endpoint": plc.endpoint(),
+            "security": {
+                "mode": "tls",
+                "client": {
+                    "certFile": cert_file.to_string_lossy(),
+                    "keyFile": key_file.to_string_lossy()
+                },
+                "ca": { "file": ca_file.to_string_lossy() }
+            }
+        }));
+
+        let session = backend.connect(&conn).await.unwrap();
+        let sec = session.security().expect("a TLS session reports its posture");
+        assert!(sec.tls);
+        assert_eq!(sec.tls_version.as_deref(), Some("1.3"));
+        let suite = sec.cipher_suite.expect("a negotiated suite");
+        assert!(suite.starts_with("TLS13_"), "negotiated suite: {suite}");
+        assert!(sec.peer_verified, "verifyPeer defaults on and the chain verified");
+        assert!(
+            sec.peer.as_deref().unwrap_or_default().contains("mock-plc"),
+            "the peer identity is the device certificate subject: {:?}",
+            sec.peer
+        );
+        assert!(sec.client_cert_not_after.is_some(), "our own leaf's expiry is surfaced");
+        assert!(sec.client_cert_serial.is_some());
+        assert!(
+            sec.client_cert_expiry_days.unwrap_or(-1) >= 0,
+            "a freshly minted client cert is not expired"
+        );
+        assert_eq!(sec.trust_anchors.len(), 1, "the managed trust store holds the one root");
+        assert!(
+            sec.target.is_some(),
+            "the Phase-2a posture read runs over the TLS session too"
+        );
+
+        // Both ways the security block can be wrong are permanent — a misconfiguration must park the
+        // instance at the backoff ceiling, never be retried as if the device were merely unreachable.
+        // Neither of these reaches a socket: they fail before the dial.
+        let malformed = conn_of(json!({ "endpoint": "127.0.0.1:1", "security": { "bogus": 1 } }));
+        match backend.connect(&malformed).await.map(|_| ()) {
+            Err(DeviceError::Permanent(_)) => {}
+            other => panic!("a malformed security block must be permanent, got {other:?}"),
+        }
+        let unsourceable = conn_of(json!({
+            "endpoint": "127.0.0.1:1",
+            "security": {
+                "mode": "tls",
+                "client": {
+                    "certFile": dir.path().join("absent.pem").to_string_lossy(),
+                    "keyFile": dir.path().join("absent.key").to_string_lossy()
+                },
+                "ca": { "file": ca_file.to_string_lossy() }
+            }
+        }));
+        match backend.connect(&unsourceable).await.map(|_| ()) {
+            Err(DeviceError::Permanent(_)) => {}
+            other => panic!("unsourceable TLS material must be permanent, got {other:?}"),
+        }
+    }
+
+    // ==== open_push (class-1) =====================================================================
+
+    /// The ForwardOpen the `io` block builds, and the traffic it arms. The request is asserted field
+    /// for field on the peer side — assembly path, both `DirectionSpec`s, the originator identity, the
+    /// advertised UDP port — and the seam's `Up`/`Data` updates on the adapter side.
+    #[tokio::test]
+    async fn open_push_forward_open_up_and_data_flow() {
+        let io = io_of(500, 20, 16);
+        let (plc, peer, mut session) = open_push_session(&io).await;
+
+        // ---- the request the target received (§4.6 → §8.2 mapping) ----
+        let open = plc.log().open.expect("the peer recorded a ForwardOpen");
+        assert_eq!(open.service, enip::cm::service::FORWARD_OPEN, "10-byte directions are not large");
+        assert_eq!(open.vendor_id, VENDOR_ID);
+        assert_eq!(open.transport_class_trigger, enip::TRANSPORT_CLASS1_TRIGGER);
+        assert_eq!(open.timeout_multiplier_code, enip::TimeoutMultiplier::X16.code());
+        assert_eq!(open.t2o_rpi_us, 500_000, "rpiMs is the T→O request");
+        assert_eq!(open.o2t_rpi_us, 20_000, "o2tRpiMs is the O→T request");
+        assert_eq!(
+            open.connection_path,
+            enip::io_connection_path(Some(151), 150, 100).encode().unwrap().to_vec(),
+            "config/output/input assemblies anchor the connection path"
+        );
+        let t2o = NetworkConnectionParams::decode_u16(open.t2o_params);
+        assert_eq!(t2o.size, 10, "modeless T→O: 2 (sequence) + 8 (data)");
+        assert_eq!(t2o.conn_type, enip::ConnType::P2P);
+        assert_eq!(t2o.priority, enip::Priority::Scheduled);
+        assert_eq!(t2o.variable, enip::VariableLength::Fixed);
+        let o2t = NetworkConnectionParams::decode_u16(open.o2t_params);
+        assert_eq!(o2t.size, 10, "header32 O→T: 2 (sequence) + 4 (run/idle) + 4 (data)");
+        assert_eq!(o2t.conn_type, enip::ConnType::P2P, "O→T is always point-to-point (§4.6)");
+        assert_ne!(open.advertised_port, 0, "the originator advertises its own UDP receive port");
+        assert_eq!(
+            open.advertised_port,
+            plc.t2o_target().port(),
+            "and that is the port the target must produce into"
+        );
+
+        // ---- the traffic ----
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        let (o2t_api_ms, t2o_api_ms, _seq) =
+            drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
+        assert_eq!(
+            (o2t_api_ms, t2o_api_ms),
+            (20, 500),
+            "the negotiated APIs from the reply reach the seam in whole milliseconds"
+        );
+
+        let (readings, _sequence, run_mode) = next_data(session.as_mut()).await;
+        assert!(run_mode, "a modeless frame carries no run/idle header ⇒ Run");
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0].signal_id, "a100/0/udint");
+        assert_eq!(readings[0].name.as_deref(), Some("din-word"));
+        assert_eq!(readings[0].value, json!(7));
+        assert_eq!(readings[0].quality, Quality::Good);
+        assert_eq!(readings[1].signal_id, "a100/4/real");
+        assert_eq!(readings[1].value, json!(55.5));
+        assert_eq!(readings[1].quality, Quality::Good);
+
+        session.close().await;
+    }
+
+    /// The translator's latest-wins collapse (§8.6): a burst of frames the consumer never drained must
+    /// come back as a handful of updates ending at the newest sequence — never as the whole burst
+    /// replayed — and a lifecycle transition sitting *behind* that burst must survive it. The second
+    /// half is the one that bites: the collapse loop carries a following non-`Data` event, so a `Lost`
+    /// queued behind an undrained burst is delivered rather than swallowed with the samples it
+    /// overtook. A swallowed `Lost` leaves the engine reading a stream that will never speak again.
+    #[tokio::test]
+    async fn translator_latest_wins_collapses_a_burst_and_never_drops_up_or_lost() {
+        const BURST: u16 = 400;
+        let io = io_of(100, 100, 8); // 100 ms T→O API × 8 = an 800 ms watchdog
+        let (plc, peer, mut session) = open_push_session(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        let (_o2t, _t2o, mut seq) =
+            drive_up(session.as_mut(), &peer, target, cid, &input_frame(1, 1.0)).await;
+
+        // Fill the seam channel first, one frame per scheduler turn: a lone queued sample gives the
+        // translator nothing to collapse, so each wakeup costs a channel slot and the (undrained)
+        // 16-deep channel fills. The translator then parks on its send.
+        let produce = |seq: u16| t2o_datagram(cid, u32::from(seq), seq, &input_frame(u32::from(seq), 1.0));
+        for _ in 0..120u16 {
+            seq += 1;
+            peer.send_to(&produce(seq), target).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        // Now the burst proper: with the translator parked these pile up in the stack's event queue,
+        // which is exactly the state the collapse loop has to get right.
+        while seq < BURST {
+            seq += 1;
+            peer.send_to(&produce(seq), target).await.unwrap();
+        }
+
+        // Now go silent until the O→T stream stops. The produce scheduler and the inactivity watchdog
+        // are the same task: production ends exactly when the watchdog removes the connection, so "no
+        // O→T datagram for ten produce periods" is an *event* saying the `Lost` is now queued behind
+        // the undrained burst. (Not a sleep: it waits on the peer's own socket.)
+        let mut buf = vec![0u8; 2048];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buf)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("the peer socket broke: {e}"),
+                Err(_elapsed) => break,
+            }
+        }
+
+        let mut ups = 0usize;
+        let mut sequences: Vec<u16> = Vec::new();
+        let mut lost = 0usize;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), session.updates().recv()).await {
+                Ok(Some(IoUpdate::Up { .. })) => ups += 1,
+                Ok(Some(IoUpdate::Data { sequence, .. })) => {
+                    assert_eq!(lost, 0, "a sample after the loss transition");
+                    sequences.push(sequence);
+                }
+                Ok(Some(IoUpdate::Lost { error })) => {
+                    assert!(error.is_transient());
+                    lost += 1;
+                }
+                Ok(None) => break, // the translator ended after the loss
+                Err(_elapsed) => panic!("the stream neither delivered a loss nor ended"),
+            }
+        }
+
+        assert_eq!(ups, 0, "the one Up was already consumed by drive_up and never re-sent");
+        assert_eq!(lost, 1, "the loss queued behind the burst is delivered exactly once");
+        assert!(!sequences.is_empty(), "the burst produced samples");
+        assert!(
+            sequences.windows(2).all(|w| w[1] > w[0]),
+            "a collapsed burst never delivers an older sample after a newer one: {sequences:?}"
+        );
+        assert!(
+            sequences.len() <= 64,
+            "the burst must collapse: {} updates for {BURST} frames (an uncollapsed translator \
+             delivers hundreds)",
+            sequences.len()
+        );
+        assert!(
+            *sequences.last().unwrap() >= BURST / 2,
+            "latest-wins keeps the NEWEST sample; last delivered was {:?}",
+            sequences.last()
+        );
+        session.close().await;
+    }
+
+    /// Two things the push `sb/read` and the `EtherNetIpIo` metric emit stand on: the snapshot stays
+    /// live independently of the engine's consumption, and the stack's counters reach the seam
+    /// unshuffled.
+    #[tokio::test]
+    async fn last_input_snapshot_stays_live_and_io_stats_map() {
+        // Field for field: a mis-wired mapping here silently reports one counter as another.
+        let mapped = map_io_stats(enip::IoStats {
+            frames_accepted: 1,
+            frames_produced: 2,
+            size_mismatch: 3,
+            stale_frames: 4,
+            sequence_gaps: 5,
+            overflowed_events: 6,
+            produce_overruns: 7,
+            send_errors: 8,
+            recv_errors: 9,
+            malformed_frames: 10,
+            unknown_connection: 11,
+            refused_redirects: 12,
+        });
+        assert_eq!(
+            mapped,
+            IoLinkStats {
+                frames_produced: 2,
+                stale_frames: 4,
+                size_mismatch: 3,
+                sequence_gaps: 5,
+                malformed_frames: 10,
+                produce_overruns: 7,
+                send_errors: 8,
+                recv_errors: 9,
+                refused_redirects: 12,
+            }
+        );
+
+        let io = io_of(500, 20, 16);
+        let (plc, peer, mut session) = open_push_session(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        assert!(session.last_input().is_none(), "no frame yet ⇒ no snapshot");
+        let (_o2t, _t2o, mut seq) =
+            drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
+        let (readings, _sequence, _run) = next_data(session.as_mut()).await;
+
+        let snapshot = session.last_input().expect("the snapshot is live after the first frame");
+        assert_eq!(snapshot.readings, readings, "the snapshot IS the last accepted frame");
+        assert!(snapshot.run_mode);
+
+        // A duplicate sequence is dropped by the signed-window rule and counted; the counters reach
+        // the seam on the translator's next wakeup, which the advancing frame provides.
+        let mut stale = 0;
+        for attempt in 1..=40u16 {
+            peer.send_to(&t2o_datagram(cid, u32::from(seq) + 500, seq, &input_frame(7, 55.5)), target)
+                .await
+                .unwrap();
+            seq += 1;
+            peer.send_to(&t2o_datagram(cid, u32::from(seq), seq, &input_frame(8, 66.5)), target)
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(50), session.updates().recv()).await;
+            stale = session.io_stats().expect("a class-1 session has counters").stale_frames;
+            if stale >= 1 {
+                break;
+            }
+            assert!(attempt < 40, "the duplicate frame was never counted as stale");
+        }
+        assert!(stale >= 1, "the duplicate T→O frame is counted, not silently accepted");
+        session.close().await;
+    }
+
+    /// The output path: a coerced value is encoded into the O→T assembly buffer and rides the next
+    /// produced frame — observed as bytes at the target socket, not merely staged.
+    #[tokio::test]
+    async fn set_output_encodes_and_rides_the_next_o2t_frame() {
+        let io = io_of(500, 20, 16);
+        let (plc, peer, mut session) = open_push_session(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
+
+        let field = &io.output.as_ref().unwrap().signals[0];
+        session.set_output(field, &json!(12.5)).await.unwrap();
+
+        let expected = 12.5f32.to_le_bytes();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut buf = vec![0u8; 2048];
+        let mut seen_o2t = false;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the staged output never reached the wire (saw an O→T frame: {seen_o2t})"
+            );
+            let Ok(Ok((n, _src))) =
+                tokio::time::timeout(Duration::from_millis(500), peer.recv_from(&mut buf)).await
+            else {
+                continue;
+            };
+            let Ok(cpf) = Cpf::decode(&buf[..n]) else { continue };
+            let Some(item) = cpf.find(ItemType::ConnectedData) else { continue };
+            let frame = enip::IoFrame::decode(enip::RealTimeFormat::Header32Bit, &item.data).unwrap();
+            seen_o2t = true;
+            assert_eq!(frame.run_mode, Some(true), "the O→T header carries the Run bit");
+            if frame.data.as_ref() == expected {
+                break;
+            }
+        }
+
+        // The refusal arms: a field the output assembly does not declare, and a value the field's CIP
+        // type cannot hold, are both caller errors — never a silent no-op.
+        let bogus: IoFieldSpec =
+            serde_json::from_value(json!({ "name": "nope", "offset": 2, "type": "int" })).unwrap();
+        assert!(
+            matches!(session.set_output(&bogus, &json!(1)).await, Err(DeviceError::Permanent(_))),
+            "an unknown output field is a permanent error"
+        );
+        assert!(
+            matches!(
+                session.set_output(field, &json!("not a number")).await,
+                Err(DeviceError::Permanent(_))
+            ),
+            "a value the CIP type cannot hold is a permanent error"
+        );
+        // A value that encodes cleanly but does not fit the declared assembly slot is caught by the
+        // layout, not written past the field: the buffer the device consumes is never corrupted.
+        let oversized: IoFieldSpec = serde_json::from_value(
+            json!({ "name": "setpoint", "offset": 0, "type": "real", "arrayCount": 2 }),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                session.set_output(&oversized, &json!([1.0, 2.0])).await,
+                Err(DeviceError::Permanent(_))
+            ),
+            "a value too wide for its assembly slot is refused by the layout"
+        );
+
+        // A heartbeat connection (no output assembly) refuses writes as unsupported.
+        let hb: IoConfig = serde_json::from_value(json!({
+            "rpiMs": 500,
+            "assemblies": { "output": 150, "input": 100 },
+            "input": {
+                "sizeBytes": 8,
+                "signals": [ { "name": "din-word", "offset": 0, "type": "udint" } ]
+            }
+        }))
+        .unwrap();
+        let (_hb_plc, _hb_peer, mut hb_session) = open_push_session(&hb).await;
+        assert!(
+            matches!(
+                hb_session.set_output(field, &json!(1.0)).await,
+                Err(DeviceError::Unsupported(_))
+            ),
+            "a device with no output assembly cannot be written to"
+        );
+        hb_session.close().await;
+        session.close().await;
+    }
+
+    /// Teardown, both ways out: the graceful close issues the ForwardClose and is idempotent, and a
+    /// close whose translator has already died falls back to aborting the task instead of waiting out
+    /// the whole handoff cap.
+    #[tokio::test]
+    async fn close_performs_forward_close_and_is_safe_twice() {
+        let io = io_of(500, 20, 16);
+        let (plc, peer, mut session) = open_push_session(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
+
+        session.close().await;
+        let closes = |plc: &MockPlc| {
+            plc.log()
+                .services
+                .iter()
+                .filter(|&&s| s == enip::cm::service::FORWARD_CLOSE)
+                .count()
+        };
+        assert_eq!(closes(&plc), 1, "the graceful close tears the class-1 connection down");
+        session.close().await; // must be safe to call twice
+        assert_eq!(closes(&plc), 1, "the second close is a no-op, not a second ForwardClose");
+
+        // The other exit: the link is lost, the translator task ends, and its control receiver goes
+        // with it — so `close` must take the abort fallback rather than park on the 5 s handoff cap.
+        let io = io_of(100, 100, 8); // an 800 ms watchdog
+        let (plc, peer, mut session) = open_push_session(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
+        let mut lost = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), session.updates().recv()).await {
+                Ok(Some(IoUpdate::Lost { .. })) => lost = true,
+                Ok(Some(_)) => {}
+                Ok(None) => break, // the translator returned; control_rx is gone
+                Err(_elapsed) => panic!("the translator never ended after the link was lost"),
+            }
+        }
+        assert!(lost, "the seam reported the lost link before ending the stream");
+        tokio::time::timeout(Duration::from_secs(2), session.close())
+            .await
+            .expect("close falls back to aborting the task, well inside PUSH_CLOSE_HANDOFF_CAP");
+
+        // And the third exit: an engine that simply drops the handle. The translator sees its control
+        // channel close and runs the same teardown, so a dropped session never strands a class-1
+        // connection on the device.
+        let io = io_of(500, 20, 16);
+        let (plc, peer, mut session) = open_push_session(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
+        assert_eq!(closes(&plc), 0, "nothing has been torn down yet");
+        drop(session);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while closes(&plc) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dropping the handle left the class-1 connection open on the device"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(closes(&plc), 1, "the dropped handle still issued the ForwardClose");
+    }
+
+    /// The inactivity watchdog on a real socket: the target goes silent, the stack declares the
+    /// class-1 connection lost, and the seam reports it as the transient error the engine reconnects
+    /// on (§10.1 row 7) — never as a permanent one that would park the instance at the backoff ceiling.
+    #[tokio::test]
+    async fn watchdog_silence_maps_lost_reason() {
+        let io = io_of(100, 100, 8); // 100 ms T→O API × 8 = an 800 ms watchdog
+        let (plc, peer, mut session) = open_push_session(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
+
+        // Silence. The watchdog is the only thing that can end this stream.
+        let mut lost = None;
+        while lost.is_none() {
+            match tokio::time::timeout(Duration::from_secs(10), session.updates().recv()).await {
+                Ok(Some(IoUpdate::Lost { error })) => lost = Some(error),
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the stream ended without reporting the loss"),
+                Err(_elapsed) => panic!("the watchdog never fired"),
+            }
+        }
+        let error = lost.unwrap();
+        assert!(error.is_transient(), "a lost class-1 link is always retried");
+        assert!(
+            error.to_string().contains("class-1 inactivity watchdog timeout"),
+            "the loss reason is mapped, not flattened: {error}"
+        );
+        session.close().await;
+    }
+}
+

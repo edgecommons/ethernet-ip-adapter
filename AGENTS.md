@@ -71,7 +71,8 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
 - CI: one caller → `edgecommons/.github/.github/workflows/component-ci.yml@main` (`language: RUST`,
   `secrets: inherit`) + in-repo 90% gate (`cargo llvm-cov --fail-under-lines 90`), **workspace-wide**
   — the owned `crates/enip` protocol crate is inside the coverage gate, not carved out (D-EIP-17).
-  Live hardware paths (the sim-gated live suite) are the only exclusion.
+  The sim-gated live suites, the fuzz harness workspace, and the `#[cfg(test)]` test doubles are the
+  only coverage exclusions; no product file is carved out (DESIGN §12.2).
 - Docs: Diátaxis `.md`, no frontmatter, synced to the site — current behavior only, present tense.
 
 ## Registry

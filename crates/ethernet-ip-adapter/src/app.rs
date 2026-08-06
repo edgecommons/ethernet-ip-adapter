@@ -23,7 +23,7 @@
 //! `southbound_health` metric working against the new config.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use edgecommons::prelude::*;
 use serde_json::{json, Value};
@@ -451,6 +451,12 @@ pub(crate) enum DisconnectedWait {
 /// full minute. A closed control channel means the same thing — the owning task is being taken down
 /// — so it returns [`DisconnectedWait::Stopped`] immediately rather than sleeping out the wait.
 /// Verbs still queued at that point die with the channel and their callers get `DEVICE_UNAVAILABLE`.
+///
+/// **Clock:** the deadline is a [`tokio::time::Instant`], the same clock the `sleep` inside the loop
+/// runs on — so a verb serviced mid-backoff resumes the *remaining* wait rather than restarting it.
+/// (Measuring the deadline on the system clock while sleeping on the runtime's is identical in
+/// production, where the two advance together, but under a paused clock every serviced verb would
+/// re-arm the full window.)
 pub(crate) async fn serve_control_disconnected(
     control: &mut tokio::sync::mpsc::Receiver<DeviceControl>,
     cfg: &DeviceConfig,
@@ -460,9 +466,9 @@ pub(crate) async fn serve_control_disconnected(
     wait: Duration,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> DisconnectedWait {
-    let deadline = Instant::now() + wait;
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return DisconnectedWait::Elapsed;
         }
@@ -509,7 +515,18 @@ pub(crate) async fn serve_control_disconnected(
     }
 }
 
+/// The full-jitter fraction for the next backoff wait — a sample in `[0, 1)` that
+/// [`Backoff::delay`] scales by the rung's cap (§10.2).
+///
+/// Under test the fraction can be **pinned** ([`crate::testutil::JitterGuard`]), which is what makes
+/// a ladder assertion an equality on the wait instead of a probability: with full jitter a rung that
+/// climbed to the ceiling still lands under a low bound a large fraction of the time, so a one-sided
+/// `wait ≤ base_ms` assertion would wave a lost `attempt` reset through most runs.
 pub(crate) fn rand01() -> f64 {
+    #[cfg(test)]
+    if let Some(pinned) = crate::testutil::pinned_jitter() {
+        return pinned;
+    }
     use std::hash::{BuildHasher, Hasher};
     let n = std::collections::hash_map::RandomState::new()
         .build_hasher()

@@ -28,7 +28,9 @@ mod publish;
 mod publish_sink;
 mod push;
 mod push_driver;
+mod reconnect;
 mod reload;
+mod security_lifecycle;
 mod sim;
 mod supervisor;
 #[cfg(test)]

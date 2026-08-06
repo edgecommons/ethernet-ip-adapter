@@ -36,39 +36,28 @@ jobs:
     # only does build/test/clippy. Measured WORKSPACE-WIDE (D-EIP-17 folded the protocol crate into
     # the same denominator as the adapter; there is no per-crate carve-out).
     #
-    # Option B, the file-replicator discipline (DESIGN §12.2): the untestable live-infra loop DRIVERS
-    # are refactored into dedicated, as-thin-as-possible seam files so a file-level exclusion excludes
-    # ONLY untestable I/O glue and never launders tested logic — the pure gating/decision logic stays in
-    # the covered files and IS unit-tested. Excluded from the denominator, each pinned to a reason:
-    #   - `crates/ethernet-ip-adapter/src/supervisor.rs` — the connect→poll/consume→reconnect drivers
-    #     (`App::run` / `run_device` / `run_push` / `FacadeEventSink`): they `.await` a live `EdgeCommons`
-    #     runtime, a live `DeviceBackend` socket, and the `data()` facade. Backoff math / connectivity /
-    #     `apply_pause` / `serve_control_disconnected` / `connect_reason` / `rand01` stay in `app.rs`, tested.
-    #   - `crates/ethernet-ip-adapter/src/poll_driver.rs` — `poll_until_disconnected` + `repoll`/publish
-    #     glue: the select-loop over a live `DeviceSession` + `data.publish().await`. The gating/batching/
-    #     stale/overrun logic it composes lives in `poll.rs` / `publish.rs` and is unit-tested.
-    #   - `crates/ethernet-ip-adapter/src/push_driver.rs` — `consume_push` + publish glue: the loop over a
-    #     live class-1 `PushSession` stream + `data.publish().await`. `process_frame` is in `push.rs`, tested.
-    #   - `crates/ethernet-ip-adapter/src/publish_sink.rs` — the one-function `publish()` seam driving
-    #     `data.publish().await`; its pure assembly (`build_update`) is in `publish.rs`, tested.
-    #   - `crates/ethernet-ip-adapter/src/eip/live.rs` — the EtherNet/IP live-socket drivers: `EipBackend`'s
-    #     TCP `connect` / ForwardOpen `open_push` and the class-1 `EipPushSession` + translator task. The
-    #     pure translators (`assembly_to_readings` / `map_lost_reason`), the error classification
-    #     (`map_enip_error`), and the codec (`eip/types`) stay in covered files and are unit-tested.
-    #   These five are validated by the S7a live cpppo/OpENer integration suites (§11) + the S9 deployed
-    #   regression — the analog of how `file-replicator` excludes its `dest/*/client.rs` I/O seams.
-    #   - `crates/enip/tests/live_cpppo.rs`, `crates/enip/tests/live_opener.rs`,
-    #     `crates/enip/tests/live_ab_server.rs`, `crates/enip/tests/live_ethernetipsharp.rs` — the four
-    #     live-sim-gated suites (§11.3): cpppo (poll/tags), OpENer (push/class-1), libplctag ab_server
-    #     (poll/tags via Unconnected_Send route), EthernetIPSharp (poll/tags + browse 0x55). Each
-    #     self-skips when its sim port is down.
+    # NO PRODUCT FILE IS EXCLUDED (DESIGN §12.2). Every driver, loop and live-socket backend in this
+    # repo is inside the denominator and unit-tested against injected seams — `Publisher` for the
+    # broker, `DeviceBackend`/`DeviceSession`/`PushSession` for the wire, `EventSink` for the `evt`
+    # surface, and, for `eip/live.rs`, a scripted EtherNet/IP peer on loopback TCP/UDP sockets. The
+    # exclusion list is three NON-product categories, each pinned to its reason:
+    #   - `crates/enip/tests/live_{cpppo,opener,ab_server,ethernetipsharp,tls,cip_security}.rs` — the
+    #     six live-peer conformance suites (DESIGN §11.3). Each probes its peer's port and self-skips
+    #     when the container is down, so on a runner with no peers they are dead test code, not
+    #     evidence about product code. They are the CONFORMANCE evidence against independent
+    #     implementations (cpppo, OpENer, libplctag ab_server, EthernetIPSharp, an OpenSSL TLS
+    #     terminator, OpENer's CIPSecurity branch), which is a different question from coverage.
     #   - `crates/enip/fuzz/**` — libFuzzer harnesses. They EXERCISE covered product code; they are not
-    #     product code (§12.2). (Also a separate workspace, so not even built here — belt-and-suspenders.)
-    #   - `crates/ethernet-ip-adapter/src/testutil.rs` — `#[cfg(test)]`-only recording test doubles.
-    # NOTHING ELSE is excluded. The protocol crate's live-socket runtime (`enip/io.rs`'s class-1 UDP
-    # manager, `client/io_service.rs`, `client/mod.rs`'s TCP connect) and the binary entry `main.rs` stay
-    # INSIDE the denominator — counted AGAINST the gate, not laundered out — and the well-tested codec
-    # keeps the aggregate comfortably over 90% (last local run: 93.5%). Do NOT add exclusions to dodge the
+    #     product code. (Also a separate workspace, so not even built here — belt-and-suspenders.)
+    #   - `crates/ethernet-ip-adapter/src/testutil.rs` — `#[cfg(test)]`-only recording test doubles and
+    #     the throwaway PKI/EST responder they share; compiled out of the shipped binary.
+    # What that leaves INSIDE the denominator and UNCOVERED, counted against the gate rather than
+    # laundered out: `supervisor.rs`'s EdgeCommons construction glue and `publish_sink.rs`'s
+    # `FacadePublisher` (both need an `Arc<EdgeCommons>`/`DataFacade`, and the core library's offline
+    # test constructor is `pub(crate)` — a dependent crate cannot build one), the binary entry
+    # `main.rs`, and the protocol crate's own live-socket runtime (`enip/io.rs`'s class-1 UDP manager,
+    # `client/io_service.rs`, `client/mod.rs`'s TCP connect). Those are exercised by the HOST /
+    # full-system E2E and the deployed regression (DESIGN §12.4). Do NOT add exclusions to dodge the
     # gate — add tests (DESIGN §12.2).
     runs-on: ubuntu-latest
     permissions:
@@ -100,12 +89,12 @@ jobs:
           git config --global \
             url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
-      - name: Coverage gate (90% lines, workspace-wide; thin live-infra seams + live suites + fuzz + doubles excluded)
+      - name: Coverage gate (90% lines, workspace-wide; no product file excluded — live-peer suites + fuzz workspace + test doubles only)
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: >
           cargo llvm-cov --workspace
-          --ignore-filename-regex '(supervisor\.rs|poll_driver\.rs|publish_sink\.rs|push_driver\.rs|eip[/\\]live\.rs|tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls|cip_security)\.rs|testutil\.rs|fuzz[/\\])'
+          --ignore-filename-regex '(tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls|cip_security)\.rs|testutil\.rs|fuzz[/\\])'
           --fail-under-lines 90
           --cobertura --output-path target/cobertura.xml
 
