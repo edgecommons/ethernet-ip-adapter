@@ -1384,9 +1384,12 @@ mod tests {
     // cpppo), then ROTATES the vault to `client2.pem` (a fresh cert signed by the same CA) and proves
     // the cert-lifecycle detects it and the next `connect_tls` presents the NEW cert (accepted by the
     // `verify=2` peer). It runs only when the harness is up:
-    //   docker compose up --build enip-sim enip-tls
-    // and is silently skipped otherwise, so the normal suite stays green with no live infra.
+    //   ./test-infra/enip-tls/gen-certs.sh && docker compose up --build -d enip-sim enip-tls
+    // and is silently skipped otherwise, so the normal suite stays green with no live infra —
+    // UNLESS `ENIP_LIVE_REQUIRED=1`, which turns every skip below into a failure (`live_required`,
+    // §4.1) so the CI live gate cannot pass vacuously.
 
+    const TLS_LIVE_ADDR: &str = "127.0.0.1:2221";
     const CERT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-infra/enip-tls/certs");
 
     fn read_cert(name: &str) -> Option<String> {
@@ -1396,11 +1399,18 @@ mod tests {
     async fn stunnel_up() -> bool {
         tokio::time::timeout(
             std::time::Duration::from_millis(400),
-            tokio::net::TcpStream::connect("127.0.0.1:2221"),
+            tokio::net::TcpStream::connect(TLS_LIVE_ADDR),
         )
         .await
         .map(|r| r.is_ok())
         .unwrap_or(false)
+    }
+
+    /// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer — or missing live test
+    /// material — is a **FAILURE**, never a silent skip, so the live gate cannot pass vacuously.
+    /// Unset (or empty, or `0`) keeps the bench-friendly self-skip.
+    fn live_required() -> bool {
+        std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
     }
 
     fn live_vault(cert: &str, key: &str, ca: &str) -> Arc<dyn CredentialService> {
@@ -1436,7 +1446,12 @@ mod tests {
     #[tokio::test]
     async fn live_client_cert_rotation_presents_the_new_cert() {
         if !stunnel_up().await {
-            eprintln!("SKIP live_client_cert_rotation: no stunnel on 127.0.0.1:2221 (run `docker compose up --build enip-sim enip-tls`)");
+            assert!(
+                !live_required(),
+                "ENIP_LIVE_REQUIRED=1 but no stunnel TLS terminator on {TLS_LIVE_ADDR} — \
+                 docker compose up --build -d enip-sim enip-tls"
+            );
+            eprintln!("SKIP live_client_cert_rotation: no stunnel on {TLS_LIVE_ADDR} (run `docker compose up --build enip-sim enip-tls`)");
             return;
         }
         let (Some(ca), Some(c1), Some(k1), Some(c2), Some(k2)) = (
@@ -1446,6 +1461,11 @@ mod tests {
             read_cert("client2.pem"),
             read_cert("client2.key"),
         ) else {
+            assert!(
+                !live_required(),
+                "ENIP_LIVE_REQUIRED=1 but the enip-tls originator certs are missing from \
+                 {CERT_DIR} — ./test-infra/enip-tls/gen-certs.sh"
+            );
             eprintln!("SKIP live_client_cert_rotation: test certs missing (run gen-certs.sh)");
             return;
         };
@@ -1481,7 +1501,12 @@ mod tests {
     #[tokio::test]
     async fn live_near_expiry_cert_fires_expiring() {
         if !stunnel_up().await {
-            eprintln!("SKIP live_near_expiry_cert: no stunnel on :2221");
+            assert!(
+                !live_required(),
+                "ENIP_LIVE_REQUIRED=1 but no stunnel TLS terminator on {TLS_LIVE_ADDR} \
+                 (near-expiry leg) — docker compose up --build -d enip-sim enip-tls"
+            );
+            eprintln!("SKIP live_near_expiry_cert: no stunnel on {TLS_LIVE_ADDR}");
             return;
         }
         let (Some(ca), Some(ce), Some(ke)) = (
@@ -1489,6 +1514,11 @@ mod tests {
             read_cert("client-expiring.pem"),
             read_cert("client-expiring.key"),
         ) else {
+            assert!(
+                !live_required(),
+                "ENIP_LIVE_REQUIRED=1 but the near-expiry originator certs are missing from \
+                 {CERT_DIR} — ./test-infra/enip-tls/gen-certs.sh"
+            );
             eprintln!("SKIP live_near_expiry_cert: certs missing");
             return;
         };

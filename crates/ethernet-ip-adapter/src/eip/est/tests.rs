@@ -649,17 +649,20 @@ async fn est_client_cacerts_fetches_the_ca_bag() {
 //
 // Independent-implementation validation (DESIGN-cip-security.md §5.2 Target C): a real Go RFC 7030
 // server + mock CA, mutual-TLS, over a real socket. Runs only when the container is up:
-//   docker compose up --build est-server         (or: docker run -p 8443:8443 ec-est-server)
+//   ./test-infra/est/gen-certs.sh && docker compose up --build -d est-server
 // and is SILENTLY SKIPPED otherwise (matching the inline live tests in tls.rs), so the normal suite
-// stays green with no live infra. Nothing here is excluded from the coverage gate — this file is
-// inside the denominator, and on a bench with no EST container the body below reads uncovered.
+// stays green with no live infra — UNLESS `ENIP_LIVE_REQUIRED=1`, which turns both skips below into
+// failures (`live_required`, §4.1) so the CI live gate cannot pass vacuously. Nothing here is
+// excluded from the coverage gate — this file is inside the denominator, and on a bench with no EST
+// container the body below reads uncovered.
 
+const EST_LIVE_ADDR: &str = "127.0.0.1:8443";
 const EST_CERT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-infra/est/certs");
 
 async fn est_server_up() -> bool {
     tokio::time::timeout(
         Duration::from_millis(400),
-        tokio::net::TcpStream::connect("127.0.0.1:8443"),
+        tokio::net::TcpStream::connect(EST_LIVE_ADDR),
     )
     .await
     .map(|r| r.is_ok())
@@ -670,15 +673,32 @@ fn read_est_cert(name: &str) -> Option<String> {
     std::fs::read_to_string(format!("{EST_CERT_DIR}/{name}")).ok()
 }
 
+/// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer — or missing live test
+/// material — is a **FAILURE**, never a silent skip, so the live gate cannot pass vacuously.
+/// Unset (or empty, or `0`) keeps the bench-friendly self-skip.
+fn live_required() -> bool {
+    std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 #[tokio::test]
 async fn live_est_enroll_against_globalsign_estserver() {
     if !est_server_up().await {
-        eprintln!("SKIP live_est_enroll: no EST server on 127.0.0.1:8443 (run `docker compose up --build est-server`)");
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no globalsign/est estserver on {EST_LIVE_ADDR} — \
+             docker compose up --build -d est-server"
+        );
+        eprintln!("SKIP live_est_enroll: no EST server on {EST_LIVE_ADDR} (run `docker compose up --build est-server`)");
         return;
     }
     let (Some(ca), Some(cc), Some(ck)) =
         (read_est_cert("ca.pem"), read_est_cert("client.pem"), read_est_cert("client.key"))
     else {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but the EST bootstrap certs are missing from {EST_CERT_DIR} — \
+             ./test-infra/est/gen-certs.sh"
+        );
         eprintln!("SKIP live_est_enroll: test certs missing (run test-infra/est/gen-certs.sh)");
         return;
     };

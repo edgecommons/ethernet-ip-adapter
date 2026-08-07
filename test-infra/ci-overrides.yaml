@@ -1,0 +1,79 @@
+# CI overlay for the `live-sims` job (.github/workflows/ci.yml) — the live-peer conformance gate
+# (DESIGN §11.3). Layered on top of compose.yaml:
+#
+#   docker compose -f compose.yaml -f test-infra/ci-overrides.yaml up -d \
+#     enip-sim enip-ab-server enip-sharp enip-tls enip-tls-cbc opener-cipsec est-server
+#
+# It does three things, each pinned to its reason below: publish cpppo on loopback, keep OpENer off
+# the compose network, and name the built images so a prebuilt (buildx-cached) image is reused
+# instead of rebuilt.
+#
+# ---------------------------------------------------------------------------------------------
+# 1. cpppo (`enip-sim`) gets a host publish — it ADDS the mapping, it does not override one.
+#
+# compose.yaml's `enip-sim` service declares NO `ports:` at all (the same is true of `enip-io-sim`):
+# it is reachable only from the compose network, by container name, which is all the containerized
+# adapter E2E needs. But `crates/enip/tests/live_cpppo.rs` dials a FIXED `127.0.0.1:44818` (the
+# address is a const, not an env override), and the same is true of the TLS terminators' upstream.
+# So the mapping has to be created here rather than replaced — there is no `ports:` key to override
+# and no `!override` tag is involved.
+#
+# 2. It is published on 127.0.0.1 ONLY, and that is the whole answer to the :44818 bind conflict.
+#
+# Two peers want TCP 44818 on the same runner:
+#   - cpppo, which live_cpppo reaches at the fixed 127.0.0.1:44818;
+#   - OpENer, which the class-1 (implicit I/O) legs of live_opener need on HOST networking, because
+#     the T→O return path must be symmetric — a bridge-NATed OpENer cannot send class-1 UDP back to
+#     the test's receive socket (DESIGN §11.2/§11.5). On host networking OpENer binds the wildcard
+#     address, so the job takes it at OPENER_ADDR=<runner primary IPv4>:44818.
+# A default `44818:44818` publish makes docker-proxy listen on 0.0.0.0:44818, and a wildcard bind
+# blocks every later bind of that port — OpENer would die on EADDRINUSE. Publishing on 127.0.0.1
+# binds docker-proxy to loopback only (and scopes the DNAT rule to loopback), so the runner's
+# primary IPv4 stays free for OpENer. Ordering matters and the job honours it: these compose peers
+# start FIRST (specific address), then OpENer binds the wildcard with SO_REUSEADDR.
+#
+# 3. `enip-io-sim` is deliberately NOT started from compose in CI.
+#
+# It is the same OpENer image, but on the compose bridge network, where the class-1 legs cannot
+# pass. The job builds `test-infra/opener` and runs it with `--network host` as `opener-live`
+# instead, so there is no second OpENer competing for :44818 and the watchdog leg's
+# `OPENER_STOP_CMD` (`docker kill opener-live`) has an unambiguous target.
+#
+# Docker Desktop / Windows note: this overlay's cpppo publish is exactly what the bench needs too,
+# and every TCP suite works with it. The class-1 legs still cannot run there (the WSL2 UDP NAT drops
+# the T→O return path) — that is a bench limitation, not a CI one.
+
+services:
+  # See (1) and (2): loopback-only so the runner's primary IPv4:44818 stays free for host-network
+  # OpENer. live_cpppo's fixed 127.0.0.1:44818 (and live_tls's stunnel upstream) resolve through it.
+  enip-sim:
+    ports:
+      - "127.0.0.1:44818:44818"
+
+  # See (3): naming the built images lets the job prebuild them with `docker buildx bake` +
+  # `type=gha` layer cache and have `docker compose up` reuse the loaded image instead of rebuilding
+  # it (compose only builds when the named image is missing, which is also the local fallback).
+  # Same names are what a future prebuild-to-ghcr mitigation would retag.
+  enip-ab-server:
+    image: enip-sim-ab-server:ci
+  enip-sharp:
+    image: enip-sim-ethernetip-sharp:ci
+  enip-tls:
+    image: enip-sim-enip-tls:ci
+  enip-tls-cbc:
+    # The CBC-only terminator is the same image as enip-tls with a different stunnel config.
+    image: enip-sim-enip-tls:ci
+  opener-cipsec:
+    image: enip-sim-opener-cipsecurity:ci
+  est-server:
+    image: enip-sim-est:ci
+  # Built (for the host-network `opener-live` container), never started from compose here.
+  enip-io-sim:
+    image: enip-sim-opener:ci
+
+# compose.yaml's `enip-io-sim` attaches to the implicit `default` network to publish the
+# `opener-sim` alias. `docker compose` creates that network implicitly, but `docker buildx bake`'s
+# stricter compose loader rejects the project ("refers to undefined network default") — declaring it
+# explicitly here costs nothing and lets the job derive its build plan from these same two files.
+networks:
+  default: {}

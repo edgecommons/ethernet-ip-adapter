@@ -2,10 +2,12 @@
 //! server (DESIGN §11.1/§11.3). This is the first time explicit messaging (`client.rs`/`logix.rs`)
 //! meets a genuine, independent EtherNet/IP implementation on the wire — not a `duplex` fixture.
 //!
-//! ## Self-skipping (the sibling Modbus live-slave pattern, §11.3)
+//! ## Self-skipping, and the required mode that removes it (§11.3)
 //! At suite start we probe `TcpStream::connect(127.0.0.1:44818)` with a short timeout. If nothing is
 //! listening the test prints `skipped (no cpppo)` and returns `Ok` — so `cargo test --workspace`
-//! stays green on a machine with no sim. Bring the sim up with the §11.1 tag layout:
+//! stays green on a machine with no sim. **`ENIP_LIVE_REQUIRED=1` turns that skip into a failure**
+//! ([`live_required`]), so the CI live gate cannot pass vacuously. Bring the sim up with the §11.1
+//! tag layout:
 //!
 //! ```bash
 //! docker run --rm -p 44818:44818 cpppo/cpppo \
@@ -42,6 +44,13 @@ async fn sim_up() -> bool {
     )
 }
 
+/// CI hardening (§11.3): under `ENIP_LIVE_REQUIRED=1` a missing peer is a **FAILURE**, never a
+/// silent skip — the live gate cannot pass vacuously. Unset (or empty, or `0`) keeps the
+/// bench-friendly self-skip, so `cargo test --workspace` stays green with no sims up.
+fn live_required() -> bool {
+    std::env::var("ENIP_LIVE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 fn opts() -> ClientOptions {
     ClientOptions {
         connect_timeout: Duration::from_secs(3),
@@ -59,6 +68,11 @@ fn tag(name: &str) -> TagAddress {
 #[tokio::test]
 async fn cpppo_live_read_write_browse() {
     if !sim_up().await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no cpppo on {CPPPO_ADDR} — \
+             docker compose up -d enip-sim"
+        );
         eprintln!("live_cpppo: skipped (no cpppo on {CPPPO_ADDR})");
         return;
     }
@@ -152,6 +166,11 @@ async fn cpppo_live_read_write_browse() {
 #[tokio::test]
 async fn cpppo_live_tag_browse_is_gracefully_refused() {
     if !sim_up().await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no cpppo on {CPPPO_ADDR} (browse leg) — \
+             docker compose up -d enip-sim"
+        );
         eprintln!("live_cpppo (browse): skipped (no cpppo on {CPPPO_ADDR})");
         return;
     }
@@ -215,6 +234,11 @@ async fn cpppo_live_tag_browse_is_gracefully_refused() {
 #[tokio::test]
 async fn cpppo_live_class3_idle_survives_the_inactivity_window() {
     if !sim_up().await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no cpppo on {CPPPO_ADDR} (class-3 keepalive leg) — \
+             docker compose up -d enip-sim"
+        );
         eprintln!("live_cpppo (class-3 keepalive): skipped (no cpppo on {CPPPO_ADDR})");
         return;
     }
@@ -233,6 +257,10 @@ async fn cpppo_live_class3_idle_survives_the_inactivity_window() {
     let client = match EipClient::connect(CPPPO_ADDR, options).await {
         Ok(c) => c,
         Err(e) => {
+            // A peer-limit path, NOT a missing peer: cpppo has no class-3 explicit messaging, so it
+            // refuses the ForwardOpen at the encapsulation layer. This stays soft even under
+            // ENIP_LIVE_REQUIRED=1 — required mode enforces that the peer was REACHED, not that it
+            // implements a service it does not have. The leg stands on OpENer, which accepts class-3.
             println!(
                 "BENCH GAP: cpppo refused the class-3 ForwardOpen to the Message Router ({e:?}). \
                  If OpENer refused it as well, report the idle-survival leg as a bench gap and stand \

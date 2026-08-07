@@ -1,0 +1,78 @@
+# The periodic fuzzing CAMPAIGN (D-EIP-19 / PROTOCOL-DESIGN §12.3).
+#
+# The two-cadence contract: `ci.yml`'s `fuzz-smoke` job runs every target for 30 s on every PR, and
+# this workflow runs every target for a long budget on a schedule, off the PR path. A reproducible
+# panic or OOM found by either is a ship blocker.
+#
+# `crates/enip/fuzz` is its own cargo workspace with NO edgecommons dependency (the protocol crate
+# knows nothing about EdgeCommons, D-EIP-17), so this workflow needs no private-git token.
+#
+# A crash fails the run and uploads the libFuzzer reproducer as an artifact. Turning that reproducer
+# into a committed regression input under `crates/enip/fuzz/corpus/<target>/` — where
+# `tests/fuzz_corpus.rs` replays it on every platform, every run — stays the human follow-up.
+name: fuzz-weekly
+
+on:
+  schedule:
+    # Saturday 03:17 UTC — off-peak, and off the weekday PR path.
+    - cron: "17 3 * * 6"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "libFuzzer budget per target, in seconds (600 = the scheduled campaign)"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      # 11 targets x 600 s is ~110 min of execution, inside the 180 min job timeout. A manual
+      # dispatch can pass a shorter budget (e.g. 60) to verify the workflow itself end to end.
+      MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '600' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain (libFuzzer needs nightly + the sanitizer runtime)
+        run: rustup toolchain install nightly --profile minimal --component llvm-tools-preview
+      - name: Install cargo-fuzz
+        # Name the tool explicitly rather than via an `@<tool>` tag: those tags get rewritten to
+        # `@<version>`, which leaves the action with no tool to install and silently installs nothing.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build every fuzz target (a target that stops compiling is a defect)
+        working-directory: crates/enip
+        # Explicit target triple: cargo-fuzz otherwise defaults to the triple of its own binary, and
+        # the installed binary is a static musl build — so it asks the nightly toolchain for a musl
+        # std that `--profile minimal` never installed and dies on `can't find crate for core`.
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+      - name: Fuzz every target for the campaign budget
+        working-directory: crates/enip
+        # Enumerated with `cargo fuzz list`, exactly like the PR smoke, so a new hostile surface joins
+        # the campaign by existing.
+        run: |
+          targets="$(cargo +nightly fuzz list)"
+          if [ -z "$targets" ]; then
+            echo "::error title=fuzz campaign found no targets::cargo fuzz list printed nothing — the campaign would pass vacuously"
+            exit 1
+          fi
+          echo "campaign targets (${MAX_TOTAL_TIME}s each): $(echo "$targets" | tr '\n' ' ')"
+          for target in $targets; do
+            echo "::group::fuzz campaign: $target"
+            cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu \
+              -- -max_total_time="$MAX_TOTAL_TIME"
+            echo "::endgroup::"
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: crates/enip/fuzz/artifacts/**
+          if-no-files-found: ignore

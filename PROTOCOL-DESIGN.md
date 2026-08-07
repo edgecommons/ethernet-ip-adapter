@@ -70,9 +70,12 @@ encapsulation TCP session in a `rustls` `TlsStream` via the transport-generic se
 (§5.7, §11.1 — the actor is generic over `AsyncRead + AsyncWrite + Unpin`, so the whole session
 machinery rides inside TLS unchanged). The crate takes a prepared `rustls::ClientConfig` and stays
 EdgeCommons-free; cert material/vault sourcing is the adapter's job (**D-ENIP-15**, the dependency
-decision below; DESIGN-cip-security.md). `rustls` speaks the GCM + TLS 1.3 suites Vol 8 ≥ 1.13
-mandates; legacy CBC/NULL/PSK-only firmware is the documented interop boundary, surfaced as the typed
-`EnipError::Tls { NoCipherOverlap }`.
+decision below; DESIGN-cip-security.md). Only **AEAD** suites are negotiable: the `rustls` ring
+provider with the `tls12` feature on (both manifests) offers the three TLS 1.3 suites plus six
+TLS 1.2 ECDHE suites — four AES-GCM, two ChaCha20-Poly1305 — and the adapter's optional
+`cipherSuites` allow-list can only narrow that set, so **CBC, NULL and PSK are unreachable**. That
+covers what Vol 8 ≥ 1.13 mandates; legacy CBC/NULL/PSK-only firmware is the documented interop
+boundary, surfaced as the typed `EnipError::Tls { NoCipherOverlap }`.
 
 **Reading the target's security posture (Phase 2a, in scope, no feature gate).** The crate decodes the
 target's CIP Security object model — the **CIP Security Object (0x5D)**, **EtherNet/IP Security Object
@@ -1106,12 +1109,17 @@ surface — the invariant for all: **no panic, no OOM (allocation caps hold), de
 | `fuzz_io_frame` | UDP datagram → consume gauntlet (runt frames — the EIPScanner bug class) |
 | `fuzz_assembly_decode` | `AssemblyLayout::decode` against arbitrary layouts + data |
 | `fuzz_tag_path` | `TagAddress::parse` (caller-supplied strings) |
+| `fuzz_discovery` | discovery reply decoders (§5.3): `DeviceIdentity::parse_reply` / `parse_item` (sockaddr item + SHORT_STRING product-name length games) and the `parse_list_services` / `parse_list_interfaces` CPF walkers |
 | `fuzz_security_attrs` | CIP Security object attrs (0x5D/0x5E/0x5F): cipher-suite count lies, short strings, width-tolerant flags (§7.7) |
 
 Structured fuzzing via `arbitrary` for round-trip targets (`encode(x)` then mutate). Corpus
-seeded from the §12.4 vectors. CI: every PR runs each target for a fixed short budget
-(`-max_total_time=30` per target) over the checked-in corpus + regressions; found crashes are
-committed as regression inputs. Longer runs are a periodic (weekly) job.
+seeded from the §12.4 vectors. Two CI cadences carry this: the `fuzz-smoke` job in
+`.github/workflows/ci.yml` runs **every** target for a fixed short budget (`-max_total_time=30`)
+over the checked-in corpus + regressions on each PR, and `.github/workflows/fuzz-weekly.yml` runs
+every target at 600 s on a weekly schedule. Both enumerate the targets with `cargo fuzz list` — a
+target joins its gate by existing — and both treat an empty list as an error rather than a pass.
+Found crashes fail the run and are committed as regression inputs under
+`fuzz/corpus/<target>/`, where `tests/fuzz_corpus.rs` then replays them on every platform.
 
 ### 12.4 Conformance vectors (provable wire-correctness)
 

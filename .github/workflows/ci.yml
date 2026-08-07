@@ -1,5 +1,10 @@
 name: ci
 
+# paths-ignore keeps docs-only work out of CI. Two consequences worth knowing before you conclude
+# a branch is broken: a push carrying no file changes at all (an --allow-empty commit) matches
+# nothing outside the ignore list and so runs nothing, and a manual workflow_dispatch bypasses the
+# filter entirely but reports live-sims and fuzz-smoke as skipped, because both are pull_request-only.
+# The live-peer gate can therefore only be exercised by a pull request.
 on:
   push:
     paths-ignore: ['**.md', 'docs/**']
@@ -126,15 +131,208 @@ jobs:
         # for a musl std that `--profile minimal` never installed and dies on `can't find crate for
         # core`.
         run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
-      - name: Smoke-run representative targets over the checked-in corpus + regressions
+      - name: Smoke-run EVERY fuzz target over the checked-in corpus + regressions
         working-directory: crates/enip
-        # Three targets spanning the highest-value hostile surfaces (§12.3): TCP framing, the runt
-        # class-1 datagram gauntlet (the EIPScanner bug class D-EIP-1 calls out), and MR replies with
-        # extended-status size lies. -max_total_time keeps each a short smoke; the whole PR-gate fuzz
-        # cadence is intentionally cheap. A crash exits non-zero and is committed as a regression input.
+        # EVERY target, enumerated with `cargo fuzz list` rather than named here, so a new hostile
+        # surface joins the gate by existing — the same self-syncing property `enip::harness::SURFACES`
+        # gives the corpus regression, and the reason a target can never be forgotten at review time.
+        # -max_total_time keeps each one a SHORT smoke (the per-PR budget is deliberately cheap); the
+        # long budgets live in the weekly campaign, .github/workflows/fuzz-weekly.yml — the two
+        # cadences PROTOCOL-DESIGN §12.3 specifies. A crash exits non-zero and is committed as a
+        # regression input.
         run: |
-          for target in fuzz_encap_frame fuzz_io_frame fuzz_message_reply; do
+          targets="$(cargo +nightly fuzz list)"
+          if [ -z "$targets" ]; then
+            echo "::error title=fuzz gate found no targets::cargo fuzz list printed nothing — the smoke would pass vacuously"
+            exit 1
+          fi
+          echo "fuzz targets under smoke: $(echo "$targets" | tr '\n' ' ')"
+          for target in $targets; do
             echo "::group::fuzz smoke: $target"
             cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=30
             echo "::endgroup::"
           done
+
+  live-sims:
+    # The LIVE-PEER CONFORMANCE GATE (DESIGN §11.3). Every suite that validates this stack against an
+    # INDEPENDENT EtherNet/IP implementation runs here, against real peers, on every PR — cpppo,
+    # libplctag's ab_server, EthernetIPSharp, an OpenSSL stunnel terminator (plus a CBC-only one),
+    # OpENer, OpENer's CIPSecurity branch, and globalsign/est's estserver — plus the three in-source
+    # live tests in the adapter crate (client-cert rotation, near-expiry, EST enrollment).
+    #
+    # `ENIP_LIVE_REQUIRED: "1"` is what makes this a gate rather than a formality: every suite probes
+    # its peer and self-skips when the port is closed (the bench-friendly default), and under this
+    # variable a missing peer becomes an assertion failure naming the peer, the address and the
+    # command that starts it. Without it a runner with no containers would print "skipped (…)" and
+    # report success — the exact vacuous pass this job exists to prevent.
+    #
+    # Peer topology on the runner:
+    #   - the TCP peers run from compose with test-infra/ci-overrides.yaml layered on top, which
+    #     publishes cpppo on 127.0.0.1 ONLY (that file documents why);
+    #   - OpENer runs on HOST networking as `opener-live`, because the class-1 (implicit I/O) legs
+    #     need a symmetric T→O UDP return path that a bridge-NATed container cannot give (DESIGN
+    #     §11.2/§11.5). It takes the runner's primary IPv4 at :44818, which is free precisely because
+    #     cpppo is published on loopback.
+    # What still does NOT execute, and why (peer limits, not skipped work — DESIGN §11.3): cpppo
+    # refuses a class-3 ForwardOpen, so live_cpppo's idle leg early-returns and OpENer carries that
+    # claim; EthernetIPSharp serves only page 1 of a tag list, so the multi-page resume asserts the
+    # typed refusal. Both are in-body assertions, not probe skips.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    # Six container image builds per PR is the cost of this job. Superseded runs of the same PR are
+    # cancelled rather than left to finish (the risk-budget mitigation); the workflow-level
+    # paths-ignore already keeps docs-only PRs out entirely.
+    concurrency:
+      group: live-sims-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache the cargo registry + target dir
+        # The same action the org reusable component-ci uses. The live suites are ordinary cargo test
+        # binaries, so a warm cache is the difference between ~5 min and ~1 min of compiling before a
+        # single frame goes on the wire.
+        uses: Swatinem/rust-cache@v2
+      - name: Authenticate to the private edgecommons git dependency
+        env:
+          # Same block as the coverage job (secrets: inherit). Needed even though most steps only run
+          # `-p ec-enip`: cargo resolves the WHOLE workspace, and the adapter crate carries the
+          # edgecommons git dependency.
+          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
+            "https://github.com/edgecommons/edgecommons.git"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
+            "https://github.com/edgecommons/edgecommons"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+      - name: Generate the throwaway test PKIs (gitignored)
+        # BEFORE the image build: test-infra/est/Dockerfile COPYs certs/ into the estserver image, and
+        # the stunnel terminators bind-mount test-infra/enip-tls/certs at run time. The same PKIs are
+        # what the live suites present as client identities.
+        #
+        # Invoked through `bash` rather than as `./…`: the repo's shell scripts are tracked mode
+        # 100644 (they are authored on Windows, where the executable bit does not survive), so a
+        # fresh Linux checkout cannot exec them directly.
+        run: |
+          bash ./test-infra/enip-tls/gen-certs.sh
+          bash ./test-infra/est/gen-certs.sh
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the sim images (parallel, GitHub Actions layer cache)
+        # bake builds all six targets CONCURRENTLY and reads its plan from the same two compose files
+        # the job brings the peers up with, so the image tags cannot drift from the compose services.
+        # type=gha caching is what keeps a warm PR near the bottom of the ~10-14 min uncached build
+        # cost (OpENer/CMake, the OpENer CIPSecurity branch, ab_server, a .NET publish, a Go build).
+        # cpppo is a plain image pull, so it has no target here.
+        uses: docker/bake-action@v6
+        with:
+          source: .
+          files: |
+            compose.yaml
+            test-infra/ci-overrides.yaml
+          targets: |
+            enip-ab-server
+            enip-sharp
+            enip-tls
+            opener-cipsec
+            est-server
+            enip-io-sim
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+      - name: Start the TCP peers
+        run: >
+          docker compose -f compose.yaml -f test-infra/ci-overrides.yaml up -d
+          enip-sim enip-ab-server enip-sharp enip-tls enip-tls-cbc opener-cipsec est-server
+      - name: Start OpENer on the host network
+        # The interface name is OpENer's own argument (it derives its CIP TCP/IP object address from
+        # it), so the address the suites dial is derived from the SAME interface. Empty detection is a
+        # hard failure here rather than a mystery timeout later.
+        run: |
+          IFACE="$(ip -o route get 1.1.1.1 | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n1)"
+          if [ -z "$IFACE" ]; then
+            echo "::error title=runner interface detection failed::ip route get 1.1.1.1 named no device"
+            exit 1
+          fi
+          RUNNER_IP="$(ip -o -4 addr show "$IFACE" | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+          if [ -z "$RUNNER_IP" ]; then
+            echo "::error title=runner IP detection failed::no IPv4 on $IFACE"
+            exit 1
+          fi
+          echo "OpENer will run on host networking, interface $IFACE ($RUNNER_IP)"
+          echo "OPENER_ADDR=${RUNNER_IP}:44818" >> "$GITHUB_ENV"
+          docker run -d --name opener-live --network host enip-sim-opener:ci "$IFACE"
+      - name: Wait for every peer port
+        # A bounded, explicit readiness gate — never a bare sleep, and never an unbounded wait. If a
+        # peer never accepts, this names it and stops here, where the container logs are the obvious
+        # next step, instead of failing later as an ENIP_LIVE_REQUIRED assertion.
+        run: |
+          bash ./test-infra/wait-ports.sh \
+            cpppo=127.0.0.1:44818 \
+            ab_server=127.0.0.1:44820 \
+            ethernetipsharp=127.0.0.1:44821 \
+            stunnel-tls=127.0.0.1:2221 \
+            stunnel-cbc=127.0.0.1:2223 \
+            opener-cipsecurity=127.0.0.1:44822 \
+            est-server=127.0.0.1:8443 \
+            opener="$OPENER_ADDR"
+      - name: enip live suites — the TCP peers, skip-free
+        env:
+          ENIP_LIVE_REQUIRED: "1"
+        run: |
+          cargo test -p ec-enip --test live_cpppo --test live_ab_server \
+            --test live_ethernetipsharp --test live_cip_security -- --nocapture
+          cargo test -p ec-enip --features tls --test live_tls -- --nocapture
+      - name: adapter in-source live tests — EST enrollment + TLS cert rotation, skip-free
+        env:
+          ENIP_LIVE_REQUIRED: "1"
+        # A NAME filter, not an exact list, so a new in-source live test joins the gate by being
+        # named `live_…`. It sweeps in a handful of ordinary unit tests whose names happen to contain
+        # the substring (`…keepalive_…`, `…the_live_…`); they are fast and hermetic, and running them
+        # twice costs nothing next to letting a live test sit outside the gate.
+        run: cargo test -p ethernet-ip-adapter live_ -- --nocapture
+      - name: live_opener — class-3 idle + latest-wins flood (the peer must stay alive)
+        env:
+          ENIP_LIVE_REQUIRED: "1"
+        # OPENER_ADDR comes from the host-network step. OPENER_STOP_CMD is deliberately ABSENT here:
+        # these two legs need OpENer alive.
+        #
+        # --test-threads=1 because both legs drive the SAME single-threaded OpENer sample: a class-1
+        # connection that times out makes OpENer close the TCP session the class-3 leg is idling on,
+        # so run in parallel one root cause reports as two failures. Serially the 75 s idle and the
+        # 10 s flood cost ~10 s more and each leg's verdict is its own.
+        run: |
+          cargo test -p ec-enip --test live_opener -- --nocapture --test-threads=1 \
+            opener_live_class3 opener_live_slow_consumer
+      - name: live_opener — the watchdog leg LAST (it kills the peer)
+        env:
+          ENIP_LIVE_REQUIRED: "1"
+          # Supplying the stop command is what makes the watchdog assertion execute in the gate; the
+          # leg stays soft on a bench that cannot silence its peer. It is a separate, final step
+          # because it leaves OpENer dead — inside the previous invocation it would sabotage the idle
+          # and flood legs (alphabetically it would even run first).
+          OPENER_STOP_CMD: "docker kill opener-live"
+        run: |
+          cargo test -p ec-enip --test live_opener -- --nocapture --exact \
+            opener_live_class1_forward_open_consume_produce_watchdog
+      - name: Peer logs (on failure)
+        if: failure()
+        run: |
+          docker compose -f compose.yaml -f test-infra/ci-overrides.yaml logs --no-color --tail=200 || true
+          docker logs opener-live 2>&1 | tail -n 200 || true
+      - name: Tear the peers down
+        if: always()
+        run: |
+          docker compose -f compose.yaml -f test-infra/ci-overrides.yaml down -v || true
+          docker rm -f opener-live || true
