@@ -950,8 +950,21 @@ mod tests {
         // Inside the first (30 s+) backoff, ask for a reconnect …
         let (reply, reply_rx) = oneshot::channel();
         rig.send_after(Duration::from_millis(200), DeviceControl::Reconnect { reply });
-        // … and inside the second one, stop the instance.
-        rig.cancel_after(Duration::from_millis(600));
+
+        // … and stop the instance once that reconnect has been ANSWERED, which puts the cancel
+        // inside the second backoff without racing for it. A second independent timer would be
+        // flaky here: under a paused clock an idle ladder auto-advances, so the reconnect's timer
+        // and a cancel timer can land in the same advance step, and a cancel that wins tears the
+        // ladder down before the reply is sent — the oneshot then resolves Err. Sequencing the
+        // cancel behind the reply makes the ordering causal instead of chronological.
+        let answered: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&answered);
+        let cancel = rig.cancel.clone();
+        tokio::spawn(async move {
+            let outcome = reply_rx.await;
+            *seen.lock().expect("answer slot") = Some(matches!(outcome, Ok(Ok(()))));
+            cancel.cancel();
+        });
 
         let started = TokioInstant::now();
         rig.run().await;
@@ -960,8 +973,9 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "neither the reconnect nor the cancel waited out the 30 s backoff"
         );
-        assert!(
-            reply_rx.await.unwrap().is_ok(),
+        assert_eq!(
+            *answered.lock().expect("answer slot"),
+            Some(true),
             "the reconnect requested mid-backoff reconnected and was answered"
         );
         assert_eq!(rig.backend.connects(), 2, "exactly the requested reconnect, then the stop");
