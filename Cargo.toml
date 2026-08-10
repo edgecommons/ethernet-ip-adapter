@@ -24,9 +24,15 @@ license = "BUSL-1.1"
 # so a version bump happens once, here. The enip protocol-crate deps (tokio-util/bytes/rand) are
 # seeded so P1 references them by `{ workspace = true }` without re-pinning.
 [workspace.dependencies]
-# edgecommons Rust library — pinned by git rev (rust-lib/v0.5.0). The gitignored `.cargo/config.toml`
-# patches this to the local sibling checkout for dev; CI builds the pinned rev. The `enip` crate never
-# depends on it.
+# edgecommons Rust library — pinned by git rev: core `main` at cdbebad8, which is 0.5.0 plus the
+# Greengrass numeric-config fix (edgecommons#96: the Nucleus config store hands integers back as
+# JSON doubles, which killed every Rust component on a config update) and the template-manifest
+# rename (edgecommons#97). The gitignored `.cargo/config.toml` patches this to the local sibling
+# checkout for dev; CI builds the pinned rev under `--locked`. The `enip` crate never depends on it.
+#
+# Changing this rev means regenerating `Cargo.lock` with that override DISABLED, in a copy of the
+# tree outside the repo — cargo discovers `.cargo/config.toml` upward, and a lock written while the
+# patch is active silently loses the git `source` line (D-EIP-30).
 edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "cdbebad8d97ba8477ee828df328c62edfe4e2486", default-features = false }
 tokio = { version = "1" }
 tokio-util = { version = "0.7" }

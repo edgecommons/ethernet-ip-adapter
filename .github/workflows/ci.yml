@@ -113,6 +113,13 @@ jobs:
           git config --global \
             url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
+      - name: Lockfile is the build plan — fail fast if it cannot satisfy the manifests
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        # Cheap, and it fails with a lock diagnostic instead of burying one 15 minutes into an
+        # instrumented build. The `--locked` on llvm-cov below is the real gate; this is the
+        # readable one. (D-EIP-30.)
+        run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Coverage gate (90% lines, workspace-wide; no product file excluded — live-peer suites + fuzz workspace + test doubles only)
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -336,7 +343,7 @@ jobs:
         # so run in parallel one root cause reports as two failures. Serially the 75 s idle and the
         # 10 s flood cost ~10 s more and each leg's verdict is its own.
         run: |
-          cargo test -p ec-enip --test live_opener -- --nocapture --test-threads=1 \
+          cargo test --locked -p ec-enip --test live_opener -- --nocapture --test-threads=1 \
             opener_live_class3 opener_live_slow_consumer
       - name: live_opener — the watchdog leg LAST (it kills the peer)
         env:
@@ -347,7 +354,7 @@ jobs:
           # and flood legs (alphabetically it would even run first).
           OPENER_STOP_CMD: "docker kill opener-live"
         run: |
-          cargo test -p ec-enip --test live_opener -- --nocapture --exact \
+          cargo test --locked -p ec-enip --test live_opener -- --nocapture --exact \
             opener_live_class1_forward_open_consume_produce_watchdog
       - name: Peer logs (on failure)
         if: failure()

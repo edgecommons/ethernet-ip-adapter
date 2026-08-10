@@ -74,7 +74,10 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
   `secrets: inherit`) + in-repo 90% gate (`cargo llvm-cov --fail-under-lines 90`), **workspace-wide**
   — the owned `crates/enip` protocol crate is inside the coverage gate, not carved out (D-EIP-17).
   The sim-gated live suites, the fuzz harness workspace, and the `#[cfg(test)]` test doubles are the
-  only coverage exclusions; no product file is carved out (DESIGN §12.2).
+  only coverage exclusions; no product file is carved out (DESIGN §12.2). Every in-repo job that
+  resolves dependencies runs `--locked` (D-EIP-30): `Cargo.lock` must be regenerated with the
+  sibling `[patch]` override disabled, because a lock written while it is active loses the git
+  `source` line for `edgecommons` and cannot build a clean clone.
 - Docs: Diátaxis `.md`, no frontmatter, synced to the site — current behavior only, present tense.
 
 ## Registry
