@@ -41,6 +41,10 @@ use crate::config::{GlobalConfig, Timeouts};
 
 /// The 5 s cap on the push session's close handoff — the single home for the number the class-1
 /// teardown and the shutdown budget must agree on (`eip/live.rs` reads it from here).
+///
+/// It bounds the handoff and its acknowledgement. A close that overruns it aborts the translator and
+/// **joins** it under `eip/live.rs`'s fixed 250 ms `ABORT_JOIN_GRACE` (D-EIP-31), so the worst push
+/// close is 5.25 s, not 5 s — see [`stop_budget`] for where that 250 ms is absorbed.
 pub(crate) const PUSH_CLOSE_HANDOFF_CAP: Duration = Duration::from_secs(5);
 
 /// Documented mirror of `enip`'s (crate-private) `CLOSE_HANDOFF_DEADLINE` (2 s): the bound on the
@@ -48,7 +52,8 @@ pub(crate) const PUSH_CLOSE_HANDOFF_CAP: Duration = Duration::from_secs(5);
 /// the budget only needs an upper bound; drift is absorbed by [`STOP_GRACE`] and the clamp.
 pub(crate) const ENIP_SESSION_CLOSE_BOUND: Duration = Duration::from_secs(2);
 
-/// Slack over the composed protocol bounds — scheduling, the final metric flush of a task, and any
+/// Slack over the composed protocol bounds — scheduling, the final metric flush of a task, the
+/// 250 ms `ABORT_JOIN_GRACE` a push close spends joining an aborted translator (D-EIP-31), and any
 /// drift between [`ENIP_SESSION_CLOSE_BOUND`] and the crate's own constant.
 pub(crate) const STOP_GRACE: Duration = Duration::from_millis(500);
 
@@ -66,6 +71,12 @@ pub(crate) const STOP_BUDGET_CEILING: Duration = Duration::from_secs(10);
 /// close) + [`STOP_GRACE`]; clamped to [[`STOP_BUDGET_FLOOR`], [`STOP_BUDGET_CEILING`]].
 ///
 /// At the shipped defaults (`requestTimeoutMs: 2000`) that is 2 s + max(5 s, 4 s) + 0.5 s = **7.5 s**.
+///
+/// A push close that overruns its cap spends a further 250 ms joining the translator it aborted
+/// (D-EIP-31), making its true worst case 5.25 s. That overshoot is deliberately **absorbed by
+/// [`STOP_GRACE`]** rather than added to the composition: the grace exists for exactly this kind of
+/// per-session slack, the 7.5 s default is unchanged, and the absolute deadline plus `stop_tasks`'
+/// own abort keep the whole teardown bounded regardless.
 pub(crate) fn stop_budget(timeouts: &Timeouts) -> Duration {
     let in_flight = Duration::from_millis(timeouts.request_timeout_ms.max(1));
     let close_worst = PUSH_CLOSE_HANDOFF_CAP.max(in_flight + ENIP_SESSION_CLOSE_BOUND);

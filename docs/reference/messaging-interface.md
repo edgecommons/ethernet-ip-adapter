@@ -173,8 +173,10 @@ serve the last consumed input snapshot. An unresolvable ref returns a `BAD` entr
 
 A single `{ref…, value}` object (no `writes` array) is also accepted. The allow-list check runs **before
 any device I/O**. A poll write is CIP-acked; a push write reports `applied: "next-frame"` (staged into
-the O→T buffer). Entries without a `value`, an unresolvable ref, an input-side push field, or a device
-rejection are reported per-entry `{"ok": false, "error": …}`. Every entry emits a `write-audit` event.
+the O→T buffer). A push write that cannot be staged — the session is closing or the class-1 connection
+is gone — reports `ok: false` with the reason. Entries without a `value`, an unresolvable ref, an
+input-side push field, or a device rejection are reported per-entry `{"ok": false, "error": …}`. Every
+entry emits a `write-audit` event.
 
 ## Control plane
 
