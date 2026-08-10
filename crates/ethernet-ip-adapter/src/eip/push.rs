@@ -68,15 +68,21 @@ pub(crate) fn assembly_to_readings(
     out
 }
 
-/// Map an `enip` class-1 loss reason to a seam error — always [`DeviceError::Transient`] (§10.1 row
-/// 7): the push loop leaves and reconnects (ForwardClose best-effort first).
-pub(crate) fn map_lost_reason(reason: enip::LostReason) -> DeviceError {
-    let detail = match reason {
+/// The operator-facing wording for a class-1 loss reason. One table, so every surface that has to
+/// name a loss — the seam error the push loop reconnects on, and the refusal a push `sb/write`
+/// carries when the connection is already gone (D-EIP-31) — says it the same way.
+pub(crate) fn lost_reason_detail(reason: enip::LostReason) -> &'static str {
+    match reason {
         enip::LostReason::Timeout => "class-1 inactivity watchdog timeout",
         enip::LostReason::ClosedByPeer => "peer closed the class-1 connection",
         enip::LostReason::Io => "class-1 socket error",
-    };
-    DeviceError::Transient(anyhow::anyhow!(detail))
+    }
+}
+
+/// Map an `enip` class-1 loss reason to a seam error — always [`DeviceError::Transient`] (§10.1 row
+/// 7): the push loop leaves and reconnects (ForwardClose best-effort first).
+pub(crate) fn map_lost_reason(reason: enip::LostReason) -> DeviceError {
+    DeviceError::Transient(anyhow::anyhow!(lost_reason_detail(reason)))
 }
 
 #[cfg(test)]

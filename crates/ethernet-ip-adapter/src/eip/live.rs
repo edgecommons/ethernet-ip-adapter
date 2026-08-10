@@ -35,7 +35,7 @@ use crate::device::{
     IoUpdate, PushSession, Result,
 };
 
-use super::push::{assembly_to_readings, map_lost_reason};
+use super::push::{assembly_to_readings, lost_reason_detail, map_lost_reason};
 use super::{client_options, map_enip_error, EipBackend, VENDOR_ID};
 
 #[async_trait]
@@ -227,48 +227,7 @@ impl EipPushSession {
             .unwrap_or_default();
         let out_size = io.output.as_ref().map_or(0, |o| o.size_bytes);
 
-        // Build the ForwardOpen spec from the config's typed `to_enip` helpers (§4.6).
-        let route = conn
-            .slot
-            .map(|s| vec![enip::PortSegment::backplane_slot(s)])
-            .unwrap_or_default();
-        let assembly = enip::AssemblyPath {
-            config: io.assemblies.config,
-            output: io.assemblies.output,
-            input: io.assemblies.input,
-            route,
-        };
-        let t2o = enip::DirectionSpec {
-            rpi: Duration::from_millis(io.rpi_ms.max(1)),
-            data_size: io.input.size_bytes,
-            format: io.input.real_time_format.to_enip(),
-            conn_type: io.connection_type.to_enip(),
-            priority: io.priority.to_enip(),
-            variable: enip::VariableLength::Fixed,
-        };
-        let (o2t_size, o2t_format) = match &io.output {
-            Some(out) => (out.size_bytes, out.real_time_format.to_enip()),
-            None => (0, enip::RealTimeFormat::Heartbeat),
-        };
-        let o2t = enip::DirectionSpec {
-            rpi: Duration::from_millis(io.effective_o2t_rpi_ms().max(1)),
-            data_size: o2t_size,
-            format: o2t_format,
-            // O→T is always point-to-point (§4.6).
-            conn_type: enip::ConnType::P2P,
-            priority: io.priority.to_enip(),
-            variable: enip::VariableLength::Fixed,
-        };
-        let spec = enip::IoConnectionSpec {
-            assembly,
-            t2o,
-            o2t,
-            timeout_multiplier: io
-                .timeout_multiplier_enip()
-                .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?,
-            trigger: enip::ProductionTrigger::Cyclic,
-            vendor_id,
-        };
+        let spec = io_spec(conn, io, vendor_id)?;
 
         // Connect the TCP session (for CM/UCMM), bind the I/O socket, and ForwardOpen.
         let opts = client_options(conn, timeouts);
@@ -370,6 +329,205 @@ impl Drop for EipPushSession {
     }
 }
 
+/// Build the class-1 ForwardOpen spec from the `io` block, through the config's typed `to_enip`
+/// helpers (§4.6). O→T is always point-to-point; a device with no output assembly opens a heartbeat.
+///
+/// # Errors
+///
+/// [`DeviceError::Permanent`] if the (already config-validated) timeout multiplier cannot be coded.
+fn io_spec(
+    conn: &ConnectionConfig,
+    io: &IoConfig,
+    vendor_id: u16,
+) -> Result<enip::IoConnectionSpec> {
+    let route = conn
+        .slot
+        .map(|s| vec![enip::PortSegment::backplane_slot(s)])
+        .unwrap_or_default();
+    let assembly = enip::AssemblyPath {
+        config: io.assemblies.config,
+        output: io.assemblies.output,
+        input: io.assemblies.input,
+        route,
+    };
+    let t2o = enip::DirectionSpec {
+        rpi: Duration::from_millis(io.rpi_ms.max(1)),
+        data_size: io.input.size_bytes,
+        format: io.input.real_time_format.to_enip(),
+        conn_type: io.connection_type.to_enip(),
+        priority: io.priority.to_enip(),
+        variable: enip::VariableLength::Fixed,
+    };
+    let (o2t_size, o2t_format) = match &io.output {
+        Some(out) => (out.size_bytes, out.real_time_format.to_enip()),
+        None => (0, enip::RealTimeFormat::Heartbeat),
+    };
+    let o2t = enip::DirectionSpec {
+        rpi: Duration::from_millis(io.effective_o2t_rpi_ms().max(1)),
+        data_size: o2t_size,
+        format: o2t_format,
+        conn_type: enip::ConnType::P2P,
+        priority: io.priority.to_enip(),
+        variable: enip::VariableLength::Fixed,
+    };
+    Ok(enip::IoConnectionSpec {
+        assembly,
+        t2o,
+        o2t,
+        timeout_multiplier: io
+            .timeout_multiplier_enip()
+            .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e)))?,
+        trigger: enip::ProductionTrigger::Cyclic,
+        vendor_id,
+    })
+}
+
+/// The seam verdict for a staging request the I/O manager refused with [`enip::EnipError::Closed`]
+/// (D-EIP-31).
+///
+/// `Closed` is the manager's ONE word for three different situations — its task is gone, the
+/// connection was removed because it was **lost**, or the connection was removed because it was
+/// **closed** — and its `Display` is the bare string `"closed"`. An operator reading a refused
+/// `sb/write` cannot tell a device fault from an orderly stop from that, which is why this names the
+/// disposition instead. `enip` also classifies `Closed` as non-transient, so [`super::map_enip_error`]
+/// would make it a [`DeviceError::Permanent`]: both dispositions are recovered by the reconnect
+/// ladder — a lost class-1 connection is the textbook transient — so both are `Transient` here.
+fn closed_verdict(lost: Option<enip::LostReason>) -> DeviceError {
+    match lost {
+        Some(reason) => DeviceError::Transient(anyhow::anyhow!(
+            "class-1 connection lost ({}); output not staged",
+            lost_reason_detail(reason)
+        )),
+        None => DeviceError::Transient(anyhow::anyhow!(
+            "the class-1 connection was closed; output not staged"
+        )),
+    }
+}
+
+/// What one staging attempt produced (D-EIP-31).
+struct Staged {
+    /// The verdict the session handle answers `sb/write` with.
+    verdict: Result<()>,
+    /// The terminal loss the disposition consult read off the stream, if any. The translator still
+    /// owes the seam this `Lost` and must end after reporting it.
+    lost: Option<enip::LostReason>,
+    /// Whatever the consult took off the stream **ahead** of that loss — still owed to the seam, so
+    /// naming a disposition never costs a sample.
+    drained: Vec<enip::IoEvent>,
+}
+
+/// Stage one encoded output-assembly buffer and turn the I/O manager's answer into a seam verdict
+/// (D-EIP-31).
+///
+/// Everything except [`enip::EnipError::Closed`] goes through [`super::map_enip_error`] unchanged.
+/// `Closed` is resolved to a disposition first, and the translator can do that because the manager
+/// **delivers the loss before it can refuse the staging**: a watchdog expiry (or a dead transmit
+/// path, or a dead socket) emits `IoEvent::Lost` on this connection's own stream and removes the
+/// connection in the same manager-loop iteration, and the staging command is only read on a later
+/// one. `Lost` is a control event the queue never evicts and a dropped sender never discards, so
+/// draining the — by then terminal — stream is a **causal** read of why the connection is gone, not
+/// a guess. Finding no loss there means the connection was removed deliberately (`close`/`shutdown`).
+async fn stage_and_interpret(handle: &mut enip::IoConnectionHandle, bytes: Vec<u8>) -> Staged {
+    let mut lost = None;
+    let mut drained = Vec::new();
+    let verdict = match handle.stage_output(bytes).await {
+        Ok(()) => Ok(()),
+        Err(enip::EnipError::Closed) => {
+            while let Ok(ev) = handle.events().try_recv() {
+                // Nothing is queued behind the terminal event, so this is the end of the drain.
+                if let enip::IoEvent::Lost { reason } = ev {
+                    lost = Some(reason);
+                    break;
+                }
+                drained.push(ev);
+            }
+            Err(closed_verdict(lost))
+        }
+        Err(other) => Err(super::map_enip_error(other)),
+    };
+    Staged {
+        verdict,
+        lost,
+        drained,
+    }
+}
+
+/// Decode one accepted T→O frame into seam readings (§5), refresh the shared snapshot push `sb/read`
+/// answers from (§7.2), and offer the `Data` update.
+async fn emit_data(
+    in_layout: &enip::AssemblyLayout,
+    in_fields: &[IoFieldSpec],
+    in_inst: u16,
+    snapshot: &SharedSnapshot,
+    updates_tx: &mpsc::Sender<IoUpdate>,
+    latest: enip::IoUpdate,
+) {
+    let readings =
+        assembly_to_readings(in_layout, in_fields, in_inst, &latest.data, latest.run_mode);
+    let received_at = latest.received_at.into_std();
+    // Keep the latest snapshot live for push `sb/read` (answered even while paused).
+    *snapshot.lock().unwrap() = Some(InputSnapshot {
+        readings: readings.clone(),
+        received_at,
+        run_mode: latest.run_mode,
+    });
+    let _ = updates_tx
+        .send(IoUpdate::Data {
+            readings,
+            sequence: latest.sequence,
+            run_mode: latest.run_mode,
+            received_at,
+        })
+        .await;
+}
+
+/// Hand the seam whatever a disposition consult took off the event stream (D-EIP-31), so naming why
+/// a staging request was refused never costs the consumer an update: latest-wins over the samples the
+/// consult drained — at most one `Up` and the freshest `Data`, exactly as the translator's own event
+/// arm collapses a burst — and then the loss itself, which no event arm will ever see now.
+///
+/// Returns `true` when that loss was terminal and the translator must end.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_consulted_tail(
+    in_layout: &enip::AssemblyLayout,
+    in_fields: &[IoFieldSpec],
+    in_inst: u16,
+    snapshot: &SharedSnapshot,
+    updates_tx: &mpsc::Sender<IoUpdate>,
+    lost: Option<enip::LostReason>,
+    drained: Vec<enip::IoEvent>,
+) -> bool {
+    let mut carried_up = None;
+    let mut carried_data = None;
+    for ev in drained {
+        match ev {
+            enip::IoEvent::Up { o2t_api, t2o_api } => carried_up = Some((o2t_api, t2o_api)),
+            enip::IoEvent::Data(update) => carried_data = Some(update),
+            enip::IoEvent::Lost { .. } => {}
+        }
+    }
+    if let Some((o2t_api, t2o_api)) = carried_up {
+        let _ = updates_tx
+            .send(IoUpdate::Up {
+                o2t_api_ms: ms(o2t_api),
+                t2o_api_ms: ms(t2o_api),
+            })
+            .await;
+    }
+    if let Some(update) = carried_data {
+        emit_data(in_layout, in_fields, in_inst, snapshot, updates_tx, update).await;
+    }
+    let Some(reason) = lost else {
+        return false;
+    };
+    let _ = updates_tx
+        .send(IoUpdate::Lost {
+            error: map_lost_reason(reason),
+        })
+        .await;
+    true
+}
+
 /// The translator task: drain `enip` I/O events (latest-wins) into seam [`IoUpdate`]s and service
 /// control messages, owning the connection handle / client / manager for the connection's lifetime.
 #[allow(clippy::too_many_arguments)]
@@ -414,24 +572,10 @@ async fn run_translator(
                                 Err(_) => break,
                             }
                         }
-                        let readings = assembly_to_readings(
-                            &in_layout, &in_fields, in_inst, &latest.data, latest.run_mode,
-                        );
-                        let received_at = latest.received_at.into_std();
-                        // Keep the latest snapshot live for push `sb/read` (answered even while paused).
-                        *snapshot.lock().unwrap() = Some(InputSnapshot {
-                            readings: readings.clone(),
-                            received_at,
-                            run_mode: latest.run_mode,
-                        });
-                        let _ = updates_tx
-                            .send(IoUpdate::Data {
-                                readings,
-                                sequence: latest.sequence,
-                                run_mode: latest.run_mode,
-                                received_at,
-                            })
-                            .await;
+                        emit_data(
+                            &in_layout, &in_fields, in_inst, &snapshot, &updates_tx, latest,
+                        )
+                        .await;
                         match carried {
                             Some(enip::IoEvent::Up { o2t_api, t2o_api }) => {
                                 let _ = updates_tx
@@ -466,15 +610,26 @@ async fn run_translator(
         if let Some((bytes, ack)) = do_output {
             // The confirmed staging path (D-ENIP-20 / D-EIP-31): the I/O manager's own verdict —
             // `Ok` only when it holds the buffer for a live connection — travels back to the caller,
-            // so `sb/write` can never report a success the producer buffer never took.
-            let verdict = handle
-                .stage_output(bytes)
-                .await
-                .map_err(super::map_enip_error);
-            if let Err(e) = &verdict {
+            // so `sb/write` can never report a success the producer buffer never took. A refusal is
+            // resolved to a disposition first, so the caller is told *why* nothing was staged.
+            let staged = stage_and_interpret(&mut handle, bytes).await;
+            if let Err(e) = &staged.verdict {
                 tracing::warn!(error = %e, "push: staging output frame failed");
             }
-            let _ = ack.send(verdict);
+            let _ = ack.send(staged.verdict);
+            if deliver_consulted_tail(
+                &in_layout,
+                &in_fields,
+                in_inst,
+                &snapshot,
+                &updates_tx,
+                staged.lost,
+                staged.drained,
+            )
+            .await
+            {
+                break 'task;
+            }
         }
         if let Some(ack) = do_close {
             let _ = handle.close(&client).await;
@@ -1334,6 +1489,39 @@ mod tests {
         (plc, peer, session)
     }
 
+    /// A live class-1 connection with **no translator**: the test owns the `IoConnectionHandle`, the
+    /// client and the I/O manager, so it can drive the manager's own staging verdicts — and the
+    /// disposition consult that reads them — directly, instead of through a `tokio::select!` whose
+    /// branch order is deliberately random. Everything else is the production path: the same
+    /// `io_spec`, the same `client_options`, the same `forward_open`.
+    async fn open_bare_connection(
+        io: &IoConfig,
+    ) -> (
+        MockPlc,
+        UdpSocket,
+        enip::EipClient,
+        enip::IoManager,
+        enip::IoConnectionHandle,
+    ) {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let plc = MockPlc::start(PlcScript::default().with_io_target(port)).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        let spec = io_spec(&conn, io, VENDOR_ID).unwrap();
+        let client = enip::EipClient::connect(&conn.endpoint, client_options(&conn, &timeouts()))
+            .await
+            .unwrap();
+        let manager = enip::IoManager::bind("0.0.0.0:0").await.unwrap();
+        let handle = manager.forward_open(&client, spec).await.unwrap();
+        (plc, peer, client, manager, handle)
+    }
+
+    /// The 4-byte O→T buffer the staging tests offer — a valid `setpoint` for [`io_of`]'s output
+    /// assembly, so a refusal is always about the connection and never about the buffer.
+    fn out_buf() -> Vec<u8> {
+        12.5f32.to_le_bytes().to_vec()
+    }
+
     /// Wedge the translator on a **full** seam update channel (16 slots) by producing T→O frames the
     /// test never consumes, and return once it is parked in `updates_tx.send`.
     ///
@@ -2170,6 +2358,216 @@ mod tests {
         assert!(
             matches!(verdict, Err(DeviceError::Transient(_))),
             "an unconfirmable write is refused, not reported staged: {verdict:?}"
+        );
+    }
+
+    /// **The third link, and the one the I/O manager cannot answer on its own.** `EnipError::Closed`
+    /// is one word for three situations — the manager task is gone, the connection was removed
+    /// because it was *lost*, or it was removed because it was *closed* — and its `Display` is the
+    /// bare string `"closed"`. Here the watchdog expires a real connection on a real socket, and the
+    /// refusal that follows names the loss, because the manager delivers `Lost` on this connection's
+    /// stream before it can refuse the staging (D-EIP-31).
+    ///
+    /// It is also `Transient`: `enip` classifies `Closed` as permanent, which `map_enip_error` would
+    /// have turned into a `DeviceError::Permanent` — a lost class-1 link is precisely what the
+    /// reconnect ladder recovers.
+    #[tokio::test]
+    async fn a_staging_refusal_after_a_loss_names_the_loss_not_just_closed() {
+        let io = io_of(100, 100, 8); // 100 ms T→O API × 8 = an 800 ms watchdog
+        let (plc, peer, _client, manager, mut handle) = open_bare_connection(&io).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        // One accepted frame arms the connection (and queues `Up` + `Data`); silence is then the only
+        // thing that can end it.
+        peer.send_to(&t2o_datagram(cid, 1, 1, &input_frame(7, 55.5)), target)
+            .await
+            .unwrap();
+
+        // Stage against the connection until the manager refuses: a bounded retry on a fact the
+        // watchdog changes, never a fixed wait for it to have changed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let staged = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the watchdog never expired the connection, so no refusal was ever produced"
+            );
+            let staged = stage_and_interpret(&mut handle, out_buf()).await;
+            if staged.verdict.is_err() {
+                break staged;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(
+            staged.lost,
+            Some(enip::LostReason::Timeout),
+            "the disposition is read from the connection's own stream, not guessed"
+        );
+        let error = staged.verdict.unwrap_err();
+        assert!(
+            error.is_transient(),
+            "a lost class-1 connection is what the reconnect ladder recovers: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("class-1 inactivity watchdog timeout"),
+            "the refusal names the device fault an operator has to act on: {error}"
+        );
+        // Naming the disposition cost the seam nothing: the samples the consult had to read past are
+        // handed back for delivery.
+        assert!(
+            staged
+                .drained
+                .iter()
+                .any(|e| matches!(e, enip::IoEvent::Data(_))),
+            "the frames queued ahead of the loss are carried out of the consult, not swallowed"
+        );
+        manager.shutdown().await;
+    }
+
+    /// The other disposition: a connection the adapter itself took down. `Closed` looks identical to
+    /// the loss above from the I/O manager's side, and reads completely differently to an operator —
+    /// an orderly stop, not a device fault (D-EIP-31). Deterministic by channel FIFO: the manager
+    /// processes the `Remove` `close` sends before it reads the staging command behind it.
+    #[tokio::test]
+    async fn a_staging_refusal_after_a_deliberate_close_says_closed() {
+        let io = io_of(500, 20, 16);
+        let (_plc, _peer, client, manager, mut handle) = open_bare_connection(&io).await;
+
+        handle.close(&client).await.unwrap();
+        let staged = stage_and_interpret(&mut handle, out_buf()).await;
+
+        assert_eq!(staged.lost, None, "nothing was lost — it was closed");
+        let error = staged.verdict.unwrap_err();
+        assert!(
+            error.is_transient(),
+            "a closed class-1 connection is reopened by the ladder, not parked at the ceiling: \
+             {error:?}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("the class-1 connection was closed"),
+            "an orderly stop says so: {text}"
+        );
+        assert!(
+            !text.contains("lost"),
+            "an orderly stop is never reported as a device fault: {text}"
+        );
+        manager.shutdown().await;
+    }
+
+    /// The third situation behind the same word: the I/O manager task itself is gone, so the staging
+    /// command is dropped unserviced. Nothing was lost, so this reads as a close too (D-EIP-31).
+    #[tokio::test]
+    async fn a_staging_refusal_after_the_manager_is_gone_says_closed() {
+        let io = io_of(500, 20, 16);
+        let (_plc, _peer, _client, manager, mut handle) = open_bare_connection(&io).await;
+
+        manager.shutdown().await;
+        let staged = stage_and_interpret(&mut handle, out_buf()).await;
+
+        assert_eq!(staged.lost, None);
+        let error = staged.verdict.unwrap_err();
+        assert!(error.is_transient(), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("the class-1 connection was closed"),
+            "a manager that has gone away is a stop, not a device fault: {error}"
+        );
+    }
+
+    /// A buffer the negotiated O→T size cannot hold is still the caller's error, not a disposition:
+    /// everything that is not `Closed` keeps going through `map_enip_error` untouched (D-EIP-31).
+    #[tokio::test]
+    async fn a_staging_refusal_that_is_not_closed_keeps_its_own_classification() {
+        let io = io_of(500, 20, 16);
+        let (_plc, _peer, _client, manager, mut handle) = open_bare_connection(&io).await;
+
+        let staged = stage_and_interpret(&mut handle, vec![1, 2]).await;
+
+        assert_eq!(staged.lost, None);
+        let error = staged.verdict.unwrap_err();
+        assert!(
+            matches!(error, DeviceError::Permanent(_)),
+            "a mis-sized buffer will be mis-sized again: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("output size does not match"),
+            "the protocol violation is reported verbatim: {error}"
+        );
+        manager.shutdown().await;
+    }
+
+    /// What the consult read to name a disposition is still owed to the consumer: the samples come
+    /// out latest-wins (one `Up`, the freshest `Data`) and the loss follows them, so the seam learns
+    /// the connection is over from a path that never reaches the translator's event arm (D-EIP-31).
+    #[tokio::test]
+    async fn a_consulted_tail_is_delivered_before_the_loss_that_ended_it() {
+        let io = io_of(500, 20, 16);
+        let layout = io.input_layout().unwrap();
+        let fields = io.input.signals.clone();
+        let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
+        let (tx, mut rx) = mpsc::channel(16);
+
+        fn sample(seq: u16, data: Vec<u8>) -> enip::IoEvent {
+            enip::IoEvent::Data(enip::IoUpdate {
+                data: Bytes::from(data),
+                sequence: seq,
+                encap_sequence: u32::from(seq),
+                run_mode: true,
+                received_at: tokio::time::Instant::now(),
+            })
+        }
+
+        let ended = deliver_consulted_tail(
+            &layout,
+            &fields,
+            io.assemblies.input,
+            &snapshot,
+            &tx,
+            Some(enip::LostReason::Io),
+            vec![
+                enip::IoEvent::Up {
+                    o2t_api: Duration::from_millis(20),
+                    t2o_api: Duration::from_millis(500),
+                },
+                sample(1, input_frame(1, 1.0)),
+                sample(2, input_frame(2, 2.0)),
+            ],
+        )
+        .await;
+
+        assert!(ended, "a consulted loss ends the translator");
+        assert!(matches!(
+            rx.recv().await,
+            Some(IoUpdate::Up {
+                o2t_api_ms: 20,
+                t2o_api_ms: 500
+            })
+        ));
+        match rx.recv().await {
+            Some(IoUpdate::Data { sequence, .. }) => assert_eq!(
+                sequence, 2,
+                "latest-wins, exactly as the translator's event arm collapses a burst"
+            ),
+            other => panic!("expected the freshest drained sample, got {other:?}"),
+        }
+        match rx.recv().await {
+            Some(IoUpdate::Lost { error }) => assert!(
+                error.to_string().contains("class-1 socket error"),
+                "the loss keeps its mapped reason: {error}"
+            ),
+            other => panic!("expected the loss last, got {other:?}"),
+        }
+        assert!(
+            snapshot.lock().unwrap().is_some(),
+            "the §7.2 snapshot push `sb/read` answers from is refreshed by the replay too"
+        );
+        // Nothing to deliver and nothing lost is a no-op that keeps the translator running.
+        assert!(
+            !deliver_consulted_tail(&layout, &fields, 0, &snapshot, &tx, None, Vec::new()).await
         );
     }
 
