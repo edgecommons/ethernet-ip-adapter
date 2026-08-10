@@ -140,8 +140,9 @@ pub(crate) async fn run_device(
 
     let mut attempt: u32 = 0;
     // A pending explicit-`reconnect` reply: fulfilled after the *next* connect attempt resolves.
-    let mut pending_reconnect: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>> =
-        None;
+    let mut pending_reconnect: Option<
+        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    > = None;
 
     loop {
         // Connect within the configured deadline (§4.1 connectMs).
@@ -169,9 +170,7 @@ pub(crate) async fn run_device(
                 if let Some(days) = security.as_ref().and_then(|s| s.client_cert_expiry_days) {
                     dm.set_cert_expiry_days(days);
                 }
-                health
-                    .tls_handshake_failing
-                    .store(false, Ordering::Relaxed);
+                health.tls_handshake_failing.store(false, Ordering::Relaxed);
                 health.set_link(LinkState::Online);
                 // A transition: flush southbound_health + connection immediately (§8.7).
                 dm.emit_now().await;
@@ -244,7 +243,13 @@ pub(crate) async fn run_device(
                             .await;
                         let wait = backoff.delay(attempt, rand01());
                         match serve_control_disconnected(
-                            &mut control, &cfg, &health, &dm, events.as_ref(), wait, &cancel,
+                            &mut control,
+                            &cfg,
+                            &health,
+                            &dm,
+                            events.as_ref(),
+                            wait,
+                            &cancel,
                         )
                         .await
                         {
@@ -285,7 +290,10 @@ pub(crate) async fn run_device(
                             .emit(
                                 Severity::Warning,
                                 "tls-handshake-failed",
-                                Some(format!("TLS handshake to {} failed: {reason}", cfg.connection.endpoint)),
+                                Some(format!(
+                                    "TLS handshake to {} failed: {reason}",
+                                    cfg.connection.endpoint
+                                )),
                                 Some(json!({ "instance": cfg.id, "security": "tls" })),
                             )
                             .await;
@@ -302,7 +310,13 @@ pub(crate) async fn run_device(
                 );
                 attempt = attempt.saturating_add(1);
                 match serve_control_disconnected(
-                    &mut control, &cfg, &health, &dm, events.as_ref(), wait, &cancel,
+                    &mut control,
+                    &cfg,
+                    &health,
+                    &dm,
+                    events.as_ref(),
+                    wait,
+                    &cancel,
                 )
                 .await
                 {
@@ -337,8 +351,9 @@ async fn run_push(
         return;
     };
     let mut attempt: u32 = 0;
-    let mut pending_reconnect: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>> =
-        None;
+    let mut pending_reconnect: Option<
+        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    > = None;
 
     loop {
         health.set_link(LinkState::Connecting);
@@ -389,7 +404,10 @@ async fn run_push(
                             .raise_alarm(
                                 Severity::Critical,
                                 "device-unreachable",
-                                Some(format!("lost the class-1 link to {}", cfg.connection.endpoint)),
+                                Some(format!(
+                                    "lost the class-1 link to {}",
+                                    cfg.connection.endpoint
+                                )),
                                 Some(json!({ "instance": cfg.id })),
                             )
                             .await;
@@ -628,9 +646,14 @@ mod tests {
     #[test]
     fn backend_for_maps_sim_ethernet_ip_and_unknown() {
         let g = global(json!({}));
-        assert_eq!(backend_for("sim", &g, None).expect("sim backend").kind(), "sim");
         assert_eq!(
-            backend_for("ethernet-ip", &g, None).expect("eip backend").kind(),
+            backend_for("sim", &g, None).expect("sim backend").kind(),
+            "sim"
+        );
+        assert_eq!(
+            backend_for("ethernet-ip", &g, None)
+                .expect("eip backend")
+                .kind(),
             "ethernet-ip"
         );
         assert!(
@@ -677,11 +700,19 @@ mod tests {
             json!("ethernet-ip"),
             "the event names the backend that connected"
         );
-        assert_eq!(rig.events.count("device-unreachable"), 1, "the clear rides the same type");
+        assert_eq!(
+            rig.events.count("device-unreachable"),
+            1,
+            "the clear rides the same type"
+        );
         assert_eq!(rig.backend.connects(), 1);
         assert!(rig.total(CONNECTION, "connectAttempts") >= 1.0);
         assert_eq!(
-            rig.metrics.last(CONNECTION).unwrap().get("sessionConnected").copied(),
+            rig.metrics
+                .last(CONNECTION)
+                .unwrap()
+                .get("sessionConnected")
+                .copied(),
             Some(1.0),
             "the connection gauge flushed at the transition (§8.7)"
         );
@@ -700,12 +731,19 @@ mod tests {
 
         rig.run().await;
 
-        assert!(rig.events.has("device-unreachable"), "a lost link raises the alarm");
+        assert!(
+            rig.events.has("device-unreachable"),
+            "a lost link raises the alarm"
+        );
         assert!(
             rig.metrics.sum(HEALTH, "reconnects") >= 1.0,
             "the lost link is counted as a reconnect"
         );
-        assert_eq!(rig.backend.connects(), 2, "it reconnected after the backoff");
+        assert_eq!(
+            rig.backend.connects(),
+            2,
+            "it reconnected after the backoff"
+        );
         // The gap between the two connects is the poll loop's own span (it polls once, at its 20 ms
         // cadence, and that read is what breaks the link) plus the backoff — so the ladder's first
         // rung is bounded by 20 ms + base_ms.
@@ -736,7 +774,10 @@ mod tests {
         rig.run().await;
 
         let waits = rig.waits();
-        assert!(waits.len() >= 3, "the three scripted permanent failures ran: {waits:?}");
+        assert!(
+            waits.len() >= 3,
+            "the three scripted permanent failures ran: {waits:?}"
+        );
         for w in waits.iter().take(3) {
             assert_eq!(
                 *w,
@@ -774,7 +815,10 @@ mod tests {
         rig.run().await;
 
         let waits = rig.waits();
-        assert!(waits.len() >= 4, "at least five connect attempts ran: {waits:?}");
+        assert!(
+            waits.len() >= 4,
+            "at least five connect attempts ran: {waits:?}"
+        );
         // Rungs 0,1,2 are gaps between failed connects — pure backoff, no session in between — so
         // with the fraction pinned each wait IS its rung's cap: the window doubles from base_ms and
         // holds at max_ms.
@@ -841,14 +885,23 @@ mod tests {
             .push_connect_err(DeviceError::Permanent(anyhow::anyhow!("gone")));
 
         let (ok_tx, ok_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(50), DeviceControl::Reconnect { reply: ok_tx });
+        rig.send_after(
+            Duration::from_millis(50),
+            DeviceControl::Reconnect { reply: ok_tx },
+        );
         let (fail_tx, fail_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(150), DeviceControl::Reconnect { reply: fail_tx });
+        rig.send_after(
+            Duration::from_millis(150),
+            DeviceControl::Reconnect { reply: fail_tx },
+        );
         rig.cancel_after(Duration::from_secs(2));
 
         rig.run().await;
 
-        assert!(ok_rx.await.unwrap().is_ok(), "the first reconnect reconnected");
+        assert!(
+            ok_rx.await.unwrap().is_ok(),
+            "the first reconnect reconnected"
+        );
         assert!(
             fail_rx.await.unwrap().is_err(),
             "the second one's connect failed — RECONNECT_FAILED, not silence"
@@ -871,7 +924,10 @@ mod tests {
             "the cancel is observed, not the connect deadline"
         );
         assert_eq!(rig.backend.connects(), 1, "no reconnect after a stop");
-        assert!(!rig.events.has("device-unreachable"), "a stop raises no alarm");
+        assert!(
+            !rig.events.has("device-unreachable"),
+            "a stop raises no alarm"
+        );
         assert!(!rig.events.has("device-connected"));
     }
 
@@ -903,13 +959,20 @@ mod tests {
 
         rig.run().await;
 
-        let seen = observed.lock().unwrap().clone().expect("a posture while connected");
+        let seen = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a posture while connected");
         assert!(seen.tls && seen.tls_version.as_deref() == Some("1.3"));
         assert_eq!(
             rig.events.last_ctx("device-connected").unwrap()["security"],
             json!("tls")
         );
-        let conn = rig.metrics.last(CONNECTION).expect("connection emitted on connect");
+        let conn = rig
+            .metrics
+            .last(CONNECTION)
+            .expect("connection emitted on connect");
         assert_eq!(conn.get("certExpiryDays").copied(), Some(12.0));
     }
 
@@ -918,14 +981,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tls_peer_unverified_session_emits_the_warning() {
         let mut rig = Rig::new(poll_device(60_000, None), global(json!({})));
-        let posture = SecurityStatus { tls: true, peer_verified: false, ..SecurityStatus::default() };
+        let posture = SecurityStatus {
+            tls: true,
+            peer_verified: false,
+            ..SecurityStatus::default()
+        };
         rig.backend
             .push_session(Box::new(SecureSession::new(good_session(), Some(posture))));
         rig.cancel_after(Duration::from_millis(50));
 
         rig.run().await;
 
-        assert!(rig.events.has("tls-peer-unverified"), "an unverified TLS peer is announced");
+        assert!(
+            rig.events.has("tls-peer-unverified"),
+            "an unverified TLS peer is announced"
+        );
         assert_eq!(
             rig.events.last_ctx("tls-peer-unverified").unwrap()["instance"],
             json!("plc-1")
@@ -949,7 +1019,10 @@ mod tests {
 
         // Inside the first (30 s+) backoff, ask for a reconnect …
         let (reply, reply_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(200), DeviceControl::Reconnect { reply });
+        rig.send_after(
+            Duration::from_millis(200),
+            DeviceControl::Reconnect { reply },
+        );
 
         // … and stop the instance once that reconnect has been ANSWERED, which puts the cancel
         // inside the second backoff without racing for it. A second independent timer would be
@@ -978,7 +1051,11 @@ mod tests {
             Some(true),
             "the reconnect requested mid-backoff reconnected and was answered"
         );
-        assert_eq!(rig.backend.connects(), 2, "exactly the requested reconnect, then the stop");
+        assert_eq!(
+            rig.backend.connects(),
+            2,
+            "exactly the requested reconnect, then the stop"
+        );
     }
 
     // ---- the push ladder ----
@@ -991,7 +1068,9 @@ mod tests {
         g["metricsIntervalSecs"] = json!(1);
         let mut rig = Rig::new(push_device(), global(g));
         rig.backend
-            .push_open_err(DeviceError::Transient(anyhow::anyhow!("forward open refused")));
+            .push_open_err(DeviceError::Transient(anyhow::anyhow!(
+                "forward open refused"
+            )));
         // Held for the whole run: an open producer keeps the second session consuming (and emitting)
         // rather than ending its stream.
         let (_frames, push) = ScriptedPush::new();
@@ -1000,7 +1079,11 @@ mod tests {
 
         rig.run().await;
 
-        assert_eq!(rig.backend.opens(), 2, "it retried the ForwardOpen after backing off");
+        assert_eq!(
+            rig.backend.opens(),
+            2,
+            "it retried the ForwardOpen after backing off"
+        );
         assert_eq!(rig.total(IO, "forwardOpenFailures"), 1.0);
         assert_eq!(rig.total(IO, "forwardOpens"), 1.0);
         assert!(rig.total(CONNECTION, "connectFailures") >= 1.0);
@@ -1023,17 +1106,25 @@ mod tests {
         let mut rig = Rig::new(push_device(), global(slow));
         for _ in 0..2 {
             rig.backend
-                .push_open_err(DeviceError::Permanent(anyhow::anyhow!("connection size mismatch")));
+                .push_open_err(DeviceError::Permanent(anyhow::anyhow!(
+                    "connection size mismatch"
+                )));
         }
 
         let (reply, reply_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(200), DeviceControl::Reconnect { reply });
+        rig.send_after(
+            Duration::from_millis(200),
+            DeviceControl::Reconnect { reply },
+        );
         rig.cancel_after(Duration::from_millis(600));
 
         let started = TokioInstant::now();
         rig.run().await;
 
-        assert!(started.elapsed() < Duration::from_secs(1), "the 60 s ceiling was not slept out");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the 60 s ceiling was not slept out"
+        );
         assert!(
             reply_rx.await.unwrap().is_err(),
             "the reconnect's ForwardOpen failed — the caller is told, not left waiting"
@@ -1069,7 +1160,10 @@ mod tests {
             .push_io(Box::new(SharedPush::new(p3, Arc::clone(&closes))));
 
         let (reply, _rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(500), DeviceControl::Reconnect { reply });
+        rig.send_after(
+            Duration::from_millis(500),
+            DeviceControl::Reconnect { reply },
+        );
         rig.cancel_after(Duration::from_secs(2));
 
         rig.run().await;
@@ -1091,7 +1185,11 @@ mod tests {
         let mut g = fast_backoff();
         g["metricsIntervalSecs"] = json!(1);
         let mut rig = Rig::new(push_device(), global(g));
-        let stats = IoLinkStats { frames_produced: 10, refused_redirects: 1, ..IoLinkStats::default() };
+        let stats = IoLinkStats {
+            frames_produced: 10,
+            refused_redirects: 1,
+            ..IoLinkStats::default()
+        };
 
         let (frames1, p1) = ScriptedPush::new();
         p1.set_stats(Some(stats));
@@ -1103,15 +1201,28 @@ mod tests {
         // Bring each connection up so the consume loop runs its metrics cadence.
         let up = frames1.clone();
         tokio::spawn(async move {
-            let _ = up.send(IoUpdate::Up { o2t_api_ms: 100, t2o_api_ms: 100 }).await;
+            let _ = up
+                .send(IoUpdate::Up {
+                    o2t_api_ms: 100,
+                    t2o_api_ms: 100,
+                })
+                .await;
         });
         let up2 = frames2.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(2_100)).await;
-            let _ = up2.send(IoUpdate::Up { o2t_api_ms: 100, t2o_api_ms: 100 }).await;
+            let _ = up2
+                .send(IoUpdate::Up {
+                    o2t_api_ms: 100,
+                    t2o_api_ms: 100,
+                })
+                .await;
         });
         let (reply, _rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(2_000), DeviceControl::Reconnect { reply });
+        rig.send_after(
+            Duration::from_millis(2_000),
+            DeviceControl::Reconnect { reply },
+        );
         rig.cancel_after(Duration::from_secs(4));
 
         rig.run().await;

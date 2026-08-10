@@ -32,10 +32,15 @@ pub(crate) fn assembly_to_readings(
     };
     let mut out = Vec::with_capacity(decoded.len());
     for (key, cipval) in decoded {
-        let Some(field) = fields.get(key) else { continue };
+        let Some(field) = fields.get(key) else {
+            continue;
+        };
         let (value, quality, quality_raw) =
             match types::decode_value(&cipval, field.eip_type, field.scale, field.value_offset) {
-                Ok(Decoded { value, non_finite: false }) => {
+                Ok(Decoded {
+                    value,
+                    non_finite: false,
+                }) => {
                     if run_mode {
                         (value, Quality::Good, "0x00".to_string())
                     } else {
@@ -43,7 +48,9 @@ pub(crate) fn assembly_to_readings(
                         (value, Quality::Uncertain, "IDLE".to_string())
                     }
                 }
-                Ok(Decoded { non_finite: true, .. }) => (
+                Ok(Decoded {
+                    non_finite: true, ..
+                }) => (
                     serde_json::Value::Null,
                     Quality::Uncertain,
                     "NON_FINITE_AFTER_SCALE".to_string(),

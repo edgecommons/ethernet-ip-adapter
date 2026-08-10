@@ -29,13 +29,16 @@
 //!
 //! Excluded from the coverage denominator (`tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp)`,
 //! §12.2).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::float_cmp)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::float_cmp
+)]
 
 use std::time::Duration;
 
-use enip::{
-    CipType, CipValue, ClientOptions, EipClient, EnipError, RoutePath, Scope, TagAddress,
-};
+use enip::{CipType, CipValue, ClientOptions, EipClient, EnipError, RoutePath, Scope, TagAddress};
 
 /// ab_server's encapsulation endpoint. `127.0.0.1:44820` by default (the §11.2 compose host mapping),
 /// overridable, e.g. `AB_SERVER_ADDR=192.168.1.50:44818`.
@@ -46,7 +49,11 @@ fn ab_addr() -> String {
 /// Probe the sim's TCP port; `false` (and a printed skip) when nothing is listening (§11.3).
 async fn sim_up(addr: &str) -> bool {
     matches!(
-        tokio::time::timeout(Duration::from_millis(400), tokio::net::TcpStream::connect(addr)).await,
+        tokio::time::timeout(
+            Duration::from_millis(400),
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
         Ok(Ok(_))
     )
 }
@@ -117,20 +124,38 @@ async fn ab_server_live_read_write_routed() {
     println!("seeded LINE_SPEED=123.5, PRODUCT_COUNT=4242, ZONE_TEMPS=[10..17]");
 
     // ---- scalar REAL read -------------------------------------------------------------------------
-    let r = client.read_tag(&tag("LINE_SPEED"), 1).await.expect("read LINE_SPEED");
-    println!("read LINE_SPEED -> {:?} (wire type {:?})", r.value, r.wire_type);
+    let r = client
+        .read_tag(&tag("LINE_SPEED"), 1)
+        .await
+        .expect("read LINE_SPEED");
+    println!(
+        "read LINE_SPEED -> {:?} (wire type {:?})",
+        r.value, r.wire_type
+    );
     assert_eq!(r.wire_type, CipType::Real);
     assert_eq!(r.value, CipValue::Real(123.5));
 
     // ---- DINT read --------------------------------------------------------------------------------
-    let r = client.read_tag(&tag("PRODUCT_COUNT"), 1).await.expect("read PRODUCT_COUNT");
-    println!("read PRODUCT_COUNT -> {:?} (wire type {:?})", r.value, r.wire_type);
+    let r = client
+        .read_tag(&tag("PRODUCT_COUNT"), 1)
+        .await
+        .expect("read PRODUCT_COUNT");
+    println!(
+        "read PRODUCT_COUNT -> {:?} (wire type {:?})",
+        r.value, r.wire_type
+    );
     assert_eq!(r.wire_type, CipType::Dint);
     assert_eq!(r.value, CipValue::Dint(4242));
 
     // ---- array read -------------------------------------------------------------------------------
-    let r = client.read_tag(&tag("ZONE_TEMPS"), 8).await.expect("read ZONE_TEMPS[8]");
-    println!("read ZONE_TEMPS[8] -> {:?} (wire type {:?})", r.value, r.wire_type);
+    let r = client
+        .read_tag(&tag("ZONE_TEMPS"), 8)
+        .await
+        .expect("read ZONE_TEMPS[8]");
+    println!(
+        "read ZONE_TEMPS[8] -> {:?} (wire type {:?})",
+        r.value, r.wire_type
+    );
     assert_eq!(r.wire_type, CipType::Real);
     assert_eq!(r.value, CipValue::Array(CipType::Real, zone_seed));
 
@@ -139,7 +164,10 @@ async fn ab_server_live_read_write_routed() {
         .write_tag(&tag("FILL_SETPOINT"), CipType::Real, &CipValue::Real(55.5))
         .await
         .expect("write FILL_SETPOINT=55.5");
-    let r = client.read_tag(&tag("FILL_SETPOINT"), 1).await.expect("read-back FILL_SETPOINT");
+    let r = client
+        .read_tag(&tag("FILL_SETPOINT"), 1)
+        .await
+        .expect("read-back FILL_SETPOINT");
     println!("write+read-back FILL_SETPOINT -> {:?}", r.value);
     assert_eq!(r.value, CipValue::Real(55.5));
 
@@ -148,14 +176,23 @@ async fn ab_server_live_read_write_routed() {
     println!("read NO_SUCH_TAG -> {bad:?}");
     match bad {
         Err(EnipError::Cip(status)) => {
-            println!("  -> per-tag CIP error (general status 0x{:02X}) as expected", status.general.code());
+            println!(
+                "  -> per-tag CIP error (general status 0x{:02X}) as expected",
+                status.general.code()
+            );
         }
         Err(other) => panic!("expected a per-tag CIP error for NO_SUCH_TAG, got {other:?}"),
         Ok(v) => panic!("expected NO_SUCH_TAG to fail, decoded {v:?}"),
     }
-    let good = client.read_tag(&tag("LINE_SPEED"), 1).await.expect("LINE_SPEED still GOOD after a BAD tag");
+    let good = client
+        .read_tag(&tag("LINE_SPEED"), 1)
+        .await
+        .expect("LINE_SPEED still GOOD after a BAD tag");
     assert_eq!(good.value, CipValue::Real(123.5));
-    println!("  -> LINE_SPEED still GOOD after the BAD tag: {:?}", good.value);
+    println!(
+        "  -> LINE_SPEED still GOOD after the BAD tag: {:?}",
+        good.value
+    );
 
     client.close().await;
     println!("== live_ab_server read/write (routed via Unconnected_Send): PASS ==");
@@ -182,12 +219,17 @@ async fn ab_server_live_browse_is_gracefully_refused() {
         return;
     }
     println!("== live_ab_server browse: connecting to real ab_server at {addr} ==");
-    let client = EipClient::connect(&addr, opts()).await.expect("connect for browse");
+    let client = EipClient::connect(&addr, opts())
+        .await
+        .expect("connect for browse");
 
     match client.list_tags(0, &Scope::Controller).await {
         // A Logix-capable target answers with the page (ab_server does not — see below).
         Ok((records, next)) => {
-            println!("browse unexpectedly returned {} record(s), next={next:?}", records.len());
+            println!(
+                "browse unexpectedly returned {} record(s), next={next:?}",
+                records.len()
+            );
             for s in &records {
                 println!("  {:<16} type=0x{:04X}", s.name, s.symbol_type.0);
             }
@@ -197,7 +239,9 @@ async fn ab_server_live_browse_is_gracefully_refused() {
         }
         // The recorded live outcome: 0x55 is unsupported. The client must surface a *typed* error.
         Err(e) => {
-            println!("browse refused by ab_server (expected — no Logix 0x55 tag-list service): {e:?}");
+            println!(
+                "browse refused by ab_server (expected — no Logix 0x55 tag-list service): {e:?}"
+            );
             assert!(
                 matches!(
                     e,
@@ -210,7 +254,10 @@ async fn ab_server_live_browse_is_gracefully_refused() {
                 "browse refusal is a typed error (got {e:?})"
             );
             if let EnipError::Cip(status) = &e {
-                println!("  -> typed CIP refusal, general status 0x{:02X} (0x08 = Unsupported)", status.general.code());
+                println!(
+                    "  -> typed CIP refusal, general status 0x{:02X} (0x08 = Unsupported)",
+                    status.general.code()
+                );
             }
             println!("== live_ab_server browse: PASS (typed refusal; browse gap-closer is EthernetIPSharp, §11.7) ==");
         }

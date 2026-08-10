@@ -96,13 +96,21 @@ impl RecordingMetrics {
 
     /// How many times `name` was emitted.
     pub fn emits(&self, name: &str) -> usize {
-        self.emitted.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+        self.emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .count()
     }
 
     /// The sum of one measure across every emitted row of `name` (the family total when the family
     /// carries dimensions).
     pub fn sum(&self, name: &str, measure: &str) -> f64 {
-        self.all(name).iter().filter_map(|v| v.get(measure).copied()).sum()
+        self.all(name)
+            .iter()
+            .filter_map(|v| v.get(measure).copied())
+            .sum()
     }
 }
 
@@ -112,12 +120,26 @@ impl MetricService for RecordingMetrics {
     fn is_metric_defined(&self, _name: &str) -> bool {
         true
     }
-    async fn emit_metric(&self, name: &str, values: HashMap<String, f64>) -> edgecommons::Result<()> {
-        self.emitted.lock().unwrap().push((name.to_string(), values));
+    async fn emit_metric(
+        &self,
+        name: &str,
+        values: HashMap<String, f64>,
+    ) -> edgecommons::Result<()> {
+        self.emitted
+            .lock()
+            .unwrap()
+            .push((name.to_string(), values));
         Ok(())
     }
-    async fn emit_metric_now(&self, name: &str, values: HashMap<String, f64>) -> edgecommons::Result<()> {
-        self.emitted.lock().unwrap().push((name.to_string(), values));
+    async fn emit_metric_now(
+        &self,
+        name: &str,
+        values: HashMap<String, f64>,
+    ) -> edgecommons::Result<()> {
+        self.emitted
+            .lock()
+            .unwrap()
+            .push((name.to_string(), values));
         Ok(())
     }
     async fn flush_metrics(&self) -> edgecommons::Result<()> {
@@ -135,7 +157,11 @@ pub struct RecordingEvents {
 impl RecordingEvents {
     /// Whether an event of `event_type` was emitted.
     pub fn has(&self, event_type: &str) -> bool {
-        self.events.lock().unwrap().iter().any(|(_, t, _)| t == event_type)
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, t, _)| t == event_type)
     }
     /// The context of the last event of `event_type`.
     pub fn last_ctx(&self, event_type: &str) -> Option<Value> {
@@ -149,29 +175,49 @@ impl RecordingEvents {
     }
     /// How many events of `event_type` were emitted.
     pub fn count(&self, event_type: &str) -> usize {
-        self.events.lock().unwrap().iter().filter(|(_, t, _)| t == event_type).count()
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, t, _)| t == event_type)
+            .count()
     }
 }
 
 #[async_trait]
 impl EventSink for RecordingEvents {
-    async fn emit(&self, _severity: Severity, event_type: &str, _message: Option<String>, context: Option<Value>) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(("emit".into(), event_type.to_string(), context.unwrap_or(Value::Null)));
+    async fn emit(
+        &self,
+        _severity: Severity,
+        event_type: &str,
+        _message: Option<String>,
+        context: Option<Value>,
+    ) {
+        self.events.lock().unwrap().push((
+            "emit".into(),
+            event_type.to_string(),
+            context.unwrap_or(Value::Null),
+        ));
     }
-    async fn raise_alarm(&self, _severity: Severity, event_type: &str, _message: Option<String>, context: Option<Value>) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(("raise".into(), event_type.to_string(), context.unwrap_or(Value::Null)));
+    async fn raise_alarm(
+        &self,
+        _severity: Severity,
+        event_type: &str,
+        _message: Option<String>,
+        context: Option<Value>,
+    ) {
+        self.events.lock().unwrap().push((
+            "raise".into(),
+            event_type.to_string(),
+            context.unwrap_or(Value::Null),
+        ));
     }
     async fn clear_alarm(&self, _severity: Severity, event_type: &str, context: Option<Value>) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(("clear".into(), event_type.to_string(), context.unwrap_or(Value::Null)));
+        self.events.lock().unwrap().push((
+            "clear".into(),
+            event_type.to_string(),
+            context.unwrap_or(Value::Null),
+        ));
     }
 }
 
@@ -194,7 +240,13 @@ pub fn device_metrics(
 ) -> (Arc<RecordingMetrics>, Arc<DeviceMetrics>) {
     let svc = Arc::new(RecordingMetrics::default());
     let global = GlobalConfig::default();
-    let dm = Arc::new(DeviceMetrics::new(svc.clone(), config(), device, &global, health));
+    let dm = Arc::new(DeviceMetrics::new(
+        svc.clone(),
+        config(),
+        device,
+        &global,
+        health,
+    ));
     (svc, dm)
 }
 
@@ -206,7 +258,13 @@ pub fn device_metrics_with(
     health: Arc<crate::app::Health>,
 ) -> (Arc<RecordingMetrics>, Arc<DeviceMetrics>) {
     let svc = Arc::new(RecordingMetrics::default());
-    let dm = Arc::new(DeviceMetrics::new(svc.clone(), config(), device, global, health));
+    let dm = Arc::new(DeviceMetrics::new(
+        svc.clone(),
+        config(),
+        device,
+        global,
+        health,
+    ));
     (svc, dm)
 }
 
@@ -275,7 +333,12 @@ impl RecordingPublisher {
 
     /// The total number of samples across every published update — a batched flush carries several.
     pub fn samples(&self) -> usize {
-        self.published.lock().unwrap().iter().map(|u| u.samples.len()).sum()
+        self.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|u| u.samples.len())
+            .sum()
     }
 }
 
@@ -401,7 +464,9 @@ impl DeviceSession for Arc<ScriptedSession> {
     async fn browse(&mut self, _cursor: Option<String>, _max: usize) -> DevResult<BrowsePage> {
         match self.browses.lock().unwrap().pop_front() {
             Some(outcome) => outcome,
-            None => Err(DeviceError::Unsupported("scripted session: no tag discovery")),
+            None => Err(DeviceError::Unsupported(
+                "scripted session: no tag discovery",
+            )),
         }
     }
 
@@ -593,7 +658,10 @@ impl ScriptedBackend {
     }
 
     fn record_attempt(&self) {
-        self.attempts.lock().unwrap().push(tokio::time::Instant::now());
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
     }
 }
 

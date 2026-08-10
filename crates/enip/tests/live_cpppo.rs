@@ -24,11 +24,18 @@
 //! class-3 connection (the second bench peer for that leg — see `live_opener.rs` for the first).
 //!
 //! Excluded from the coverage denominator (`tests[/\\]live_(cpppo|opener)`, §12.2).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::float_cmp)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::float_cmp
+)]
 
 use std::time::Duration;
 
-use enip::{CipType, CipValue, ClientOptions, EipClient, EnipError, Scope, TagAddress, TimeoutMultiplier};
+use enip::{
+    CipType, CipValue, ClientOptions, EipClient, EnipError, Scope, TagAddress, TimeoutMultiplier,
+};
 
 const CPPPO_ADDR: &str = "127.0.0.1:44818";
 
@@ -105,20 +112,38 @@ async fn cpppo_live_read_write_browse() {
     println!("seeded LINE_SPEED=123.5, PRODUCT_COUNT=4242, ZONE_TEMPS=[10..17]");
 
     // ---- scalar read --------------------------------------------------------------------------
-    let r = client.read_tag(&tag("LINE_SPEED"), 1).await.expect("read LINE_SPEED");
-    println!("read LINE_SPEED -> {:?} (wire type {:?})", r.value, r.wire_type);
+    let r = client
+        .read_tag(&tag("LINE_SPEED"), 1)
+        .await
+        .expect("read LINE_SPEED");
+    println!(
+        "read LINE_SPEED -> {:?} (wire type {:?})",
+        r.value, r.wire_type
+    );
     assert_eq!(r.wire_type, CipType::Real);
     assert_eq!(r.value, CipValue::Real(123.5));
 
     // ---- DINT read ----------------------------------------------------------------------------
-    let r = client.read_tag(&tag("PRODUCT_COUNT"), 1).await.expect("read PRODUCT_COUNT");
-    println!("read PRODUCT_COUNT -> {:?} (wire type {:?})", r.value, r.wire_type);
+    let r = client
+        .read_tag(&tag("PRODUCT_COUNT"), 1)
+        .await
+        .expect("read PRODUCT_COUNT");
+    println!(
+        "read PRODUCT_COUNT -> {:?} (wire type {:?})",
+        r.value, r.wire_type
+    );
     assert_eq!(r.wire_type, CipType::Dint);
     assert_eq!(r.value, CipValue::Dint(4242));
 
     // ---- array read ---------------------------------------------------------------------------
-    let r = client.read_tag(&tag("ZONE_TEMPS"), 8).await.expect("read ZONE_TEMPS[8]");
-    println!("read ZONE_TEMPS[8] -> {:?} (wire type {:?})", r.value, r.wire_type);
+    let r = client
+        .read_tag(&tag("ZONE_TEMPS"), 8)
+        .await
+        .expect("read ZONE_TEMPS[8]");
+    println!(
+        "read ZONE_TEMPS[8] -> {:?} (wire type {:?})",
+        r.value, r.wire_type
+    );
     assert_eq!(r.wire_type, CipType::Real);
     assert_eq!(r.value, CipValue::Array(CipType::Real, zone_seed));
 
@@ -127,7 +152,10 @@ async fn cpppo_live_read_write_browse() {
         .write_tag(&tag("FILL_SETPOINT"), CipType::Real, &CipValue::Real(55.5))
         .await
         .expect("write FILL_SETPOINT=55.5");
-    let r = client.read_tag(&tag("FILL_SETPOINT"), 1).await.expect("read-back FILL_SETPOINT");
+    let r = client
+        .read_tag(&tag("FILL_SETPOINT"), 1)
+        .await
+        .expect("read-back FILL_SETPOINT");
     println!("write+read-back FILL_SETPOINT -> {:?}", r.value);
     assert_eq!(r.value, CipValue::Real(55.5));
 
@@ -136,15 +164,24 @@ async fn cpppo_live_read_write_browse() {
     println!("read NO_SUCH_TAG -> {bad:?}");
     match bad {
         Err(EnipError::Cip(status)) => {
-            println!("  -> per-tag CIP error (general status 0x{:02X}) as expected", status.general.code());
+            println!(
+                "  -> per-tag CIP error (general status 0x{:02X}) as expected",
+                status.general.code()
+            );
         }
         Err(other) => panic!("expected a per-tag CIP error for NO_SUCH_TAG, got {other:?}"),
         Ok(v) => panic!("expected NO_SUCH_TAG to fail, decoded {v:?}"),
     }
     // The link is still GOOD after a per-tag error: a real tag reads fine in the same session.
-    let good = client.read_tag(&tag("LINE_SPEED"), 1).await.expect("LINE_SPEED still GOOD after a BAD tag");
+    let good = client
+        .read_tag(&tag("LINE_SPEED"), 1)
+        .await
+        .expect("LINE_SPEED still GOOD after a BAD tag");
     assert_eq!(good.value, CipValue::Real(123.5));
-    println!("  -> LINE_SPEED still GOOD after the BAD tag: {:?}", good.value);
+    println!(
+        "  -> LINE_SPEED still GOOD after the BAD tag: {:?}",
+        good.value
+    );
 
     client.close().await;
     println!("== live_cpppo read/write/error: PASS ==");
@@ -175,18 +212,29 @@ async fn cpppo_live_tag_browse_is_gracefully_refused() {
         return;
     }
     println!("== live_cpppo browse: connecting to real cpppo at {CPPPO_ADDR} ==");
-    let client = EipClient::connect(CPPPO_ADDR, opts()).await.expect("connect for browse");
+    let client = EipClient::connect(CPPPO_ADDR, opts())
+        .await
+        .expect("connect for browse");
 
     match client.list_tags(0, &Scope::Controller).await {
         // A Logix-capable target (real PLC / future sim) answers with the page.
         Ok((records, next)) => {
-            println!("browse returned {} record(s), next={next:?}:", records.len());
-            let mut all: Vec<(String, _)> = records.iter().map(|s| (s.name.clone(), s.symbol_type)).collect();
+            println!(
+                "browse returned {} record(s), next={next:?}:",
+                records.len()
+            );
+            let mut all: Vec<(String, _)> = records
+                .iter()
+                .map(|s| (s.name.clone(), s.symbol_type))
+                .collect();
             // Page to completion.
             let mut start = next;
             let mut pages = 1;
             while let Some(n) = start {
-                let (recs, nxt) = client.list_tags(n, &Scope::Controller).await.expect("browse page");
+                let (recs, nxt) = client
+                    .list_tags(n, &Scope::Controller)
+                    .await
+                    .expect("browse page");
                 for s in &recs {
                     all.push((s.name.clone(), s.symbol_type));
                 }
@@ -197,21 +245,44 @@ async fn cpppo_live_tag_browse_is_gracefully_refused() {
                 }
             }
             for (name, st) in &all {
-                println!("  {name:<16} type=0x{:04X} value_supported={}", st.0, st.is_value_supported());
+                println!(
+                    "  {name:<16} type=0x{:04X} value_supported={}",
+                    st.0,
+                    st.is_value_supported()
+                );
             }
             let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
-            assert!(names.contains(&"RECIPE"), "browse lists RECIPE; got {names:?}");
-            let recipe = all.iter().find(|(n, _)| n == "RECIPE").map(|(_, st)| *st).unwrap();
-            assert!(!recipe.is_value_supported(), "RECIPE (SSTRING) is value-unsupported (§11.1)");
+            assert!(
+                names.contains(&"RECIPE"),
+                "browse lists RECIPE; got {names:?}"
+            );
+            let recipe = all
+                .iter()
+                .find(|(n, _)| n == "RECIPE")
+                .map(|(_, st)| *st)
+                .unwrap();
+            assert!(
+                !recipe.is_value_supported(),
+                "RECIPE (SSTRING) is value-unsupported (§11.1)"
+            );
             println!("== live_cpppo browse: PASS (Logix-capable target) ==");
         }
         // cpppo (and any generic non-Logix CIP device): the tag-list service is unsupported. The
         // client must surface a *typed* error, never a panic — the adapter maps this to
         // BROWSE_UNSUPPORTED (§7.3, §10.1). This is the recorded live outcome against cpppo 3.9.7.
         Err(e) => {
-            println!("browse refused by cpppo (expected — no Logix tag-enumeration service): {e:?}");
+            println!(
+                "browse refused by cpppo (expected — no Logix tag-enumeration service): {e:?}"
+            );
             assert!(
-                matches!(e, EnipError::Encap(_) | EnipError::Cip(_) | EnipError::Closed | EnipError::ConnectionLost { .. } | EnipError::Io(_)),
+                matches!(
+                    e,
+                    EnipError::Encap(_)
+                        | EnipError::Cip(_)
+                        | EnipError::Closed
+                        | EnipError::ConnectionLost { .. }
+                        | EnipError::Io(_)
+                ),
                 "browse refusal is a typed error (got {e:?})"
             );
             println!("== live_cpppo browse: PASS (typed refusal; full browse is a real-Logix path, §12.4) ==");
@@ -244,10 +315,17 @@ async fn cpppo_live_class3_idle_survives_the_inactivity_window() {
     }
     println!("== live_cpppo: class-3 idle survival against real cpppo at {CPPPO_ADDR} ==");
 
-    let options = ClientOptions { connected_messaging: true, ..opts() };
+    let options = ClientOptions {
+        connected_messaging: true,
+        ..opts()
+    };
     // The scenario is the DEFAULT tuning — nothing is dialled down to make it pass, and no adapter
     // config key exists for it.
-    assert_eq!(options.class3_rpi, Duration::from_secs(2), "the default requested class-3 RPI");
+    assert_eq!(
+        options.class3_rpi,
+        Duration::from_secs(2),
+        "the default requested class-3 RPI"
+    );
     assert_eq!(
         options.class3_timeout_multiplier,
         TimeoutMultiplier::X16,
@@ -269,14 +347,20 @@ async fn cpppo_live_class3_idle_survives_the_inactivity_window() {
             return;
         }
     };
-    assert!(client.is_connected_messaging(), "the session rides a class-3 connection");
+    assert!(
+        client.is_connected_messaging(),
+        "the session rides a class-3 connection"
+    );
     println!("class-3 ForwardOpen ACCEPTED — explicit requests now ride SendUnitData");
 
     let baseline = client
         .get_attribute_single(0x01, 1, 4)
         .await
         .expect("baseline Identity/Revision read over the class-3 connection");
-    println!("baseline Get_Attribute_Single(Identity, 1, 4) -> {} byte(s)", baseline.len());
+    println!(
+        "baseline Get_Attribute_Single(Identity, 1, 4) -> {} byte(s)",
+        baseline.len()
+    );
 
     let idle = Duration::from_secs(75);
     println!("idling {idle:?} — no request at all; keepalives are due every 24 s...");
@@ -303,5 +387,7 @@ async fn cpppo_live_class3_idle_survives_the_inactivity_window() {
     );
 
     client.close().await;
-    println!("== live_cpppo class-3 keepalive: PASS (keepalives flowed; session survived the idle) ==");
+    println!(
+        "== live_cpppo class-3 keepalive: PASS (keepalives flowed; session survived the idle) =="
+    );
 }

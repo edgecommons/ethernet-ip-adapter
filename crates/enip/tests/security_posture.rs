@@ -17,11 +17,11 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
+use enip::encap::Command;
 use enip::{
     CipSecurityState, ClientOptions, Cpf, CpfItem, EipClient, EncapFrame, EncapHeader, WireReader,
     WireWriter,
 };
-use enip::encap::Command;
 
 const SESSION_HANDLE: u32 = 0x00AB_CDEF;
 
@@ -32,7 +32,10 @@ struct MockPeer {
 
 impl MockPeer {
     fn new(stream: DuplexStream) -> Self {
-        Self { stream, buf: BytesMut::new() }
+        Self {
+            stream,
+            buf: BytesMut::new(),
+        }
     }
     async fn recv(&mut self) -> Option<EncapFrame> {
         loop {
@@ -59,7 +62,12 @@ impl MockPeer {
         let req = self.recv().await.expect("register");
         assert_eq!(req.header.command, Command::RegisterSession);
         let reply = EncapFrame::new(
-            EncapHeader::request(Command::RegisterSession, 0, SESSION_HANDLE, req.header.sender_context),
+            EncapHeader::request(
+                Command::RegisterSession,
+                0,
+                SESSION_HANDLE,
+                req.header.sender_context,
+            ),
             Bytes::from(vec![0x01, 0x00, 0x00, 0x00]),
         );
         self.send(&reply).await;
@@ -133,16 +141,16 @@ fn parse_get_attr(frame: &EncapFrame) -> (u8, u16, u16, u16) {
 /// A mock CIP-Security-capable device: answers every 0x5D/0x5E/0x5F attribute with a crafted value.
 fn answer_full(class: u16, instance: u16, attr: u16) -> (u8, Vec<u8>) {
     match (class, instance, attr) {
-        (0x5D, 1, 1) => (0x00, vec![0x02]),             // Configured
-        (0x5D, 1, 2) => (0x00, vec![0x03, 0x00]),       // profiles supported: Integrity+Confidentiality
-        (0x5D, 1, 3) => (0x00, vec![0x02, 0x00]),       // profiles configured: Confidentiality
-        (0x5E, 1, 1) => (0x00, vec![0x02]),             // state
+        (0x5D, 1, 1) => (0x00, vec![0x02]),       // Configured
+        (0x5D, 1, 2) => (0x00, vec![0x03, 0x00]), // profiles supported: Integrity+Confidentiality
+        (0x5D, 1, 3) => (0x00, vec![0x02, 0x00]), // profiles configured: Confidentiality
+        (0x5E, 1, 1) => (0x00, vec![0x02]),       // state
         (0x5E, 1, 2) => (0x00, vec![0x00, 0x00, 0x00, 0x00]), // capability flags
         (0x5E, 1, 3) => (0x00, vec![0x02, 0xC0, 0x2B, 0xC0, 0x23]), // available: GCM + CBC
         (0x5E, 1, 4) => (0x00, vec![0x01, 0xC0, 0x2B]), // allowed: GCM only
-        (0x5E, 1, 9) => (0x00, vec![0x01]),             // verify client true
-        (0x5E, 1, 10) => (0x00, vec![0x01]),            // send chain true
-        (0x5E, 1, 11) => (0x00, vec![0x00]),            // check expiration false
+        (0x5E, 1, 9) => (0x00, vec![0x01]),       // verify client true
+        (0x5E, 1, 10) => (0x00, vec![0x01]),      // send chain true
+        (0x5E, 1, 11) => (0x00, vec![0x00]),      // check expiration false
         (0x5F, 0, 8) => (0x00, vec![0x01, 0x00, 0x00, 0x00]), // push supported
         (0x5F, 1, 1) => (0x00, {
             let mut v = vec![0x06];
@@ -168,8 +176,11 @@ async fn reads_full_security_posture_from_a_cip_security_device() {
             let (svc, class, instance, attr) = parse_get_attr(&req);
             assert_eq!(svc, 0x0E, "get_attribute_single");
             let (status, data) = answer_full(class, instance, attr);
-            peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x0E, status, &data)))
-                .await;
+            peer.send(&rrdata_reply(
+                req.header.sender_context,
+                &mr_reply(0x0E, status, &data),
+            ))
+            .await;
         }
     });
 
@@ -223,8 +234,11 @@ async fn generic_device_reports_unavailable_not_error() {
             let (svc, _c, _i, _a) = parse_get_attr(&req);
             assert_eq!(svc, 0x0E);
             // Service not supported / object does not exist — the generic-CIP-device answer.
-            peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x0E, 0x08, &[])))
-                .await;
+            peer.send(&rrdata_reply(
+                req.header.sender_context,
+                &mr_reply(0x0E, 0x08, &[]),
+            ))
+            .await;
         }
     });
 
@@ -234,8 +248,14 @@ async fn generic_device_reports_unavailable_not_error() {
         ..ClientOptions::default()
     };
     let client = EipClient::connect_over(client_io, opts).await.unwrap();
-    let posture = client.read_security_posture().await.expect("no error on unavailable");
-    assert!(!posture.is_available(), "no CIP Security objects ⇒ unavailable");
+    let posture = client
+        .read_security_posture()
+        .await
+        .expect("no error on unavailable");
+    assert!(
+        !posture.is_available(),
+        "no CIP Security objects ⇒ unavailable"
+    );
     assert!(posture.cip_security.is_none());
     assert!(posture.eip_security.is_none());
     assert!(posture.certificate_management.is_none());

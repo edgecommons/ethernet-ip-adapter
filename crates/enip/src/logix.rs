@@ -109,9 +109,7 @@ impl SymbolType {
     /// non-goals); the adapter marks them `supported: false`.
     #[must_use]
     pub fn is_value_supported(self) -> bool {
-        !self.is_struct()
-            && self.dims() == 0
-            && self.cip_type().is_some_and(CipType::is_elementary)
+        !self.is_struct() && self.dims() == 0 && self.cip_type().is_some_and(CipType::is_elementary)
     }
 }
 
@@ -218,11 +216,7 @@ impl EipClient {
 
     /// The fragmented read loop (§7.2, D-ENIP-12): re-reads from offset 0 with `0x52`, accumulating
     /// each fragment's value bytes until a final `status 0`, capped by `max_value_bytes`.
-    async fn read_tag_fragmented(
-        &self,
-        tag: &TagAddress,
-        elements: u16,
-    ) -> Result<TagReadResult> {
+    async fn read_tag_fragmented(&self, tag: &TagAddress, elements: u16) -> Result<TagReadResult> {
         let cap = self.max_value_bytes();
         let mut offset: u32 = 0;
         let mut acc: Vec<u8> = Vec::new();
@@ -264,8 +258,11 @@ impl EipClient {
                 return Err(EnipError::TooLarge { limit: cap });
             }
             acc.extend_from_slice(value_bytes);
-            let advance = u32::try_from(value_bytes.len()).map_err(|_| EnipError::TooLarge { limit: cap })?;
-            offset = offset.checked_add(advance).ok_or(EnipError::TooLarge { limit: cap })?;
+            let advance =
+                u32::try_from(value_bytes.len()).map_err(|_| EnipError::TooLarge { limit: cap })?;
+            offset = offset
+                .checked_add(advance)
+                .ok_or(EnipError::TooLarge { limit: cap })?;
 
             if !more {
                 break;
@@ -299,7 +296,10 @@ impl EipClient {
             .encode_value(&mut value_buf)
             .map_err(EnipError::Malformed)?;
         let value_bytes = value_buf.into_bytes();
-        let element_count = u16::try_from(value.element_count()).map_err(|_| EnipError::TooLarge { limit: u16::MAX as usize })?;
+        let element_count =
+            u16::try_from(value.element_count()).map_err(|_| EnipError::TooLarge {
+                limit: u16::MAX as usize,
+            })?;
 
         // Single-packet write when the value fits comfortably in the usable request size.
         let usable = self.max_request_bytes();
@@ -319,12 +319,21 @@ impl EipClient {
         }
 
         // Fragmented write: chunk on element boundaries so no partial element is split.
-        let chunk_elems = usable.saturating_sub(12).checked_div(element_size).unwrap_or(0).max(1);
-        let chunk_bytes = chunk_elems.checked_mul(element_size).unwrap_or(element_size);
+        let chunk_elems = usable
+            .saturating_sub(12)
+            .checked_div(element_size)
+            .unwrap_or(0)
+            .max(1);
+        let chunk_bytes = chunk_elems
+            .checked_mul(element_size)
+            .unwrap_or(element_size);
         let mut offset: u32 = 0;
         let mut sent = 0usize;
         while sent < value_bytes.len() {
-            let end = sent.checked_add(chunk_bytes).unwrap_or(value_bytes.len()).min(value_bytes.len());
+            let end = sent
+                .checked_add(chunk_bytes)
+                .unwrap_or(value_bytes.len())
+                .min(value_bytes.len());
             let chunk = value_bytes.get(sent..end).unwrap_or(&[]);
             let mut data = WireWriter::with_capacity(chunk.len().saturating_add(8));
             data.u16(ty.code());
@@ -341,8 +350,12 @@ impl EipClient {
             if !reply.status.is_ok() && !reply.status.has_more() {
                 return Err(EnipError::Cip(reply.status));
             }
-            let advance = u32::try_from(chunk.len()).map_err(|_| EnipError::TooLarge { limit: u32::MAX as usize })?;
-            offset = offset.checked_add(advance).ok_or(EnipError::TooLarge { limit: u32::MAX as usize })?;
+            let advance = u32::try_from(chunk.len()).map_err(|_| EnipError::TooLarge {
+                limit: u32::MAX as usize,
+            })?;
+            offset = offset.checked_add(advance).ok_or(EnipError::TooLarge {
+                limit: u32::MAX as usize,
+            })?;
             sent = end;
         }
         Ok(())
@@ -436,11 +449,7 @@ impl EipClient {
 }
 
 /// Build the final [`CipValue`] from a reassembled fragmented read's bytes.
-fn build_fragment_value(
-    ty: CipType,
-    struct_handle: Option<u16>,
-    acc: &[u8],
-) -> Result<CipValue> {
+fn build_fragment_value(ty: CipType, struct_handle: Option<u16>, acc: &[u8]) -> Result<CipValue> {
     match ty {
         CipType::Struct => Ok(CipValue::Struct {
             handle: struct_handle.unwrap_or(0),
@@ -456,7 +465,11 @@ fn build_fragment_value(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     #[test]

@@ -31,8 +31,8 @@ use tokio::task::JoinHandle;
 
 use crate::config::{IoConfig, IoFieldSpec, Timeouts};
 use crate::device::{
-    ConnectionConfig, DeviceBackend, DeviceError, DeviceSession, InputSnapshot, IoLinkStats, IoUpdate,
-    PushSession, Result,
+    ConnectionConfig, DeviceBackend, DeviceError, DeviceSession, InputSnapshot, IoLinkStats,
+    IoUpdate, PushSession, Result,
 };
 
 use super::push::{assembly_to_readings, map_lost_reason};
@@ -82,7 +82,10 @@ impl DeviceBackend for EipBackend {
                 request_timeout,
                 super::tls::plaintext_status(Some(target)),
             ))),
-            None => Ok(Box::new(super::session::EipSession::new(client, request_timeout))),
+            None => Ok(Box::new(super::session::EipSession::new(
+                client,
+                request_timeout,
+            ))),
         }
     }
 
@@ -101,7 +104,9 @@ impl DeviceBackend for EipBackend {
 /// `None`, and a connection-level read failure is swallowed (logged) so it never fails the connect —
 /// the posture is a diagnostic surface, not a liveness gate. A device found in the `Factory Default`
 /// state while being polled gets a WARN (an unprovisioned device on a secured poll path, §4.1).
-async fn read_target_posture(client: &enip::EipClient) -> Option<crate::device::TargetSecurityPosture> {
+async fn read_target_posture(
+    client: &enip::EipClient,
+) -> Option<crate::device::TargetSecurityPosture> {
     match client.read_security_posture().await {
         Ok(posture) => {
             if let Some(cip) = &posture.cip_security {
@@ -430,7 +435,9 @@ impl PushSession for EipPushSession {
         let key = self
             .out_fields
             .iter()
-            .position(|f| f.offset == field.offset && f.eip_type == field.eip_type && f.bit == field.bit)
+            .position(|f| {
+                f.offset == field.offset && f.eip_type == field.eip_type && f.bit == field.bit
+            })
             .ok_or_else(|| DeviceError::Permanent(anyhow::anyhow!("unknown output field")))?;
         let cip = super::types::encode_write(
             value,
@@ -455,7 +462,8 @@ impl PushSession for EipPushSession {
             let (ack_tx, ack_rx) = oneshot::channel();
             if self.control.send(PushControl::Close(ack_tx)).await.is_ok() {
                 // The shutdown budget and this handoff share one number (§10.3, D-EIP-27).
-                let _ = tokio::time::timeout(crate::lifecycle::PUSH_CLOSE_HANDOFF_CAP, ack_rx).await;
+                let _ =
+                    tokio::time::timeout(crate::lifecycle::PUSH_CLOSE_HANDOFF_CAP, ack_rx).await;
             } else {
                 task.abort();
             }
@@ -565,7 +573,11 @@ mod tests {
         Cpf::from_items(vec![
             CpfItem::new(
                 ItemType::SequencedAddress,
-                SequencedAddress { connection_id: cid, encap_sequence: encap_seq }.encode(),
+                SequencedAddress {
+                    connection_id: cid,
+                    encap_sequence: encap_seq,
+                }
+                .encode(),
             ),
             CpfItem::connected_data(Bytes::from(payload)),
         ])
@@ -710,7 +722,9 @@ mod tests {
             let task_log = Arc::clone(&log);
             let task = tokio::spawn(async move {
                 loop {
-                    let Ok((tcp, _peer)) = listener.accept().await else { return };
+                    let Ok((tcp, _peer)) = listener.accept().await else {
+                        return;
+                    };
                     if script.hang_up {
                         drop(tcp);
                         continue;
@@ -741,8 +755,15 @@ mod tests {
         /// The `127.0.0.1:<port>` the originator advertised for T→O frames — where the test's UDP
         /// socket must produce.
         fn t2o_target(&self) -> SocketAddr {
-            let port = self.log().open.expect("a ForwardOpen was recorded").advertised_port;
-            assert_ne!(port, 0, "the ForwardOpen must advertise the originator's UDP receive port");
+            let port = self
+                .log()
+                .open
+                .expect("a ForwardOpen was recorded")
+                .advertised_port;
+            assert_ne!(
+                port, 0,
+                "the ForwardOpen must advertise the originator's UDP receive port"
+            );
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
         }
 
@@ -868,9 +889,7 @@ mod tests {
 
     /// The ForwardOpen success reply body (§8.2) — the same shape `enip`'s own `io.rs` fixture crafts.
     fn forward_open_success(rec: &OpenRecord, script: &PlcScript) -> (Vec<u8>, Vec<CpfItem>) {
-        let (o2t_api, t2o_api) = script
-            .apis_us
-            .unwrap_or((rec.o2t_rpi_us, rec.t2o_rpi_us));
+        let (o2t_api, t2o_api) = script.apis_us.unwrap_or((rec.o2t_rpi_us, rec.t2o_rpi_us));
         let mut w = Vec::new();
         w.extend_from_slice(&0xAABB_CCDDu32.to_le_bytes()); // O→T id: target-assigned
         w.extend_from_slice(&rec.t2o_cid.to_le_bytes());
@@ -894,7 +913,11 @@ mod tests {
     }
 
     /// Answer one `SendRRData`. `None` ends the connection (a request the script has no answer for).
-    fn answer_rr(frame: &EncapFrame, script: &PlcScript, log: &Arc<Mutex<PlcLog>>) -> Option<EncapFrame> {
+    fn answer_rr(
+        frame: &EncapFrame,
+        script: &PlcScript,
+        log: &Arc<Mutex<PlcLog>>,
+    ) -> Option<EncapFrame> {
         let cpf = Cpf::decode(frame.data.get(6..)?).ok()?;
         let mr = cpf.find(ItemType::UnconnectedData)?.data.clone();
         let service = *mr.first()?;
@@ -926,7 +949,10 @@ mod tests {
             }
             GET_ATTRIBUTE_SINGLE => {
                 let (class, instance, attribute) = parse_attr_path(&path);
-                log.lock().unwrap().attribute_reads.push((class, instance, attribute));
+                log.lock()
+                    .unwrap()
+                    .attribute_reads
+                    .push((class, instance, attribute));
                 match script
                     .posture_state
                     .and_then(|s| posture_attribute(s, class, instance, attribute))
@@ -948,13 +974,20 @@ mod tests {
         script: &PlcScript,
         log: &Arc<Mutex<PlcLog>>,
     ) {
-        let Some(reg) = read_frame(&mut s).await else { return };
+        let Some(reg) = read_frame(&mut s).await else {
+            return;
+        };
         if !matches!(reg.header.command, Command::RegisterSession) {
             return;
         }
         let handle = if script.bad_register { 0 } else { 0x1234_5678 };
         let reply = EncapFrame::new(
-            EncapHeader::request(Command::RegisterSession, 0, handle, reg.header.sender_context),
+            EncapHeader::request(
+                Command::RegisterSession,
+                0,
+                handle,
+                reg.header.sender_context,
+            ),
             Bytes::from(vec![1, 0, 0, 0]), // protocol version 1, options 0
         );
         if write_frame(&mut s, &reply).await.is_none() || script.drop_after_register {
@@ -962,10 +995,14 @@ mod tests {
         }
 
         loop {
-            let Some(frame) = read_frame(&mut s).await else { return };
+            let Some(frame) = read_frame(&mut s).await else {
+                return;
+            };
             match frame.header.command {
                 Command::SendRRData => {
-                    let Some(reply) = answer_rr(&frame, script, log) else { return };
+                    let Some(reply) = answer_rr(&frame, script, log) else {
+                        return;
+                    };
                     if write_frame(&mut s, &reply).await.is_none() {
                         return;
                     }
@@ -1126,9 +1163,10 @@ mod tests {
                 .await
                 .unwrap();
             match tokio::time::timeout(Duration::from_millis(25), session.updates().recv()).await {
-                Ok(Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms })) => {
-                    return (o2t_api_ms, t2o_api_ms, seq)
-                }
+                Ok(Some(IoUpdate::Up {
+                    o2t_api_ms,
+                    t2o_api_ms,
+                })) => return (o2t_api_ms, t2o_api_ms, seq),
                 Ok(other) => panic!("expected Up as the first seam update, got {other:?}"),
                 Err(_elapsed) => {}
             }
@@ -1138,9 +1176,12 @@ mod tests {
     /// The next `Data` update, or a panic naming what arrived instead.
     async fn next_data(session: &mut dyn PushSession) -> (Vec<crate::device::Reading>, u16, bool) {
         match tokio::time::timeout(Duration::from_secs(5), session.updates().recv()).await {
-            Ok(Some(IoUpdate::Data { readings, sequence, run_mode, .. })) => {
-                (readings, sequence, run_mode)
-            }
+            Ok(Some(IoUpdate::Data {
+                readings,
+                sequence,
+                run_mode,
+                ..
+            })) => (readings, sequence, run_mode),
             other => panic!("expected a Data update, got {other:?}"),
         }
     }
@@ -1180,17 +1221,27 @@ mod tests {
         // is what distinguishes "the device has no posture" from "the posture read broke the link".
         let reads = plc.log().attribute_reads;
         for probe in [(0x5D, 1, 1), (0x5E, 1, 1), (0x5F, 0, 8)] {
-            assert!(reads.contains(&probe), "connect probes {probe:?}: {reads:?}");
+            assert!(
+                reads.contains(&probe),
+                "connect probes {probe:?}: {reads:?}"
+            );
         }
         session.close().await;
 
         // The posture is a diagnostic surface, not a liveness gate: a read that dies at the
         // *connection* level is swallowed the same way, so a link hiccup during the probe can never
         // turn a reachable device into a failed connect.
-        let plc = MockPlc::start(PlcScript { drop_after_register: true, ..PlcScript::default() }).await;
+        let plc = MockPlc::start(PlcScript {
+            drop_after_register: true,
+            ..PlcScript::default()
+        })
+        .await;
         let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
         let session = backend.connect(&conn).await.unwrap();
-        assert!(session.security().is_none(), "a broken posture read is swallowed, not surfaced");
+        assert!(
+            session.security().is_none(),
+            "a broken posture read is swallowed, not surfaced"
+        );
     }
 
     /// A CIP Security device's posture is decoded onto the seam type field for field, and a device
@@ -1208,8 +1259,13 @@ mod tests {
             backend.connect(&conn).await.unwrap()
         };
 
-        let sec = session.security().expect("a posture-carrying session reports security");
-        assert!(!sec.tls, "the session is plaintext; only the target's posture was read");
+        let sec = session
+            .security()
+            .expect("a posture-carrying session reports security");
+        assert!(
+            !sec.tls,
+            "the session is plaintext; only the target's posture was read"
+        );
         let target = sec.target.expect("the target's posture");
         assert_eq!(target.state.as_deref(), Some("Factory Default"));
         assert_eq!(
@@ -1222,12 +1278,17 @@ mod tests {
         );
         assert_eq!(
             target.available_cipher_suites,
-            vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"]
+            vec![
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_AES_128_GCM_SHA256"
+            ]
         );
         assert_eq!(target.verify_client, Some(true));
         assert_eq!(target.send_certificate_chain, Some(true));
         assert_eq!(target.check_expiration, Some(false));
-        let cert = target.certificate.expect("the Certificate Management summary");
+        let cert = target
+            .certificate
+            .expect("the Certificate Management summary");
         assert_eq!(cert.name.as_deref(), Some("device-cert"));
         assert_eq!(cert.state.as_deref(), Some("Verified"));
         assert_eq!(cert.encoding.as_deref(), Some("PEM"));
@@ -1260,7 +1321,11 @@ mod tests {
         let backend = EipBackend::new(timeouts());
 
         // A peer that accepts the TCP connection and hangs up: a link-level failure ⇒ retry.
-        let plc = MockPlc::start(PlcScript { hang_up: true, ..PlcScript::default() }).await;
+        let plc = MockPlc::start(PlcScript {
+            hang_up: true,
+            ..PlcScript::default()
+        })
+        .await;
         let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
         match backend.connect(&conn).await.map(|_| ()) {
             Err(DeviceError::Transient(_)) => {}
@@ -1269,7 +1334,11 @@ mod tests {
 
         // A peer that answers RegisterSession with session handle 0 — a protocol violation that will
         // repeat forever, so it must NOT be retried as if it were a hiccup.
-        let plc = MockPlc::start(PlcScript { bad_register: true, ..PlcScript::default() }).await;
+        let plc = MockPlc::start(PlcScript {
+            bad_register: true,
+            ..PlcScript::default()
+        })
+        .await;
         let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
         match backend.connect(&conn).await.map(|_| ()) {
             Err(DeviceError::Permanent(_)) => {}
@@ -1284,7 +1353,8 @@ mod tests {
             let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
             let outcome = backend.open_push(&conn, &io).await.map(|_| ());
             match (&outcome, transient) {
-                (Err(DeviceError::Transient(_)), true) | (Err(DeviceError::Permanent(_)), false) => {}
+                (Err(DeviceError::Transient(_)), true)
+                | (Err(DeviceError::Permanent(_)), false) => {}
                 _ => panic!("forward-open status 0x{status:02X}: unexpected {outcome:?}"),
             }
         }
@@ -1305,7 +1375,11 @@ mod tests {
         std::fs::write(&key_file, &pki.client_key_pem).unwrap();
         std::fs::write(&ca_file, &pki.ca_pem).unwrap();
 
-        let script = PlcScript { tls: Some(pki.server_config()), ..PlcScript::default() }.with_posture(2);
+        let script = PlcScript {
+            tls: Some(pki.server_config()),
+            ..PlcScript::default()
+        }
+        .with_posture(2);
         let plc = MockPlc::start(script).await;
         let backend = EipBackend::new(timeouts());
         let conn = conn_of(json!({
@@ -1321,24 +1395,36 @@ mod tests {
         }));
 
         let session = backend.connect(&conn).await.unwrap();
-        let sec = session.security().expect("a TLS session reports its posture");
+        let sec = session
+            .security()
+            .expect("a TLS session reports its posture");
         assert!(sec.tls);
         assert_eq!(sec.tls_version.as_deref(), Some("1.3"));
         let suite = sec.cipher_suite.expect("a negotiated suite");
         assert!(suite.starts_with("TLS13_"), "negotiated suite: {suite}");
-        assert!(sec.peer_verified, "verifyPeer defaults on and the chain verified");
+        assert!(
+            sec.peer_verified,
+            "verifyPeer defaults on and the chain verified"
+        );
         assert!(
             sec.peer.as_deref().unwrap_or_default().contains("mock-plc"),
             "the peer identity is the device certificate subject: {:?}",
             sec.peer
         );
-        assert!(sec.client_cert_not_after.is_some(), "our own leaf's expiry is surfaced");
+        assert!(
+            sec.client_cert_not_after.is_some(),
+            "our own leaf's expiry is surfaced"
+        );
         assert!(sec.client_cert_serial.is_some());
         assert!(
             sec.client_cert_expiry_days.unwrap_or(-1) >= 0,
             "a freshly minted client cert is not expired"
         );
-        assert_eq!(sec.trust_anchors.len(), 1, "the managed trust store holds the one root");
+        assert_eq!(
+            sec.trust_anchors.len(),
+            1,
+            "the managed trust store holds the one root"
+        );
         assert!(
             sec.target.is_some(),
             "the Phase-2a posture read runs over the TLS session too"
@@ -1381,15 +1467,25 @@ mod tests {
 
         // ---- the request the target received (§4.6 → §8.2 mapping) ----
         let open = plc.log().open.expect("the peer recorded a ForwardOpen");
-        assert_eq!(open.service, enip::cm::service::FORWARD_OPEN, "10-byte directions are not large");
+        assert_eq!(
+            open.service,
+            enip::cm::service::FORWARD_OPEN,
+            "10-byte directions are not large"
+        );
         assert_eq!(open.vendor_id, VENDOR_ID);
         assert_eq!(open.transport_class_trigger, enip::TRANSPORT_CLASS1_TRIGGER);
-        assert_eq!(open.timeout_multiplier_code, enip::TimeoutMultiplier::X16.code());
+        assert_eq!(
+            open.timeout_multiplier_code,
+            enip::TimeoutMultiplier::X16.code()
+        );
         assert_eq!(open.t2o_rpi_us, 500_000, "rpiMs is the T→O request");
         assert_eq!(open.o2t_rpi_us, 20_000, "o2tRpiMs is the O→T request");
         assert_eq!(
             open.connection_path,
-            enip::io_connection_path(Some(151), 150, 100).encode().unwrap().to_vec(),
+            enip::io_connection_path(Some(151), 150, 100)
+                .encode()
+                .unwrap()
+                .to_vec(),
             "config/output/input assemblies anchor the connection path"
         );
         let t2o = NetworkConnectionParams::decode_u16(open.t2o_params);
@@ -1398,9 +1494,19 @@ mod tests {
         assert_eq!(t2o.priority, enip::Priority::Scheduled);
         assert_eq!(t2o.variable, enip::VariableLength::Fixed);
         let o2t = NetworkConnectionParams::decode_u16(open.o2t_params);
-        assert_eq!(o2t.size, 10, "header32 O→T: 2 (sequence) + 4 (run/idle) + 4 (data)");
-        assert_eq!(o2t.conn_type, enip::ConnType::P2P, "O→T is always point-to-point (§4.6)");
-        assert_ne!(open.advertised_port, 0, "the originator advertises its own UDP receive port");
+        assert_eq!(
+            o2t.size, 10,
+            "header32 O→T: 2 (sequence) + 4 (run/idle) + 4 (data)"
+        );
+        assert_eq!(
+            o2t.conn_type,
+            enip::ConnType::P2P,
+            "O→T is always point-to-point (§4.6)"
+        );
+        assert_ne!(
+            open.advertised_port, 0,
+            "the originator advertises its own UDP receive port"
+        );
         assert_eq!(
             open.advertised_port,
             plc.t2o_target().port(),
@@ -1419,7 +1525,10 @@ mod tests {
         );
 
         let (readings, _sequence, run_mode) = next_data(session.as_mut()).await;
-        assert!(run_mode, "a modeless frame carries no run/idle header ⇒ Run");
+        assert!(
+            run_mode,
+            "a modeless frame carries no run/idle header ⇒ Run"
+        );
         assert_eq!(readings.len(), 2);
         assert_eq!(readings[0].signal_id, "a100/0/udint");
         assert_eq!(readings[0].name.as_deref(), Some("din-word"));
@@ -1451,7 +1560,8 @@ mod tests {
         // Fill the seam channel first, one frame per scheduler turn: a lone queued sample gives the
         // translator nothing to collapse, so each wakeup costs a channel slot and the (undrained)
         // 16-deep channel fills. The translator then parks on its send.
-        let produce = |seq: u16| t2o_datagram(cid, u32::from(seq), seq, &input_frame(u32::from(seq), 1.0));
+        let produce =
+            |seq: u16| t2o_datagram(cid, u32::from(seq), seq, &input_frame(u32::from(seq), 1.0));
         for _ in 0..120u16 {
             seq += 1;
             peer.send_to(&produce(seq), target).await.unwrap();
@@ -1496,8 +1606,14 @@ mod tests {
             }
         }
 
-        assert_eq!(ups, 0, "the one Up was already consumed by drive_up and never re-sent");
-        assert_eq!(lost, 1, "the loss queued behind the burst is delivered exactly once");
+        assert_eq!(
+            ups, 0,
+            "the one Up was already consumed by drive_up and never re-sent"
+        );
+        assert_eq!(
+            lost, 1,
+            "the loss queued behind the burst is delivered exactly once"
+        );
         assert!(!sequences.is_empty(), "the burst produced samples");
         assert!(
             sequences.windows(2).all(|w| w[1] > w[0]),
@@ -1561,29 +1677,49 @@ mod tests {
             drive_up(session.as_mut(), &peer, target, cid, &input_frame(7, 55.5)).await;
         let (readings, _sequence, _run) = next_data(session.as_mut()).await;
 
-        let snapshot = session.last_input().expect("the snapshot is live after the first frame");
-        assert_eq!(snapshot.readings, readings, "the snapshot IS the last accepted frame");
+        let snapshot = session
+            .last_input()
+            .expect("the snapshot is live after the first frame");
+        assert_eq!(
+            snapshot.readings, readings,
+            "the snapshot IS the last accepted frame"
+        );
         assert!(snapshot.run_mode);
 
         // A duplicate sequence is dropped by the signed-window rule and counted; the counters reach
         // the seam on the translator's next wakeup, which the advancing frame provides.
         let mut stale = 0;
         for attempt in 1..=40u16 {
-            peer.send_to(&t2o_datagram(cid, u32::from(seq) + 500, seq, &input_frame(7, 55.5)), target)
-                .await
-                .unwrap();
+            peer.send_to(
+                &t2o_datagram(cid, u32::from(seq) + 500, seq, &input_frame(7, 55.5)),
+                target,
+            )
+            .await
+            .unwrap();
             seq += 1;
-            peer.send_to(&t2o_datagram(cid, u32::from(seq), seq, &input_frame(8, 66.5)), target)
-                .await
-                .unwrap();
+            peer.send_to(
+                &t2o_datagram(cid, u32::from(seq), seq, &input_frame(8, 66.5)),
+                target,
+            )
+            .await
+            .unwrap();
             let _ = tokio::time::timeout(Duration::from_millis(50), session.updates().recv()).await;
-            stale = session.io_stats().expect("a class-1 session has counters").stale_frames;
+            stale = session
+                .io_stats()
+                .expect("a class-1 session has counters")
+                .stale_frames;
             if stale >= 1 {
                 break;
             }
-            assert!(attempt < 40, "the duplicate frame was never counted as stale");
+            assert!(
+                attempt < 40,
+                "the duplicate frame was never counted as stale"
+            );
         }
-        assert!(stale >= 1, "the duplicate T→O frame is counted, not silently accepted");
+        assert!(
+            stale >= 1,
+            "the duplicate T→O frame is counted, not silently accepted"
+        );
         session.close().await;
     }
 
@@ -1614,11 +1750,20 @@ mod tests {
             else {
                 continue;
             };
-            let Ok(cpf) = Cpf::decode(&buf[..n]) else { continue };
-            let Some(item) = cpf.find(ItemType::ConnectedData) else { continue };
-            let frame = enip::IoFrame::decode(enip::RealTimeFormat::Header32Bit, &item.data).unwrap();
+            let Ok(cpf) = Cpf::decode(&buf[..n]) else {
+                continue;
+            };
+            let Some(item) = cpf.find(ItemType::ConnectedData) else {
+                continue;
+            };
+            let frame =
+                enip::IoFrame::decode(enip::RealTimeFormat::Header32Bit, &item.data).unwrap();
             seen_o2t = true;
-            assert_eq!(frame.run_mode, Some(true), "the O→T header carries the Run bit");
+            assert_eq!(
+                frame.run_mode,
+                Some(true),
+                "the O→T header carries the Run bit"
+            );
             if frame.data.as_ref() == expected {
                 break;
             }
@@ -1629,7 +1774,10 @@ mod tests {
         let bogus: IoFieldSpec =
             serde_json::from_value(json!({ "name": "nope", "offset": 2, "type": "int" })).unwrap();
         assert!(
-            matches!(session.set_output(&bogus, &json!(1)).await, Err(DeviceError::Permanent(_))),
+            matches!(
+                session.set_output(&bogus, &json!(1)).await,
+                Err(DeviceError::Permanent(_))
+            ),
             "an unknown output field is a permanent error"
         );
         assert!(
@@ -1694,9 +1842,17 @@ mod tests {
                 .filter(|&&s| s == enip::cm::service::FORWARD_CLOSE)
                 .count()
         };
-        assert_eq!(closes(&plc), 1, "the graceful close tears the class-1 connection down");
+        assert_eq!(
+            closes(&plc),
+            1,
+            "the graceful close tears the class-1 connection down"
+        );
         session.close().await; // must be safe to call twice
-        assert_eq!(closes(&plc), 1, "the second close is a no-op, not a second ForwardClose");
+        assert_eq!(
+            closes(&plc),
+            1,
+            "the second close is a no-op, not a second ForwardClose"
+        );
 
         // The other exit: the link is lost, the translator task ends, and its control receiver goes
         // with it — so `close` must take the abort fallback rather than park on the 5 s handoff cap.
@@ -1714,7 +1870,10 @@ mod tests {
                 Err(_elapsed) => panic!("the translator never ended after the link was lost"),
             }
         }
-        assert!(lost, "the seam reported the lost link before ending the stream");
+        assert!(
+            lost,
+            "the seam reported the lost link before ending the stream"
+        );
         tokio::time::timeout(Duration::from_secs(2), session.close())
             .await
             .expect("close falls back to aborting the task, well inside PUSH_CLOSE_HANDOFF_CAP");
@@ -1737,7 +1896,11 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(closes(&plc), 1, "the dropped handle still issued the ForwardClose");
+        assert_eq!(
+            closes(&plc),
+            1,
+            "the dropped handle still issued the ForwardClose"
+        );
     }
 
     /// The inactivity watchdog on a real socket: the target goes silent, the stack declares the
@@ -1762,12 +1925,16 @@ mod tests {
             }
         }
         let error = lost.unwrap();
-        assert!(error.is_transient(), "a lost class-1 link is always retried");
         assert!(
-            error.to_string().contains("class-1 inactivity watchdog timeout"),
+            error.is_transient(),
+            "a lost class-1 link is always retried"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("class-1 inactivity watchdog timeout"),
             "the loss reason is mapped, not flattened: {error}"
         );
         session.close().await;
     }
 }
-

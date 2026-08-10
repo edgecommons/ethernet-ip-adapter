@@ -128,7 +128,10 @@ const MANIFEST: &[Vector] = &[
 
 #[test]
 fn manifest_is_labelled_and_hex_is_valid() {
-    assert!(MANIFEST.len() >= 17, "the manifest must cover every §12.4 vector");
+    assert!(
+        MANIFEST.len() >= 17,
+        "the manifest must cover every §12.4 vector"
+    );
     for v in MANIFEST {
         // Every entry carries a source label and a layer, and its hex parses (empty allowed only for
         // the deliberately-empty class-1 zero-length frame, which is not in the table).
@@ -140,13 +143,18 @@ fn manifest_is_labelled_and_hex_is_valid() {
     }
     // Both provenances are represented (§12.4 sources 1 and 3).
     assert!(MANIFEST.iter().any(|v| v.source == Source::CpppoCaptured));
-    assert!(MANIFEST.iter().any(|v| v.source == Source::HandAssembledPerSpec));
+    assert!(MANIFEST
+        .iter()
+        .any(|v| v.source == Source::HandAssembledPerSpec));
 }
 
 /// Look up a manifest vector's bytes by name (keeps the typed tests and the table in lock-step —
 /// a rename in one place fails the other).
 fn vector(name: &str) -> Vec<u8> {
-    let v = MANIFEST.iter().find(|v| v.name == name).expect("vector in manifest");
+    let v = MANIFEST
+        .iter()
+        .find(|v| v.name == name)
+        .expect("vector in manifest");
     hx(v.hex)
 }
 
@@ -208,7 +216,10 @@ fn golden_read_tag_success_reply() {
 
     // The whole captured frame re-encodes byte-exact.
     let frame = EncapFrame::decode(&vector("read_tag_reply_frame")).unwrap();
-    assert_eq!(frame.encode().unwrap().as_ref(), vector("read_tag_reply_frame").as_slice());
+    assert_eq!(
+        frame.encode().unwrap().as_ref(),
+        vector("read_tag_reply_frame").as_slice()
+    );
 }
 
 #[test]
@@ -223,14 +234,21 @@ fn golden_read_tag_error_reply() {
     assert!(reply.data.is_empty());
 
     let frame = EncapFrame::decode(&vector("read_tag_missing_reply_frame")).unwrap();
-    assert_eq!(frame.encode().unwrap().as_ref(), vector("read_tag_missing_reply_frame").as_slice());
+    assert_eq!(
+        frame.encode().unwrap().as_ref(),
+        vector("read_tag_missing_reply_frame").as_slice()
+    );
 }
 
 #[test]
 fn golden_read_tag_request_matches_cpppo_accepted_bytes() {
     let expected_mr = vector("read_tag_request_mr");
     let tag = TagAddress::parse("PRODUCT_COUNT").unwrap();
-    let req = MessageRequest::new(0x4C, tag.into_path(), bytes::Bytes::from_static(&[0x01, 0x00]));
+    let req = MessageRequest::new(
+        0x4C,
+        tag.into_path(),
+        bytes::Bytes::from_static(&[0x01, 0x00]),
+    );
     assert_eq!(req.encode().unwrap().as_ref(), expected_mr.as_slice());
 }
 
@@ -366,7 +384,14 @@ fn golden_epath_instance_32bit() {
     //
     // 6 bytes = 3 words, so the segment is self-padding and keeps the path even-length.
     let expected = vector("epath_instance_32bit");
-    assert_eq!(EPath::new().instance(0x0001_0000).encode().unwrap().as_ref(), expected.as_slice());
+    assert_eq!(
+        EPath::new()
+            .instance(0x0001_0000)
+            .encode()
+            .unwrap()
+            .as_ref(),
+        expected.as_slice()
+    );
 }
 
 #[test]
@@ -419,7 +444,10 @@ fn golden_class1_o2t_header32_frame() {
         run_mode: Some(true),
         data: bytes::Bytes::from_static(&[0x01, 0x02, 0x03, 0x04]),
     };
-    assert_eq!(frame.encode(RealTimeFormat::Header32Bit).as_ref(), expected.as_slice());
+    assert_eq!(
+        frame.encode(RealTimeFormat::Header32Bit).as_ref(),
+        expected.as_slice()
+    );
     let decoded = IoFrame::decode(RealTimeFormat::Header32Bit, &expected).unwrap();
     assert_eq!(decoded, frame);
 }
@@ -433,24 +461,47 @@ fn golden_class1_t2o_modeless_frame() {
         run_mode: None,
         data: bytes::Bytes::from_static(&[0xAA, 0xBB]),
     };
-    assert_eq!(frame.encode(RealTimeFormat::Modeless).as_ref(), expected.as_slice());
-    assert_eq!(IoFrame::decode(RealTimeFormat::Modeless, &expected).unwrap(), frame);
+    assert_eq!(
+        frame.encode(RealTimeFormat::Modeless).as_ref(),
+        expected.as_slice()
+    );
+    assert_eq!(
+        IoFrame::decode(RealTimeFormat::Modeless, &expected).unwrap(),
+        frame
+    );
 }
 
 #[test]
 fn golden_class1_o2t_heartbeat_frame() {
     // §8.5: a heartbeat direction — sequence only, zero data.
     let expected = vector("class1_o2t_heartbeat");
-    let frame = IoFrame { sequence: Some(1), run_mode: None, data: bytes::Bytes::new() };
-    assert_eq!(frame.encode(RealTimeFormat::Heartbeat).as_ref(), expected.as_slice());
-    assert_eq!(IoFrame::decode(RealTimeFormat::Heartbeat, &expected).unwrap(), frame);
+    let frame = IoFrame {
+        sequence: Some(1),
+        run_mode: None,
+        data: bytes::Bytes::new(),
+    };
+    assert_eq!(
+        frame.encode(RealTimeFormat::Heartbeat).as_ref(),
+        expected.as_slice()
+    );
+    assert_eq!(
+        IoFrame::decode(RealTimeFormat::Heartbeat, &expected).unwrap(),
+        frame
+    );
 }
 
 #[test]
 fn golden_class1_zero_length_frame() {
     // §8.5: the pure zero-length frame (ZeroLength format) — no sequence, no data. Not in the hex
     // manifest because its bytes are empty; asserted here for both-direction completeness.
-    let frame = IoFrame { sequence: None, run_mode: None, data: bytes::Bytes::new() };
+    let frame = IoFrame {
+        sequence: None,
+        run_mode: None,
+        data: bytes::Bytes::new(),
+    };
     assert!(frame.encode(RealTimeFormat::ZeroLength).is_empty());
-    assert_eq!(IoFrame::decode(RealTimeFormat::ZeroLength, &[]).unwrap(), frame);
+    assert_eq!(
+        IoFrame::decode(RealTimeFormat::ZeroLength, &[]).unwrap(),
+        frame
+    );
 }

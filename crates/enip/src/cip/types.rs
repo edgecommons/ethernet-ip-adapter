@@ -252,8 +252,14 @@ impl CipValue {
                 })
             }
         };
-        let count = data.len().checked_div(size).ok_or(WireError::Overflow { context: CONTEXT })?;
-        let rem = data.len().checked_rem(size).ok_or(WireError::Overflow { context: CONTEXT })?;
+        let count = data
+            .len()
+            .checked_div(size)
+            .ok_or(WireError::Overflow { context: CONTEXT })?;
+        let rem = data
+            .len()
+            .checked_rem(size)
+            .ok_or(WireError::Overflow { context: CONTEXT })?;
         if rem != 0 {
             return Err(WireError::Malformed {
                 context: CONTEXT,
@@ -469,6 +475,12 @@ mod tests {
         w.put_slice(&[0xAA, 0xBB]);
         let (ty, v) = CipValue::decode_tagged(w.as_slice()).unwrap();
         assert_eq!(ty, CipType::String);
-        assert!(matches!(v, CipValue::Unsupported { type_code: 0xD0, bytes_len: 2 }));
+        assert!(matches!(
+            v,
+            CipValue::Unsupported {
+                type_code: 0xD0,
+                bytes_len: 2
+            }
+        ));
     }
 }

@@ -50,7 +50,11 @@ impl DecodeError {
     pub fn quality_raw(&self) -> String {
         match self {
             Self::TypeMismatch { expected, got } => {
-                format!("DECODE type mismatch (expected {}, got {:?})", expected.wire(), got)
+                format!(
+                    "DECODE type mismatch (expected {}, got {:?})",
+                    expected.wire(),
+                    got
+                )
             }
         }
     }
@@ -74,7 +78,10 @@ pub fn decode_value(
     match v {
         enip::CipValue::Array(el_ty, elems) => {
             if *el_ty != want {
-                return Err(DecodeError::TypeMismatch { expected: ty, got: *el_ty });
+                return Err(DecodeError::TypeMismatch {
+                    expected: ty,
+                    got: *el_ty,
+                });
             }
             let mut out = Vec::with_capacity(elems.len());
             let mut non_finite = false;
@@ -88,14 +95,23 @@ pub fn decode_value(
             // If any element scaled to a non-finite number the whole array reading is UNCERTAIN
             // (a JSON array cannot hold NaN/inf), value null.
             if non_finite {
-                Ok(Decoded { value: Value::Null, non_finite: true })
+                Ok(Decoded {
+                    value: Value::Null,
+                    non_finite: true,
+                })
             } else {
-                Ok(Decoded { value: Value::Array(out), non_finite: false })
+                Ok(Decoded {
+                    value: Value::Array(out),
+                    non_finite: false,
+                })
             }
         }
         scalar => {
             if scalar.wire_type() != want {
-                return Err(DecodeError::TypeMismatch { expected: ty, got: scalar.wire_type() });
+                return Err(DecodeError::TypeMismatch {
+                    expected: ty,
+                    got: scalar.wire_type(),
+                });
             }
             decode_scalar(scalar, ty, scale, offset)
         }
@@ -112,19 +128,34 @@ fn decode_scalar(
 ) -> Result<Decoded, DecodeError> {
     if ty == EipType::Bool {
         let enip::CipValue::Bool(b) = v else {
-            return Err(DecodeError::TypeMismatch { expected: ty, got: v.wire_type() });
+            return Err(DecodeError::TypeMismatch {
+                expected: ty,
+                got: v.wire_type(),
+            });
         };
-        return Ok(Decoded { value: json!(b), non_finite: false });
+        return Ok(Decoded {
+            value: json!(b),
+            non_finite: false,
+        });
     }
 
-    let raw = numeric_to_f64(v).ok_or(DecodeError::TypeMismatch { expected: ty, got: v.wire_type() })?;
+    let raw = numeric_to_f64(v).ok_or(DecodeError::TypeMismatch {
+        expected: ty,
+        got: v.wire_type(),
+    })?;
 
     if scale.is_some() || offset.is_some() {
         let published = raw * scale.unwrap_or(1.0) + offset.unwrap_or(0.0);
         if !published.is_finite() {
-            return Ok(Decoded { value: Value::Null, non_finite: true });
+            return Ok(Decoded {
+                value: Value::Null,
+                non_finite: true,
+            });
         }
-        return Ok(Decoded { value: float_json(published), non_finite: false });
+        return Ok(Decoded {
+            value: float_json(published),
+            non_finite: false,
+        });
     }
 
     // No transform: preserve native precision (integers stay JSON integers), but a raw non-finite
@@ -132,19 +163,34 @@ fn decode_scalar(
     match v {
         enip::CipValue::Real(f) => {
             if f.is_finite() {
-                Ok(Decoded { value: float_json(f64::from(*f)), non_finite: false })
+                Ok(Decoded {
+                    value: float_json(f64::from(*f)),
+                    non_finite: false,
+                })
             } else {
-                Ok(Decoded { value: Value::Null, non_finite: true })
+                Ok(Decoded {
+                    value: Value::Null,
+                    non_finite: true,
+                })
             }
         }
         enip::CipValue::Lreal(f) => {
             if f.is_finite() {
-                Ok(Decoded { value: float_json(*f), non_finite: false })
+                Ok(Decoded {
+                    value: float_json(*f),
+                    non_finite: false,
+                })
             } else {
-                Ok(Decoded { value: Value::Null, non_finite: true })
+                Ok(Decoded {
+                    value: Value::Null,
+                    non_finite: true,
+                })
             }
         }
-        other => Ok(Decoded { value: native_int_json(other), non_finite: false }),
+        other => Ok(Decoded {
+            value: native_int_json(other),
+            non_finite: false,
+        }),
     }
 }
 
@@ -266,7 +312,10 @@ pub fn encode_write(
         Some(n) => {
             let arr = value.as_array().ok_or(WriteError::ExpectedArray)?;
             if arr.len() != n as usize {
-                return Err(WriteError::WrongArrayLen { expected: n as usize, got: arr.len() });
+                return Err(WriteError::WrongArrayLen {
+                    expected: n as usize,
+                    got: arr.len(),
+                });
             }
             let mut elems = Vec::with_capacity(arr.len());
             for e in arr {
@@ -407,15 +456,27 @@ mod tests {
     }
     #[test]
     fn row_udint() {
-        roundtrip(EipType::Udint, json!(4_000_000_000u64), CipValue::Udint(4_000_000_000));
+        roundtrip(
+            EipType::Udint,
+            json!(4_000_000_000u64),
+            CipValue::Udint(4_000_000_000),
+        );
     }
     #[test]
     fn row_lint() {
-        roundtrip(EipType::Lint, json!(-1_000_000_000_000i64), CipValue::Lint(-1_000_000_000_000));
+        roundtrip(
+            EipType::Lint,
+            json!(-1_000_000_000_000i64),
+            CipValue::Lint(-1_000_000_000_000),
+        );
     }
     #[test]
     fn row_ulint() {
-        roundtrip(EipType::Ulint, json!(9_000_000_000_000u64), CipValue::Ulint(9_000_000_000_000));
+        roundtrip(
+            EipType::Ulint,
+            json!(9_000_000_000_000u64),
+            CipValue::Ulint(9_000_000_000_000),
+        );
     }
     #[test]
     fn row_real() {
@@ -436,7 +497,12 @@ mod tests {
             cip,
             CipValue::Array(
                 enip::CipType::Dint,
-                vec![CipValue::Dint(1), CipValue::Dint(2), CipValue::Dint(3), CipValue::Dint(4)]
+                vec![
+                    CipValue::Dint(1),
+                    CipValue::Dint(2),
+                    CipValue::Dint(3),
+                    CipValue::Dint(4)
+                ]
             )
         );
         let back = decode_value(&cip, EipType::Dint, None, None).unwrap();
@@ -446,7 +512,13 @@ mod tests {
     #[test]
     fn array_write_wrong_length_is_rejected() {
         let e = encode_write(&json!([1, 2, 3]), EipType::Dint, None, None, Some(4)).unwrap_err();
-        assert_eq!(e, WriteError::WrongArrayLen { expected: 4, got: 3 });
+        assert_eq!(
+            e,
+            WriteError::WrongArrayLen {
+                expected: 4,
+                got: 3
+            }
+        );
     }
 
     // ---- scale/offset both directions ----
@@ -470,14 +542,26 @@ mod tests {
     fn write_out_of_range_is_rejected_not_clamped() {
         // sint range is [-128, 127]; 500 must be rejected, not clamped to 127.
         let e = encode_write(&json!(500), EipType::Sint, None, None, None).unwrap_err();
-        assert!(matches!(e, WriteError::OutOfRange { ty: EipType::Sint, .. }));
+        assert!(matches!(
+            e,
+            WriteError::OutOfRange {
+                ty: EipType::Sint,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn write_scaled_out_of_range_is_rejected() {
         // device = 1000 / 0.001 = 1_000_000, out of range for int (i16 max 32767).
         let e = encode_write(&json!(1000.0), EipType::Int, Some(0.001), None, None).unwrap_err();
-        assert!(matches!(e, WriteError::OutOfRange { ty: EipType::Int, .. }));
+        assert!(matches!(
+            e,
+            WriteError::OutOfRange {
+                ty: EipType::Int,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -521,7 +605,10 @@ mod tests {
 
     #[test]
     fn read_array_with_a_non_finite_element_is_uncertain() {
-        let arr = CipValue::Array(enip::CipType::Real, vec![CipValue::Real(1.0), CipValue::Real(f32::INFINITY)]);
+        let arr = CipValue::Array(
+            enip::CipType::Real,
+            vec![CipValue::Real(1.0), CipValue::Real(f32::INFINITY)],
+        );
         let d = decode_value(&arr, EipType::Real, None, None).unwrap();
         assert!(d.non_finite);
         assert_eq!(d.value, Value::Null);
@@ -532,7 +619,13 @@ mod tests {
     #[test]
     fn read_type_mismatch_is_reported() {
         let e = decode_value(&CipValue::Dint(1), EipType::Real, None, None).unwrap_err();
-        assert_eq!(e, DecodeError::TypeMismatch { expected: EipType::Real, got: enip::CipType::Dint });
+        assert_eq!(
+            e,
+            DecodeError::TypeMismatch {
+                expected: EipType::Real,
+                got: enip::CipType::Dint
+            }
+        );
         assert!(e.quality_raw().starts_with("DECODE type mismatch"));
     }
 
@@ -540,6 +633,12 @@ mod tests {
     fn read_array_element_type_mismatch_is_reported() {
         let arr = CipValue::Array(enip::CipType::Int, vec![CipValue::Int(1)]);
         let e = decode_value(&arr, EipType::Dint, None, None).unwrap_err();
-        assert!(matches!(e, DecodeError::TypeMismatch { expected: EipType::Dint, .. }));
+        assert!(matches!(
+            e,
+            DecodeError::TypeMismatch {
+                expected: EipType::Dint,
+                ..
+            }
+        ));
     }
 }

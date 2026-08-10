@@ -183,7 +183,8 @@ impl EstConfig {
             }
         }
         // The write-back destination must be resolvable (explicit, or derivable from security.client).
-        self.resolve_destination(sec).map_err(|e| format!("device `{device_id}`: {e}"))?;
+        self.resolve_destination(sec)
+            .map_err(|e| format!("device `{device_id}`: {e}"))?;
         Ok(())
     }
 
@@ -193,14 +194,23 @@ impl EstConfig {
     pub fn renew_before_days(&self, sec: &SecurityConfig) -> i64 {
         self.renew_before_days
             .map(i64::from)
-            .or_else(|| sec.client.as_ref().and_then(|c| c.renew_before_days).map(i64::from))
+            .or_else(|| {
+                sec.client
+                    .as_ref()
+                    .and_then(|c| c.renew_before_days)
+                    .map(i64::from)
+            })
             .unwrap_or(DEFAULT_RENEW_BEFORE_DAYS)
     }
 
     /// The retry backoff between failed attempts.
     #[must_use]
     pub fn retry_backoff(&self) -> Duration {
-        Duration::from_secs(self.retry_backoff_mins.unwrap_or(DEFAULT_RETRY_BACKOFF_MINS) * 60)
+        Duration::from_secs(
+            self.retry_backoff_mins
+                .unwrap_or(DEFAULT_RETRY_BACKOFF_MINS)
+                * 60,
+        )
     }
 
     /// The CSR subject CommonName.
@@ -318,7 +328,11 @@ impl EstEndpoint {
         if let Some(label) = label.filter(|l| !l.is_empty()) {
             base_path = format!("{base_path}/{}", label.trim_matches('/'));
         }
-        Ok(Self { host, port, base_path })
+        Ok(Self {
+            host,
+            port,
+            base_path,
+        })
     }
 
     /// The full request path for an EST operation (`cacerts` / `simpleenroll` / `simplereenroll`).
@@ -379,8 +393,7 @@ pub struct CsrBundle {
 pub fn generate_key_and_csr(subject_cn: &str) -> Result<CsrBundle, String> {
     use rcgen::{CertificateParams, DnType, KeyPair};
 
-    let mut params =
-        CertificateParams::new(vec![]).map_err(|e| format!("CSR params: {e}"))?;
+    let mut params = CertificateParams::new(vec![]).map_err(|e| format!("CSR params: {e}"))?;
     params
         .distinguished_name
         .push(DnType::CommonName, subject_cn);
@@ -511,7 +524,12 @@ pub fn parse_response(bytes: &[u8]) -> Result<HttpResponse, String> {
             }
         }
     }
-    Ok(HttpResponse { status, base64_body, retry_after_secs, body })
+    Ok(HttpResponse {
+        status,
+        base64_body,
+        retry_after_secs,
+        body,
+    })
 }
 
 /// Find the first occurrence of `needle` in `haystack`.
@@ -519,9 +537,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -545,8 +561,8 @@ pub fn parse_pkcs7_certs(der: &[u8]) -> Result<Vec<CertificateDer<'static>>, Str
     // feature is needed.
     const ID_SIGNED_DATA: der::asn1::ObjectIdentifier =
         der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
-    let ci = ContentInfo::from_der(der)
-        .map_err(|e| format!("parsing the PKCS#7 ContentInfo: {e}"))?;
+    let ci =
+        ContentInfo::from_der(der).map_err(|e| format!("parsing the PKCS#7 ContentInfo: {e}"))?;
     if ci.content_type != ID_SIGNED_DATA {
         return Err(format!(
             "EST reply is not PKCS#7 SignedData (content type {})",
@@ -625,7 +641,10 @@ pub fn resolve_est_trust(
     } else if let Some(ca) = &sec.ca {
         source_ca_pems(ca, creds)
     } else {
-        Err("security.est needs trust anchors for the EST server (est.trust or security.ca)".to_string())
+        Err(
+            "security.est needs trust anchors for the EST server (est.trust or security.ca)"
+                .to_string(),
+        )
     }
 }
 
@@ -642,10 +661,12 @@ pub fn resolve_auth_material(
     creds: Option<&Arc<dyn CredentialService>>,
 ) -> Result<EstAuthMaterial, String> {
     // Current client identity from the connection (used for re-enroll and as the optional cert under Basic).
-    let current = source_client_material(sec, creds).ok().and_then(|(c, k, _)| match (c, k) {
-        (Some(c), Some(k)) => Some((c, k)),
-        _ => None,
-    });
+    let current = source_client_material(sec, creds)
+        .ok()
+        .and_then(|(c, k, _)| match (c, k) {
+            (Some(c), Some(k)) => Some((c, k)),
+            _ => None,
+        });
 
     if let Some(auth) = &est.auth {
         if let Some(basic) = &auth.basic {
@@ -665,7 +686,10 @@ pub fn resolve_auth_material(
         }
         if let Some(bootstrap) = &auth.bootstrap {
             let (cert, key) = source_identity(bootstrap, creds)?;
-            return Ok(EstAuthMaterial::ClientCert { cert_pem: cert, key_pem: key });
+            return Ok(EstAuthMaterial::ClientCert {
+                cert_pem: cert,
+                key_pem: key,
+            });
         }
     }
     // Default: reuse the connection's current client identity (mutual-TLS re-enroll).
@@ -705,11 +729,14 @@ pub fn write_enrolled(
     creds: Option<&Arc<dyn CredentialService>>,
 ) -> Result<String, String> {
     use edgecommons::credentials::PutOptions;
-    let creds = creds.ok_or_else(|| "security.est enrolled a cert but no vault is configured to store it".to_string())?;
+    let creds = creds.ok_or_else(|| {
+        "security.est enrolled a cert but no vault is configured to store it".to_string()
+    })?;
     match dest {
         ResolvedDestination::Bundle(name) => {
             let bundle = serde_json::json!({ "certPem": cert_pem, "keyPem": key_pem });
-            let bytes = serde_json::to_vec(&bundle).map_err(|e| format!("encoding the TLS bundle: {e}"))?;
+            let bytes =
+                serde_json::to_vec(&bundle).map_err(|e| format!("encoding the TLS bundle: {e}"))?;
             creds
                 .put(name, &bytes, PutOptions::default())
                 .map_err(|e| format!("vault put(`{name}`) for the enrolled bundle: {e}"))?;
@@ -767,11 +794,14 @@ impl EstClient {
             }
         }
         if roots.is_empty() {
-            return Err("no EST server trust anchors were sourced (est.trust / security.ca)".to_string());
+            return Err(
+                "no EST server trust anchors were sourced (est.trust / security.ca)".to_string(),
+            );
         }
-        let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-            .build()
-            .map_err(|e| format!("building the EST server verifier: {e}"))?;
+        let verifier =
+            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()
+                .map_err(|e| format!("building the EST server verifier: {e}"))?;
 
         let builder = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -784,9 +814,11 @@ impl EstClient {
             EstAuthMaterial::ClientCert { cert_pem, key_pem } => {
                 (Some((cert_pem.clone(), key_pem.clone())), None)
             }
-            EstAuthMaterial::Basic { username, password, client } => {
-                (client.clone(), Some((username.clone(), password.clone())))
-            }
+            EstAuthMaterial::Basic {
+                username,
+                password,
+                client,
+            } => (client.clone(), Some((username.clone(), password.clone()))),
         };
         let config = match client_identity {
             Some((cert_pem, key_pem)) => {
@@ -820,7 +852,10 @@ impl EstClient {
     /// A message for a connect/handshake/IO failure or a malformed response.
     pub async fn request(&self, op: EstOp, csr_der: Option<&[u8]>) -> Result<HttpResponse, String> {
         let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let basic = self.basic_auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        let basic = self
+            .basic_auth
+            .as_ref()
+            .map(|(u, p)| (u.as_str(), p.as_str()));
         let req = encode_request(&self.endpoint, op, csr_der, basic);
 
         let fut = async {
@@ -875,8 +910,15 @@ impl EstClient {
         reenroll: bool,
         csr_der: &[u8],
     ) -> Result<Vec<CertificateDer<'static>>, EstError> {
-        let op = if reenroll { EstOp::SimpleReenroll } else { EstOp::SimpleEnroll };
-        let resp = self.request(op, Some(csr_der)).await.map_err(EstError::Io)?;
+        let op = if reenroll {
+            EstOp::SimpleReenroll
+        } else {
+            EstOp::SimpleEnroll
+        };
+        let resp = self
+            .request(op, Some(csr_der))
+            .await
+            .map_err(EstError::Io)?;
         interpret_enroll_response(&resp)
     }
 
@@ -886,7 +928,10 @@ impl EstClient {
     ///
     /// [`EstError`] classifying the failure.
     pub async fn cacerts(&self) -> Result<Vec<CertificateDer<'static>>, EstError> {
-        let resp = self.request(EstOp::CaCerts, None).await.map_err(EstError::Io)?;
+        let resp = self
+            .request(EstOp::CaCerts, None)
+            .await
+            .map_err(EstError::Io)?;
         if resp.status != 200 {
             return Err(EstError::Status(resp.status));
         }
@@ -900,7 +945,9 @@ impl EstClient {
 /// # Errors
 ///
 /// [`EstError`] for a non-200 status or a parse failure.
-pub fn interpret_enroll_response(resp: &HttpResponse) -> Result<Vec<CertificateDer<'static>>, EstError> {
+pub fn interpret_enroll_response(
+    resp: &HttpResponse,
+) -> Result<Vec<CertificateDer<'static>>, EstError> {
     match resp.status {
         200 => {
             let der = decode_body(resp)?;
@@ -1083,7 +1130,9 @@ pub async fn enroll_once(
     if est.fetch_ca_certs {
         match client.cacerts().await {
             Ok(bag) => tracing::info!(count = bag.len(), "EST /cacerts fetched (trust bootstrap)"),
-            Err(e) => tracing::warn!(error = %e, transient = e.is_transient(), "EST /cacerts failed (continuing with configured trust)"),
+            Err(e) => {
+                tracing::warn!(error = %e, transient = e.is_transient(), "EST /cacerts failed (continuing with configured trust)")
+            }
         }
     }
 
@@ -1091,7 +1140,11 @@ pub async fn enroll_once(
         .request_certificate(reenroll, &csr.csr_der)
         .await
         .map_err(|e| {
-            let hint = if e.is_transient() { " (transient — will retry)" } else { "" };
+            let hint = if e.is_transient() {
+                " (transient — will retry)"
+            } else {
+                ""
+            };
             format!("{e}{hint}")
         })?;
 
@@ -1117,7 +1170,8 @@ pub async fn enroll_once(
 #[must_use]
 pub fn next_renew_rfc3339(not_after: Option<&str>, renew_before_days: i64) -> Option<String> {
     let na = not_after?;
-    let parsed = time::OffsetDateTime::parse(na, &time::format_description::well_known::Rfc3339).ok()?;
+    let parsed =
+        time::OffsetDateTime::parse(na, &time::format_description::well_known::Rfc3339).ok()?;
     let renew_at = parsed - time::Duration::days(renew_before_days);
     renew_at
         .format(&time::format_description::well_known::Rfc3339)

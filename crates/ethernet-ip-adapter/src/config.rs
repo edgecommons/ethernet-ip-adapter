@@ -719,9 +719,11 @@ impl IoConfig {
     /// [`String`] describing the offending field when the layout does not validate.
     pub fn output_layout(&self) -> std::result::Result<Option<enip::AssemblyLayout>, String> {
         match &self.output {
-            Some(out) if !out.signals.is_empty() => {
-                Ok(Some(build_layout(&out.signals, out.size_bytes, "io.output")?))
-            }
+            Some(out) if !out.signals.is_empty() => Ok(Some(build_layout(
+                &out.signals,
+                out.size_bytes,
+                "io.output",
+            )?)),
             _ => Ok(None),
         }
     }
@@ -761,10 +763,14 @@ impl IoConfig {
             ));
         }
         if self.input.size_bytes == 0 {
-            return Err(format!("device `{device_id}`: io.input.sizeBytes must be ≥ 1"));
+            return Err(format!(
+                "device `{device_id}`: io.input.sizeBytes must be ≥ 1"
+            ));
         }
         if self.input.signals.is_empty() {
-            return Err(format!("device `{device_id}`: io.input.signals is empty (min 1)"));
+            return Err(format!(
+                "device `{device_id}`: io.input.signals is empty (min 1)"
+            ));
         }
 
         // A size-0 (heartbeat) output must carry no data fields.
@@ -784,7 +790,9 @@ impl IoConfig {
         for (fields, inst, side) in [
             (self.input.signals.as_slice(), input_inst, IoSide::Input),
             (
-                self.output.as_ref().map_or(&[][..], |o| o.signals.as_slice()),
+                self.output
+                    .as_ref()
+                    .map_or(&[][..], |o| o.signals.as_slice()),
                 output_inst,
                 IoSide::Output,
             ),
@@ -800,9 +808,7 @@ impl IoConfig {
                 if !ids.insert(id.clone()) {
                     return Err(format!("device `{device_id}`: duplicate signal id `{id}`"));
                 }
-                if !field.is_numeric()
-                    && (field.scale.is_some() || field.value_offset.is_some())
-                {
+                if !field.is_numeric() && (field.scale.is_some() || field.value_offset.is_some()) {
                     return Err(format!(
                         "device `{device_id}`: field `{}` is bool - scale/valueOffset do not apply",
                         field.name
@@ -1150,7 +1156,10 @@ mod tests {
         let d = device(minimal_device()).unwrap();
         assert_eq!(d.id, "plc-1");
         assert_eq!(d.adapter, "ethernet-ip");
-        assert!(!d.connection.connected, "unconnected is the default (D-EIP-8)");
+        assert!(
+            !d.connection.connected,
+            "unconnected is the default (D-EIP-8)"
+        );
         assert_eq!(d.connection.slot, None);
         // The default poll-group id is assigned.
         assert_eq!(d.poll_groups[0].id.as_deref(), Some("group-1"));
@@ -1187,7 +1196,8 @@ mod tests {
         assert_eq!(d.effective_poll_ms(&d.poll_groups[0], &g), 5_000);
 
         // global.defaults sets it.
-        let g = GlobalConfig::from_value(&json!({ "defaults": { "pollIntervalMs": 3000 } })).unwrap();
+        let g =
+            GlobalConfig::from_value(&json!({ "defaults": { "pollIntervalMs": 3000 } })).unwrap();
         assert_eq!(d.effective_poll_ms(&d.poll_groups[0], &g), 3_000);
 
         // device.defaults overrides global.
@@ -1303,7 +1313,10 @@ mod tests {
                 { "name": "recipe", "tagPath": "RECIPE", "type": "string" } ] } ]
         }));
         let msg = bad.unwrap_err();
-        assert!(msg.contains("string"), "the error names the bad type: {msg}");
+        assert!(
+            msg.contains("string"),
+            "the error names the bad type: {msg}"
+        );
     }
 
     #[test]
@@ -1518,9 +1531,12 @@ mod tests {
         assert_eq!(fields[1].signal_id(in_inst), "a100/0/bool.0"); // bit
         assert_eq!(fields[2].signal_id(in_inst), "a100/0/bool.1");
         assert_eq!(fields[3].signal_id(in_inst), "a100/4/udint"); // array field
-        // output field id uses the output instance.
+                                                                  // output field id uses the output instance.
         let out = io.output.as_ref().unwrap();
-        assert_eq!(out.signals[0].signal_id(io.assemblies.output), "a150/0/udint");
+        assert_eq!(
+            out.signals[0].signal_id(io.assemblies.output),
+            "a150/0/udint"
+        );
     }
 
     #[test]
@@ -1614,7 +1630,10 @@ mod tests {
             "writes": { "allow": ["a150/0/udint", "a150/99/real"] }
         }))
         .unwrap();
-        assert_eq!(d.unmatched_allow_entries(), vec!["a150/99/real".to_string()]);
+        assert_eq!(
+            d.unmatched_allow_entries(),
+            vec!["a150/99/real".to_string()]
+        );
         assert!(d.writes.permits("a150/0/udint"));
     }
 
@@ -1672,7 +1691,10 @@ mod tests {
             { "name": "overflow", "offset": 30, "type": "udint" }
         ]);
         let msg = a_push_device(io).unwrap_err();
-        assert!(msg.contains("out of bounds"), "names the bounds failure: {msg}");
+        assert!(
+            msg.contains("out of bounds"),
+            "names the bounds failure: {msg}"
+        );
         assert!(msg.contains("overflow"), "names the offending field: {msg}");
     }
 
@@ -1691,7 +1713,9 @@ mod tests {
         io["input"]["signals"] = json!([
             { "name": "bad-bit", "offset": 0, "type": "udint", "bit": 0 }
         ]);
-        assert!(a_push_device(io).unwrap_err().contains("invalid bit selector"));
+        assert!(a_push_device(io)
+            .unwrap_err()
+            .contains("invalid bit selector"));
     }
 
     #[test]
@@ -1769,7 +1793,9 @@ mod tests {
         io["output"]["signals"] = json!([
             { "name": "din-word", "offset": 0, "type": "udint" } // clashes with an input field
         ]);
-        assert!(a_push_device(io).unwrap_err().contains("duplicate signal name"));
+        assert!(a_push_device(io)
+            .unwrap_err()
+            .contains("duplicate signal name"));
     }
 
     #[test]
@@ -1805,7 +1831,11 @@ mod tests {
         let dev = jsonschema::validator_for(&device_schema).expect("device schema compiles");
         for inst in cfg["component"]["instances"].as_array().unwrap() {
             let errs: Vec<String> = dev.iter_errors(inst).map(|e| e.to_string()).collect();
-            assert!(errs.is_empty(), "instance {} fails schema: {errs:?}", inst["id"]);
+            assert!(
+                errs.is_empty(),
+                "instance {} fails schema: {errs:?}",
+                inst["id"]
+            );
             // And the parser accepts it too (schema + parser agree).
             DeviceConfig::from_value(inst).expect("instance parses");
         }
@@ -1836,17 +1866,24 @@ mod tests {
         // adapter's vocabulary.
         let schema: Value =
             serde_json::from_str(include_str!("../config.schema.json")).expect("schema is JSON");
-        assert_eq!(schema["$defs"]["instance"], json!({ "$ref": "#/$defs/device" }));
+        assert_eq!(
+            schema["$defs"]["instance"],
+            json!({ "$ref": "#/$defs/device" })
+        );
         let inst_schema = json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "$defs": schema["$defs"].clone(),
             "$ref": "#/$defs/instance"
         });
         let v = jsonschema::validator_for(&inst_schema).expect("instance alias compiles");
-        let cfg: Value =
-            serde_json::from_str(include_str!("../test-configs/config.json")).expect("config is JSON");
+        let cfg: Value = serde_json::from_str(include_str!("../test-configs/config.json"))
+            .expect("config is JSON");
         for inst in cfg["component"]["instances"].as_array().unwrap() {
-            assert!(v.is_valid(inst), "instance {} validates via the alias", inst["id"]);
+            assert!(
+                v.is_valid(inst),
+                "instance {} validates via the alias",
+                inst["id"]
+            );
         }
     }
 
@@ -1872,6 +1909,9 @@ mod tests {
             "pollGroups": [ { "signals": [
                 { "name": "a", "tagPath": "A", "type": "real" } ] } ]
         });
-        assert!(!dev.is_valid(&poll_with_io), "schema forbids io on a poll device");
+        assert!(
+            !dev.is_valid(&poll_with_io),
+            "schema forbids io on a poll device"
+        );
     }
 }

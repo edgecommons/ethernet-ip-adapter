@@ -36,19 +36,37 @@ impl FieldSpec {
     /// A scalar field of `ty` at `offset` mapped to `key`.
     #[must_use]
     pub fn scalar(key: usize, offset: usize, ty: CipType) -> Self {
-        Self { key, offset, ty, bit: None, count: 1 }
+        Self {
+            key,
+            offset,
+            ty,
+            bit: None,
+            count: 1,
+        }
     }
 
     /// An `count`-element array field of `ty` at `offset` mapped to `key`.
     #[must_use]
     pub fn array(key: usize, offset: usize, ty: CipType, count: usize) -> Self {
-        Self { key, offset, ty, bit: None, count }
+        Self {
+            key,
+            offset,
+            ty,
+            bit: None,
+            count,
+        }
     }
 
     /// A packed-boolean field: `bit` (0–7) within the byte at `offset`, mapped to `key`.
     #[must_use]
     pub fn boolean(key: usize, offset: usize, bit: u8) -> Self {
-        Self { key, offset, ty: CipType::Bool, bit: Some(bit), count: 1 }
+        Self {
+            key,
+            offset,
+            ty: CipType::Bool,
+            bit: Some(bit),
+            count: 1,
+        }
     }
 }
 
@@ -104,13 +122,22 @@ impl core::fmt::Display for AssemblyError {
         match self {
             Self::FieldOutOfBounds { key } => write!(f, "assembly field {key} out of bounds"),
             Self::ZeroCount { key } => write!(f, "assembly field {key} has zero count"),
-            Self::InvalidBitField { key } => write!(f, "assembly field {key} has an invalid bit selector"),
-            Self::NonElementaryType { key } => write!(f, "assembly field {key} is not an elementary type"),
+            Self::InvalidBitField { key } => {
+                write!(f, "assembly field {key} has an invalid bit selector")
+            }
+            Self::NonElementaryType { key } => {
+                write!(f, "assembly field {key} is not an elementary type")
+            }
             Self::DataSizeMismatch { expected, actual } => {
-                write!(f, "assembly data size mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "assembly data size mismatch: expected {expected}, got {actual}"
+                )
             }
             Self::UnknownField { key } => write!(f, "unknown assembly field {key}"),
-            Self::ValueTypeMismatch { key } => write!(f, "value type mismatch for assembly field {key}"),
+            Self::ValueTypeMismatch { key } => {
+                write!(f, "value type mismatch for assembly field {key}")
+            }
         }
     }
 }
@@ -200,10 +227,13 @@ impl AssemblyLayout {
         // A cursor into the validated buffer; `skip`/reads are bounds-checked, but construction has
         // already proven the field fits, so these cannot fail on a correctly-sized buffer.
         let mut r = WireReader::with_context(data, CONTEXT);
-        r.skip(field.offset).map_err(|_| AssemblyError::FieldOutOfBounds { key: field.key })?;
+        r.skip(field.offset)
+            .map_err(|_| AssemblyError::FieldOutOfBounds { key: field.key })?;
 
         if let Some(bit) = field.bit {
-            let byte = r.u8().map_err(|_| AssemblyError::FieldOutOfBounds { key: field.key })?;
+            let byte = r
+                .u8()
+                .map_err(|_| AssemblyError::FieldOutOfBounds { key: field.key })?;
             let mask = 1u8.checked_shl(u32::from(bit)).unwrap_or(0);
             return Ok(CipValue::Bool(byte & mask != 0));
         }
@@ -219,7 +249,8 @@ impl AssemblyLayout {
         let bytes = r
             .take(span)
             .map_err(|_| AssemblyError::FieldOutOfBounds { key: field.key })?;
-        CipValue::decode(field.ty, bytes).map_err(|_| AssemblyError::FieldOutOfBounds { key: field.key })
+        CipValue::decode(field.ty, bytes)
+            .map_err(|_| AssemblyError::FieldOutOfBounds { key: field.key })
     }
 
     /// Insert values into `buf`, the write-side inverse used by the output assembly (§9). `buf` must
@@ -261,7 +292,9 @@ impl AssemblyLayout {
             let CipValue::Bool(set) = value else {
                 return Err(AssemblyError::ValueTypeMismatch { key });
             };
-            let slot = buf.get_mut(field.offset).ok_or(AssemblyError::FieldOutOfBounds { key })?;
+            let slot = buf
+                .get_mut(field.offset)
+                .ok_or(AssemblyError::FieldOutOfBounds { key })?;
             let mask = 1u8.checked_shl(u32::from(bit)).unwrap_or(0);
             if *set {
                 *slot |= mask;
@@ -281,7 +314,9 @@ impl AssemblyLayout {
 
         // Encode the value bytes into a scratch buffer, then copy into the target span (checked).
         let mut w = WireWriter::new();
-        value.encode_value(&mut w).map_err(|_| AssemblyError::ValueTypeMismatch { key })?;
+        value
+            .encode_value(&mut w)
+            .map_err(|_| AssemblyError::ValueTypeMismatch { key })?;
         let bytes = w.into_bytes();
         let end = field
             .offset
@@ -297,7 +332,11 @@ impl AssemblyLayout {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     fn sample_layout() -> AssemblyLayout {
@@ -307,9 +346,9 @@ mod tests {
             vec![
                 FieldSpec::scalar(0, 0, CipType::Dint),
                 FieldSpec::scalar(1, 4, CipType::Real),
-                FieldSpec::scalar(2, 8, CipType::Byte),   // whole status byte
-                FieldSpec::boolean(3, 8, 0),               // running bit — overlaps the status byte
-                FieldSpec::boolean(4, 8, 3),               // fault bit — overlaps too
+                FieldSpec::scalar(2, 8, CipType::Byte), // whole status byte
+                FieldSpec::boolean(3, 8, 0),            // running bit — overlaps the status byte
+                FieldSpec::boolean(4, 8, 3),            // fault bit — overlaps too
                 FieldSpec::scalar(5, 10, CipType::Int),
             ],
             12,
@@ -329,8 +368,8 @@ mod tests {
         assert_eq!(fields[0], (0, CipValue::Dint(42)));
         assert_eq!(fields[1], (1, CipValue::Real(55.5)));
         assert_eq!(fields[2], (2, CipValue::Byte(0b0000_1001)));
-        assert_eq!(fields[3], (3, CipValue::Bool(true)));  // running
-        assert_eq!(fields[4], (4, CipValue::Bool(true)));  // fault
+        assert_eq!(fields[3], (3, CipValue::Bool(true))); // running
+        assert_eq!(fields[4], (4, CipValue::Bool(true))); // fault
         assert_eq!(fields[5], (5, CipValue::Int(-7)));
     }
 
@@ -341,7 +380,12 @@ mod tests {
         let mut buf = vec![0u8; 8];
         let value = CipValue::Array(
             CipType::Int,
-            vec![CipValue::Int(1), CipValue::Int(2), CipValue::Int(3), CipValue::Int(4)],
+            vec![
+                CipValue::Int(1),
+                CipValue::Int(2),
+                CipValue::Int(3),
+                CipValue::Int(4),
+            ],
         );
         layout.encode_into(&[(0, value.clone())], &mut buf).unwrap();
         let decoded = layout.decode(&buf).unwrap();
@@ -352,7 +396,7 @@ mod tests {
     fn encode_into_preserves_unset_bytes_and_sets_bits() {
         let layout = sample_layout();
         let mut buf = vec![0xFFu8; 12]; // start all-ones so "preserve" is observable
-        // Set only the DINT and clear the fault bit, set running bit.
+                                        // Set only the DINT and clear the fault bit, set running bit.
         layout
             .encode_into(
                 &[
@@ -364,27 +408,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(&buf[0..4], &0x0102_0304i32.to_le_bytes()); // DINT written
-        assert_eq!(&buf[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]);      // REAL bytes preserved
-        assert_eq!(buf[8] & 0b0000_0001, 0b0000_0001);          // running set
-        assert_eq!(buf[8] & 0b0000_1000, 0);                    // fault cleared
-        assert_eq!(&buf[10..12], &[0xFF, 0xFF]);                // spare INT preserved
+        assert_eq!(&buf[4..8], &[0xFF, 0xFF, 0xFF, 0xFF]); // REAL bytes preserved
+        assert_eq!(buf[8] & 0b0000_0001, 0b0000_0001); // running set
+        assert_eq!(buf[8] & 0b0000_1000, 0); // fault cleared
+        assert_eq!(&buf[10..12], &[0xFF, 0xFF]); // spare INT preserved
     }
 
     #[test]
     fn construction_rejects_out_of_bounds_field() {
         // A DINT at offset 10 needs bytes 10..14 but data_size is 12.
-        let err = AssemblyLayout::new(vec![FieldSpec::scalar(9, 10, CipType::Dint)], 12).unwrap_err();
+        let err =
+            AssemblyLayout::new(vec![FieldSpec::scalar(9, 10, CipType::Dint)], 12).unwrap_err();
         assert_eq!(err, AssemblyError::FieldOutOfBounds { key: 9 });
     }
 
     #[test]
     fn construction_rejects_array_overflow_via_checked_mul() {
         // count × element_size overflows usize — must be a typed error, never a wrap/panic.
-        let err = AssemblyLayout::new(
-            vec![FieldSpec::array(7, 0, CipType::Lint, usize::MAX)],
-            16,
-        )
-        .unwrap_err();
+        let err = AssemblyLayout::new(vec![FieldSpec::array(7, 0, CipType::Lint, usize::MAX)], 16)
+            .unwrap_err();
         assert_eq!(err, AssemblyError::FieldOutOfBounds { key: 7 });
     }
 
@@ -392,14 +434,32 @@ mod tests {
     fn construction_rejects_bad_bit_and_zero_count_and_bad_type() {
         // bit on a non-BOOL type
         assert_eq!(
-            AssemblyLayout::new(vec![FieldSpec { key: 1, offset: 0, ty: CipType::Int, bit: Some(0), count: 1 }], 4)
-                .unwrap_err(),
+            AssemblyLayout::new(
+                vec![FieldSpec {
+                    key: 1,
+                    offset: 0,
+                    ty: CipType::Int,
+                    bit: Some(0),
+                    count: 1
+                }],
+                4
+            )
+            .unwrap_err(),
             AssemblyError::InvalidBitField { key: 1 }
         );
         // bit index > 7
         assert_eq!(
-            AssemblyLayout::new(vec![FieldSpec { key: 2, offset: 0, ty: CipType::Bool, bit: Some(8), count: 1 }], 4)
-                .unwrap_err(),
+            AssemblyLayout::new(
+                vec![FieldSpec {
+                    key: 2,
+                    offset: 0,
+                    ty: CipType::Bool,
+                    bit: Some(8),
+                    count: 1
+                }],
+                4
+            )
+            .unwrap_err(),
             AssemblyError::InvalidBitField { key: 2 }
         );
         // zero count
@@ -419,11 +479,17 @@ mod tests {
         let layout = sample_layout();
         assert_eq!(
             layout.decode(&[0u8; 11]).unwrap_err(),
-            AssemblyError::DataSizeMismatch { expected: 12, actual: 11 }
+            AssemblyError::DataSizeMismatch {
+                expected: 12,
+                actual: 11
+            }
         );
         assert_eq!(
             layout.decode(&[0u8; 13]).unwrap_err(),
-            AssemblyError::DataSizeMismatch { expected: 12, actual: 13 }
+            AssemblyError::DataSizeMismatch {
+                expected: 12,
+                actual: 13
+            }
         );
     }
 
@@ -448,19 +514,26 @@ mod tests {
         let layout = sample_layout();
         let mut buf = vec![0u8; 12];
         assert_eq!(
-            layout.encode_into(&[(99, CipValue::Dint(1))], &mut buf).unwrap_err(),
+            layout
+                .encode_into(&[(99, CipValue::Dint(1))], &mut buf)
+                .unwrap_err(),
             AssemblyError::UnknownField { key: 99 }
         );
         // field 0 is a DINT; a REAL value is a type mismatch.
         assert_eq!(
-            layout.encode_into(&[(0, CipValue::Real(1.0))], &mut buf).unwrap_err(),
+            layout
+                .encode_into(&[(0, CipValue::Real(1.0))], &mut buf)
+                .unwrap_err(),
             AssemblyError::ValueTypeMismatch { key: 0 }
         );
         // wrong-length buffer
         let mut small = vec![0u8; 4];
         assert_eq!(
             layout.encode_into(&[], &mut small).unwrap_err(),
-            AssemblyError::DataSizeMismatch { expected: 12, actual: 4 }
+            AssemblyError::DataSizeMismatch {
+                expected: 12,
+                actual: 4
+            }
         );
     }
 }

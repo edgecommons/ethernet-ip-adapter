@@ -54,7 +54,10 @@ impl EipBackend {
     /// credentials vault (plaintext / file-cert deployments).
     #[must_use]
     pub fn new(timeouts: Timeouts) -> Self {
-        Self { timeouts, creds: None }
+        Self {
+            timeouts,
+            creds: None,
+        }
     }
 
     /// Attach the credentials vault used to source TLS material for `mode: tls` connections.
@@ -142,7 +145,9 @@ mod tests {
 
     #[test]
     fn row_connection_lost_is_transient() {
-        assert!(is_transient(EnipError::ConnectionLost { context: "session eof" }));
+        assert!(is_transient(EnipError::ConnectionLost {
+            context: "session eof"
+        }));
     }
 
     #[test]
@@ -184,7 +189,9 @@ mod tests {
 
     #[test]
     fn row_protocol_violation_is_permanent() {
-        assert!(is_permanent(EnipError::ProtocolViolation { detail: "bad reply" }));
+        assert!(is_permanent(EnipError::ProtocolViolation {
+            detail: "bad reply"
+        }));
     }
 
     #[test]
@@ -201,7 +208,9 @@ mod tests {
 
     #[test]
     fn row_unsupported_maps_to_unsupported() {
-        let mapped = map_enip_error(EnipError::Unsupported { what: "struct value" });
+        let mapped = map_enip_error(EnipError::Unsupported {
+            what: "struct value",
+        });
         assert!(matches!(mapped, DeviceError::Unsupported("struct value")));
     }
 
@@ -218,8 +227,10 @@ mod tests {
         .timeouts;
 
         // Routed (ControlLogix slot) + connected messaging.
-        let routed: ConnectionConfig =
-            serde_json::from_value(serde_json::json!({ "endpoint": "plc:44818", "slot": 2, "connected": true })).unwrap();
+        let routed: ConnectionConfig = serde_json::from_value(
+            serde_json::json!({ "endpoint": "plc:44818", "slot": 2, "connected": true }),
+        )
+        .unwrap();
         let opts = super::client_options(&routed, &timeouts);
         assert!(opts.route.is_some(), "a slot yields a backplane route");
         assert!(opts.connected_messaging, "connected ⇒ class-3 messaging");

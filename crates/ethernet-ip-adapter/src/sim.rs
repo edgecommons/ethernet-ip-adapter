@@ -117,7 +117,10 @@ impl SimPushSession {
         let snap_task = Arc::clone(&snapshot);
         let task = tokio::spawn(async move {
             if tx
-                .send(IoUpdate::Up { o2t_api_ms, t2o_api_ms })
+                .send(IoUpdate::Up {
+                    o2t_api_ms,
+                    t2o_api_ms,
+                })
                 .await
                 .is_err()
             {
@@ -181,7 +184,9 @@ impl PushSession for SimPushSession {
         let key = self
             .out_fields
             .iter()
-            .position(|f| f.offset == field.offset && f.eip_type == field.eip_type && f.bit == field.bit)
+            .position(|f| {
+                f.offset == field.offset && f.eip_type == field.eip_type && f.bit == field.bit
+            })
             .ok_or_else(|| DeviceError::Permanent(anyhow::anyhow!("unknown output field")))?;
         let cip = crate::eip::types::encode_write(
             value,
@@ -379,7 +384,11 @@ mod tests {
         let sp = spec("fill-setpoint", "FILL_SETPOINT", "real", None);
         s.write_signal(&sp, &json!(55.5)).await.unwrap();
         let r = s.read_signals(&[sp]).await.unwrap();
-        assert_eq!(r[0].value, json!(55.5), "the write is observable on the next poll");
+        assert_eq!(
+            r[0].value,
+            json!(55.5),
+            "the write is observable on the next poll"
+        );
     }
 
     #[tokio::test]
@@ -389,7 +398,10 @@ mod tests {
         assert_eq!(page.tags.len(), SIM_TAGS.len());
         assert!(page.next_cursor.is_none());
         let recipe = page.tags.iter().find(|t| t.name == "RECIPE").unwrap();
-        assert_eq!(recipe.type_name, "SSTRING", "the unsupported type is surfaced by name");
+        assert_eq!(
+            recipe.type_name, "SSTRING",
+            "the unsupported type is surfaced by name"
+        );
         let zones = page.tags.iter().find(|t| t.name == "ZONE_TEMPS").unwrap();
         assert_eq!(zones.array_dim, Some(8));
     }
@@ -416,7 +428,10 @@ mod tests {
             }
         }
         let expected: Vec<String> = SIM_TAGS.iter().map(|(n, _, _)| (*n).to_string()).collect();
-        assert_eq!(walked, expected, "every tag exactly once, in order, no skips or repeats");
+        assert_eq!(
+            walked, expected,
+            "every tag exactly once, in order, no skips or repeats"
+        );
 
         // A resume cursor is honoured mid-set.
         let mid = s.browse(Some("7".to_string()), 100).await.unwrap();
@@ -425,7 +440,10 @@ mod tests {
         assert!(mid.next_cursor.is_none());
 
         let err = s.browse(Some("x".to_string()), 100).await.unwrap_err();
-        assert!(!err.is_transient(), "a corrupt cursor never fixes itself by retrying");
+        assert!(
+            !err.is_transient(),
+            "a corrupt cursor never fixes itself by retrying"
+        );
         assert!(err.to_string().contains("invalid browse cursor"), "{err}");
     }
 
@@ -453,7 +471,10 @@ mod tests {
         let Err(e) = SimBackend.connect(&conn("")).await else {
             panic!("connecting with no endpoint must fail");
         };
-        assert!(!e.is_transient(), "a missing endpoint will never fix itself by retrying");
+        assert!(
+            !e.is_transient(),
+            "a missing endpoint will never fix itself by retrying"
+        );
     }
 
     #[tokio::test]

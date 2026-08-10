@@ -102,7 +102,10 @@ pub fn read_reload_state(
         None => None,
     };
 
-    Ok(ReloadState { fingerprint, client })
+    Ok(ReloadState {
+        fingerprint,
+        client,
+    })
 }
 
 /// Whether the client cert is comfortably valid, nearing expiry, or expired. Kept across ticks so the
@@ -126,9 +129,15 @@ pub enum WatchAction {
         not_after: Option<String>,
     },
     /// The client cert is within `renewBeforeDays` of expiry — emit `cert-expiring` (once).
-    Expiring { days: i64, not_after: Option<String> },
+    Expiring {
+        days: i64,
+        not_after: Option<String>,
+    },
     /// The client cert has expired — emit `cert-expired` (once).
-    Expired { days: i64, not_after: Option<String> },
+    Expired {
+        days: i64,
+        not_after: Option<String>,
+    },
 }
 
 /// The lifecycle state a driver keeps across ticks — pure; the supervisor feeds it [`ReloadState`]s.
@@ -194,7 +203,10 @@ impl CertWatcher {
             }
         }
 
-        WatchOutcome { actions, expiry_days }
+        WatchOutcome {
+            actions,
+            expiry_days,
+        }
     }
 }
 
@@ -250,8 +262,8 @@ mod tests {
     }
 
     fn sec(v: serde_json::Value) -> SecurityConfig {
-        let c: ConnectionConfig = serde_json::from_value(json!({ "endpoint": "h", "security": v }))
-            .unwrap();
+        let c: ConnectionConfig =
+            serde_json::from_value(json!({ "endpoint": "h", "security": v })).unwrap();
         SecurityConfig::from_connection(&c).unwrap().unwrap()
     }
 
@@ -261,9 +273,15 @@ mod tests {
     fn read_reload_state_parses_serial_notafter_and_days() {
         let (creds, _d) = vault();
         let fx = mint(400);
-        creds.put("tls/cert", fx.cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/key", fx.key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put("tls/cert", fx.cert_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/key", fx.key_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/root", fx.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         let s = sec(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "tls/cert" }, "key": { "$secret": "tls/key" } },
             "ca": { "cert": { "$secret": "tls/root" } } }));
@@ -271,26 +289,44 @@ mod tests {
         let c = st.client.expect("client cert present");
         assert!(c.serial.is_some());
         assert!(c.not_after.is_some());
-        assert!((398..=401).contains(&c.expiry_days), "~400 days out: {}", c.expiry_days);
+        assert!(
+            (398..=401).contains(&c.expiry_days),
+            "~400 days out: {}",
+            c.expiry_days
+        );
     }
 
     #[test]
     fn fingerprint_changes_when_the_client_cert_rotates() {
         let (creds, _d) = vault();
         let a = mint(400);
-        creds.put("tls/cert", a.cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/key", a.key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/root", a.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put("tls/cert", a.cert_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/key", a.key_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/root", a.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         let s = sec(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "tls/cert" }, "key": { "$secret": "tls/key" } },
             "ca": { "cert": { "$secret": "tls/root" } } }));
-        let fp1 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc()).unwrap().fingerprint;
+        let fp1 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc())
+            .unwrap()
+            .fingerprint;
 
         // Rotate the client cert (a fresh mint ⇒ different bytes).
         let b = mint(500);
-        creds.put("tls/cert", b.cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/key", b.key_pem.as_bytes(), PutOptions::default()).unwrap();
-        let fp2 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc()).unwrap().fingerprint;
+        creds
+            .put("tls/cert", b.cert_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/key", b.key_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        let fp2 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc())
+            .unwrap()
+            .fingerprint;
         assert_ne!(fp1, fp2, "a rotated client cert changes the fingerprint");
     }
 
@@ -298,18 +334,30 @@ mod tests {
     fn fingerprint_changes_when_the_trust_store_rotates() {
         let (creds, _d) = vault();
         let a = mint(400);
-        creds.put("tls/cert", a.cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/key", a.key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/trust", a.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put("tls/cert", a.cert_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/key", a.key_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("ot/trust", a.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         let s = sec(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "tls/cert" }, "key": { "$secret": "tls/key" } },
             "ca": { "trustStore": "ot/trust" } }));
-        let fp1 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc()).unwrap().fingerprint;
+        let fp1 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc())
+            .unwrap()
+            .fingerprint;
 
         // A CA rollover: a second root version added to the trust store.
         let b = mint(400);
-        creds.put("ot/trust", b.ca_pem.as_bytes(), PutOptions::default()).unwrap();
-        let fp2 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc()).unwrap().fingerprint;
+        creds
+            .put("ot/trust", b.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        let fp2 = read_reload_state(&s, Some(&creds), OffsetDateTime::now_utc())
+            .unwrap()
+            .fingerprint;
         assert_ne!(fp1, fp2, "a rotated CA changes the fingerprint");
     }
 
@@ -330,7 +378,11 @@ mod tests {
     fn first_observation_is_a_baseline_not_a_rotation() {
         let mut w = CertWatcher::default();
         let out = w.observe(&state(1, 400), 30);
-        assert!(out.actions.is_empty(), "first tick establishes the baseline: {:?}", out.actions);
+        assert!(
+            out.actions.is_empty(),
+            "first tick establishes the baseline: {:?}",
+            out.actions
+        );
         assert_eq!(out.expiry_days, Some(400));
     }
 
@@ -356,7 +408,10 @@ mod tests {
         let out = w.observe(&state(1, 20), 30);
         assert_eq!(
             out.actions,
-            vec![WatchAction::Expiring { days: 20, not_after: Some("2030-01-01T00:00:00Z".to_string()) }]
+            vec![WatchAction::Expiring {
+                days: 20,
+                not_after: Some("2030-01-01T00:00:00Z".to_string())
+            }]
         );
         // Still expiring next tick (same fingerprint) ⇒ no repeat event.
         assert!(w.observe(&state(1, 19), 30).actions.is_empty());
@@ -368,9 +423,15 @@ mod tests {
         let out = w.observe(&state(1, -3), 30);
         assert_eq!(
             out.actions,
-            vec![WatchAction::Expired { days: -3, not_after: Some("2030-01-01T00:00:00Z".to_string()) }]
+            vec![WatchAction::Expired {
+                days: -3,
+                not_after: Some("2030-01-01T00:00:00Z".to_string())
+            }]
         );
-        assert!(w.observe(&state(1, -4), 30).actions.is_empty(), "no repeat expired event");
+        assert!(
+            w.observe(&state(1, -4), 30).actions.is_empty(),
+            "no repeat expired event"
+        );
     }
 
     #[test]
@@ -378,13 +439,16 @@ mod tests {
         let mut w = CertWatcher::default();
         // Establish baseline while already expiring.
         assert_eq!(w.observe(&state(1, 10), 30).actions.len(), 1); // Expiring
-        // Rotate to a healthy cert (fingerprint changes, days healthy): Rotated, expiry back to Ok.
+                                                                   // Rotate to a healthy cert (fingerprint changes, days healthy): Rotated, expiry back to Ok.
         let out = w.observe(&state(2, 400), 30);
         assert_eq!(out.actions.len(), 1);
         assert!(matches!(out.actions[0], WatchAction::Rotated { .. }));
         // A later expiry re-fires (the warning re-armed).
         let out = w.observe(&state(2, 5), 30);
-        assert!(out.actions.iter().any(|a| matches!(a, WatchAction::Expiring { .. })));
+        assert!(out
+            .actions
+            .iter()
+            .any(|a| matches!(a, WatchAction::Expiring { .. })));
     }
 
     #[test]
@@ -392,14 +456,26 @@ mod tests {
         let mut w = CertWatcher::default();
         w.observe(&state(1, 400), 30); // baseline healthy
         let out = w.observe(&state(2, -1), 30); // rotated to an expired cert
-        assert!(out.actions.iter().any(|a| matches!(a, WatchAction::Rotated { .. })));
-        assert!(out.actions.iter().any(|a| matches!(a, WatchAction::Expired { .. })));
+        assert!(out
+            .actions
+            .iter()
+            .any(|a| matches!(a, WatchAction::Rotated { .. })));
+        assert!(out
+            .actions
+            .iter()
+            .any(|a| matches!(a, WatchAction::Expired { .. })));
     }
 
     #[test]
     fn no_client_cert_yields_no_expiry_actions() {
         let mut w = CertWatcher::default();
-        let out = w.observe(&ReloadState { fingerprint: 1, client: None }, 30);
+        let out = w.observe(
+            &ReloadState {
+                fingerprint: 1,
+                client: None,
+            },
+            30,
+        );
         assert!(out.actions.is_empty());
         assert_eq!(out.expiry_days, None);
     }

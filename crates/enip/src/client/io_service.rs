@@ -30,7 +30,9 @@ impl ForwardOpenService for EipClient {
         items.extend(extra_items);
         let cpf = Cpf::from_items(items);
         let data = encap_data_with_cpf(&cpf)?;
-        let frame = self.transaction(Command::SendRRData, data, "forward_open").await?;
+        let frame = self
+            .transaction(Command::SendRRData, data, "forward_open")
+            .await?;
         if !frame.header.status.is_ok() {
             return Err(EnipError::Encap(frame.header.status));
         }

@@ -52,11 +52,11 @@ impl Decoder for EncapCodec {
                 }));
             }
 
-            let total = HEADER_LEN
-                .checked_add(length)
-                .ok_or(EnipError::Malformed(crate::error::WireError::Overflow {
+            let total = HEADER_LEN.checked_add(length).ok_or(EnipError::Malformed(
+                crate::error::WireError::Overflow {
                     context: "encap codec",
-                }))?;
+                },
+            ))?;
 
             if src.len() < total {
                 src.reserve(total.saturating_sub(src.len()));
@@ -183,6 +183,9 @@ mod tests {
         w.u32(0);
         buf.extend_from_slice(w.as_slice());
         let mut codec = EncapCodec::new();
-        assert!(matches!(codec.decode(&mut buf), Err(EnipError::Malformed(_))));
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(EnipError::Malformed(_))
+        ));
     }
 }

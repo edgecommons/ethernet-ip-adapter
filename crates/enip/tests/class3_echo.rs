@@ -39,7 +39,10 @@ struct MockPeer {
 
 impl MockPeer {
     fn new(stream: DuplexStream) -> Self {
-        Self { stream, buf: BytesMut::new() }
+        Self {
+            stream,
+            buf: BytesMut::new(),
+        }
     }
 
     /// Read the next full request frame, or `None` at EOF (client dropped).
@@ -85,7 +88,10 @@ impl MockPeer {
 // ---------------------------------------------------------------------------
 
 fn mk_frame(command: Command, handle: u32, ctx: [u8; 8], data: Vec<u8>) -> EncapFrame {
-    EncapFrame::new(EncapHeader::request(command, 0, handle, ctx), Bytes::from(data))
+    EncapFrame::new(
+        EncapHeader::request(command, 0, handle, ctx),
+        Bytes::from(data),
+    )
 }
 
 /// A Message Router reply: `reply-service · reserved · status · ext-words · data`.
@@ -110,7 +116,12 @@ fn rrdata_reply(ctx: [u8; 8], mr: &[u8]) -> EncapFrame {
     w.u32(0); // interface handle
     w.u16(0); // timeout
     w.put_slice(&cpf_bytes);
-    mk_frame(Command::SendRRData, SESSION_HANDLE, ctx, w.into_bytes().to_vec())
+    mk_frame(
+        Command::SendRRData,
+        SESSION_HANDLE,
+        ctx,
+        w.into_bytes().to_vec(),
+    )
 }
 
 /// Split a UCMM (`SendRRData`) request frame into `(service, service-data)`.
@@ -206,7 +217,10 @@ async fn class3_open_rejects_echo_mismatch() {
         let requested_serial = id.connection_serial;
 
         // Echo everything faithfully EXCEPT the connection serial.
-        let corrupted = OpenIdentity { connection_serial: requested_serial ^ 1, ..id };
+        let corrupted = OpenIdentity {
+            connection_serial: requested_serial ^ 1,
+            ..id
+        };
         let mr = mr_reply(FORWARD_OPEN, &forward_open_success(&corrupted));
         mock.send(&rrdata_reply(open_frame.header.sender_context, &mr))
             .await;
@@ -215,7 +229,10 @@ async fn class3_open_rejects_echo_mismatch() {
         // (§8.8 body: priority · ticks · serial · vendor · originator serial · …).
         let close_frame = mock.recv().await.expect("best-effort forward close");
         let (close_service, close_data) = parse_ucmm_request(&close_frame);
-        assert_eq!(close_service, FORWARD_CLOSE, "the target is told to drop the connection");
+        assert_eq!(
+            close_service, FORWARD_CLOSE,
+            "the target is told to drop the connection"
+        );
         assert_eq!(
             &close_data[2..4],
             &requested_serial.to_le_bytes(),
@@ -231,7 +248,10 @@ async fn class3_open_rejects_echo_mismatch() {
         Err(EnipError::ProtocolViolation { detail }) => {
             assert_eq!(detail, "forward-open reply connection serial mismatch");
         }
-        other => panic!("expected a protocol violation, got {:?}", other.map(|_| "Ok(client)")),
+        other => panic!(
+            "expected a protocol violation, got {:?}",
+            other.map(|_| "Ok(client)")
+        ),
     }
     assert!(peer.await.unwrap());
 }
@@ -263,5 +283,8 @@ async fn class3_open_still_succeeds_on_faithful_echo() {
         .expect("a faithful reply opens the class-3 path");
     assert!(client.is_connected_messaging());
     drop(client);
-    assert!(peer.await.unwrap(), "no ForwardClose followed a faithful reply");
+    assert!(
+        peer.await.unwrap(),
+        "no ForwardClose followed a faithful reply"
+    );
 }

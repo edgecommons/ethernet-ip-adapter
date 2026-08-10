@@ -14,7 +14,12 @@
 //! A panic in any decoder surfaces as a failed test on any platform; cargo-fuzz remains the deeper
 //! exploration layer (`--max_total_time`, coverage-guided mutation) run on Linux/WSL/CI.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +28,10 @@ use enip::harness::{self, SURFACES};
 
 /// The checked-in corpus directory for a target, if it exists.
 fn corpus_dir(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz").join("corpus").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fuzz")
+        .join("corpus")
+        .join(name)
 }
 
 /// A tiny deterministic SplitMix64 — no external crate, reproducible across platforms.
@@ -54,7 +62,11 @@ fn every_fuzz_surface_survives_its_seed_corpus() {
     let mut total_seeds = 0usize;
     for (name, exercise) in SURFACES {
         let dir = corpus_dir(name);
-        assert!(dir.is_dir(), "missing seed corpus dir for {name}: {}", dir.display());
+        assert!(
+            dir.is_dir(),
+            "missing seed corpus dir for {name}: {}",
+            dir.display()
+        );
         let mut seeds = 0usize;
         for entry in fs::read_dir(&dir).expect("read corpus dir") {
             let path = entry.expect("dir entry").path();
@@ -72,7 +84,10 @@ fn every_fuzz_surface_survives_its_seed_corpus() {
         assert!(seeds > 0, "seed corpus for {name} is empty");
         total_seeds += seeds;
     }
-    assert!(total_seeds >= SURFACES.len(), "each surface must have at least one seed");
+    assert!(
+        total_seeds >= SURFACES.len(),
+        "each surface must have at least one seed"
+    );
 }
 
 #[test]
@@ -81,7 +96,9 @@ fn every_fuzz_surface_survives_a_random_sweep() {
     let mut rng = SplitMix64(0x0DDB_1A5E_5EED_CAFE);
     // Lengths chosen to straddle each decoder's fixed-header boundaries (0..=40) plus a few larger
     // buffers that exercise count/length fields and allocation caps.
-    let lengths = [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 25, 32, 40, 64, 128, 255, 512];
+    let lengths = [
+        0usize, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 25, 32, 40, 64, 128, 255, 512,
+    ];
     for (_name, exercise) in SURFACES {
         for &len in &lengths {
             for _ in 0..64 {
@@ -93,9 +110,9 @@ fn every_fuzz_surface_survives_a_random_sweep() {
         // length/count, which is the classic over-read/over-allocate trap.
         for &declared in &[0x00u8, 0x01, 0x7F, 0x80, 0xFF] {
             let payloads: [Vec<u8>; 3] = [
-                vec![0xCC, 0x00, 0xFF, declared],            // MR reply ext-status size lie
-                vec![declared, 0x00, 0x0C, 0x00, declared],  // CPF item-count / length lie
-                vec![0x01, 0x00, declared, declared, 0xC4],  // assorted count/type bytes
+                vec![0xCC, 0x00, 0xFF, declared], // MR reply ext-status size lie
+                vec![declared, 0x00, 0x0C, 0x00, declared], // CPF item-count / length lie
+                vec![0x01, 0x00, declared, declared, 0xC4], // assorted count/type bytes
             ];
             for p in payloads {
                 exercise(&p);
@@ -113,7 +130,9 @@ fn typed_cip_value_roundtrip_survives_random_sweep() {
     // `arbitrary` — exercised here over a deterministic spread so the round-trip is regression-tested
     // on every platform.
     let mut rng = SplitMix64(0xC1_C2_C3_C4_D0_D1_D2_D3);
-    let codes = [0xC1u16, 0xC2, 0xC3, 0xC4, 0xC5, 0xC8, 0xCA, 0xCB, 0xD0, 0xD4, 0x02A0, 0x1234];
+    let codes = [
+        0xC1u16, 0xC2, 0xC3, 0xC4, 0xC5, 0xC8, 0xCA, 0xCB, 0xD0, 0xD4, 0x02A0, 0x1234,
+    ];
     for &code in &codes {
         for len in 0..=17usize {
             for _ in 0..16 {

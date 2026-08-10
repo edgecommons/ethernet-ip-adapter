@@ -109,7 +109,12 @@ impl RoutePath {
         if self.segments.is_empty() {
             return base;
         }
-        let mut segs: Vec<_> = self.segments.iter().cloned().map(crate::cip::epath::Segment::Port).collect();
+        let mut segs: Vec<_> = self
+            .segments
+            .iter()
+            .cloned()
+            .map(crate::cip::epath::Segment::Port)
+            .collect();
         segs.extend(base.segments().iter().cloned());
         EPath::from_segments(segs)
     }
@@ -268,24 +273,36 @@ impl EipClient {
 
         let mut codec = EncapCodec::new();
         let mut buf = BytesMut::new();
-        let reply =
-            recv_frame(&mut stream, &mut buf, &mut codec, handshake_deadline, "register").await?;
+        let reply = recv_frame(
+            &mut stream,
+            &mut buf,
+            &mut codec,
+            handshake_deadline,
+            "register",
+        )
+        .await?;
 
         if !matches!(reply.header.command, Command::RegisterSession) {
-            return Err(EnipError::ProtocolViolation { detail: "register reply command mismatch" });
+            return Err(EnipError::ProtocolViolation {
+                detail: "register reply command mismatch",
+            });
         }
         if !reply.header.status.is_ok() {
             return Err(EnipError::Encap(reply.header.status));
         }
         let session_handle = reply.header.session_handle;
         if session_handle == 0 {
-            return Err(EnipError::ProtocolViolation { detail: "register assigned session handle 0" });
+            return Err(EnipError::ProtocolViolation {
+                detail: "register assigned session handle 0",
+            });
         }
         // Reply protocol version must be 1 (§5.5).
         let mut vr = WireReader::with_context(&reply.data, "register reply");
         let version = vr.u16().unwrap_or(0);
         if version != PROTOCOL_VERSION {
-            return Err(EnipError::Unsupported { what: "encapsulation protocol version" });
+            return Err(EnipError::Unsupported {
+                what: "encapsulation protocol version",
+            });
         }
 
         let stats = Arc::new(SessionStats::default());
@@ -355,7 +372,11 @@ impl EipClient {
         ClientStats {
             stale_replies: self.inner.stats.stale_replies.load(Ordering::Relaxed),
             timeouts: self.inner.stats.timeouts.load(Ordering::Relaxed),
-            connected_seq_mismatches: self.inner.stats.connected_seq_mismatches.load(Ordering::Relaxed),
+            connected_seq_mismatches: self
+                .inner
+                .stats
+                .connected_seq_mismatches
+                .load(Ordering::Relaxed),
             keepalives_sent: self.inner.stats.keepalives_sent.load(Ordering::Relaxed),
         }
     }
@@ -368,7 +389,11 @@ impl EipClient {
 
     /// Send a CIP Message Router request and return the decoded reply (§7). Routes over the connected
     /// class-3 path when open, else over UCMM (wrapping in Unconnected_Send when a route is set).
-    pub(crate) async fn send_cip(&self, mr: MessageRequest, op: &'static str) -> Result<crate::cip::message::MessageReply> {
+    pub(crate) async fn send_cip(
+        &self,
+        mr: MessageRequest,
+        op: &'static str,
+    ) -> Result<crate::cip::message::MessageReply> {
         if let Some(conn) = &self.inner.connected {
             self.send_connected(conn, mr, op).await
         } else {
@@ -392,7 +417,12 @@ impl EipClient {
     /// Both caller-side bounds count their elapse as a timeout (§10.2, never silent): the actor
     /// never saw a request that expired queueing for it, and by definition produced no verdict for
     /// one that tripped the backstop, so neither would otherwise appear on `stats().timeouts`.
-    async fn transaction(&self, command: Command, data: Bytes, op: &'static str) -> Result<EncapFrame> {
+    async fn transaction(
+        &self,
+        command: Command,
+        data: Bytes,
+        op: &'static str,
+    ) -> Result<EncapFrame> {
         let deadline = deadline_from(self.inner.request_timeout);
         let (reply_tx, reply_rx) = oneshot::channel();
         let t = Transaction {
@@ -427,13 +457,20 @@ impl EipClient {
     }
 
     /// UCMM (unconnected) send (§7.1) — direct, or wrapped in Unconnected_Send when routed.
-    async fn send_unconnected(&self, mr: MessageRequest, op: &'static str) -> Result<crate::cip::message::MessageReply> {
+    async fn send_unconnected(
+        &self,
+        mr: MessageRequest,
+        op: &'static str,
+    ) -> Result<crate::cip::message::MessageReply> {
         let outer = match &self.inner.route {
             Some(route) if !route.is_empty() => wrap_unconnected_send(&mr, route)?,
             _ => mr,
         };
         let mr_bytes = outer.encode()?;
-        let cpf = Cpf::from_items(vec![CpfItem::null_address(), CpfItem::unconnected_data(mr_bytes)]);
+        let cpf = Cpf::from_items(vec![
+            CpfItem::null_address(),
+            CpfItem::unconnected_data(mr_bytes),
+        ]);
         let data = encap_data_with_cpf(&cpf)?;
         let frame = self.transaction(Command::SendRRData, data, op).await?;
         parse_explicit_reply(&frame)
@@ -441,7 +478,9 @@ impl EipClient {
 
     /// Read the device identity over the session (§5.3, §11.2) — a ListIdentity command.
     pub async fn identity(&self) -> Result<DeviceIdentity> {
-        let frame = self.transaction(Command::ListIdentity, Bytes::new(), "identity").await?;
+        let frame = self
+            .transaction(Command::ListIdentity, Bytes::new(), "identity")
+            .await?;
         if !frame.header.status.is_ok() {
             return Err(EnipError::Encap(frame.header.status));
         }
@@ -462,7 +501,12 @@ impl EipClient {
         }
         let (done_tx, done_rx) = oneshot::channel();
         let _ = tokio::time::timeout(CLOSE_HANDOFF_DEADLINE, async {
-            if self.tx.send(SessionCommand::Unregister { done_tx }).await.is_ok() {
+            if self
+                .tx
+                .send(SessionCommand::Unregister { done_tx })
+                .await
+                .is_ok()
+            {
                 let _ = done_rx.await;
             }
         })
@@ -474,7 +518,9 @@ impl EipClient {
 /// the route path (§7.1).
 fn wrap_unconnected_send(inner: &MessageRequest, route: &RoutePath) -> Result<MessageRequest> {
     let emb = inner.encode()?;
-    let emb_len = u16::try_from(emb.len()).map_err(|_| EnipError::TooLarge { limit: u16::MAX as usize })?;
+    let emb_len = u16::try_from(emb.len()).map_err(|_| EnipError::TooLarge {
+        limit: u16::MAX as usize,
+    })?;
     let route_bytes = route.to_epath().encode()?;
     let words = route_bytes.len().checked_div(2).unwrap_or(0);
     let route_words = u8::try_from(words).map_err(|_| EnipError::TooLarge { limit: 255 })?;
@@ -523,7 +569,11 @@ fn parse_explicit_reply(frame: &EncapFrame) -> Result<crate::cip::message::Messa
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     #[test]
@@ -571,7 +621,10 @@ mod tests {
         let r = client
             .transaction(Command::ListIdentity, Bytes::new(), "identity")
             .await;
-        assert!(matches!(r, Err(EnipError::Timeout { op: "identity" })), "{r:?}");
+        assert!(
+            matches!(r, Err(EnipError::Timeout { op: "identity" })),
+            "{r:?}"
+        );
         assert!(
             started.elapsed() >= request_timeout + REPLY_BACKSTOP_GRACE,
             "the backstop must fire strictly after the deadline, not on it"
@@ -589,7 +642,10 @@ mod tests {
         // §7.6 — the class-3 knobs default to the values the crate hard-coded before they became
         // options, so a caller that changes nothing gets a byte-identical ForwardOpen.
         assert_eq!(o.class3_rpi, Duration::from_secs(2));
-        assert_eq!(o.class3_timeout_multiplier, crate::cm::TimeoutMultiplier::X16);
+        assert_eq!(
+            o.class3_timeout_multiplier,
+            crate::cm::TimeoutMultiplier::X16
+        );
         assert_eq!(
             o.class3_rpi.as_micros(),
             2_000_000,

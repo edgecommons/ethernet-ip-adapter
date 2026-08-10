@@ -48,9 +48,15 @@ pub(crate) struct ConnectedState {
 impl ConnectedState {
     /// The next connected-data sequence count (never 0, §7.6).
     fn next_sequence(&self) -> u16 {
-        let mut v = self.sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let mut v = self
+            .sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         if v == 0 {
-            v = self.sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            v = self
+                .sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
         }
         v
     }
@@ -89,7 +95,11 @@ impl EipClient {
             rpi_micros,
             opts.class3_timeout_multiplier,
         );
-        let mr = MessageRequest::new(open.service(), super::connection_manager_path(), open.encode()?);
+        let mr = MessageRequest::new(
+            open.service(),
+            super::connection_manager_path(),
+            open.encode()?,
+        );
         let reply = self.send_unconnected(mr, "forward_open").await?;
         reply.expect_service(open.service())?;
         if !reply.status.is_ok() {
@@ -207,7 +217,9 @@ fn parse_connected_reply(
     let mr_bytes = dr.take_rest();
 
     if seq_reply != expected_seq || reply_addr != expected_addr {
-        stats.connected_seq_mismatches.fetch_add(1, Ordering::Relaxed);
+        stats
+            .connected_seq_mismatches
+            .fetch_add(1, Ordering::Relaxed);
         return Err(EnipError::ProtocolViolation {
             detail: "connected-data sequence/connection-id mismatch",
         });

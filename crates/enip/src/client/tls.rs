@@ -113,7 +113,9 @@ impl EipClient {
             .max(Duration::from_millis(1));
         let mut client = tokio::time::timeout(remaining, Self::connect_tls_over(tcp, opts, tls))
             .await
-            .map_err(|_elapsed| EnipError::Timeout { op: "tls handshake" })??;
+            .map_err(|_elapsed| EnipError::Timeout {
+                op: "tls handshake",
+            })??;
         client.peer_addr = peer_addr;
         Ok(client)
     }
@@ -136,7 +138,11 @@ impl EipClient {
     /// [`EnipError::Timeout`] `{ op: "tls handshake" }` if the handshake exceeds
     /// `opts.connect_timeout`; [`EnipError::Tls`] for a handshake/verification/no-overlap failure,
     /// then the ordinary RegisterSession errors.
-    pub async fn connect_tls_over<S>(stream: S, opts: ClientOptions, tls: TlsOptions) -> Result<Self>
+    pub async fn connect_tls_over<S>(
+        stream: S,
+        opts: ClientOptions,
+        tls: TlsOptions,
+    ) -> Result<Self>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -144,7 +150,9 @@ impl EipClient {
         let handshake = connector.connect(tls.server_name, stream);
         let tls_stream = tokio::time::timeout(opts.connect_timeout, handshake)
             .await
-            .map_err(|_elapsed| EnipError::Timeout { op: "tls handshake" })?
+            .map_err(|_elapsed| EnipError::Timeout {
+                op: "tls handshake",
+            })?
             .map_err(map_handshake_error)?;
         let info = session_info(&tls_stream);
         let mut client = Self::connect_over(tls_stream, opts).await?;
@@ -258,7 +266,10 @@ mod tests {
         ));
         assert!(matches!(
             e,
-            EnipError::Tls { kind: TlsErrorKind::PeerUnverified, .. }
+            EnipError::Tls {
+                kind: TlsErrorKind::PeerUnverified,
+                ..
+            }
         ));
     }
 
@@ -270,8 +281,14 @@ mod tests {
         match e {
             EnipError::Tls { kind, detail } => {
                 assert_eq!(kind, TlsErrorKind::NoCipherOverlap);
-                assert!(detail.contains("CBC-only"), "must carry the legacy hint: {detail}");
-                assert!(!kind.is_transient(), "cert/suite failures are non-transient");
+                assert!(
+                    detail.contains("CBC-only"),
+                    "must carry the legacy hint: {detail}"
+                );
+                assert!(
+                    !kind.is_transient(),
+                    "cert/suite failures are non-transient"
+                );
             }
             other => panic!("expected Tls, got {other:?}"),
         }
@@ -284,7 +301,10 @@ mod tests {
         ));
         assert!(matches!(
             e,
-            EnipError::Tls { kind: TlsErrorKind::NoCipherOverlap, .. }
+            EnipError::Tls {
+                kind: TlsErrorKind::NoCipherOverlap,
+                ..
+            }
         ));
     }
 
@@ -293,7 +313,10 @@ mod tests {
         let e = classify_rustls_error(&rustls::Error::DecryptError);
         assert!(matches!(
             e,
-            EnipError::Tls { kind: TlsErrorKind::HandshakeFailed, .. }
+            EnipError::Tls {
+                kind: TlsErrorKind::HandshakeFailed,
+                ..
+            }
         ));
     }
 
@@ -305,7 +328,11 @@ mod tests {
             EnipError::Tls { kind, .. } => {
                 assert_eq!(kind, TlsErrorKind::Io);
                 assert!(kind.is_transient(), "pre-handshake io is transient");
-                assert!(EnipError::Tls { kind, detail: String::new() }.is_transient());
+                assert!(EnipError::Tls {
+                    kind,
+                    detail: String::new()
+                }
+                .is_transient());
             }
             other => panic!("expected Tls, got {other:?}"),
         }
@@ -318,7 +345,10 @@ mod tests {
         let io = std::io::Error::new(std::io::ErrorKind::InvalidData, inner);
         assert!(matches!(
             map_handshake_error(io),
-            EnipError::Tls { kind: TlsErrorKind::PeerUnverified, .. }
+            EnipError::Tls {
+                kind: TlsErrorKind::PeerUnverified,
+                ..
+            }
         ));
     }
 
@@ -360,9 +390,7 @@ mod tests {
     }
 
     fn mint() -> CertFixture {
-        use rcgen::{
-            BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType,
-        };
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType};
         // Self-signed CA.
         let mut ca_params = CertificateParams::new(vec![]).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -391,7 +419,9 @@ mod tests {
     }
 
     /// A rustls server config that (optionally) requires and verifies a client cert against the CA.
-    fn test_server_config(_require_client: bool) -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
+    fn test_server_config(
+        _require_client: bool,
+    ) -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
         let fx = mint();
         let cfg = server_config_from(&fx, true);
         (cfg, fx.ca_der)
@@ -410,10 +440,12 @@ mod tests {
         let builder = if require_client {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(fx.ca_der.clone()).unwrap();
-            let verifier =
-                rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), ring())
-                    .build()
-                    .unwrap();
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                ring(),
+            )
+            .build()
+            .unwrap();
             builder.with_client_cert_verifier(verifier)
         } else {
             builder.with_no_client_auth()
@@ -510,7 +542,13 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            matches!(err, EnipError::Tls { kind: TlsErrorKind::PeerUnverified, .. }),
+            matches!(
+                err,
+                EnipError::Tls {
+                    kind: TlsErrorKind::PeerUnverified,
+                    ..
+                }
+            ),
             "got {err:?}"
         );
         let _ = server.await;
@@ -577,7 +615,12 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            matches!(err, EnipError::Timeout { op: "tls handshake" }),
+            matches!(
+                err,
+                EnipError::Timeout {
+                    op: "tls handshake"
+                }
+            ),
             "got {err:?}"
         );
     }

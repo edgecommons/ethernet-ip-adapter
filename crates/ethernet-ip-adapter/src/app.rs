@@ -22,7 +22,7 @@
 //! keeps the connectivity provider, the allow-listed `sb/write`, the events, and the single
 //! `southbound_health` metric working against the new config.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use edgecommons::prelude::*;
@@ -261,10 +261,7 @@ pub fn connectivity_of(cfg: &DeviceConfig, health: &Health) -> InstanceConnectiv
     // fleet consumer watching `state` sees the posture without an `sb/status` round-trip. Present only
     // once a session posture has been read (both modes).
     if let Some(sec) = health.security() {
-        attributes.insert(
-            "targetCipSecurity".to_string(),
-            json!(sec.target.is_some()),
-        );
+        attributes.insert("targetCipSecurity".to_string(), json!(sec.target.is_some()));
     }
     if let Some(slot) = cfg.connection.slot {
         attributes.insert("slot".to_string(), json!(slot));
@@ -341,7 +338,9 @@ pub enum DeviceControl {
     Browse {
         cursor: Option<String>,
         max: usize,
-        reply: tokio::sync::oneshot::Sender<std::result::Result<crate::device::BrowsePage, BrowseError>>,
+        reply: tokio::sync::oneshot::Sender<
+            std::result::Result<crate::device::BrowsePage, BrowseError>,
+        >,
     },
 }
 
@@ -360,9 +359,21 @@ pub enum BrowseError {
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
     /// Emit a one-shot event (§6.3).
-    async fn emit(&self, severity: Severity, event_type: &str, message: Option<String>, context: Option<Value>);
+    async fn emit(
+        &self,
+        severity: Severity,
+        event_type: &str,
+        message: Option<String>,
+        context: Option<Value>,
+    );
     /// Raise a stateful alarm (§6.3 `device-unreachable`).
-    async fn raise_alarm(&self, severity: Severity, event_type: &str, message: Option<String>, context: Option<Value>);
+    async fn raise_alarm(
+        &self,
+        severity: Severity,
+        event_type: &str,
+        message: Option<String>,
+        context: Option<Value>,
+    );
     /// Clear a stateful alarm (rides the same severity/channel as the raise).
     async fn clear_alarm(&self, severity: Severity, event_type: &str, context: Option<Value>);
 }
@@ -621,8 +632,16 @@ mod tests {
 
         health.paused.store(true, Ordering::Relaxed);
         let element = connectivity_of(&cfg, &health).to_json();
-        assert_eq!(element["state"], json!("PAUSED"), "a paused instance is not silently stale");
-        assert_eq!(element["connected"], json!(true), "connectivity stays truthful beside it");
+        assert_eq!(
+            element["state"],
+            json!("PAUSED"),
+            "a paused instance is not silently stale"
+        );
+        assert_eq!(
+            element["connected"],
+            json!(true),
+            "connectivity stays truthful beside it"
+        );
         assert_eq!(element["attributes"]["paused"], json!(true));
     }
 
@@ -631,7 +650,10 @@ mod tests {
         let cfg = a_device();
         let health = Health::default();
         // No posture read yet ⇒ no targetCipSecurity attribute.
-        assert!(connectivity_of(&cfg, &health).attributes.get("targetCipSecurity").is_none());
+        assert!(connectivity_of(&cfg, &health)
+            .attributes
+            .get("targetCipSecurity")
+            .is_none());
 
         // A session that read a target posture ⇒ targetCipSecurity: true.
         health.set_security(Some(crate::device::SecurityStatus {
@@ -685,13 +707,21 @@ mod tests {
 
         health.set_link(LinkState::Online);
         let c = connectivity_of(&cfg, &health);
-        assert_eq!(c.state.as_deref(), Some("PAUSED"), "paused + online = PAUSED");
+        assert_eq!(
+            c.state.as_deref(),
+            Some("PAUSED"),
+            "paused + online = PAUSED"
+        );
         assert_eq!(c.attributes["paused"], json!(true));
         assert!(c.connected);
 
         health.set_link(LinkState::Backoff);
         let c = connectivity_of(&cfg, &health);
-        assert_eq!(c.state.as_deref(), Some("BACKOFF"), "a break while paused reports BACKOFF");
+        assert_eq!(
+            c.state.as_deref(),
+            Some("BACKOFF"),
+            "a break while paused reports BACKOFF"
+        );
         assert_eq!(c.attributes["paused"], json!(true), "still marked paused");
         assert!(!c.connected);
     }
@@ -706,7 +736,10 @@ mod tests {
         let events = crate::testutil::RecordingEvents::default();
 
         // Before: ONLINE + gauge 0 + no event.
-        assert_eq!(connectivity_of(&cfg, &health).state.as_deref(), Some("ONLINE"));
+        assert_eq!(
+            connectivity_of(&cfg, &health).state.as_deref(),
+            Some("ONLINE")
+        );
 
         let changed = apply_pause(&cfg, &health, &dm, &events, true, Some("site/op")).await;
         assert!(changed, "the first pause changes state");
@@ -718,20 +751,38 @@ mod tests {
         assert!(c.connected, "connected stays truthful while paused");
         // 2. the transition flushes southbound_health immediately (no paused measure — the eight
         // SOUTHBOUND §5 measures only).
-        let h = metrics.last("southbound_health").expect("health emitted on the pause transition");
-        assert!(!h.contains_key("paused"), "southbound_health carries no paused extension measure");
+        let h = metrics
+            .last("southbound_health")
+            .expect("health emitted on the pause transition");
+        assert!(
+            !h.contains_key("paused"),
+            "southbound_health carries no paused extension measure"
+        );
         // 3. the event (with the requester identity path).
         assert!(events.has("adapter-paused"));
-        assert_eq!(events.last_ctx("adapter-paused").unwrap()["by"], json!("site/op"));
+        assert_eq!(
+            events.last_ctx("adapter-paused").unwrap()["by"],
+            json!("site/op")
+        );
 
         // Idempotent: pausing again changes nothing and emits no new event.
         assert!(!apply_pause(&cfg, &health, &dm, &events, true, None).await);
-        assert_eq!(events.count("adapter-paused"), 1, "idempotent pause emits no second event");
+        assert_eq!(
+            events.count("adapter-paused"),
+            1,
+            "idempotent pause emits no second event"
+        );
 
         // Resume flips the surfaces back.
         assert!(apply_pause(&cfg, &health, &dm, &events, false, None).await);
-        assert_eq!(connectivity_of(&cfg, &health).state.as_deref(), Some("ONLINE"));
-        assert_eq!(connectivity_of(&cfg, &health).attributes["paused"], json!(false));
+        assert_eq!(
+            connectivity_of(&cfg, &health).state.as_deref(),
+            Some("ONLINE")
+        );
+        assert_eq!(
+            connectivity_of(&cfg, &health).attributes["paused"],
+            json!(false)
+        );
         assert!(events.has("adapter-resumed"));
     }
 
@@ -764,7 +815,9 @@ mod tests {
     fn connect_reason_renders_the_error_or_a_timeout() {
         // The Ok(Err(..)) arm carries the device error text.
         let outcome: std::result::Result<crate::device::Result<()>, tokio::time::error::Elapsed> =
-            Ok(Err(crate::device::DeviceError::Permanent(anyhow::anyhow!("no route to host"))));
+            Ok(Err(crate::device::DeviceError::Permanent(anyhow::anyhow!(
+                "no route to host"
+            ))));
         let reason = connect_reason(&outcome, Duration::from_millis(500));
         assert!(reason.contains("no route to host"));
 
@@ -798,28 +851,69 @@ mod tests {
 
         // A pause + one of every I/O verb + a final reconnect, all buffered before we serve.
         let (p_tx, p_rx) = oneshot::channel();
-        tx.send(DeviceControl::Pause { by: Some("op".into()), reply: p_tx }).await.unwrap();
+        tx.send(DeviceControl::Pause {
+            by: Some("op".into()),
+            reply: p_tx,
+        })
+        .await
+        .unwrap();
         let (r_tx, r_rx) = oneshot::channel();
-        tx.send(DeviceControl::ReadNow { specs: vec![], reply: r_tx }).await.unwrap();
+        tx.send(DeviceControl::ReadNow {
+            specs: vec![],
+            reply: r_tx,
+        })
+        .await
+        .unwrap();
         let (s_tx, s_rx) = oneshot::channel();
-        tx.send(DeviceControl::Snapshot { reply: s_tx }).await.unwrap();
+        tx.send(DeviceControl::Snapshot { reply: s_tx })
+            .await
+            .unwrap();
         let (rp_tx, rp_rx) = oneshot::channel();
-        tx.send(DeviceControl::Repoll { reply: rp_tx }).await.unwrap();
+        tx.send(DeviceControl::Repoll { reply: rp_tx })
+            .await
+            .unwrap();
         let (b_tx, b_rx) = oneshot::channel();
-        tx.send(DeviceControl::Browse { cursor: None, max: 10, reply: b_tx }).await.unwrap();
+        tx.send(DeviceControl::Browse {
+            cursor: None,
+            max: 10,
+            reply: b_tx,
+        })
+        .await
+        .unwrap();
         let spec = cfg.signals().next().unwrap().clone();
         let (w_tx, w_rx) = oneshot::channel();
-        tx.send(DeviceControl::Write(WriteRequest { signal: spec, value: json!(1.0), ack: w_tx })).await.unwrap();
+        tx.send(DeviceControl::Write(WriteRequest {
+            signal: spec,
+            value: json!(1.0),
+            ack: w_tx,
+        }))
+        .await
+        .unwrap();
         let field = a_push_device().io.as_ref().unwrap().input.signals[0].clone();
         let (wo_tx, wo_rx) = oneshot::channel();
-        tx.send(DeviceControl::WriteOutput { field, value: json!(1), reply: wo_tx }).await.unwrap();
+        tx.send(DeviceControl::WriteOutput {
+            field,
+            value: json!(1),
+            reply: wo_tx,
+        })
+        .await
+        .unwrap();
         let (res_tx, res_rx) = oneshot::channel();
-        tx.send(DeviceControl::Resume { reply: res_tx }).await.unwrap();
+        tx.send(DeviceControl::Resume { reply: res_tx })
+            .await
+            .unwrap();
         let (rc_tx, _rc_rx) = oneshot::channel();
-        tx.send(DeviceControl::Reconnect { reply: rc_tx }).await.unwrap();
+        tx.send(DeviceControl::Reconnect { reply: rc_tx })
+            .await
+            .unwrap();
 
         let returned = serve_control_disconnected(
-            &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(5),
+            &mut rx,
+            &cfg,
+            &health,
+            &dm,
+            &events,
+            Duration::from_secs(5),
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -832,13 +926,25 @@ mod tests {
         assert!(events.has("adapter-paused"));
         assert!(r_rx.await.unwrap().is_err(), "a read answers disconnected");
         assert!(s_rx.await.unwrap().is_none(), "a snapshot answers None");
-        assert!(rp_rx.await.unwrap().is_err(), "a repoll answers disconnected");
-        assert!(b_rx.await.unwrap().is_err(), "a browse answers disconnected");
+        assert!(
+            rp_rx.await.unwrap().is_err(),
+            "a repoll answers disconnected"
+        );
+        assert!(
+            b_rx.await.unwrap().is_err(),
+            "a browse answers disconnected"
+        );
         assert!(w_rx.await.unwrap().is_err(), "a write answers disconnected");
-        assert!(wo_rx.await.unwrap().is_err(), "a push write answers disconnected");
+        assert!(
+            wo_rx.await.unwrap().is_err(),
+            "a push write answers disconnected"
+        );
         assert!(res_rx.await.unwrap(), "resume took effect");
         // Pause then resume both ran while disconnected: the flag ends cleared, both events fired.
-        assert!(!health.paused.load(Ordering::Relaxed), "resume cleared the shared flag");
+        assert!(
+            !health.paused.load(Ordering::Relaxed),
+            "resume cleared the shared flag"
+        );
         assert!(events.has("adapter-resumed"));
     }
 
@@ -851,7 +957,12 @@ mod tests {
         let events = crate::testutil::RecordingEvents::default();
         let (_tx, mut rx) = tokio::sync::mpsc::channel::<DeviceControl>(4);
         let returned = serve_control_disconnected(
-            &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(2),
+            &mut rx,
+            &cfg,
+            &health,
+            &dm,
+            &events,
+            Duration::from_secs(2),
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -875,16 +986,26 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let returned = serve_control_disconnected(
-            &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(60), &cancel,
+            &mut rx,
+            &cfg,
+            &health,
+            &dm,
+            &events,
+            Duration::from_secs(60),
+            &cancel,
         )
         .await;
 
         assert!(matches!(returned, DisconnectedWait::Stopped));
         assert_eq!(
-            tokio::time::Instant::now(), started,
+            tokio::time::Instant::now(),
+            started,
             "a cancelled instance leaves the backoff immediately, not after the window"
         );
-        assert!(!events.has("device-unreachable"), "a stop raises no alarm here");
+        assert!(
+            !events.has("device-unreachable"),
+            "a stop raises no alarm here"
+        );
     }
 
     /// A closed control channel means the owning task is going away, so it stops immediately rather
@@ -900,14 +1021,20 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let returned = serve_control_disconnected(
-            &mut rx, &cfg, &health, &dm, &events, Duration::from_secs(30),
+            &mut rx,
+            &cfg,
+            &health,
+            &dm,
+            &events,
+            Duration::from_secs(30),
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
         assert!(matches!(returned, DisconnectedWait::Stopped));
         assert_eq!(
-            tokio::time::Instant::now(), started,
+            tokio::time::Instant::now(),
+            started,
             "the remaining wait is not slept out"
         );
     }

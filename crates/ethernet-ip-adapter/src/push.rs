@@ -71,7 +71,13 @@ pub(crate) fn process_frame(
             }
         }
 
-        if !publish::should_publish(st.baseline.as_ref(), &reading.value, reading.quality, mode, deadband) {
+        if !publish::should_publish(
+            st.baseline.as_ref(),
+            &reading.value,
+            reading.quality,
+            mode,
+            deadband,
+        ) {
             health.samples_suppressed.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -132,7 +138,10 @@ mod tests {
     }
 
     fn deadbands(pairs: &[(&str, DeadbandSpec)]) -> HashMap<String, DeadbandSpec> {
-        pairs.iter().map(|(id, d)| ((*id).to_string(), d.clone())).collect()
+        pairs
+            .iter()
+            .map(|(id, d)| ((*id).to_string(), d.clone()))
+            .collect()
     }
 
     fn none_db() -> DeadbandSpec {
@@ -177,22 +186,58 @@ mod tests {
         let mut e = Engine::new(t0);
 
         let go = |e: &mut Engine, now: Instant, v: i64, h: &Health| {
-            process_frame(e, &[reading("a100/0/udint", json!(v), Quality::Good)], &dbs, PublishMode::Always, 100, 0, now, TS, h).len()
+            process_frame(
+                e,
+                &[reading("a100/0/udint", json!(v), Quality::Good)],
+                &dbs,
+                PublishMode::Always,
+                100,
+                0,
+                now,
+                TS,
+                h,
+            )
+            .len()
         };
         assert_eq!(go(&mut e, t0, 1, &h), 1, "first frame publishes");
-        assert_eq!(go(&mut e, t0 + Duration::from_millis(50), 2, &h), 0, "within 100ms ⇒ throttled");
-        assert_eq!(go(&mut e, t0 + Duration::from_millis(120), 3, &h), 1, "past the floor ⇒ publishes");
+        assert_eq!(
+            go(&mut e, t0 + Duration::from_millis(50), 2, &h),
+            0,
+            "within 100ms ⇒ throttled"
+        );
+        assert_eq!(
+            go(&mut e, t0 + Duration::from_millis(120), 3, &h),
+            1,
+            "past the floor ⇒ publishes"
+        );
         assert_eq!(h.samples_suppressed.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn deadband_gates_a_push_field_in_onchange() {
-        let dbs = deadbands(&[("a100/4/real", DeadbandSpec { kind: crate::config::DeadbandKind::Absolute, value: 0.5 })]);
+        let dbs = deadbands(&[(
+            "a100/4/real",
+            DeadbandSpec {
+                kind: crate::config::DeadbandKind::Absolute,
+                value: 0.5,
+            },
+        )]);
         let h = Health::default();
         let now = Instant::now();
         let mut e = Engine::new(now);
         let go = |e: &mut Engine, v: f64, h: &Health| {
-            process_frame(e, &[reading("a100/4/real", json!(v), Quality::Good)], &dbs, PublishMode::OnChange, 0, 0, now, TS, h).len()
+            process_frame(
+                e,
+                &[reading("a100/4/real", json!(v), Quality::Good)],
+                &dbs,
+                PublishMode::OnChange,
+                0,
+                0,
+                now,
+                TS,
+                h,
+            )
+            .len()
         };
         assert_eq!(go(&mut e, 10.0, &h), 1, "first publishes");
         assert_eq!(go(&mut e, 10.2, &h), 0, "0.2 < 0.5 suppressed");
@@ -207,16 +252,49 @@ mod tests {
         let mut e = Engine::new(now);
         // IDLE (UNCERTAIN) frame: publishes despite onChange + a sampleMs floor + no value change.
         assert_eq!(
-            process_frame(&mut e, &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)], &dbs, PublishMode::OnChange, 500, 0, now, TS, &h).len(),
+            process_frame(
+                &mut e,
+                &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)],
+                &dbs,
+                PublishMode::OnChange,
+                500,
+                0,
+                now,
+                TS,
+                &h
+            )
+            .len(),
             1
         );
         assert_eq!(
-            process_frame(&mut e, &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)], &dbs, PublishMode::OnChange, 500, 0, now, TS, &h).len(),
+            process_frame(
+                &mut e,
+                &[reading("a100/0/bool.1", json!(true), Quality::Uncertain)],
+                &dbs,
+                PublishMode::OnChange,
+                500,
+                0,
+                now,
+                TS,
+                &h
+            )
+            .len(),
             1
         );
         // A BAD frame publishes too.
         assert_eq!(
-            process_frame(&mut e, &[reading("a100/0/bool.1", Value::Null, Quality::Bad)], &dbs, PublishMode::OnChange, 500, 0, now, TS, &h).len(),
+            process_frame(
+                &mut e,
+                &[reading("a100/0/bool.1", Value::Null, Quality::Bad)],
+                &dbs,
+                PublishMode::OnChange,
+                500,
+                0,
+                now,
+                TS,
+                &h
+            )
+            .len(),
             1
         );
         assert_eq!(h.samples_bad.load(Ordering::Relaxed), 1);
@@ -233,12 +311,26 @@ mod tests {
         let t0 = Instant::now();
         let mut e = Engine::new(t0);
         // batchMs=100 buffers the frame's sample, stamped with the injected receipt-time TS.
-        assert!(process_frame(&mut e, &[reading("a100/0/udint", json!(1), Quality::Good)], &dbs, PublishMode::Always, 0, 100, t0, TS, &h).is_empty());
+        assert!(process_frame(
+            &mut e,
+            &[reading("a100/0/udint", json!(1), Quality::Good)],
+            &dbs,
+            PublishMode::Always,
+            0,
+            100,
+            t0,
+            TS,
+            &h
+        )
+        .is_empty());
         // Flush far later than the receipt: the capture stamp survives the batching latency.
         let flush = e.take_due(100, t0 + Duration::from_secs(30));
         assert_eq!(flush.len(), 1);
-        assert_eq!(flush[0].samples[0].server_ts.as_deref(), Some(TS),
-            "the frame-receipt capture stamp survives the delay");
+        assert_eq!(
+            flush[0].samples[0].server_ts.as_deref(),
+            Some(TS),
+            "the frame-receipt capture stamp survives the delay"
+        );
     }
 
     #[tokio::test]
@@ -247,7 +339,10 @@ mod tests {
         // and the loop terminates on Lost.
         let dbs = deadbands(&[("a100/0/udint", none_db())]);
         let mut session = ScriptedPush::new(vec![
-            IoUpdate::Up { o2t_api_ms: 100, t2o_api_ms: 100 },
+            IoUpdate::Up {
+                o2t_api_ms: 100,
+                t2o_api_ms: 100,
+            },
             IoUpdate::Data {
                 readings: vec![reading("a100/0/udint", json!(1), Quality::Good)],
                 sequence: 1,
@@ -260,7 +355,9 @@ mod tests {
                 run_mode: true,
                 received_at: Instant::now(),
             },
-            IoUpdate::Lost { error: DeviceError::Transient(anyhow::anyhow!("watchdog")) },
+            IoUpdate::Lost {
+                error: DeviceError::Transient(anyhow::anyhow!("watchdog")),
+            },
         ]);
         let h = Health::default();
         let mut e = Engine::new(Instant::now());
@@ -270,13 +367,27 @@ mod tests {
             match session.updates().recv().await {
                 Some(IoUpdate::Up { .. }) => up_seen = true,
                 Some(IoUpdate::Data { readings, .. }) => {
-                    published += process_frame(&mut e, &readings, &dbs, PublishMode::OnChange, 0, 0, Instant::now(), TS, &h).len();
+                    published += process_frame(
+                        &mut e,
+                        &readings,
+                        &dbs,
+                        PublishMode::OnChange,
+                        0,
+                        0,
+                        Instant::now(),
+                        TS,
+                        &h,
+                    )
+                    .len();
                 }
                 Some(IoUpdate::Lost { .. }) | None => break,
             }
         }
         assert!(up_seen, "the Up transition was delivered");
-        assert_eq!(published, 1, "the first frame published; the unchanged second was suppressed");
+        assert_eq!(
+            published, 1,
+            "the first frame published; the unchanged second was suppressed"
+        );
         assert_eq!(h.samples_good.load(Ordering::Relaxed), 2);
         assert_eq!(h.samples_suppressed.load(Ordering::Relaxed), 1);
     }
@@ -312,22 +423,44 @@ mod tests {
         }))
         .unwrap();
         let spec = poll.signals().next().unwrap();
-        let sample = publish::sample_of(json!([1.0, 2.0]), Quality::Good, Some("0x00"), Some("2026-07-18T12:00:00Z".into()));
+        let sample = publish::sample_of(
+            json!([1.0, 2.0]),
+            Quality::Good,
+            Some("0x00"),
+            Some("2026-07-18T12:00:00Z".into()),
+        );
         let update = publish::build_update(
             &spec.tag_path,
             &spec.name,
             spec.address_json(&poll.connection),
-            &publish::DeviceParts { adapter: "ethernet-ip", instance: &poll.id, endpoint: &poll.connection.endpoint },
+            &publish::DeviceParts {
+                adapter: "ethernet-ip",
+                instance: &poll.id,
+                endpoint: &poll.connection.endpoint,
+            },
             vec![sample],
         );
-        assert_eq!(update.signal_id.as_deref(), Some("ZONE_TEMPS"), "signal.id is the verbatim tagPath");
+        assert_eq!(
+            update.signal_id.as_deref(),
+            Some("ZONE_TEMPS"),
+            "signal.id is the verbatim tagPath"
+        );
         assert_eq!(update.signal_name.as_deref(), Some("zone-temps"));
-        assert_eq!(update.effective_signal_path(), Some("zone-temps"), "channel = name, not the id");
+        assert_eq!(
+            update.effective_signal_path(),
+            Some("zone-temps"),
+            "channel = name, not the id"
+        );
         assert_eq!(
             update.signal_address,
             Some(json!({ "tagPath": "ZONE_TEMPS", "type": "real", "arrayCount": 8, "slot": 0 }))
         );
-        assert_eq!(update.device, Some(json!({ "adapter": "ethernet-ip", "instance": "filler-plc", "endpoint": "127.0.0.1:44818" })));
+        assert_eq!(
+            update.device,
+            Some(
+                json!({ "adapter": "ethernet-ip", "instance": "filler-plc", "endpoint": "127.0.0.1:44818" })
+            )
+        );
         let s = &update.samples[0];
         assert_eq!(s.value, Some(json!([1.0, 2.0])));
         assert_eq!(s.quality, Some(FQ::Good));
@@ -340,15 +473,28 @@ mod tests {
         let io = push_io();
         let assembly = io.assemblies.input;
         let field = &io.input.signals[0]; // motor-run, bool bit 0
-        let bad = publish::sample_of(Value::Null, Quality::Bad, Some("0x04 path segment error"), None);
+        let bad = publish::sample_of(
+            Value::Null,
+            Quality::Bad,
+            Some("0x04 path segment error"),
+            None,
+        );
         let update = publish::build_update(
             &field.signal_id(assembly),
             &field.name,
             field.address_json(assembly, &conn),
-            &publish::DeviceParts { adapter: "ethernet-ip", instance: "palletizer-io", endpoint: "opener:44818" },
+            &publish::DeviceParts {
+                adapter: "ethernet-ip",
+                instance: "palletizer-io",
+                endpoint: "opener:44818",
+            },
             vec![bad],
         );
-        assert_eq!(update.signal_id.as_deref(), Some("a100/0/bool.0"), "push id form (D-EIP-18)");
+        assert_eq!(
+            update.signal_id.as_deref(),
+            Some("a100/0/bool.0"),
+            "push id form (D-EIP-18)"
+        );
         assert_eq!(update.signal_name.as_deref(), Some("motor-run"));
         assert_eq!(
             update.signal_address,
@@ -362,7 +508,11 @@ mod tests {
         );
         let s = &update.samples[0];
         assert_eq!(s.quality, Some(FQ::Bad));
-        assert_eq!(s.value, Some(Value::Null), "a BAD sample's value is JSON null");
+        assert_eq!(
+            s.value,
+            Some(Value::Null),
+            "a BAD sample's value is JSON null"
+        );
         assert!(s.source_ts.is_none());
     }
 }

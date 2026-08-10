@@ -12,7 +12,8 @@
 
 use super::*;
 use edgecommons::credentials::{
-    CredentialService, DefaultCredentialService, FileKeyProvider, KeyProvider, LocalVault, PutOptions,
+    CredentialService, DefaultCredentialService, FileKeyProvider, KeyProvider, LocalVault,
+    PutOptions,
 };
 use serde_json::json;
 
@@ -44,7 +45,9 @@ fn vault(seed: u8) -> (Arc<dyn CredentialService>, tempfile::TempDir) {
 }
 
 fn golden_pkcs7_der() -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD.decode(GOLDEN_PKCS7_B64).unwrap()
+    base64::engine::general_purpose::STANDARD
+        .decode(GOLDEN_PKCS7_B64)
+        .unwrap()
 }
 
 // ---- config parse + validate -------------------------------------------------------------------
@@ -71,7 +74,10 @@ fn est_disabled_by_default_and_validates_as_noop() {
 fn est_enabled_requires_https_server() {
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/c" } }));
     let missing = est_of(json!({ "enabled": true }));
-    assert!(missing.validate("plc", &sec).unwrap_err().contains("est.server"));
+    assert!(missing
+        .validate("plc", &sec)
+        .unwrap_err()
+        .contains("est.server"));
     let plain = est_of(json!({ "enabled": true, "server": "http://est/.well-known/est" }));
     assert!(plain.validate("plc", &sec).unwrap_err().contains("https"));
 }
@@ -79,8 +85,10 @@ fn est_enabled_requires_https_server() {
 #[test]
 fn est_enabled_valid_config_passes() {
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/client" } }));
-    let est = est_of(json!({ "enabled": true, "server": "https://est.plant:8085/.well-known/est",
-        "label": "eip", "renewBeforeDays": 20 }));
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://est.plant:8085/.well-known/est",
+        "label": "eip", "renewBeforeDays": 20 }),
+    );
     assert!(est.validate("plc", &sec).is_ok());
     assert_eq!(est.renew_before_days(&sec), 20);
 }
@@ -88,16 +96,23 @@ fn est_enabled_valid_config_passes() {
 #[test]
 fn est_auth_bootstrap_and_basic_collision_rejected() {
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/c" } }));
-    let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est",
-        "auth": { "bootstrap": { "certSecret": "boot" }, "basic": { "$secret": "creds" } } }));
-    assert!(est.validate("plc", &sec).unwrap_err().contains("BOTH bootstrap and basic"));
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://e/.well-known/est",
+        "auth": { "bootstrap": { "certSecret": "boot" }, "basic": { "$secret": "creds" } } }),
+    );
+    assert!(est
+        .validate("plc", &sec)
+        .unwrap_err()
+        .contains("BOTH bootstrap and basic"));
 }
 
 #[test]
 fn est_bootstrap_incomplete_rejected() {
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/c" } }));
-    let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est",
-        "auth": { "bootstrap": { "certFile": "only-cert.pem" } } }));
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://e/.well-known/est",
+        "auth": { "bootstrap": { "certFile": "only-cert.pem" } } }),
+    );
     assert!(est.validate("plc", &sec).unwrap_err().contains("bootstrap"));
 }
 
@@ -130,21 +145,34 @@ fn destination_defaults_to_client_inline_pair() {
     let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est" }));
     assert_eq!(
         est.resolve_destination(&sec).unwrap(),
-        ResolvedDestination::Pair { cert: "ot/cert".into(), key: "ot/key".into() }
+        ResolvedDestination::Pair {
+            cert: "ot/cert".into(),
+            key: "ot/key".into()
+        }
     );
 }
 
 #[test]
 fn destination_explicit_into_bundle_and_pair() {
     let sec = sec_of(json!({ "mode": "tls", "client": { "certFile": "c", "keyFile": "k" } }));
-    let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est",
-        "into": { "certSecret": "vault/bundle" } }));
-    assert_eq!(est.resolve_destination(&sec).unwrap(), ResolvedDestination::Bundle("vault/bundle".into()));
-    let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est",
-        "into": { "cert": "c1", "key": "k1" } }));
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://e/.well-known/est",
+        "into": { "certSecret": "vault/bundle" } }),
+    );
     assert_eq!(
         est.resolve_destination(&sec).unwrap(),
-        ResolvedDestination::Pair { cert: "c1".into(), key: "k1".into() }
+        ResolvedDestination::Bundle("vault/bundle".into())
+    );
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://e/.well-known/est",
+        "into": { "cert": "c1", "key": "k1" } }),
+    );
+    assert_eq!(
+        est.resolve_destination(&sec).unwrap(),
+        ResolvedDestination::Pair {
+            cert: "c1".into(),
+            key: "k1".into()
+        }
     );
 }
 
@@ -153,18 +181,28 @@ fn destination_file_client_without_into_is_rejected() {
     // A file-only client identity gives EST nowhere in the vault to write ⇒ needs est.into.
     let sec = sec_of(json!({ "mode": "tls", "client": { "certFile": "c", "keyFile": "k" } }));
     let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est" }));
-    assert!(est.validate("plc", &sec).unwrap_err().contains("write-back destination"));
+    assert!(est
+        .validate("plc", &sec)
+        .unwrap_err()
+        .contains("write-back destination"));
 }
 
 // ---- URL parsing -------------------------------------------------------------------------------
 
 #[test]
 fn url_parse_host_port_path_and_label() {
-    let e = EstEndpoint::parse("https://est.plant.example:8085/.well-known/est", Some("eip")).unwrap();
+    let e = EstEndpoint::parse(
+        "https://est.plant.example:8085/.well-known/est",
+        Some("eip"),
+    )
+    .unwrap();
     assert_eq!(e.host, "est.plant.example");
     assert_eq!(e.port, 8085);
     assert_eq!(e.base_path, "/.well-known/est/eip");
-    assert_eq!(e.op_path("simpleenroll"), "/.well-known/est/eip/simpleenroll");
+    assert_eq!(
+        e.op_path("simpleenroll"),
+        "/.well-known/est/eip/simpleenroll"
+    );
     assert_eq!(e.host_header(), "est.plant.example:8085");
 }
 
@@ -195,7 +233,10 @@ fn url_parse_ip_gives_ip_server_name() {
 fn url_parse_rejects_non_https_and_empty_host() {
     assert!(EstEndpoint::parse("http://est/.well-known/est", None).is_err());
     assert!(EstEndpoint::parse("https:///path", None).is_err());
-    assert!(EstEndpoint::parse("https://est:99999/x", None).is_err(), "port out of u16 range");
+    assert!(
+        EstEndpoint::parse("https://est:99999/x", None).is_err(),
+        "port out of u16 range"
+    );
 }
 
 // ---- CSR generation ----------------------------------------------------------------------------
@@ -209,7 +250,11 @@ fn csr_generation_yields_a_key_and_a_parseable_pkcs10() {
     // x509-cert decoder the adapter already depends on).
     use x509_cert::der::Decode;
     let req = x509_cert::request::CertReq::from_der(&csr.csr_der).unwrap();
-    assert!(req.info.subject.to_string().contains("eip-originator"), "subject: {}", req.info.subject);
+    assert!(
+        req.info.subject.to_string().contains("eip-originator"),
+        "subject: {}",
+        req.info.subject
+    );
 }
 
 // ---- HTTP request encoding ---------------------------------------------------------------------
@@ -241,7 +286,12 @@ fn encode_cacerts_is_a_bodyless_get() {
 #[test]
 fn encode_request_adds_basic_auth_header() {
     let e = EstEndpoint::parse("https://est/.well-known/est", None).unwrap();
-    let bytes = encode_request(&e, EstOp::SimpleReenroll, Some(b"x"), Some(("user", "pass")));
+    let bytes = encode_request(
+        &e,
+        EstOp::SimpleReenroll,
+        Some(b"x"),
+        Some(("user", "pass")),
+    );
     let text = String::from_utf8_lossy(&bytes);
     let token = base64::engine::general_purpose::STANDARD.encode("user:pass");
     assert!(text.contains(&format!("Authorization: Basic {token}\r\n")));
@@ -283,7 +333,10 @@ fn parse_pkcs7_golden_vector_extracts_the_issued_cert() {
     // The extracted DER is a real X.509 whose serial matches the OpenSSL-issued cert.
     let serial = crate::eip::tls::certs_from_pem(&chain_to_pem(&certs), "golden")
         .ok()
-        .and_then(|c| c.first().and_then(|c| crate::eip::tls::cert_serial(c.as_ref())));
+        .and_then(|c| {
+            c.first()
+                .and_then(|c| crate::eip::tls::cert_serial(c.as_ref()))
+        });
     assert_eq!(serial.as_deref(), Some(GOLDEN_SERIAL));
 }
 
@@ -292,7 +345,10 @@ fn parse_pkcs7_rejects_non_pkcs7() {
     // A bare X.509 cert (not a PKCS#7 ContentInfo) is refused.
     let c = mint_certs();
     let err = parse_pkcs7_certs(c.ca_der.as_ref()).unwrap_err();
-    assert!(err.contains("PKCS#7") || err.contains("SignedData"), "{err}");
+    assert!(
+        err.contains("PKCS#7") || err.contains("SignedData"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -317,14 +373,38 @@ fn interpret_enroll_status_mapping() {
     };
     assert_eq!(interpret_enroll_response(&ok).unwrap().len(), 1);
 
-    let pending = HttpResponse { status: 202, base64_body: false, retry_after_secs: Some(30), body: vec![] };
-    assert!(matches!(interpret_enroll_response(&pending), Err(EstError::RetryAfter(30))));
+    let pending = HttpResponse {
+        status: 202,
+        base64_body: false,
+        retry_after_secs: Some(30),
+        body: vec![],
+    };
+    assert!(matches!(
+        interpret_enroll_response(&pending),
+        Err(EstError::RetryAfter(30))
+    ));
 
-    let unauth = HttpResponse { status: 401, base64_body: false, retry_after_secs: None, body: vec![] };
-    assert!(matches!(interpret_enroll_response(&unauth), Err(EstError::Unauthorized(401))));
+    let unauth = HttpResponse {
+        status: 401,
+        base64_body: false,
+        retry_after_secs: None,
+        body: vec![],
+    };
+    assert!(matches!(
+        interpret_enroll_response(&unauth),
+        Err(EstError::Unauthorized(401))
+    ));
 
-    let boom = HttpResponse { status: 500, base64_body: false, retry_after_secs: None, body: vec![] };
-    assert!(matches!(interpret_enroll_response(&boom), Err(EstError::Status(500))));
+    let boom = HttpResponse {
+        status: 500,
+        base64_body: false,
+        retry_after_secs: None,
+        body: vec![],
+    };
+    assert!(matches!(
+        interpret_enroll_response(&boom),
+        Err(EstError::Status(500))
+    ));
 }
 
 #[test]
@@ -336,7 +416,12 @@ fn decode_body_tolerates_wrapped_base64() {
         .map(|c| String::from_utf8_lossy(c).to_string())
         .collect::<Vec<_>>()
         .join("\r\n");
-    let resp = HttpResponse { status: 200, base64_body: true, retry_after_secs: None, body: wrapped.into_bytes() };
+    let resp = HttpResponse {
+        status: 200,
+        base64_body: true,
+        retry_after_secs: None,
+        body: wrapped.into_bytes(),
+    };
     let certs = interpret_enroll_response(&resp).unwrap();
     assert_eq!(certs.len(), 1);
 }
@@ -382,10 +467,20 @@ fn scheduler_idle_when_healthy() {
 #[test]
 fn scheduler_backoff_suppresses_a_recent_attempt() {
     // Within the backoff window, even a needed enroll waits.
-    let d = EstScheduler::decide(None, 30, Some(Duration::from_secs(5)), Duration::from_secs(60));
+    let d = EstScheduler::decide(
+        None,
+        30,
+        Some(Duration::from_secs(5)),
+        Duration::from_secs(60),
+    );
     assert_eq!(d, EstDecision::Idle);
     // After the backoff, it proceeds.
-    let d = EstScheduler::decide(None, 30, Some(Duration::from_secs(120)), Duration::from_secs(60));
+    let d = EstScheduler::decide(
+        None,
+        30,
+        Some(Duration::from_secs(120)),
+        Duration::from_secs(60),
+    );
     assert_eq!(d, EstDecision::Enroll { reenroll: false });
 }
 
@@ -424,31 +519,50 @@ fn est_status_json_shape() {
 fn resolve_trust_prefers_est_trust_then_connection_ca() {
     let (creds, _d) = vault(40);
     let c = mint_certs();
-    creds.put("est/ca", c.ca_pem.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("conn/ca", c.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+    creds
+        .put("est/ca", c.ca_pem.as_bytes(), PutOptions::default())
+        .unwrap();
+    creds
+        .put("conn/ca", c.ca_pem.as_bytes(), PutOptions::default())
+        .unwrap();
 
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/c" },
         "ca": { "secret": "conn/ca" } }));
-    let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est",
-        "trust": { "secret": "est/ca" } }));
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://e/.well-known/est",
+        "trust": { "secret": "est/ca" } }),
+    );
     let t = resolve_est_trust(&est, &sec, Some(&creds)).unwrap();
     assert_eq!(t.len(), 1);
 
     // Without est.trust it falls back to the connection CA.
     let est2 = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est" }));
-    assert_eq!(resolve_est_trust(&est2, &sec, Some(&creds)).unwrap().len(), 1);
+    assert_eq!(
+        resolve_est_trust(&est2, &sec, Some(&creds)).unwrap().len(),
+        1
+    );
 }
 
 #[test]
 fn resolve_auth_basic_reads_the_basic_auth_view() {
     let (creds, _d) = vault(41);
     let ba = json!({ "username": "estuser", "password": "s3cr3t" });
-    creds.put("est/creds", serde_json::to_vec(&ba).unwrap().as_slice(), PutOptions::default()).unwrap();
+    creds
+        .put(
+            "est/creds",
+            serde_json::to_vec(&ba).unwrap().as_slice(),
+            PutOptions::default(),
+        )
+        .unwrap();
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/c" } }));
-    let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est",
-        "auth": { "basic": { "$secret": "est/creds" } } }));
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://e/.well-known/est",
+        "auth": { "basic": { "$secret": "est/creds" } } }),
+    );
     match resolve_auth_material(&est, &sec, Some(&creds)).unwrap() {
-        EstAuthMaterial::Basic { username, password, .. } => {
+        EstAuthMaterial::Basic {
+            username, password, ..
+        } => {
             assert_eq!(username, "estuser");
             assert_eq!(password, "s3cr3t");
         }
@@ -460,8 +574,16 @@ fn resolve_auth_basic_reads_the_basic_auth_view() {
 fn resolve_auth_defaults_to_current_client_identity() {
     let (creds, _d) = vault(42);
     let c = mint_certs();
-    creds.put("ot/cert", c.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("ot/key", c.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+    creds
+        .put(
+            "ot/cert",
+            c.client_cert_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+    creds
+        .put("ot/key", c.client_key_pem.as_bytes(), PutOptions::default())
+        .unwrap();
     let sec = sec_of(json!({ "mode": "tls",
         "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } } }));
     let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est" }));
@@ -486,10 +608,19 @@ fn write_enrolled_bundle_is_readable_as_a_tls_bundle() {
 #[test]
 fn write_enrolled_pair_writes_two_secrets() {
     let (creds, _d) = vault(44);
-    let dest = ResolvedDestination::Pair { cert: "ot/cert".into(), key: "ot/key".into() };
+    let dest = ResolvedDestination::Pair {
+        cert: "ot/cert".into(),
+        key: "ot/key".into(),
+    };
     write_enrolled(&dest, "CERTPEM", "KEYPEM", Some(&creds)).unwrap();
-    assert_eq!(creds.get_string("ot/cert").unwrap().as_deref(), Some("CERTPEM"));
-    assert_eq!(creds.get_string("ot/key").unwrap().as_deref(), Some("KEYPEM"));
+    assert_eq!(
+        creds.get_string("ot/cert").unwrap().as_deref(),
+        Some("CERTPEM")
+    );
+    assert_eq!(
+        creds.get_string("ot/key").unwrap().as_deref(),
+        Some("KEYPEM")
+    );
 }
 
 #[test]
@@ -522,7 +653,13 @@ fn est_client_new_rejects_bad_client_key() {
         cert_pem: certs.client_cert_pem.clone(),
         key_pem: "-----BEGIN PRIVATE KEY-----\nnotakey\n-----END PRIVATE KEY-----\n".into(),
     };
-    assert!(EstClient::new(endpoint, std::slice::from_ref(&certs.ca_pem), &auth, Duration::from_secs(1)).is_err());
+    assert!(EstClient::new(
+        endpoint,
+        std::slice::from_ref(&certs.ca_pem),
+        &auth,
+        Duration::from_secs(1)
+    )
+    .is_err());
 }
 
 #[tokio::test]
@@ -534,7 +671,13 @@ async fn est_client_request_connect_refused_is_transport_error() {
         cert_pem: certs.client_cert_pem.clone(),
         key_pem: certs.client_key_pem.clone(),
     };
-    let client = EstClient::new(endpoint, std::slice::from_ref(&certs.ca_pem), &auth, Duration::from_secs(2)).unwrap();
+    let client = EstClient::new(
+        endpoint,
+        std::slice::from_ref(&certs.ca_pem),
+        &auth,
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let err = client.request(EstOp::CaCerts, None).await.unwrap_err();
     assert!(err.contains("connecting") || err.contains("EST"), "{err}");
     // And request_certificate maps it to a transient EstError::Io.
@@ -544,7 +687,9 @@ async fn est_client_request_connect_refused_is_transport_error() {
 
 #[test]
 fn resolve_est_trust_without_any_source_errors() {
-    let sec = sec_of(json!({ "mode": "tls", "client": { "certFile": "c", "keyFile": "k" }, "verifyPeer": false }));
+    let sec = sec_of(
+        json!({ "mode": "tls", "client": { "certFile": "c", "keyFile": "k" }, "verifyPeer": false }),
+    );
     let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est" }));
     assert!(resolve_est_trust(&est, &sec, None).is_err());
 }
@@ -554,18 +699,35 @@ fn resolve_auth_without_auth_or_client_errors() {
     let sec = sec_of(json!({ "mode": "tls", "verifyPeer": false }));
     let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est" }));
     let err = resolve_auth_material(&est, &sec, None).unwrap_err();
-    assert!(err.contains("no auth") || err.contains("client identity"), "{err}");
+    assert!(
+        err.contains("no auth") || err.contains("client identity"),
+        "{err}"
+    );
 }
 
 #[test]
 fn resolve_auth_bootstrap_sources_the_identity() {
     let (creds, _d) = vault(45);
     let c = mint_certs();
-    creds.put("boot/cert", c.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("boot/key", c.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+    creds
+        .put(
+            "boot/cert",
+            c.client_cert_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+    creds
+        .put(
+            "boot/key",
+            c.client_key_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/c" } }));
-    let est = est_of(json!({ "enabled": true, "server": "https://e/.well-known/est",
-        "auth": { "bootstrap": { "cert": { "$secret": "boot/cert" }, "key": { "$secret": "boot/key" } } } }));
+    let est = est_of(
+        json!({ "enabled": true, "server": "https://e/.well-known/est",
+        "auth": { "bootstrap": { "cert": { "$secret": "boot/cert" }, "key": { "$secret": "boot/key" } } } }),
+    );
     assert!(matches!(
         resolve_auth_material(&est, &sec, Some(&creds)).unwrap(),
         EstAuthMaterial::ClientCert { .. }
@@ -586,11 +748,31 @@ async fn enroll_once_writes_the_issued_cert_and_2b_reloads_it() {
 
     let (creds, _d) = vault(50);
     // Bootstrap identity + EST server trust + a pre-existing (old) client bundle at the destination.
-    creds.put("boot/cert", certs.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("boot/key", certs.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("est/ca", certs.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+    creds
+        .put(
+            "boot/cert",
+            certs.client_cert_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+    creds
+        .put(
+            "boot/key",
+            certs.client_key_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+    creds
+        .put("est/ca", certs.ca_pem.as_bytes(), PutOptions::default())
+        .unwrap();
     let old_bundle = json!({ "certPem": certs.client_cert_pem, "keyPem": certs.client_key_pem });
-    creds.put("ot/originator", serde_json::to_vec(&old_bundle).unwrap().as_slice(), PutOptions::default()).unwrap();
+    creds
+        .put(
+            "ot/originator",
+            serde_json::to_vec(&old_bundle).unwrap().as_slice(),
+            PutOptions::default(),
+        )
+        .unwrap();
 
     let sec = sec_of(json!({ "mode": "tls",
         "client": { "certSecret": "ot/originator" },
@@ -602,10 +784,17 @@ async fn enroll_once_writes_the_issued_cert_and_2b_reloads_it() {
         "into": { "certSecret": "ot/originator" } }));
 
     // The material fingerprint BEFORE enrollment (Phase 2b watcher baseline).
-    let before = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
+    let before = crate::eip::rotation::read_reload_state(
+        &sec,
+        Some(&creds),
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
 
     // Enroll (initial): POST the CSR, get the golden cert, write it to the vault.
-    let out = enroll_once(&est, &sec, Some(&creds), false, Duration::from_secs(5)).await.unwrap();
+    let out = enroll_once(&est, &sec, Some(&creds), false, Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(out.chain_len, 1);
     assert_eq!(out.serial.as_deref(), Some(GOLDEN_SERIAL));
     assert_eq!(out.written_to, "ot/originator");
@@ -616,16 +805,31 @@ async fn enroll_once_writes_the_issued_cert_and_2b_reloads_it() {
         .unwrap()
         .first()
         .and_then(|c| crate::eip::tls::cert_serial(c.as_ref()));
-    assert_eq!(issued_serial.as_deref(), Some(GOLDEN_SERIAL), "vault holds the enrolled cert");
+    assert_eq!(
+        issued_serial.as_deref(),
+        Some(GOLDEN_SERIAL),
+        "vault holds the enrolled cert"
+    );
 
     // Phase 2b handoff: the fingerprint changed ⇒ the rotation watcher reports Rotated (⇒ reconnect).
-    let after = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
-    assert_ne!(before.fingerprint, after.fingerprint, "the enrolled material changed the fingerprint");
+    let after = crate::eip::rotation::read_reload_state(
+        &sec,
+        Some(&creds),
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    assert_ne!(
+        before.fingerprint, after.fingerprint,
+        "the enrolled material changed the fingerprint"
+    );
     let mut watcher = crate::eip::rotation::CertWatcher::default();
     watcher.observe(&before, 30);
     let outcome = watcher.observe(&after, 30);
     assert!(
-        outcome.actions.iter().any(|a| matches!(a, crate::eip::rotation::WatchAction::Rotated { .. })),
+        outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, crate::eip::rotation::WatchAction::Rotated { .. })),
         "2b watcher detects the EST rotation: {:?}",
         outcome.actions
     );
@@ -635,12 +839,19 @@ async fn enroll_once_writes_the_issued_cert_and_2b_reloads_it() {
 async fn est_client_cacerts_fetches_the_ca_bag() {
     let certs = mint_certs();
     let port = spawn_est_server(&certs, est_http_200(GOLDEN_PKCS7_B64)).await;
-    let endpoint = EstEndpoint::parse(&format!("https://127.0.0.1:{port}/.well-known/est"), None).unwrap();
+    let endpoint =
+        EstEndpoint::parse(&format!("https://127.0.0.1:{port}/.well-known/est"), None).unwrap();
     let auth = EstAuthMaterial::ClientCert {
         cert_pem: certs.client_cert_pem.clone(),
         key_pem: certs.client_key_pem.clone(),
     };
-    let client = EstClient::new(endpoint, std::slice::from_ref(&certs.ca_pem), &auth, Duration::from_secs(5)).unwrap();
+    let client = EstClient::new(
+        endpoint,
+        std::slice::from_ref(&certs.ca_pem),
+        &auth,
+        Duration::from_secs(5),
+    )
+    .unwrap();
     let bag = client.cacerts().await.unwrap();
     assert_eq!(bag.len(), 1);
 }
@@ -691,9 +902,11 @@ async fn live_est_enroll_against_globalsign_estserver() {
         eprintln!("SKIP live_est_enroll: no EST server on {EST_LIVE_ADDR} (run `docker compose up --build est-server`)");
         return;
     }
-    let (Some(ca), Some(cc), Some(ck)) =
-        (read_est_cert("ca.pem"), read_est_cert("client.pem"), read_est_cert("client.key"))
-    else {
+    let (Some(ca), Some(cc), Some(ck)) = (
+        read_est_cert("ca.pem"),
+        read_est_cert("client.pem"),
+        read_est_cert("client.key"),
+    ) else {
         assert!(
             !live_required(),
             "ENIP_LIVE_REQUIRED=1 but the EST bootstrap certs are missing from {EST_CERT_DIR} — \
@@ -704,12 +917,20 @@ async fn live_est_enroll_against_globalsign_estserver() {
     };
 
     let (creds, _d) = vault(60);
-    creds.put("boot/cert", cc.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("boot/key", ck.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("est/ca", ca.as_bytes(), PutOptions::default()).unwrap();
+    creds
+        .put("boot/cert", cc.as_bytes(), PutOptions::default())
+        .unwrap();
+    creds
+        .put("boot/key", ck.as_bytes(), PutOptions::default())
+        .unwrap();
+    creds
+        .put("est/ca", ca.as_bytes(), PutOptions::default())
+        .unwrap();
 
-    let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/originator" },
-        "ca": { "secret": "est/ca" } }));
+    let sec = sec_of(
+        json!({ "mode": "tls", "client": { "certSecret": "ot/originator" },
+        "ca": { "secret": "est/ca" } }),
+    );
     let est = est_of(json!({ "enabled": true,
         "server": "https://127.0.0.1:8443/.well-known/est",
         "trust": { "secret": "est/ca" },
@@ -740,16 +961,32 @@ async fn enroll_once_surfaces_a_202_retry() {
     let resp = b"HTTP/1.1 202 Accepted\r\nRetry-After: 45\r\nConnection: close\r\n\r\n".to_vec();
     let port = spawn_est_server(&certs, resp).await;
     let (creds, _d) = vault(51);
-    creds.put("boot/cert", certs.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("boot/key", certs.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-    creds.put("est/ca", certs.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+    creds
+        .put(
+            "boot/cert",
+            certs.client_cert_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+    creds
+        .put(
+            "boot/key",
+            certs.client_key_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+    creds
+        .put("est/ca", certs.ca_pem.as_bytes(), PutOptions::default())
+        .unwrap();
     let sec = sec_of(json!({ "mode": "tls", "client": { "certSecret": "ot/originator" } }));
     let est = est_of(json!({ "enabled": true,
         "server": format!("https://127.0.0.1:{port}/.well-known/est"),
         "trust": { "secret": "est/ca" },
         "auth": { "bootstrap": { "cert": { "$secret": "boot/cert" }, "key": { "$secret": "boot/key" } } },
         "into": { "certSecret": "ot/originator" } }));
-    let err = enroll_once(&est, &sec, Some(&creds), false, Duration::from_secs(5)).await.unwrap_err();
+    let err = enroll_once(&est, &sec, Some(&creds), false, Duration::from_secs(5))
+        .await
+        .unwrap_err();
     assert!(err.contains("pending") || err.contains("retry"), "{err}");
     // Nothing was written to the destination on a 202.
     assert!(creds.get("ot/originator").unwrap().is_none());

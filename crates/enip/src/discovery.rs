@@ -180,7 +180,10 @@ pub fn parse_list_services(data: &[u8]) -> Result<Vec<ServiceItem>, WireError> {
         let capability = r.u16()?;
         let name_bytes = r.take_rest();
         // Name is NULL-terminated ASCII within a fixed field; trim at the first NUL.
-        let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+        let end = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
         let name_slice = name_bytes.get(..end).unwrap_or(&[]);
         let name = core::str::from_utf8(name_slice)
             .map_err(|_| WireError::InvalidUtf8 {

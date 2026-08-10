@@ -18,6 +18,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use enip::assembly::{AssemblyError, AssemblyLayout, FieldSpec};
+use enip::cip::message::MessageReply;
 use enip::cip::status::{CipStatus, GeneralStatus};
 use enip::cip::types::{CipType, CipValue};
 use enip::cpf::{Cpf, CpfItem, ItemType};
@@ -30,7 +31,6 @@ use enip::{
     parse_list_interfaces, parse_list_services, DeviceType, EPath, MessageRequest, PathError,
     PortSegment, Segment, SymbolType, TagAddress, VendorId, WireReader, WireWriter,
 };
-use enip::cip::message::MessageReply;
 
 // ---------------------------------------------------------------------------
 // error model
@@ -39,9 +39,18 @@ use enip::cip::message::MessageReply;
 #[test]
 fn wire_error_display_covers_every_variant() {
     let variants = [
-        WireError::Truncated { needed: 4, remaining: 2, context: "encap header" },
-        WireError::Malformed { context: "cpf", detail: "bad item" },
-        WireError::Overflow { context: "cip reply" },
+        WireError::Truncated {
+            needed: 4,
+            remaining: 2,
+            context: "encap header",
+        },
+        WireError::Malformed {
+            context: "cpf",
+            detail: "bad item",
+        },
+        WireError::Overflow {
+            context: "cip reply",
+        },
         WireError::InvalidUtf8 { context: "logix" },
     ];
     for v in &variants {
@@ -80,7 +89,10 @@ fn enip_error_transient_classification_and_display() {
         EnipError::Timeout { op: "read" },
         EnipError::Encap(EncapStatus::InvalidLength),
         EnipError::Cip(CipStatus::new(GeneralStatus::ServiceNotSupported)),
-        EnipError::ForwardOpenRejected { status: CipStatus::new(GeneralStatus::ConnectionFailure), remaining_path_size: None },
+        EnipError::ForwardOpenRejected {
+            status: CipStatus::new(GeneralStatus::ConnectionFailure),
+            remaining_path_size: None,
+        },
         EnipError::Malformed(WireError::Overflow { context: "x" }),
         EnipError::ProtocolViolation { detail: "d" },
         EnipError::Unsupported { what: "w" },
@@ -102,7 +114,10 @@ fn general_status_description_total_over_all_codes() {
         assert_eq!(g.code(), code);
         assert!(!g.description().is_empty());
     }
-    assert_eq!(GeneralStatus::from_code(0x99).description(), "unknown status");
+    assert_eq!(
+        GeneralStatus::from_code(0x99).description(),
+        "unknown status"
+    );
     assert!(GeneralStatus::Success.is_ok());
 }
 
@@ -115,14 +130,24 @@ fn cip_status_classifiers_and_display() {
     assert!(res.is_resource_error() && res.is_routing_error() && res.is_err());
 
     // logix_extended_detail: each known code, an unknown ext, and the non-extended short-circuit.
-    for (word, expect_some) in [(0x2104u16, true), (0x2105, true), (0x2107, true), (0x9999, false)] {
+    for (word, expect_some) in [
+        (0x2104u16, true),
+        (0x2105, true),
+        (0x2107, true),
+        (0x9999, false),
+    ] {
         let s = CipStatus::with_extended(GeneralStatus::ExtendedError, vec![word]);
         assert_eq!(s.logix_extended_detail().is_some(), expect_some);
     }
-    assert!(CipStatus::new(GeneralStatus::PathSegmentError).logix_extended_detail().is_none());
+    assert!(CipStatus::new(GeneralStatus::PathSegmentError)
+        .logix_extended_detail()
+        .is_none());
 
     // Display: plain, with-detail, and with-extended-words rendering.
-    assert_eq!(CipStatus::new(GeneralStatus::PartialTransfer).to_string(), "0x06 (partial transfer)");
+    assert_eq!(
+        CipStatus::new(GeneralStatus::PartialTransfer).to_string(),
+        "0x06 (partial transfer)"
+    );
     let ext = CipStatus::with_extended(GeneralStatus::ExtendedError, vec![0x2107, 0x0001]);
     let s = ext.to_string();
     assert!(s.contains("tag type mismatch") && s.contains("[ext 0x2107 0x0001]"));
@@ -189,9 +214,19 @@ fn cip_type_and_value_edges() {
 
     // encode_value refuses the opaque markers.
     let mut w = WireWriter::new();
-    assert!(CipValue::Struct { handle: 1, bytes_len: 4 }.encode_value(&mut w).is_err());
+    assert!(CipValue::Struct {
+        handle: 1,
+        bytes_len: 4
+    }
+    .encode_value(&mut w)
+    .is_err());
     let mut w2 = WireWriter::new();
-    assert!(CipValue::Unsupported { type_code: 0xD0, bytes_len: 2 }.encode_value(&mut w2).is_err());
+    assert!(CipValue::Unsupported {
+        type_code: 0xD0,
+        bytes_len: 2
+    }
+    .encode_value(&mut w2)
+    .is_err());
 
     // A BOOL round-trips through encode_value (0xFF/0x00).
     let mut wb = WireWriter::new();
@@ -233,7 +268,10 @@ fn epath_builders_and_word_len() {
     assert!(matches!(p.segments().first(), Some(Segment::Class(0x02))));
 
     // Wide instance ids widen to the 16-bit segment forms.
-    let wide = EPath::new().class(0x1234).instance(0x5678).connection_point(0x9ABC);
+    let wide = EPath::new()
+        .class(0x1234)
+        .instance(0x5678)
+        .connection_point(0x9ABC);
     assert!(wide.encode().unwrap().len() % 2 == 0);
 
     let from = EPath::from_segments(vec![Segment::Class(1), Segment::Instance(2)]);
@@ -251,9 +289,12 @@ fn tag_path_parser_variants_and_errors() {
 
     // Error surface — each PathError variant is a typed error with a Display string.
     assert_eq!(TagAddress::parse(""), Err(PathError::Empty));
-    assert!(matches!(TagAddress::parse("a..b"), Err(PathError::EmptyComponent)));
+    assert!(matches!(
+        TagAddress::parse("a..b"),
+        Err(PathError::EmptyComponent)
+    ));
     assert!(TagAddress::parse("[3]").is_err()); // leading bracket, empty name
-    // A wildly out-of-range index overflows u32.
+                                                // A wildly out-of-range index overflows u32.
     assert!(TagAddress::parse("X[99999999999999999999]").is_err());
 
     for e in [
@@ -368,7 +409,10 @@ fn assembly_layout_encode_into_roundtrip_and_errors() {
         layout.encode_into(&[], &mut small),
         Err(AssemblyError::DataSizeMismatch { .. })
     ));
-    assert!(matches!(layout.decode(&small), Err(AssemblyError::DataSizeMismatch { .. })));
+    assert!(matches!(
+        layout.decode(&small),
+        Err(AssemblyError::DataSizeMismatch { .. })
+    ));
 
     // Construction rejections + their Display strings.
     assert!(matches!(
@@ -380,7 +424,16 @@ fn assembly_layout_encode_into_roundtrip_and_errors() {
         Err(AssemblyError::NonElementaryType { .. })
     ));
     assert!(matches!(
-        AssemblyLayout::new(vec![FieldSpec { key: 0, offset: 0, ty: CipType::Bool, bit: Some(9), count: 1 }], 8),
+        AssemblyLayout::new(
+            vec![FieldSpec {
+                key: 0,
+                offset: 0,
+                ty: CipType::Bool,
+                bit: Some(9),
+                count: 1
+            }],
+            8
+        ),
         Err(AssemblyError::InvalidBitField { .. })
     ));
     assert!(matches!(
@@ -392,7 +445,10 @@ fn assembly_layout_encode_into_roundtrip_and_errors() {
         AssemblyError::ZeroCount { key: 0 },
         AssemblyError::InvalidBitField { key: 0 },
         AssemblyError::NonElementaryType { key: 0 },
-        AssemblyError::DataSizeMismatch { expected: 6, actual: 5 },
+        AssemblyError::DataSizeMismatch {
+            expected: 6,
+            actual: 5,
+        },
         AssemblyError::UnknownField { key: 1 },
         AssemblyError::ValueTypeMismatch { key: 2 },
     ] {
@@ -468,9 +524,15 @@ async fn io_connection_produce_and_watchdog() {
     use tokio::time::{advance, Instant};
 
     let now = Instant::now();
-    let mut conn = IoConnection::new(io_params(RealTimeFormat::Header32Bit, RealTimeFormat::Modeless), now);
+    let mut conn = IoConnection::new(
+        io_params(RealTimeFormat::Header32Bit, RealTimeFormat::Modeless),
+        now,
+    );
     assert_eq!(conn.connection_id(), 0x2000_0002);
-    assert_eq!(conn.apis(), (Duration::from_millis(10), Duration::from_millis(10)));
+    assert_eq!(
+        conn.apis(),
+        (Duration::from_millis(10), Duration::from_millis(10))
+    );
     assert_eq!(conn.tx_endpoint(), SocketAddr::from(([127, 0, 0, 1], 2222)));
     assert!(conn.multicast_group().is_none());
     conn.set_output(Bytes::from_static(&[1, 2, 3, 4]));
@@ -482,7 +544,10 @@ async fn io_connection_produce_and_watchdog() {
 
     // Advance past one O→T API — a tick fires and the sequence advances.
     advance(Duration::from_millis(11)).await;
-    let frame = conn.poll_produce(Instant::now()).expect("a produce tick is due").unwrap();
+    let frame = conn
+        .poll_produce(Instant::now())
+        .expect("a produce tick is due")
+        .unwrap();
     assert!(!frame.is_empty());
     assert_eq!(conn.last_produced_sequence(), 1);
     assert_eq!(conn.last_encap_sequence(), 1);
@@ -502,7 +567,10 @@ async fn io_connection_produce_and_watchdog() {
 async fn io_connection_consume_accept_and_size_drop() {
     use tokio::time::Instant;
     let now = Instant::now();
-    let mut conn = IoConnection::new(io_params(RealTimeFormat::Modeless, RealTimeFormat::Modeless), now);
+    let mut conn = IoConnection::new(
+        io_params(RealTimeFormat::Modeless, RealTimeFormat::Modeless),
+        now,
+    );
 
     // A correctly-sized modeless T→O frame (seq 1 + 4 data bytes) is accepted as the first frame.
     let frame = enip::IoFrame {
@@ -540,10 +608,19 @@ fn io_enum_helpers_and_debug() {
         let _ = (fmt.has_sequence(), fmt.has_header(), fmt.carries_data());
         assert!(!format!("{fmt:?}").is_empty());
     }
-    for r in [LostReason::Timeout, LostReason::ClosedByPeer, LostReason::Io] {
+    for r in [
+        LostReason::Timeout,
+        LostReason::ClosedByPeer,
+        LostReason::Io,
+    ] {
         assert!(!format!("{r:?}").is_empty());
     }
-    for d in [DropReason::Malformed, DropReason::UnknownConnection, DropReason::SizeMismatch, DropReason::Stale] {
+    for d in [
+        DropReason::Malformed,
+        DropReason::UnknownConnection,
+        DropReason::SizeMismatch,
+        DropReason::Stale,
+    ] {
         assert!(!format!("{d:?}").is_empty());
     }
 }

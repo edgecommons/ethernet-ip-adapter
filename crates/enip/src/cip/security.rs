@@ -134,7 +134,9 @@ pub struct CipSecurityObject {
 ///
 /// # Errors
 /// [`WireError::Truncated`] if the attribute is empty.
-pub fn decode_cip_security_state(bytes: &[u8]) -> core::result::Result<CipSecurityState, WireError> {
+pub fn decode_cip_security_state(
+    bytes: &[u8],
+) -> core::result::Result<CipSecurityState, WireError> {
     let mut r = WireReader::with_context(bytes, "cip security state");
     Ok(CipSecurityState::from_code(r.u8()?))
 }
@@ -540,7 +542,9 @@ impl EipClient {
     ///
     /// # Errors
     /// A connection-level [`EnipError`].
-    pub async fn read_certificate_management(&self) -> Result<Option<CertificateManagementSummary>> {
+    pub async fn read_certificate_management(
+        &self,
+    ) -> Result<Option<CertificateManagementSummary>> {
         // Class attribute 8 (Capability Flags) is read at instance 0.
         let capabilities = self
             .get_attr_optional(CLASS_CERTIFICATE_MANAGEMENT, 0, 8)
@@ -620,9 +624,15 @@ mod tests {
 
     #[test]
     fn cip_security_state_is_total_and_named() {
-        assert_eq!(CipSecurityState::from_code(0), CipSecurityState::FactoryDefault);
+        assert_eq!(
+            CipSecurityState::from_code(0),
+            CipSecurityState::FactoryDefault
+        );
         assert_eq!(CipSecurityState::from_code(2), CipSecurityState::Configured);
-        assert_eq!(CipSecurityState::from_code(0x77), CipSecurityState::Unknown(0x77));
+        assert_eq!(
+            CipSecurityState::from_code(0x77),
+            CipSecurityState::Unknown(0x77)
+        );
         assert_eq!(CipSecurityState::from_code(2).description(), "Configured");
         for code in 0u8..=0xFF {
             assert_eq!(CipSecurityState::from_code(code).code(), code);
@@ -699,7 +709,10 @@ mod tests {
         assert!(decode_bool_attr(&[0x01]).unwrap());
         assert!(!decode_bool_attr(&[0x00]).unwrap());
         // A profiles WORD ignores trailing bytes (devices may pad).
-        assert_eq!(decode_security_profiles(&[0x02, 0x00, 0xFF]).unwrap().bits, 0x0002);
+        assert_eq!(
+            decode_security_profiles(&[0x02, 0x00, 0xFF]).unwrap().bits,
+            0x0002
+        );
     }
 
     #[test]
@@ -722,12 +735,18 @@ mod tests {
 
     #[test]
     fn certificate_state_and_encoding_total() {
-        assert_eq!(CertificateState::from_code(0), CertificateState::NonExistent);
+        assert_eq!(
+            CertificateState::from_code(0),
+            CertificateState::NonExistent
+        );
         assert_eq!(CertificateState::from_code(3), CertificateState::Verified);
         assert_eq!(CertificateState::from_code(9), CertificateState::Unknown(9));
         assert_eq!(CertificateEncoding::from_code(0), CertificateEncoding::Pem);
         assert_eq!(CertificateEncoding::from_code(1).description(), "PKCS#7");
-        assert_eq!(CertificateEncoding::from_code(5), CertificateEncoding::Unknown(5));
+        assert_eq!(
+            CertificateEncoding::from_code(5),
+            CertificateEncoding::Unknown(5)
+        );
     }
 
     #[test]

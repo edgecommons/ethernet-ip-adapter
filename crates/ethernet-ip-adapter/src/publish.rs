@@ -172,7 +172,9 @@ fn value_changed(prev: &Value, new: &Value, deadband: &DeadbandSpec) -> bool {
             if p.len() != n.len() {
                 return true;
             }
-            p.iter().zip(n).any(|(a, b)| element_changed(a, b, deadband))
+            p.iter()
+                .zip(n)
+                .any(|(a, b)| element_changed(a, b, deadband))
         }
         _ => element_changed(prev, new, deadband),
     }
@@ -224,7 +226,12 @@ impl Batcher {
     /// Add a passing sample. Returns `Some(samples)` to publish **now** when `batch_ms == 0`; else
     /// buffers it (opening the window on the first) and returns `None` — [`Self::take_due`] flushes it
     /// once the window closes.
-    pub(crate) fn add(&mut self, sample: Sample, now: Instant, batch_ms: u64) -> Option<Vec<Sample>> {
+    pub(crate) fn add(
+        &mut self,
+        sample: Sample,
+        now: Instant,
+        batch_ms: u64,
+    ) -> Option<Vec<Sample>> {
         if batch_ms == 0 {
             return Some(vec![sample]);
         }
@@ -252,7 +259,8 @@ impl Batcher {
     /// When the open window will next be due (for the loop's wake computation), or `None` if idle.
     #[must_use]
     pub(crate) fn next_deadline(&self, batch_ms: u64) -> Option<Instant> {
-        self.window_open.map(|t| t + Duration::from_millis(batch_ms))
+        self.window_open
+            .map(|t| t + Duration::from_millis(batch_ms))
     }
 }
 
@@ -394,8 +402,10 @@ pub(crate) fn now_iso() -> String {
 #[must_use]
 pub(crate) fn iso_at(captured: Instant) -> String {
     let ago = Instant::now().saturating_duration_since(captured);
-    let dt = time::OffsetDateTime::now_utc() - time::Duration::try_from(ago).unwrap_or(time::Duration::ZERO);
-    dt.format(&time::format_description::well_known::Rfc3339).unwrap_or_default()
+    let dt = time::OffsetDateTime::now_utc()
+        - time::Duration::try_from(ago).unwrap_or(time::Duration::ZERO);
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -436,9 +446,15 @@ mod tests {
         );
 
         sink.set_delay(Duration::from_millis(20));
-        let (res, latency) =
-            publish_via(&sink, "LINE_SPEED", "line-speed", address.clone(), &device, samples.clone())
-                .await;
+        let (res, latency) = publish_via(
+            &sink,
+            "LINE_SPEED",
+            "line-speed",
+            address.clone(),
+            &device,
+            samples.clone(),
+        )
+        .await;
 
         assert!(res.is_ok());
         let published = sink.updates();
@@ -454,7 +470,8 @@ mod tests {
 
         // A sink failure comes back as its display string, and is still measured.
         sink.set_fail(true);
-        let (res, _) = publish_via(&sink, "LINE_SPEED", "line-speed", address, &device, samples).await;
+        let (res, _) =
+            publish_via(&sink, "LINE_SPEED", "line-speed", address, &device, samples).await;
         assert_eq!(res.unwrap_err(), "recording publisher: scripted failure");
     }
 
@@ -530,16 +547,28 @@ mod tests {
     #[test]
     fn deadband_absolute_gates_below_the_threshold() {
         let abs = db(DeadbandKind::Absolute, 0.5);
-        assert!(!value_changed(&json!(10.0), &json!(10.4), &abs), "0.4 < 0.5 suppressed");
-        assert!(value_changed(&json!(10.0), &json!(10.5), &abs), "0.5 >= 0.5 passes");
+        assert!(
+            !value_changed(&json!(10.0), &json!(10.4), &abs),
+            "0.4 < 0.5 suppressed"
+        );
+        assert!(
+            value_changed(&json!(10.0), &json!(10.5), &abs),
+            "0.5 >= 0.5 passes"
+        );
     }
 
     #[test]
     fn deadband_percent_is_relative_to_the_old_value() {
         let pct = db(DeadbandKind::Percent, 1.0); // 1%
-        // old=100 → 1% threshold = 1.0.
-        assert!(!value_changed(&json!(100.0), &json!(100.9), &pct), "0.9 < 1.0 suppressed");
-        assert!(value_changed(&json!(100.0), &json!(101.0), &pct), "1.0 >= 1.0 passes");
+                                                  // old=100 → 1% threshold = 1.0.
+        assert!(
+            !value_changed(&json!(100.0), &json!(100.9), &pct),
+            "0.9 < 1.0 suppressed"
+        );
+        assert!(
+            value_changed(&json!(100.0), &json!(101.0), &pct),
+            "1.0 >= 1.0 passes"
+        );
         // old=0 → zero threshold degrades to any-change.
         assert!(value_changed(&json!(0.0), &json!(0.001), &pct));
     }
@@ -558,7 +587,10 @@ mod tests {
         let abs = db(DeadbandKind::Absolute, 0.5);
         // Only the 3rd element moves past 0.5.
         let prev = json!([1.0, 2.0, 3.0]);
-        assert!(value_changed(&prev, &json!([1.1, 2.1, 3.6]), &abs), "3rd exceeds");
+        assert!(
+            value_changed(&prev, &json!([1.1, 2.1, 3.6]), &abs),
+            "3rd exceeds"
+        );
         assert!(
             !value_changed(&prev, &json!([1.1, 2.1, 3.1]), &abs),
             "no element moves >= 0.5"
@@ -573,7 +605,11 @@ mod tests {
     fn batcher_with_zero_window_publishes_immediately() {
         let mut b = Batcher::default();
         let now = Instant::now();
-        let out = b.add(sample_of(json!(1), Quality::Good, Some("0x00"), None), now, 0);
+        let out = b.add(
+            sample_of(json!(1), Quality::Good, Some("0x00"), None),
+            now,
+            0,
+        );
         assert_eq!(out.map(|v| v.len()), Some(1));
         assert!(b.next_deadline(0).is_none());
     }
@@ -582,13 +618,27 @@ mod tests {
     fn batcher_buffers_then_flushes_on_window_close() {
         let mut b = Batcher::default();
         let t0 = Instant::now();
-        assert!(b.add(sample_of(json!(1), Quality::Good, None, Some("t0".into())), t0, 100).is_none());
+        assert!(b
+            .add(
+                sample_of(json!(1), Quality::Good, None, Some("t0".into())),
+                t0,
+                100
+            )
+            .is_none());
         let t1 = t0 + Duration::from_millis(40);
-        assert!(b.add(sample_of(json!(2), Quality::Good, None, Some("t1".into())), t1, 100).is_none());
+        assert!(b
+            .add(
+                sample_of(json!(2), Quality::Good, None, Some("t1".into())),
+                t1,
+                100
+            )
+            .is_none());
         // Not yet due at t0+50.
         assert!(b.take_due(t0 + Duration::from_millis(50), 100).is_none());
         // Due at t0+100: both buffered samples ride one flush, in arrival order.
-        let flush = b.take_due(t0 + Duration::from_millis(100), 100).expect("a due flush");
+        let flush = b
+            .take_due(t0 + Duration::from_millis(100), 100)
+            .expect("a due flush");
         assert_eq!(flush.len(), 2);
         assert_eq!(flush[0].value, Some(json!(1)));
         assert_eq!(flush[1].value, Some(json!(2)));
@@ -606,14 +656,30 @@ mod tests {
         assert!(is_stale(None, start, start + Duration::from_secs(60), 60));
         // A recent GOOD read resets the clock.
         let good = start + Duration::from_secs(100);
-        assert!(!is_stale(Some(good), start, good + Duration::from_secs(30), 60));
-        assert!(is_stale(Some(good), start, good + Duration::from_secs(60), 60));
+        assert!(!is_stale(
+            Some(good),
+            start,
+            good + Duration::from_secs(30),
+            60
+        ));
+        assert!(is_stale(
+            Some(good),
+            start,
+            good + Duration::from_secs(60),
+            60
+        ));
     }
 
     #[test]
     fn overrun_is_a_cycle_longer_than_its_interval() {
-        assert!(cycle_overran(Duration::from_millis(600), Duration::from_millis(500)));
-        assert!(!cycle_overran(Duration::from_millis(400), Duration::from_millis(500)));
+        assert!(cycle_overran(
+            Duration::from_millis(600),
+            Duration::from_millis(500)
+        ));
+        assert!(!cycle_overran(
+            Duration::from_millis(400),
+            Duration::from_millis(500)
+        ));
     }
 
     #[test]
@@ -625,7 +691,8 @@ mod tests {
         };
         let ts = iso_at(captured);
         let parsed =
-            time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339).unwrap();
+            time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339)
+                .unwrap();
         let delta = time::OffsetDateTime::now_utc() - parsed;
         assert!(
             delta >= time::Duration::seconds(29) && delta <= time::Duration::seconds(31),
@@ -639,7 +706,8 @@ mod tests {
         // Round-trips as RFC-3339 (has a date/time separator and a zone).
         assert!(ts.contains('T'), "unexpected timestamp: {ts}");
         assert!(
-            time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339).is_ok()
+            time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339)
+                .is_ok()
         );
     }
 
@@ -651,12 +719,21 @@ mod tests {
         let mut e = Engine::new(t0);
         // Two signals each open a 100ms window at t0.
         e.state.entry("A".into()).or_default().batcher.add(
-            sample_of(json!(1), Quality::Good, None, Some("t".into())), t0, 100);
+            sample_of(json!(1), Quality::Good, None, Some("t".into())),
+            t0,
+            100,
+        );
         e.state.entry("B".into()).or_default().batcher.add(
-            sample_of(json!(2), Quality::Good, None, Some("t".into())), t0, 100);
+            sample_of(json!(2), Quality::Good, None, Some("t".into())),
+            t0,
+            100,
+        );
         // No window is due yet ⇒ nothing flushes, but the next deadline is known.
         assert!(e.take_due(100, t0 + Duration::from_millis(50)).is_empty());
-        assert_eq!(e.next_batch_deadline(100), Some(t0 + Duration::from_millis(100)));
+        assert_eq!(
+            e.next_batch_deadline(100),
+            Some(t0 + Duration::from_millis(100))
+        );
         // At t0+100 both windows close ⇒ one Publish each.
         let mut due = e.take_due(100, t0 + Duration::from_millis(100));
         due.sort_by(|a, b| a.signal_id.cmp(&b.signal_id));
@@ -678,7 +755,10 @@ mod tests {
         let resume = t0 + Duration::from_secs(120);
         e.rebase_stale(resume);
         // With a 60s threshold, neither is stale immediately after the rebase.
-        assert_eq!(e.count_stale(["A", "B"].into_iter(), 60, resume + Duration::from_secs(30)), 0);
+        assert_eq!(
+            e.count_stale(["A", "B"].into_iter(), 60, resume + Duration::from_secs(30)),
+            0
+        );
     }
 
     /// `rebase_from` (push resume, §7.4.8) sets each field's onChange baseline to its current value AND
@@ -690,10 +770,19 @@ mod tests {
         let now = t0 + Duration::from_secs(30);
         e.rebase_from(&[("a100/0/udint".into(), json!(7))], now);
         let st = e.state.get("a100/0/udint").expect("state seeded");
-        assert_eq!(st.baseline.as_ref(), Some(&json!(7)), "baseline set to the current value");
+        assert_eq!(
+            st.baseline.as_ref(),
+            Some(&json!(7)),
+            "baseline set to the current value"
+        );
         assert_eq!(st.last_good, Some(now), "staleness clock re-based to now");
         // The re-based baseline means the same value now suppresses under onChange.
-        assert!(!should_publish(st.baseline.as_ref(), &json!(7), Quality::Good,
-            PublishMode::OnChange, &db(DeadbandKind::None, 0.0)));
+        assert!(!should_publish(
+            st.baseline.as_ref(),
+            &json!(7),
+            Quality::Good,
+            PublishMode::OnChange,
+            &db(DeadbandKind::None, 0.0)
+        ));
     }
 }
