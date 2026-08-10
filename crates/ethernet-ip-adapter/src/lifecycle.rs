@@ -576,7 +576,10 @@ mod tests {
         let c = cooperative.clone();
 
         let tasks = vec![
-            ("plc-ok".to_string(), vec![tokio::spawn(async move { c.cancelled().await })]),
+            (
+                "plc-ok".to_string(),
+                vec![tokio::spawn(async move { c.cancelled().await })],
+            ),
             (
                 "plc-wedged".to_string(),
                 vec![tokio::spawn(async { std::future::pending::<()>().await })],
@@ -669,12 +672,21 @@ mod tests {
         let out = stop_on_startup_error(failed, &registry, &root, Duration::from_secs(5)).await;
 
         let err = out.expect_err("the startup error still propagates");
-        assert!(err.to_string().contains("plc-3"), "the original error is unchanged: {err}");
+        assert!(
+            err.to_string().contains("plc-3"),
+            "the original error is unchanged: {err}"
+        );
         assert!(root.is_cancelled(), "the root token was cancelled");
         for token in &tokens {
-            assert!(token.is_cancelled(), "every launched instance was cancelled");
+            assert!(
+                token.is_cancelled(),
+                "every launched instance was cancelled"
+            );
         }
-        assert!(registry.is_empty(), "the registry drained — no task left running");
+        assert!(
+            registry.is_empty(),
+            "the registry drained — no task left running"
+        );
     }
 
     /// The success path is inert: it neither cancels the root nor disturbs the registry, so wrapping
@@ -766,8 +778,20 @@ mod tests {
         // `Many`, and insertion order does not make the first one a default.
         let (rt, _rx_b) = inert_runtime(poll_device("plc-b"), json!({ "id": "plc-b" }));
         registry.insert(rt);
-        assert_eq!(registry.handle("plc-a").map(|h| h.cfg.id.clone()).as_deref(), Some("plc-a"));
-        assert_eq!(registry.handle("plc-b").map(|h| h.cfg.id.clone()).as_deref(), Some("plc-b"));
+        assert_eq!(
+            registry
+                .handle("plc-a")
+                .map(|h| h.cfg.id.clone())
+                .as_deref(),
+            Some("plc-a")
+        );
+        assert_eq!(
+            registry
+                .handle("plc-b")
+                .map(|h| h.cfg.id.clone())
+                .as_deref(),
+            Some("plc-b")
+        );
         assert!(matches!(registry.sole_handle(), SoleHandle::Many));
 
         // Back to one: the survivor answers unaddressed requests again.
@@ -776,7 +800,10 @@ mod tests {
             SoleHandle::One(h) => assert_eq!(h.cfg.id, "plc-b"),
             _ => panic!("the survivor is the sole instance"),
         }
-        assert!(registry.handle("plc-a").is_none(), "a stopped instance stops routing");
+        assert!(
+            registry.handle("plc-a").is_none(),
+            "a stopped instance stops routing"
+        );
 
         // Drained: `None` again.
         registry.take_all();
@@ -820,7 +847,8 @@ mod tests {
         );
         assert!(!registry.all_push(), "an empty registry is not all-push");
 
-        let (rt, _rx1) = inert_runtime(push_device("io-1"), json!({ "id": "io-1", "mode": "push" }));
+        let (rt, _rx1) =
+            inert_runtime(push_device("io-1"), json!({ "id": "io-1", "mode": "push" }));
         registry.insert(rt);
         assert!(registry.all_push());
         assert_eq!(

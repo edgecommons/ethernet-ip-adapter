@@ -55,9 +55,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::cip::epath::Segment;
 use crate::cip::message::{MessageReply, MessageRequest};
 use crate::cm::{
-    connection_manager_path, io_connection_path, transport_class1_trigger, verify_forward_open_echo,
-    ConnType, ForwardCloseRequest, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
-    NetworkConnectionParams, Priority, ProductionTrigger, TimeoutMultiplier, VariableLength,
+    connection_manager_path, io_connection_path, transport_class1_trigger,
+    verify_forward_open_echo, ConnType, ForwardCloseRequest, ForwardOpenRequest,
+    ForwardOpenSuccess, ForwardRequestFail, NetworkConnectionParams, Priority, ProductionTrigger,
+    TimeoutMultiplier, VariableLength,
 };
 use crate::cpf::{Cpf, CpfItem, ItemType, SequencedAddress, SockAddrInfo};
 use crate::error::{EnipError, Result};
@@ -269,7 +270,10 @@ impl IoFrame {
     /// Decode a class-1 connected-data frame per the direction's `format`, in the same
     /// sequence-then-header order (D-ENIP-10). Every read is bounds-checked: a runt buffer is
     /// [`crate::error::WireError`], never a panic (the EIPScanner overrun class).
-    pub fn decode(format: RealTimeFormat, buf: &[u8]) -> core::result::Result<Self, crate::error::WireError> {
+    pub fn decode(
+        format: RealTimeFormat,
+        buf: &[u8],
+    ) -> core::result::Result<Self, crate::error::WireError> {
         let mut r = WireReader::with_context(buf, "io frame");
         let sequence = if format.has_sequence() {
             Some(r.u16()?)
@@ -283,7 +287,11 @@ impl IoFrame {
             None
         };
         let data = Bytes::copy_from_slice(r.take_rest());
-        Ok(Self { sequence, run_mode, data })
+        Ok(Self {
+            sequence,
+            run_mode,
+            data,
+        })
     }
 }
 
@@ -497,7 +505,11 @@ pub(crate) fn push_latest_wins(state: &mut EventQueueState, ev: IoEvent) -> Push
         return PushOutcome::Queued;
     }
     if state.data_len >= state.capacity {
-        if let Some(idx) = state.deque.iter().position(|e| matches!(e, IoEvent::Data(_))) {
+        if let Some(idx) = state
+            .deque
+            .iter()
+            .position(|e| matches!(e, IoEvent::Data(_)))
+        {
             state.deque.remove(idx);
             state.data_len = state.data_len.saturating_sub(1);
             state.deque.push_back(ev);
@@ -576,7 +588,9 @@ impl IoEventSender {
         };
         match outcome {
             PushOutcome::EvictedOldest => {
-                self.counters.overflowed_events.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .overflowed_events
+                    .fetch_add(1, Ordering::Relaxed);
                 self.shared.notify.notify_one();
             }
             PushOutcome::Queued => self.shared.notify.notify_one(),
@@ -657,7 +671,10 @@ pub(crate) fn io_event_channel(
         notify: tokio::sync::Notify::new(),
     });
     (
-        IoEventSender { shared: Arc::clone(&shared), counters },
+        IoEventSender {
+            shared: Arc::clone(&shared),
+            counters,
+        },
         IoEventReceiver { shared },
     )
 }
@@ -717,13 +734,21 @@ pub struct IoConnectionSpec {
 impl IoConnectionSpec {
     /// The requested on-wire size of a direction (§8.3): `data + sequence + header` per its format.
     fn on_wire_size(dir: &DirectionSpec) -> Result<u16> {
-        let data = if dir.format.carries_data() { dir.data_size } else { 0 };
+        let data = if dir.format.carries_data() {
+            dir.data_size
+        } else {
+            0
+        };
         let total = dir
             .format
             .overhead()
             .checked_add(data)
-            .ok_or(EnipError::TooLarge { limit: usize::from(u16::MAX) })?;
-        u16::try_from(total).map_err(|_| EnipError::TooLarge { limit: usize::from(u16::MAX) })
+            .ok_or(EnipError::TooLarge {
+                limit: usize::from(u16::MAX),
+            })?;
+        u16::try_from(total).map_err(|_| EnipError::TooLarge {
+            limit: usize::from(u16::MAX),
+        })
     }
 }
 
@@ -852,13 +877,20 @@ impl IoConnection {
     /// header per the T→O format, size-check against the negotiated size, then apply the signed
     /// forward-window sequence rule `(new − last) as i16 > 0`. Every reject is a counted, typed drop;
     /// an accepted frame refreshes the watchdog and yields an [`IoUpdate`].
-    pub fn consume(&mut self, connected_data: &[u8], encap_sequence: u32, now: Instant) -> ConsumeOutcome {
+    pub fn consume(
+        &mut self,
+        connected_data: &[u8],
+        encap_sequence: u32,
+        now: Instant,
+    ) -> ConsumeOutcome {
         // Strip sequence + optional header. A runt frame is a typed drop, counted as a size mismatch.
         let frame = match IoFrame::decode(self.params.t2o_format, connected_data) {
             Ok(frame) => frame,
             Err(_) => {
                 self.counters.size_mismatch.fetch_add(1, Ordering::Relaxed);
-                return ConsumeOutcome::Dropped { reason: DropReason::SizeMismatch };
+                return ConsumeOutcome::Dropped {
+                    reason: DropReason::SizeMismatch,
+                };
             }
         };
 
@@ -871,7 +903,9 @@ impl IoConnection {
         };
         if bad {
             self.counters.size_mismatch.fetch_add(1, Ordering::Relaxed);
-            return ConsumeOutcome::Dropped { reason: DropReason::SizeMismatch };
+            return ConsumeOutcome::Dropped {
+                reason: DropReason::SizeMismatch,
+            };
         }
 
         // Sequence acceptance: signed forward window (§8.6, D-ENIP-7).
@@ -880,12 +914,16 @@ impl IoConnection {
                 let delta = seq.wrapping_sub(last) as i16;
                 if delta <= 0 {
                     self.counters.stale_frames.fetch_add(1, Ordering::Relaxed);
-                    return ConsumeOutcome::Dropped { reason: DropReason::Stale };
+                    return ConsumeOutcome::Dropped {
+                        reason: DropReason::Stale,
+                    };
                 }
                 if delta > 1 {
                     // A forward jump > 1 counts the gap (missed frames) but still accepts.
                     let gap = u64::from((delta as u16).saturating_sub(1));
-                    self.counters.sequence_gaps.fetch_add(gap, Ordering::Relaxed);
+                    self.counters
+                        .sequence_gaps
+                        .fetch_add(gap, Ordering::Relaxed);
                 }
             }
             self.last_accepted_seq = Some(seq);
@@ -895,9 +933,14 @@ impl IoConnection {
         let first = !self.up;
         self.up = true;
         self.watchdog_deadline = now
-            .checked_add(watchdog_timeout(self.params.t2o_api, self.params.timeout_multiplier))
+            .checked_add(watchdog_timeout(
+                self.params.t2o_api,
+                self.params.timeout_multiplier,
+            ))
             .unwrap_or(now);
-        self.counters.frames_accepted.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .frames_accepted
+            .fetch_add(1, Ordering::Relaxed);
         ConsumeOutcome::Accepted {
             first,
             update: IoUpdate {
@@ -947,9 +990,10 @@ impl IoConnection {
             skipped
         };
         if counted > 0 {
-            self.counters
-                .produce_overruns
-                .fetch_add(u64::try_from(counted).unwrap_or(u64::MAX), Ordering::Relaxed);
+            self.counters.produce_overruns.fetch_add(
+                u64::try_from(counted).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
         }
         // Re-arm at `next_produce_at + (skipped + 1) × period` — the first tick strictly after `now`.
         // Any clamp or overflow on the way re-phases the schedule from `now` instead.
@@ -970,10 +1014,15 @@ impl IoConnection {
     /// ([`is_per_datagram_error`]) leaves the streak alone (target liveness is the T→O watchdog's
     /// job, not the send path's), while any other kind extends it and declares the connection dead
     /// at [`MAX_CONSECUTIVE_SEND_ERRORS`].
-    pub fn record_send(&mut self, result: core::result::Result<(), std::io::ErrorKind>) -> SendOutcome {
+    pub fn record_send(
+        &mut self,
+        result: core::result::Result<(), std::io::ErrorKind>,
+    ) -> SendOutcome {
         match result {
             Ok(()) => {
-                self.counters.frames_produced.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .frames_produced
+                    .fetch_add(1, Ordering::Relaxed);
                 self.consecutive_send_errors = 0;
                 SendOutcome::Sent
             }
@@ -1014,8 +1063,16 @@ impl IoConnection {
             Bytes::new()
         };
         let frame = IoFrame {
-            sequence: if format.has_sequence() { Some(self.o2t_class1_seq) } else { None },
-            run_mode: if format.has_header() { Some(self.run) } else { None },
+            sequence: if format.has_sequence() {
+                Some(self.o2t_class1_seq)
+            } else {
+                None
+            },
+            run_mode: if format.has_header() {
+                Some(self.run)
+            } else {
+                None
+            },
             data,
         };
         let payload = frame.encode(format);
@@ -1087,13 +1144,23 @@ struct Registry {
 
 /// The result of routing one datagram (§8.6).
 enum Routed {
-    Accepted { connection_id: u32, first: bool, update: IoUpdate },
-    Dropped { connection_id: Option<u32>, reason: DropReason },
+    Accepted {
+        connection_id: u32,
+        first: bool,
+        update: IoUpdate,
+    },
+    Dropped {
+        connection_id: Option<u32>,
+        reason: DropReason,
+    },
 }
 
 impl Registry {
     fn new(stats: Arc<ManagerCounters>) -> Self {
-        Self { conns: HashMap::new(), stats }
+        Self {
+            conns: HashMap::new(),
+            stats,
+        }
     }
 
     /// Decode `buf` as a class-1 datagram and route it to its connection (§8.6). Every failure is a
@@ -1103,7 +1170,10 @@ impl Registry {
             Ok(cpf) => cpf,
             Err(_) => {
                 self.stats.malformed_frames.fetch_add(1, Ordering::Relaxed);
-                return Routed::Dropped { connection_id: None, reason: DropReason::Malformed };
+                return Routed::Dropped {
+                    connection_id: None,
+                    reason: DropReason::Malformed,
+                };
             }
         };
         let (Some(addr_item), Some(data_item)) = (
@@ -1111,17 +1181,25 @@ impl Registry {
             cpf.find(ItemType::ConnectedData),
         ) else {
             self.stats.malformed_frames.fetch_add(1, Ordering::Relaxed);
-            return Routed::Dropped { connection_id: None, reason: DropReason::Malformed };
+            return Routed::Dropped {
+                connection_id: None,
+                reason: DropReason::Malformed,
+            };
         };
         let addr = match SequencedAddress::decode(&addr_item.data) {
             Ok(addr) => addr,
             Err(_) => {
                 self.stats.malformed_frames.fetch_add(1, Ordering::Relaxed);
-                return Routed::Dropped { connection_id: None, reason: DropReason::Malformed };
+                return Routed::Dropped {
+                    connection_id: None,
+                    reason: DropReason::Malformed,
+                };
             }
         };
         let Some(conn) = self.conns.get_mut(&addr.connection_id) else {
-            self.stats.unknown_connection.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .unknown_connection
+                .fetch_add(1, Ordering::Relaxed);
             return Routed::Dropped {
                 connection_id: Some(addr.connection_id),
                 reason: DropReason::UnknownConnection,
@@ -1209,7 +1287,11 @@ impl IoManager {
         let stats = Arc::new(ManagerCounters::default());
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(manager_task(socket, rx, stats.clone()));
-        Ok(Self { tx, local_addr, stats })
+        Ok(Self {
+            tx,
+            local_addr,
+            stats,
+        })
     }
 
     /// The bound local socket address.
@@ -1239,7 +1321,12 @@ impl IoManager {
         let connection_serial = rand::random::<u16>() | 1;
         let originator_serial = rand::random::<u32>();
 
-        let open = build_class1_open(&spec, t2o_connection_id, connection_serial, originator_serial)?;
+        let open = build_class1_open(
+            &spec,
+            t2o_connection_id,
+            connection_serial,
+            originator_serial,
+        )?;
         let mr = MessageRequest::new(open.service(), connection_manager_path(), open.encode()?);
         // Advertise the UDP endpoint the originator receives T→O on, and sends O→T from, via the
         // O→T (0x8000) + T→O (0x8001) Sockaddr Info items (§8.2). Targets take the T→O item's port as
@@ -1256,9 +1343,12 @@ impl IoManager {
         ];
         let reply_cpf = session.cm_ucmm(mr, extra_items).await?;
 
-        let data_item = reply_cpf
-            .find(ItemType::UnconnectedData)
-            .ok_or(EnipError::ProtocolViolation { detail: "forward-open reply missing data item" })?;
+        let data_item =
+            reply_cpf
+                .find(ItemType::UnconnectedData)
+                .ok_or(EnipError::ProtocolViolation {
+                    detail: "forward-open reply missing data item",
+                })?;
         let reply = MessageReply::decode(&data_item.data).map_err(EnipError::Malformed)?;
         reply.expect_service(open.service())?;
         if !reply.status.is_ok() {
@@ -1355,7 +1445,10 @@ impl IoManager {
         // is already producing into it. Tear it down before reporting the closure.
         if self
             .tx
-            .send(ManagerCommand::Add { conn: Box::new(conn), events_tx })
+            .send(ManagerCommand::Add {
+                conn: Box::new(conn),
+                events_tx,
+            })
             .await
             .is_err()
         {
@@ -1431,18 +1524,26 @@ impl IoConnectionHandle {
                 });
             }
             if bytes.len() > self.o2t_data_size {
-                return Err(EnipError::TooLarge { limit: self.o2t_data_size });
+                return Err(EnipError::TooLarge {
+                    limit: self.o2t_data_size,
+                });
             }
         }
         self.cmd
-            .try_send(ManagerCommand::SetOutput { connection_id: self.connection_id, bytes })
+            .try_send(ManagerCommand::SetOutput {
+                connection_id: self.connection_id,
+                bytes,
+            })
             .map_err(|_| EnipError::Closed)
     }
 
     /// Set the O→T run/idle bit (§8.7 / D-ENIP-9).
     pub fn set_run(&self, run: bool) -> Result<()> {
         self.cmd
-            .try_send(ManagerCommand::SetRun { connection_id: self.connection_id, run })
+            .try_send(ManagerCommand::SetRun {
+                connection_id: self.connection_id,
+                run,
+            })
             .map_err(|_| EnipError::Closed)
     }
 
@@ -1452,7 +1553,10 @@ impl IoConnectionHandle {
     pub fn stats(&self) -> IoStats {
         let mut s = self.counters.snapshot();
         s.malformed_frames = self.manager_stats.malformed_frames.load(Ordering::Relaxed);
-        s.unknown_connection = self.manager_stats.unknown_connection.load(Ordering::Relaxed);
+        s.unknown_connection = self
+            .manager_stats
+            .unknown_connection
+            .load(Ordering::Relaxed);
         s.recv_errors = self.manager_stats.recv_errors.load(Ordering::Relaxed);
         s
     }
@@ -1470,7 +1574,9 @@ impl IoConnectionHandle {
         let _ = session.cm_ucmm(mr, Vec::new()).await;
         let _ = self
             .cmd
-            .send(ManagerCommand::Remove { connection_id: self.connection_id })
+            .send(ManagerCommand::Remove {
+                connection_id: self.connection_id,
+            })
             .await;
         Ok(())
     }
@@ -1482,7 +1588,11 @@ impl IoConnectionHandle {
 async fn best_effort_forward_close<S: ForwardOpenService>(session: &S, open: &ForwardOpenRequest) {
     let close = ForwardCloseRequest::for_open(open);
     if let Ok(data) = close.encode() {
-        let mr = MessageRequest::new(crate::cm::service::FORWARD_CLOSE, connection_manager_path(), data);
+        let mr = MessageRequest::new(
+            crate::cm::service::FORWARD_CLOSE,
+            connection_manager_path(),
+            data,
+        );
         let _ = session.cm_ucmm(mr, Vec::new()).await;
     }
 }
@@ -1498,13 +1608,27 @@ fn build_class1_open(
     let t2o_size = IoConnectionSpec::on_wire_size(&spec.t2o)?;
     let large = o2t_size > LARGE_FORWARD_OPEN_THRESHOLD || t2o_size > LARGE_FORWARD_OPEN_THRESHOLD;
 
-    let o2t_params = NetworkConnectionParams::io(o2t_size, spec.o2t.variable, spec.o2t.priority, spec.o2t.conn_type);
-    let t2o_params = NetworkConnectionParams::io(t2o_size, spec.t2o.variable, spec.t2o.priority, spec.t2o.conn_type);
+    let o2t_params = NetworkConnectionParams::io(
+        o2t_size,
+        spec.o2t.variable,
+        spec.o2t.priority,
+        spec.o2t.conn_type,
+    );
+    let t2o_params = NetworkConnectionParams::io(
+        t2o_size,
+        spec.t2o.variable,
+        spec.t2o.priority,
+        spec.t2o.conn_type,
+    );
 
     let o2t_rpi = duration_to_micros(spec.o2t.rpi)?;
     let t2o_rpi = duration_to_micros(spec.t2o.rpi)?;
 
-    let mut path = io_connection_path(spec.assembly.config, spec.assembly.output, spec.assembly.input);
+    let mut path = io_connection_path(
+        spec.assembly.config,
+        spec.assembly.output,
+        spec.assembly.input,
+    );
     // Prefix route port segments so the ForwardOpen reaches a chassis-backed target (§8.4).
     for seg in spec.assembly.route.iter().rev() {
         path.prepend(Segment::Port(seg.clone()));
@@ -1528,7 +1652,9 @@ fn build_class1_open(
 
 /// A `Duration` as microseconds in a `u32` RPI field (§8.2), or [`EnipError::TooLarge`].
 fn duration_to_micros(d: Duration) -> Result<u32> {
-    u32::try_from(d.as_micros()).map_err(|_| EnipError::TooLarge { limit: u32::MAX as usize })
+    u32::try_from(d.as_micros()).map_err(|_| EnipError::TooLarge {
+        limit: u32::MAX as usize,
+    })
 }
 
 /// How the O→T Sockaddr Info item of a ForwardOpen reply was treated (§8.2, D-ENIP-17). The
@@ -1561,10 +1687,17 @@ fn resolve_tx_endpoint(
         detail: "no O→T transmit address available",
     })?;
     let Some(s) = o2t_sock else {
-        return Ok((SocketAddr::new(target, IO_UDP_PORT), TxEndpointDisposition::Direct));
+        return Ok((
+            SocketAddr::new(target, IO_UDP_PORT),
+            TxEndpointDisposition::Direct,
+        ));
     };
     let sock_ip = Ipv4Addr::from(s.sin_addr);
-    let port = if s.sin_port != 0 { s.sin_port } else { IO_UDP_PORT };
+    let port = if s.sin_port != 0 {
+        s.sin_port
+    } else {
+        IO_UDP_PORT
+    };
     let disposition = if sock_ip.is_unspecified() {
         TxEndpointDisposition::PortOnly
     } else if IpAddr::V4(sock_ip) == target {
@@ -1732,7 +1865,9 @@ fn deliver(
     first: bool,
     update: IoUpdate,
 ) {
-    let Some(tx) = events.get(&connection_id) else { return };
+    let Some(tx) = events.get(&connection_id) else {
+        return;
+    };
     if first {
         if let Some(conn) = registry.conns.get(&connection_id) {
             let (o2t_api, t2o_api) = conn.apis();
@@ -1779,7 +1914,11 @@ fn remove_connection(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     // -- test builders ------------------------------------------------------
@@ -1814,7 +1953,11 @@ mod tests {
         let cpf = Cpf::from_items(vec![
             CpfItem::new(
                 ItemType::SequencedAddress,
-                SequencedAddress { connection_id: cid, encap_sequence: eseq }.encode(),
+                SequencedAddress {
+                    connection_id: cid,
+                    encap_sequence: eseq,
+                }
+                .encode(),
             ),
             CpfItem::connected_data(Bytes::copy_from_slice(payload)),
         ]);
@@ -1837,16 +1980,32 @@ mod tests {
             &[0x05, 0x00, /* seq */ 0x01, 0x00, 0x00, 0x00, /* run header */ 0xAA, 0xBB]
         );
         // Round-trips.
-        assert_eq!(IoFrame::decode(RealTimeFormat::Header32Bit, &bytes).unwrap(), frame);
+        assert_eq!(
+            IoFrame::decode(RealTimeFormat::Header32Bit, &bytes).unwrap(),
+            frame
+        );
 
         // Idle header has bit 0 clear.
-        let idle = IoFrame { sequence: Some(1), run_mode: Some(false), data: Bytes::new() };
+        let idle = IoFrame {
+            sequence: Some(1),
+            run_mode: Some(false),
+            data: Bytes::new(),
+        };
         let ib = idle.encode(RealTimeFormat::Header32Bit);
         assert_eq!(ib.as_ref(), &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        assert_eq!(IoFrame::decode(RealTimeFormat::Header32Bit, &ib).unwrap().run_mode, Some(false));
+        assert_eq!(
+            IoFrame::decode(RealTimeFormat::Header32Bit, &ib)
+                .unwrap()
+                .run_mode,
+            Some(false)
+        );
 
         // Modeless: seq then data, no header.
-        let m = IoFrame { sequence: Some(7), run_mode: None, data: Bytes::from_static(&[1, 2, 3]) };
+        let m = IoFrame {
+            sequence: Some(7),
+            run_mode: None,
+            data: Bytes::from_static(&[1, 2, 3]),
+        };
         let mb = m.encode(RealTimeFormat::Modeless);
         assert_eq!(mb.as_ref(), &[0x07, 0x00, 1, 2, 3]);
         assert_eq!(IoFrame::decode(RealTimeFormat::Modeless, &mb).unwrap(), m);
@@ -1865,7 +2024,10 @@ mod tests {
     #[tokio::test]
     async fn accepts_first_then_forward_frames_and_counts_gap() {
         let now = Instant::now();
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
 
         // First frame (seq 1) → accepted, first == true.
         let out = conn.consume(&modeless_payload(1, &[0u8; 8]), 100, now);
@@ -1873,11 +2035,17 @@ mod tests {
         assert_eq!(conn.stats().frames_accepted, 1);
 
         // Forward by 1 (seq 2) → accepted, no gap.
-        assert!(matches!(conn.consume(&modeless_payload(2, &[0u8; 8]), 101, now), ConsumeOutcome::Accepted { first: false, .. }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(2, &[0u8; 8]), 101, now),
+            ConsumeOutcome::Accepted { first: false, .. }
+        ));
         assert_eq!(conn.stats().sequence_gaps, 0);
 
         // Forward jump seq 2 → 5 (gap of 2) → accepted, sequence_gaps += 2.
-        assert!(matches!(conn.consume(&modeless_payload(5, &[0u8; 8]), 102, now), ConsumeOutcome::Accepted { .. }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(5, &[0u8; 8]), 102, now),
+            ConsumeOutcome::Accepted { .. }
+        ));
         assert_eq!(conn.stats().sequence_gaps, 2);
         assert_eq!(conn.stats().frames_accepted, 3);
     }
@@ -1885,33 +2053,70 @@ mod tests {
     #[tokio::test]
     async fn duplicate_and_stale_and_reordered_are_dropped_and_counted() {
         let now = Instant::now();
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
         conn.consume(&modeless_payload(10, &[0u8; 8]), 1, now); // accept seq 10
 
         // Duplicate (seq 10): (10-10) as i16 == 0, not > 0 → stale.
-        assert!(matches!(conn.consume(&modeless_payload(10, &[0u8; 8]), 2, now), ConsumeOutcome::Dropped { reason: DropReason::Stale }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(10, &[0u8; 8]), 2, now),
+            ConsumeOutcome::Dropped {
+                reason: DropReason::Stale
+            }
+        ));
         // Stale (seq 9): negative delta → stale.
-        assert!(matches!(conn.consume(&modeless_payload(9, &[0u8; 8]), 3, now), ConsumeOutcome::Dropped { reason: DropReason::Stale }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(9, &[0u8; 8]), 3, now),
+            ConsumeOutcome::Dropped {
+                reason: DropReason::Stale
+            }
+        ));
         // Reordered old (seq 5): negative delta → stale.
-        assert!(matches!(conn.consume(&modeless_payload(5, &[0u8; 8]), 4, now), ConsumeOutcome::Dropped { reason: DropReason::Stale }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(5, &[0u8; 8]), 4, now),
+            ConsumeOutcome::Dropped {
+                reason: DropReason::Stale
+            }
+        ));
         assert_eq!(conn.stats().stale_frames, 3);
 
         // A valid forward frame after the drops is still accepted.
-        assert!(matches!(conn.consume(&modeless_payload(11, &[0u8; 8]), 5, now), ConsumeOutcome::Accepted { .. }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(11, &[0u8; 8]), 5, now),
+            ConsumeOutcome::Accepted { .. }
+        ));
         assert_eq!(conn.stats().frames_accepted, 2);
     }
 
     #[tokio::test]
     async fn wrong_size_frame_is_dropped_and_counted() {
         let now = Instant::now();
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
         // Negotiated T→O data size is 8; deliver 4 bytes → size mismatch.
-        assert!(matches!(conn.consume(&modeless_payload(1, &[0u8; 4]), 1, now), ConsumeOutcome::Dropped { reason: DropReason::SizeMismatch }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(1, &[0u8; 4]), 1, now),
+            ConsumeOutcome::Dropped {
+                reason: DropReason::SizeMismatch
+            }
+        ));
         // A runt (no room for the sequence) → also a size-mismatch drop, never a panic.
-        assert!(matches!(conn.consume(&[0x00], 2, now), ConsumeOutcome::Dropped { reason: DropReason::SizeMismatch }));
+        assert!(matches!(
+            conn.consume(&[0x00], 2, now),
+            ConsumeOutcome::Dropped {
+                reason: DropReason::SizeMismatch
+            }
+        ));
         assert_eq!(conn.stats().size_mismatch, 2);
         // A correctly-sized frame is then accepted.
-        assert!(matches!(conn.consume(&modeless_payload(1, &[0u8; 8]), 3, now), ConsumeOutcome::Accepted { .. }));
+        assert!(matches!(
+            conn.consume(&modeless_payload(1, &[0u8; 8]), 3, now),
+            ConsumeOutcome::Accepted { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1919,22 +2124,40 @@ mod tests {
         let now = Instant::now();
         let stats = Arc::new(ManagerCounters::default());
         let mut registry = Registry::new(stats.clone());
-        let conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        let conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
         let cid = conn.connection_id();
         registry.conns.insert(cid, conn);
 
         // Unknown connection id 0xDEADBEEF.
         let unknown = datagram(0xDEAD_BEEF, 1, &modeless_payload(1, &[0u8; 8]));
-        assert!(matches!(registry.consume_datagram(&unknown, now), Routed::Dropped { reason: DropReason::UnknownConnection, .. }));
+        assert!(matches!(
+            registry.consume_datagram(&unknown, now),
+            Routed::Dropped {
+                reason: DropReason::UnknownConnection,
+                ..
+            }
+        ));
         assert_eq!(stats.unknown_connection.load(Ordering::Relaxed), 1);
 
         // Malformed CPF (garbage bytes that are not a valid item list).
-        assert!(matches!(registry.consume_datagram(&[0xFF, 0xFF, 0xFF], now), Routed::Dropped { reason: DropReason::Malformed, .. }));
+        assert!(matches!(
+            registry.consume_datagram(&[0xFF, 0xFF, 0xFF], now),
+            Routed::Dropped {
+                reason: DropReason::Malformed,
+                ..
+            }
+        ));
         assert!(stats.malformed_frames.load(Ordering::Relaxed) >= 1);
 
         // The known connection still accepts a valid datagram after the drops.
         let good = datagram(cid, 1, &modeless_payload(1, &[0u8; 8]));
-        assert!(matches!(registry.consume_datagram(&good, now), Routed::Accepted { first: true, .. }));
+        assert!(matches!(
+            registry.consume_datagram(&good, now),
+            Routed::Accepted { first: true, .. }
+        ));
     }
 
     // -- watchdog (D-ENIP-8), paused clock ---------------------------------
@@ -1943,7 +2166,10 @@ mod tests {
     async fn watchdog_fires_once_after_multiplier_times_t2o_api() {
         let now = Instant::now();
         // T2O API 20 ms × multiplier 16 = 320 ms deadline.
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
         assert!(!conn.poll_watchdog(now));
 
         // Just before the deadline → not expired.
@@ -1970,7 +2196,10 @@ mod tests {
     async fn produce_fires_at_o2t_api_incrementing_sequences() {
         let now = Instant::now();
         // O→T Header32Bit with data; first tick one API out.
-        let mut conn = IoConnection::new(params(RealTimeFormat::Header32Bit, RealTimeFormat::Modeless), now);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Header32Bit, RealTimeFormat::Modeless),
+            now,
+        );
         conn.set_output(Bytes::from_static(&[1, 2, 3, 4]));
 
         // Nothing due yet.
@@ -1985,10 +2214,15 @@ mod tests {
         assert_eq!(conn.last_encap_sequence(), 1);
         // Decode the produced datagram: sequenced address + connected data (seq then header then data).
         let cpf = Cpf::decode(&d1).unwrap();
-        let addr = SequencedAddress::decode(&cpf.find(ItemType::SequencedAddress).unwrap().data).unwrap();
+        let addr =
+            SequencedAddress::decode(&cpf.find(ItemType::SequencedAddress).unwrap().data).unwrap();
         assert_eq!(addr.connection_id, 0xAABB_CCDD);
         assert_eq!(addr.encap_sequence, 1);
-        let frame = IoFrame::decode(RealTimeFormat::Header32Bit, &cpf.find(ItemType::ConnectedData).unwrap().data).unwrap();
+        let frame = IoFrame::decode(
+            RealTimeFormat::Header32Bit,
+            &cpf.find(ItemType::ConnectedData).unwrap().data,
+        )
+        .unwrap();
         assert_eq!(frame.sequence, Some(1));
         assert_eq!(frame.run_mode, Some(true));
         assert_eq!(frame.data.as_ref(), &[1, 2, 3, 4]);
@@ -2013,7 +2247,11 @@ mod tests {
         tokio::time::advance(Duration::from_millis(20)).await;
         let d = conn.poll_produce(Instant::now()).unwrap().unwrap();
         let cpf = Cpf::decode(&d).unwrap();
-        let frame = IoFrame::decode(RealTimeFormat::Heartbeat, &cpf.find(ItemType::ConnectedData).unwrap().data).unwrap();
+        let frame = IoFrame::decode(
+            RealTimeFormat::Heartbeat,
+            &cpf.find(ItemType::ConnectedData).unwrap().data,
+        )
+        .unwrap();
         // Heartbeat: sequence present, no data.
         assert_eq!(frame.sequence, Some(1));
         assert!(frame.data.is_empty());
@@ -2022,7 +2260,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn missed_produce_ticks_count_overruns() {
         let now = Instant::now();
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
         // Jump three API periods at once: one fire, two skipped.
         tokio::time::advance(Duration::from_millis(60)).await;
         assert!(conn.poll_produce(Instant::now()).is_some());
@@ -2030,7 +2271,11 @@ mod tests {
         assert_eq!(conn.stats().produce_overruns, 2);
         // Only one frame was produced despite three periods elapsing.
         assert_eq!(conn.last_encap_sequence(), 1);
-        assert_eq!(conn.stats().frames_produced, 1, "one fire despite two skipped ticks");
+        assert_eq!(
+            conn.stats().frames_produced,
+            1,
+            "one fire despite two skipped ticks"
+        );
     }
 
     // -- forward-open sizing / trigger -------------------------------------
@@ -2039,24 +2284,55 @@ mod tests {
     fn on_wire_size_accounts_for_sequence_and_header() {
         // Modeless T→O of 8 bytes data → 2 (seq) + 8 = 10.
         let t2o = DirectionSpec {
-            rpi: Duration::from_millis(20), data_size: 8, format: RealTimeFormat::Modeless,
-            conn_type: ConnType::P2P, priority: Priority::Scheduled, variable: VariableLength::Fixed,
+            rpi: Duration::from_millis(20),
+            data_size: 8,
+            format: RealTimeFormat::Modeless,
+            conn_type: ConnType::P2P,
+            priority: Priority::Scheduled,
+            variable: VariableLength::Fixed,
         };
         assert_eq!(IoConnectionSpec::on_wire_size(&t2o).unwrap(), 10);
         // Header32Bit O→T of 4 bytes → 2 (seq) + 4 (header) + 4 = 10.
-        let o2t = DirectionSpec { format: RealTimeFormat::Header32Bit, data_size: 4, ..t2o.clone() };
+        let o2t = DirectionSpec {
+            format: RealTimeFormat::Header32Bit,
+            data_size: 4,
+            ..t2o.clone()
+        };
         assert_eq!(IoConnectionSpec::on_wire_size(&o2t).unwrap(), 10);
         // Heartbeat O→T size 0 → 2 (seq only).
-        let hb = DirectionSpec { format: RealTimeFormat::Heartbeat, data_size: 0, ..t2o };
+        let hb = DirectionSpec {
+            format: RealTimeFormat::Heartbeat,
+            data_size: 0,
+            ..t2o
+        };
         assert_eq!(IoConnectionSpec::on_wire_size(&hb).unwrap(), 2);
     }
 
     #[test]
     fn build_open_produces_class1_trigger_and_sized_ncp() {
         let spec = IoConnectionSpec {
-            assembly: AssemblyPath { config: Some(151), output: 150, input: 100, route: vec![] },
-            t2o: DirectionSpec { rpi: Duration::from_millis(20), data_size: 32, format: RealTimeFormat::Modeless, conn_type: ConnType::P2P, priority: Priority::Scheduled, variable: VariableLength::Fixed },
-            o2t: DirectionSpec { rpi: Duration::from_millis(20), data_size: 4, format: RealTimeFormat::Header32Bit, conn_type: ConnType::P2P, priority: Priority::Scheduled, variable: VariableLength::Fixed },
+            assembly: AssemblyPath {
+                config: Some(151),
+                output: 150,
+                input: 100,
+                route: vec![],
+            },
+            t2o: DirectionSpec {
+                rpi: Duration::from_millis(20),
+                data_size: 32,
+                format: RealTimeFormat::Modeless,
+                conn_type: ConnType::P2P,
+                priority: Priority::Scheduled,
+                variable: VariableLength::Fixed,
+            },
+            o2t: DirectionSpec {
+                rpi: Duration::from_millis(20),
+                data_size: 4,
+                format: RealTimeFormat::Header32Bit,
+                conn_type: ConnType::P2P,
+                priority: Priority::Scheduled,
+                variable: VariableLength::Fixed,
+            },
             timeout_multiplier: TimeoutMultiplier::X16,
             trigger: ProductionTrigger::Cyclic,
             vendor_id: 0x1337,
@@ -2082,16 +2358,32 @@ mod tests {
         // A foreign unicast address: refused, its port kept.
         let sa = SockAddrInfo::ipv4(0xC0A8_0164, 0x08AE); // 192.168.1.100:2222
         let (ep, how) = resolve_tx_endpoint(Some(sa), Some(target)).unwrap();
-        assert_eq!(ep, SocketAddr::new(target, 2222), "we transmit to the target, on the named port");
-        assert_eq!(how, TxEndpointDisposition::RefusedForeign(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
+        assert_eq!(
+            ep,
+            SocketAddr::new(target, 2222),
+            "we transmit to the target, on the named port"
+        );
+        assert_eq!(
+            how,
+            TxEndpointDisposition::RefusedForeign(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)))
+        );
         // The port really does follow the sockaddr — the refusal is address-only.
-        let (ep_port, _) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0xC0A8_0164, 4444)), Some(target)).unwrap();
+        let (ep_port, _) =
+            resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0xC0A8_0164, 4444)), Some(target)).unwrap();
         assert_eq!(ep_port, SocketAddr::new(target, 4444));
         // Broadcast, multicast, and loopback redirects are refused by the same rule.
         for addr in [0xFFFF_FFFF, 0xEFC0_0001, 0x7F00_0001] {
-            let (ep, how) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(addr, 0x08AE)), Some(target)).unwrap();
-            assert_eq!(ep.ip(), target, "{addr:#010x} must not become a transmit target");
-            assert!(matches!(how, TxEndpointDisposition::RefusedForeign(_)), "{addr:#010x}");
+            let (ep, how) =
+                resolve_tx_endpoint(Some(SockAddrInfo::ipv4(addr, 0x08AE)), Some(target)).unwrap();
+            assert_eq!(
+                ep.ip(),
+                target,
+                "{addr:#010x} must not become a transmit target"
+            );
+            assert!(
+                matches!(how, TxEndpointDisposition::RefusedForeign(_)),
+                "{addr:#010x}"
+            );
         }
         // A foreign redirect with no known target address is unresolvable, never honoured.
         assert!(resolve_tx_endpoint(Some(sa), None).is_err());
@@ -2101,8 +2393,15 @@ mod tests {
         let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
         let fixture = FoFixture::new(None, 20_000, 20_000).with_o2t_sock(sa);
         let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
-        assert_eq!(handle.apis(), (Duration::from_millis(20), Duration::from_millis(20)));
-        assert_eq!(fixture.requests().len(), 1, "a refused redirect does not tear the connection down");
+        assert_eq!(
+            handle.apis(),
+            (Duration::from_millis(20), Duration::from_millis(20))
+        );
+        assert_eq!(
+            fixture.requests().len(),
+            1,
+            "a refused redirect does not tear the connection down"
+        );
         mgr.shutdown().await;
     }
 
@@ -2112,11 +2411,13 @@ mod tests {
     fn tx_endpoint_keeps_zero_addr_and_same_addr_behavior() {
         let target = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         // 0.0.0.0 (INADDR_ANY): the target supplies the address, the sockaddr the port.
-        let (ep0, how0) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0, 0x08AE)), Some(target)).unwrap();
+        let (ep0, how0) =
+            resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0, 0x08AE)), Some(target)).unwrap();
         assert_eq!(ep0, SocketAddr::new(target, 2222));
         assert_eq!(how0, TxEndpointDisposition::PortOnly);
         // A zero port still falls back to the standard implicit-I/O port.
-        let (ep_zero_port, _) = resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0, 0)), Some(target)).unwrap();
+        let (ep_zero_port, _) =
+            resolve_tx_endpoint(Some(SockAddrInfo::ipv4(0, 0)), Some(target)).unwrap();
         assert_eq!(ep_zero_port, SocketAddr::new(target, IO_UDP_PORT));
         // The target's own address: honoured as written.
         let (ep_same, how_same) =
@@ -2149,7 +2450,10 @@ mod tests {
         // A null (reconfigure) request is refused by the same rule, and reported as what it is.
         match resolve_multicast_group(Some(group), ConnType::Null) {
             Err(EnipError::ProtocolViolation { detail }) => {
-                assert_eq!(detail, "multicast T→O sockaddr on a null (reconfigure) request");
+                assert_eq!(
+                    detail,
+                    "multicast T→O sockaddr on a null (reconfigure) request"
+                );
             }
             other => panic!("expected a protocol violation, got {other:?}"),
         }
@@ -2161,7 +2465,10 @@ mod tests {
             Err(EnipError::ProtocolViolation { detail }) => {
                 assert_eq!(detail, "multicast T→O sockaddr on a point-to-point request");
             }
-            other => panic!("expected a protocol violation, got {:?}", other.map(|h| h.apis())),
+            other => panic!(
+                "expected a protocol violation, got {:?}",
+                other.map(|h| h.apis())
+            ),
         }
         assert_forward_closed(&fixture.requests());
         mgr.shutdown().await;
@@ -2179,22 +2486,41 @@ mod tests {
             Some(Ipv4Addr::new(239, 192, 0, 1)),
             "the requested-multicast connection records the group"
         );
-        assert_eq!(resolve_multicast_group(Some(unicast), ConnType::Multicast).unwrap(), None);
-        assert_eq!(resolve_multicast_group(None, ConnType::Multicast).unwrap(), None);
-        assert_eq!(resolve_multicast_group(Some(unicast), ConnType::P2P).unwrap(), None);
+        assert_eq!(
+            resolve_multicast_group(Some(unicast), ConnType::Multicast).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_multicast_group(None, ConnType::Multicast).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_multicast_group(Some(unicast), ConnType::P2P).unwrap(),
+            None
+        );
         assert_eq!(resolve_multicast_group(None, ConnType::P2P).unwrap(), None);
 
         // End to end: a multicast-requested spec opens against either reply.
         let spec = || IoConnectionSpec {
-            t2o: DirectionSpec { conn_type: ConnType::Multicast, ..sample_spec().t2o },
+            t2o: DirectionSpec {
+                conn_type: ConnType::Multicast,
+                ..sample_spec().t2o
+            },
             ..sample_spec()
         };
         for sock in [group, unicast] {
             let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
             let fixture = FoFixture::new(None, 20_000, 20_000).with_t2o_sock(sock);
             let handle = mgr.forward_open(&fixture, spec()).await.unwrap();
-            assert_eq!(handle.apis(), (Duration::from_millis(20), Duration::from_millis(20)));
-            assert_eq!(fixture.requests().len(), 1, "no ForwardClose on the happy path");
+            assert_eq!(
+                handle.apis(),
+                (Duration::from_millis(20), Duration::from_millis(20))
+            );
+            assert_eq!(
+                fixture.requests().len(),
+                1,
+                "no ForwardClose on the happy path"
+            );
             mgr.shutdown().await;
         }
     }
@@ -2215,8 +2541,14 @@ mod tests {
         tokio::time::advance(Duration::from_millis(10)).await;
         let at = Instant::now();
         assert!(conn.poll_produce(at).is_some(), "a tick is due");
-        assert!(conn.stats().produce_overruns > 0, "the lapsed ticks are counted");
-        assert!(conn.next_produce_at > armed, "the schedule advanced despite the zero period");
+        assert!(
+            conn.stats().produce_overruns > 0,
+            "the lapsed ticks are counted"
+        );
+        assert!(
+            conn.next_produce_at > armed,
+            "the schedule advanced despite the zero period"
+        );
         // Degraded to at most one frame per scheduler tick, not an unbounded burst.
         assert!(conn.poll_produce(at).is_none());
 
@@ -2236,7 +2568,10 @@ mod tests {
                 conn.stats().produce_overruns
             );
         }
-        assert!(fires > 1, "the degraded connection keeps producing on the tick cadence");
+        assert!(
+            fires > 1,
+            "the degraded connection keeps producing on the tick cadence"
+        );
     }
 
     /// A huge lapse against a tiny period is O(1): the old loop would have run ~864 million
@@ -2257,7 +2592,11 @@ mod tests {
 
         assert!(conn.poll_produce(Instant::now()).is_some());
         assert_eq!(conn.stats().produce_overruns, expected_skipped);
-        assert_eq!(conn.stats().frames_produced, 0, "nothing was sent, only built");
+        assert_eq!(
+            conn.stats().frames_produced,
+            0,
+            "nothing was sent, only built"
+        );
     }
 
     /// The arithmetic form must be indistinguishable from the loop for ordinary periods: fire at
@@ -2266,14 +2605,23 @@ mod tests {
     async fn poll_produce_semantics_unchanged_for_normal_periods() {
         let start = Instant::now();
         let period = Duration::from_millis(20);
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), start);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            start,
+        );
 
         assert!(conn.poll_produce(start).is_none());
         tokio::time::advance(Duration::from_millis(19)).await;
-        assert!(conn.poll_produce(Instant::now()).is_none(), "not due one ms early");
+        assert!(
+            conn.poll_produce(Instant::now()).is_none(),
+            "not due one ms early"
+        );
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(conn.poll_produce(Instant::now()).is_some(), "due at exactly one API");
+        assert!(
+            conn.poll_produce(Instant::now()).is_some(),
+            "due at exactly one API"
+        );
         assert_eq!(conn.stats().produce_overruns, 0);
         assert_eq!(conn.next_produce_at, start + period * 2);
 
@@ -2282,7 +2630,10 @@ mod tests {
         assert!(conn.poll_produce(Instant::now()).is_some());
         assert_eq!(conn.stats().produce_overruns, 2);
         assert_eq!(conn.next_produce_at, start + period * 5);
-        assert!(conn.poll_produce(Instant::now()).is_none(), "the schedule is re-armed ahead");
+        assert!(
+            conn.poll_produce(Instant::now()).is_none(),
+            "the schedule is re-armed ahead"
+        );
     }
 
     // -- reply-API validation (F1) -----------------------------------------
@@ -2306,8 +2657,14 @@ mod tests {
 
         // Each direction is bounded independently: a good partner never rescues a bad value.
         for &bad in &[0u32, 99, MAX_US + 1] {
-            assert!(validate_reply_apis(&reply(bad, IN_RANGE)).is_err(), "o→t {bad} µs");
-            assert!(validate_reply_apis(&reply(IN_RANGE, bad)).is_err(), "t→o {bad} µs");
+            assert!(
+                validate_reply_apis(&reply(bad, IN_RANGE)).is_err(),
+                "o→t {bad} µs"
+            );
+            assert!(
+                validate_reply_apis(&reply(IN_RANGE, bad)).is_err(),
+                "t→o {bad} µs"
+            );
         }
         for &good in &[100u32, IN_RANGE, MAX_US] {
             assert!(validate_reply_apis(&reply(good, good)).is_ok(), "{good} µs");
@@ -2330,7 +2687,10 @@ mod tests {
     fn record_send_counts_only_successful_sends() {
         use std::io::ErrorKind;
         let now = Instant::now();
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
 
         // Building a frame does not count it; only the send does.
         let _ = conn.produce_frame().unwrap();
@@ -2341,25 +2701,59 @@ mod tests {
         // A per-datagram failure is counted but never advances frames_produced, and never
         // contributes to the death streak (target liveness is the T→O watchdog's job).
         for _ in 0..10 {
-            assert_eq!(conn.record_send(Err(ErrorKind::ConnectionReset)), SendOutcome::Dropped);
+            assert_eq!(
+                conn.record_send(Err(ErrorKind::ConnectionReset)),
+                SendOutcome::Dropped
+            );
         }
-        assert_eq!(conn.stats().frames_produced, 1, "a failed send is not a produced frame");
+        assert_eq!(
+            conn.stats().frames_produced,
+            1,
+            "a failed send is not a produced frame"
+        );
         assert_eq!(conn.stats().send_errors, 10);
 
         // Three consecutive non-survivable failures declare the connection dead.
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::ConnectionDead);
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::Dropped
+        );
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::Dropped
+        );
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::ConnectionDead
+        );
         assert_eq!(conn.stats().send_errors, 13);
 
         // An interleaved success resets the streak.
-        let mut conn = IoConnection::new(params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless), now);
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
+        let mut conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::Dropped
+        );
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::Dropped
+        );
         assert_eq!(conn.record_send(Ok(())), SendOutcome::Sent);
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::Dropped);
-        assert_eq!(conn.record_send(Err(ErrorKind::AddrNotAvailable)), SendOutcome::ConnectionDead);
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::Dropped
+        );
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::Dropped
+        );
+        assert_eq!(
+            conn.record_send(Err(ErrorKind::AddrNotAvailable)),
+            SendOutcome::ConnectionDead
+        );
         assert_eq!(conn.stats().frames_produced, 1);
         assert_eq!(conn.stats().send_errors, 5);
     }
@@ -2389,7 +2783,11 @@ mod tests {
         for _ in 0..4 {
             for kind in PER_DATAGRAM {
                 assert!(is_per_datagram_error(kind), "{kind:?} is per-datagram");
-                assert_eq!(policy.on_recv_error(kind), RecvErrorAction::Continue, "{kind:?}");
+                assert_eq!(
+                    policy.on_recv_error(kind),
+                    RecvErrorAction::Continue,
+                    "{kind:?}"
+                );
             }
         }
 
@@ -2407,16 +2805,31 @@ mod tests {
         let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
         let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
         policy.on_recv_ok();
-        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::Continue);
+        assert_eq!(
+            policy.on_recv_error(ErrorKind::AddrNotAvailable),
+            RecvErrorAction::Continue
+        );
 
         // …and so does a per-datagram error mid-streak: it proves the socket still carries traffic.
         let mut policy = RecvErrorPolicy::default();
         let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
         let _ = policy.on_recv_error(ErrorKind::AddrNotAvailable);
-        assert_eq!(policy.on_recv_error(ErrorKind::ConnectionReset), RecvErrorAction::Continue);
-        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::Continue);
-        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::Continue);
-        assert_eq!(policy.on_recv_error(ErrorKind::AddrNotAvailable), RecvErrorAction::FatalSocket);
+        assert_eq!(
+            policy.on_recv_error(ErrorKind::ConnectionReset),
+            RecvErrorAction::Continue
+        );
+        assert_eq!(
+            policy.on_recv_error(ErrorKind::AddrNotAvailable),
+            RecvErrorAction::Continue
+        );
+        assert_eq!(
+            policy.on_recv_error(ErrorKind::AddrNotAvailable),
+            RecvErrorAction::Continue
+        );
+        assert_eq!(
+            policy.on_recv_error(ErrorKind::AddrNotAvailable),
+            RecvErrorAction::FatalSocket
+        );
     }
 
     #[tokio::test]
@@ -2503,8 +2916,15 @@ mod tests {
                 PushOutcome::EvictedOldest,
             ]
         );
-        assert_eq!(queued_sequences(&state), vec![3, 4, 5], "the three newest survive, in order");
-        assert_eq!(state.data_len, 3, "the Data census never exceeds the capacity");
+        assert_eq!(
+            queued_sequences(&state),
+            vec![3, 4, 5],
+            "the three newest survive, in order"
+        );
+        assert_eq!(
+            state.data_len, 3,
+            "the Data census never exceeds the capacity"
+        );
     }
 
     /// **Control events are immune.** `Up` and `Lost` enqueue even while `Data` is at capacity, and
@@ -2513,20 +2933,34 @@ mod tests {
     fn push_latest_wins_never_evicts_control() {
         let mut state = EventQueueState::new(2);
         assert_eq!(
-            push_latest_wins(&mut state, IoEvent::Up {
-                o2t_api: Duration::from_millis(10),
-                t2o_api: Duration::from_millis(10)
-            }),
+            push_latest_wins(
+                &mut state,
+                IoEvent::Up {
+                    o2t_api: Duration::from_millis(10),
+                    t2o_api: Duration::from_millis(10)
+                }
+            ),
             PushOutcome::Queued
         );
-        assert_eq!(push_latest_wins(&mut state, IoEvent::Data(sample(1))), PushOutcome::Queued);
-        assert_eq!(push_latest_wins(&mut state, IoEvent::Data(sample(2))), PushOutcome::Queued);
+        assert_eq!(
+            push_latest_wins(&mut state, IoEvent::Data(sample(1))),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            push_latest_wins(&mut state, IoEvent::Data(sample(2))),
+            PushOutcome::Queued
+        );
         assert_eq!(
             push_latest_wins(&mut state, IoEvent::Data(sample(3))),
             PushOutcome::EvictedOldest
         );
         assert_eq!(
-            push_latest_wins(&mut state, IoEvent::Lost { reason: LostReason::Timeout }),
+            push_latest_wins(
+                &mut state,
+                IoEvent::Lost {
+                    reason: LostReason::Timeout
+                }
+            ),
             PushOutcome::Queued,
             "Lost enqueues even at Data capacity"
         );
@@ -2555,10 +2989,18 @@ mod tests {
             PushOutcome::ReceiverGone
         );
         assert_eq!(
-            push_latest_wins(&mut state, IoEvent::Lost { reason: LostReason::Io }),
+            push_latest_wins(
+                &mut state,
+                IoEvent::Lost {
+                    reason: LostReason::Io
+                }
+            ),
             PushOutcome::ReceiverGone
         );
-        assert!(state.deque.is_empty(), "nothing is retained for a gone receiver");
+        assert!(
+            state.deque.is_empty(),
+            "nothing is retained for a gone receiver"
+        );
     }
 
     /// **The F8 headline, end to end on the real queue.** A stalled consumer that finally drains
@@ -2579,7 +3021,11 @@ mod tests {
             })
             .collect();
         assert_eq!(seqs, vec![7, 8, 9, 10], "the four freshest samples survive");
-        assert_eq!(counters.snapshot().overflowed_events, 6, "every evicted sample is counted");
+        assert_eq!(
+            counters.snapshot().overflowed_events,
+            6,
+            "every evicted sample is counted"
+        );
     }
 
     /// **The second F8 defect.** `Lost` used to be a droppable `try_send` on a full channel, so a
@@ -2592,16 +3038,24 @@ mod tests {
         for seq in 1..=8u16 {
             tx.send(IoEvent::Data(sample(seq)));
         }
-        tx.send(IoEvent::Lost { reason: LostReason::Timeout });
+        tx.send(IoEvent::Lost {
+            reason: LostReason::Timeout,
+        });
 
         let events = drain(&mut rx);
-        assert_eq!(events.len(), 3, "two surviving samples plus the terminal event");
+        assert_eq!(
+            events.len(),
+            3,
+            "two surviving samples plus the terminal event"
+        );
         match events.last() {
             Some(IoEvent::Lost { reason }) => assert_eq!(*reason, LostReason::Timeout),
             other => panic!("expected Lost{{Timeout}} last, got {other:?}"),
         }
         match events.first() {
-            Some(IoEvent::Data(u)) => assert_eq!(u.sequence, 7, "the older samples were the ones evicted"),
+            Some(IoEvent::Data(u)) => {
+                assert_eq!(u.sequence, 7, "the older samples were the ones evicted")
+            }
             other => panic!("expected the freshest Data first, got {other:?}"),
         }
     }
@@ -2616,7 +3070,10 @@ mod tests {
             Some(IoEvent::Data(u)) => assert_eq!(u.sequence, 1),
             other => panic!("expected the queued Data first, got {other:?}"),
         }
-        assert!(rx.recv().await.is_none(), "the stream ends once the sender is gone and drained");
+        assert!(
+            rx.recv().await.is_none(),
+            "the stream ends once the sender is gone and drained"
+        );
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
         assert_eq!(
             TryRecvError::Disconnected.to_string(),
@@ -2635,8 +3092,14 @@ mod tests {
         for seq in 1..=8u16 {
             tx.send(IoEvent::Data(sample(seq)));
         }
-        tx.send(IoEvent::Lost { reason: LostReason::Io });
-        assert_eq!(counters.snapshot().overflowed_events, 0, "a gone consumer is not an overflow");
+        tx.send(IoEvent::Lost {
+            reason: LostReason::Io,
+        });
+        assert_eq!(
+            counters.snapshot().overflowed_events,
+            0,
+            "a gone consumer is not an overflow"
+        );
     }
 
     /// `Up` carries the negotiated APIs and must reach the consumer whatever the sample rate — the
@@ -2644,7 +3107,10 @@ mod tests {
     #[tokio::test]
     async fn up_survives_a_data_flood() {
         let (tx, mut rx) = io_event_channel(4, Arc::new(ConnCounters::default()));
-        tx.send(IoEvent::Up { o2t_api: Duration::from_millis(10), t2o_api: Duration::from_millis(20) });
+        tx.send(IoEvent::Up {
+            o2t_api: Duration::from_millis(10),
+            t2o_api: Duration::from_millis(20),
+        });
         for seq in 1..=8u16 {
             tx.send(IoEvent::Data(sample(seq)));
         }
@@ -2665,7 +3131,9 @@ mod tests {
         let (tx, mut rx) = io_event_channel(4, Arc::new(ConnCounters::default()));
 
         // Cancel a pending recv (nothing queued), then send: the event is still there.
-        assert!(tokio::time::timeout(Duration::from_millis(20), rx.recv()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(20), rx.recv())
+            .await
+            .is_err());
         tx.send(IoEvent::Data(sample(9)));
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(IoEvent::Data(u))) => assert_eq!(u.sequence, 9),
@@ -2675,7 +3143,9 @@ mod tests {
         // A send from another task while recv is parked wakes it.
         let handle = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            tx.send(IoEvent::Lost { reason: LostReason::ClosedByPeer });
+            tx.send(IoEvent::Lost {
+                reason: LostReason::ClosedByPeer,
+            });
         });
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(IoEvent::Lost { reason })) => assert_eq!(reason, LostReason::ClosedByPeer),
@@ -2783,7 +3253,11 @@ mod tests {
     }
 
     impl ForwardOpenService for FoFixture {
-        async fn cm_ucmm(&self, request: MessageRequest, _extra_items: Vec<CpfItem>) -> Result<Cpf> {
+        async fn cm_ucmm(
+            &self,
+            request: MessageRequest,
+            _extra_items: Vec<CpfItem>,
+        ) -> Result<Cpf> {
             let service = request.service;
             let data = request.data.clone();
             self.seen.lock().unwrap().push((service, data.clone()));
@@ -2845,9 +3319,18 @@ mod tests {
             variable: VariableLength::Fixed,
         };
         IoConnectionSpec {
-            assembly: AssemblyPath { config: Some(151), output: 150, input: 100, route: vec![] },
+            assembly: AssemblyPath {
+                config: Some(151),
+                output: 150,
+                input: 100,
+                route: vec![],
+            },
             t2o: dir.clone(),
-            o2t: DirectionSpec { data_size: 4, format: RealTimeFormat::Header32Bit, ..dir },
+            o2t: DirectionSpec {
+                data_size: 4,
+                format: RealTimeFormat::Header32Bit,
+                ..dir
+            },
             timeout_multiplier: TimeoutMultiplier::X16,
             trigger: ProductionTrigger::Cyclic,
             vendor_id: 0x1337,
@@ -2866,8 +3349,16 @@ mod tests {
             "first request is the open"
         );
         let (close_service, close_data) = &requests[1];
-        assert_eq!(*close_service, crate::cm::service::FORWARD_CLOSE, "0x4E follows the refusal");
-        assert_eq!(&close_data[2..4], &open_data[10..12], "the close carries the open's serial");
+        assert_eq!(
+            *close_service,
+            crate::cm::service::FORWARD_CLOSE,
+            "0x4E follows the refusal"
+        );
+        assert_eq!(
+            &close_data[2..4],
+            &open_data[10..12],
+            "the close carries the open's serial"
+        );
     }
 
     /// **F1 regression.** A reply naming a 0 µs O→T API is refused *before* anything is armed, and
@@ -2880,7 +3371,10 @@ mod tests {
             Err(EnipError::ProtocolViolation { detail }) => {
                 assert_eq!(detail, "forward-open reply API out of range");
             }
-            other => panic!("expected a protocol violation, got {:?}", other.map(|h| h.apis())),
+            other => panic!(
+                "expected a protocol violation, got {:?}",
+                other.map(|h| h.apis())
+            ),
         }
         assert_forward_closed(&fixture.requests());
         mgr.shutdown().await;
@@ -2901,9 +3395,15 @@ mod tests {
             let fixture = FoFixture::new(Some(field), 20_000, 20_000);
             match mgr.forward_open(&fixture, sample_spec()).await {
                 Err(EnipError::ProtocolViolation { detail }) => {
-                    assert!(detail.starts_with("forward-open reply"), "{field:?}: {detail}");
+                    assert!(
+                        detail.starts_with("forward-open reply"),
+                        "{field:?}: {detail}"
+                    );
                 }
-                other => panic!("{field:?}: expected a violation, got {:?}", other.map(|h| h.apis())),
+                other => panic!(
+                    "{field:?}: expected a violation, got {:?}",
+                    other.map(|h| h.apis())
+                ),
             }
             assert_forward_closed(&fixture.requests());
             mgr.shutdown().await;
@@ -2922,7 +3422,10 @@ mod tests {
             Err(EnipError::ProtocolViolation { detail }) => {
                 assert_eq!(detail, "no O→T transmit address available");
             }
-            other => panic!("expected a protocol violation, got {:?}", other.map(|h| h.apis())),
+            other => panic!(
+                "expected a protocol violation, got {:?}",
+                other.map(|h| h.apis())
+            ),
         }
         assert_forward_closed(&fixture.requests());
         mgr.shutdown().await;
@@ -2935,8 +3438,15 @@ mod tests {
         let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
         let fixture = FoFixture::new(None, 20_000, 20_000);
         let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
-        assert_eq!(handle.apis(), (Duration::from_millis(20), Duration::from_millis(20)));
-        assert_eq!(fixture.requests().len(), 1, "no ForwardClose on the happy path");
+        assert_eq!(
+            handle.apis(),
+            (Duration::from_millis(20), Duration::from_millis(20))
+        );
+        assert_eq!(
+            fixture.requests().len(),
+            1,
+            "no ForwardClose on the happy path"
+        );
         mgr.shutdown().await;
     }
 
@@ -2951,8 +3461,16 @@ mod tests {
         let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
         let fixture = FoFixture::new(None, 20_000, 20_000).with_o2t_sock(foreign);
         let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
-        assert_eq!(handle.stats().refused_redirects, 1, "the refusal is counted once");
-        assert_eq!(fixture.requests().len(), 1, "and is not fatal — the connection still opens");
+        assert_eq!(
+            handle.stats().refused_redirects,
+            1,
+            "the refusal is counted once"
+        );
+        assert_eq!(
+            fixture.requests().len(),
+            1,
+            "and is not fatal — the connection still opens"
+        );
         mgr.shutdown().await;
 
         // The target's own address, honoured as written: nothing was refused.
@@ -2991,12 +3509,19 @@ mod tests {
         let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
 
         // 10 ms APIs in the reply; X16 ⇒ a 160 ms T→O watchdog.
-        let fixture = FoFixture::new(None, 10_000, 10_000)
-            .with_o2t_sock(SockAddrInfo::ipv4(0, peer_port));
-        let dir = DirectionSpec { rpi: Duration::from_millis(10), ..sample_spec().t2o };
+        let fixture =
+            FoFixture::new(None, 10_000, 10_000).with_o2t_sock(SockAddrInfo::ipv4(0, peer_port));
+        let dir = DirectionSpec {
+            rpi: Duration::from_millis(10),
+            ..sample_spec().t2o
+        };
         let spec = IoConnectionSpec {
             t2o: dir.clone(),
-            o2t: DirectionSpec { data_size: 4, format: RealTimeFormat::Header32Bit, ..dir },
+            o2t: DirectionSpec {
+                data_size: 4,
+                format: RealTimeFormat::Header32Bit,
+                ..dir
+            },
             ..sample_spec()
         };
         let mut handle = mgr.forward_open(&fixture, spec).await.unwrap();
@@ -3006,7 +3531,11 @@ mod tests {
         let requests = fixture.requests();
         let open_data = &requests[0].1;
         let t2o_cid = u32::from_le_bytes([open_data[6], open_data[7], open_data[8], open_data[9]]);
-        assert_eq!(t2o_cid, handle.connection_id(), "the handle routes by the on-wire T→O id");
+        assert_eq!(
+            t2o_cid,
+            handle.connection_id(),
+            "the handle routes by the on-wire T→O id"
+        );
 
         // (1) The peer produces T→O frames until the loop routes one and delivers Up.
         //
@@ -3051,15 +3580,23 @@ mod tests {
 
         // (2) The scheduler produces O→T frames at the peer's port on the target's address.
         let mut buf = vec![0u8; 2048];
-        let Ok(received) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf)).await
+        let Ok(received) =
+            tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf)).await
         else {
             panic!("expected a produced O→T datagram at the peer within 2 s");
         };
         let (n, _src) = received.unwrap();
         let cpf = Cpf::decode(&buf[..n]).unwrap();
-        let addr = SequencedAddress::decode(&cpf.find(ItemType::SequencedAddress).unwrap().data).unwrap();
-        assert_eq!(addr.connection_id, 0xAABB_CCDD, "produced under the target-assigned O→T id");
-        assert!(cpf.find(ItemType::ConnectedData).is_some(), "the frame carries connected data");
+        let addr =
+            SequencedAddress::decode(&cpf.find(ItemType::SequencedAddress).unwrap().data).unwrap();
+        assert_eq!(
+            addr.connection_id, 0xAABB_CCDD,
+            "produced under the target-assigned O→T id"
+        );
+        assert!(
+            cpf.find(ItemType::ConnectedData).is_some(),
+            "the frame carries connected data"
+        );
 
         // (3) The peer goes silent ⇒ the watchdog declares the connection lost and removes it.
         let deadline = Instant::now() + Duration::from_secs(2);

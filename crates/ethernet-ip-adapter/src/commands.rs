@@ -259,10 +259,9 @@ impl Commander {
     /// [`DeviceRegistry::sole_handle`] for the unaddressed default, both a single locked scan.
     fn resolve(&self, addressed: Option<&str>) -> std::result::Result<DeviceHandle, CommandError> {
         match addressed {
-            Some(id) => self
-                .registry
-                .handle(id)
-                .ok_or_else(|| CommandError::new("NO_SUCH_INSTANCE", format!("no configured device `{id}`"))),
+            Some(id) => self.registry.handle(id).ok_or_else(|| {
+                CommandError::new("NO_SUCH_INSTANCE", format!("no configured device `{id}`"))
+            }),
             // Exactly one running instance answers an unaddressed request.
             None => match self.registry.sole_handle() {
                 SoleHandle::One(h) => Ok(h),
@@ -291,7 +290,11 @@ impl Commander {
         let link = h.health.link();
         let connected = link == LinkState::Online;
         let paused = h.health.paused.load(Ordering::Relaxed);
-        let state = if paused && connected { "PAUSED" } else { link.as_str() };
+        let state = if paused && connected {
+            "PAUSED"
+        } else {
+            link.as_str()
+        };
         let mut out = serde_json::Map::new();
         out.insert("id".into(), json!(h.cfg.id));
         out.insert("mode".into(), json!(h.cfg.mode.as_str()));
@@ -334,12 +337,19 @@ impl Commander {
             "sb/read",
             ok,
             ms(started),
-            CommandTally { read_signals: served, ..CommandTally::default() },
+            CommandTally {
+                read_signals: served,
+                ..CommandTally::default()
+            },
         );
         result.map(|(v, _)| Some(v))
     }
 
-    async fn read_poll(&self, h: &DeviceHandle, refs: &[Value]) -> std::result::Result<(Value, u64), CommandError> {
+    async fn read_poll(
+        &self,
+        h: &DeviceHandle,
+        refs: &[Value],
+    ) -> std::result::Result<(Value, u64), CommandError> {
         // Resolve each ref: a friendly name → the configured spec; an explicit {tagPath,type} → a
         // synthesized spec; anything else → a BAD "UNRESOLVED_REF" entry.
         let mut plan: Vec<std::result::Result<SignalSpec, String>> = Vec::with_capacity(refs.len());
@@ -395,7 +405,11 @@ impl Commander {
         Ok((json!({ "id": h.cfg.id, "reads": reads }), served))
     }
 
-    async fn read_push(&self, h: &DeviceHandle, refs: &[Value]) -> std::result::Result<(Value, u64), CommandError> {
+    async fn read_push(
+        &self,
+        h: &DeviceHandle,
+        refs: &[Value],
+    ) -> std::result::Result<(Value, u64), CommandError> {
         let io = h
             .cfg
             .io
@@ -410,7 +424,12 @@ impl Commander {
 
         let by_id: HashMap<&str, &Reading> = snapshot
             .as_ref()
-            .map(|s| s.readings.iter().map(|r| (r.signal_id.as_str(), r)).collect())
+            .map(|s| {
+                s.readings
+                    .iter()
+                    .map(|r| (r.signal_id.as_str(), r))
+                    .collect()
+            })
             .unwrap_or_default();
         // Capture time (four-slot timestamp model): the snapshot frame's receipt instant.
         let ts = snapshot
@@ -466,12 +485,20 @@ impl Commander {
             "sb/write",
             ok,
             ms(started),
-            CommandTally { write_signals: attempted, write_failures: failures, ..CommandTally::default() },
+            CommandTally {
+                write_signals: attempted,
+                write_failures: failures,
+                ..CommandTally::default()
+            },
         );
         result.map(|(v, _)| Some(v))
     }
 
-    async fn write_poll(&self, h: &DeviceHandle, entries: &[Value]) -> std::result::Result<(Value, CommandTally), CommandError> {
+    async fn write_poll(
+        &self,
+        h: &DeviceHandle,
+        entries: &[Value],
+    ) -> std::result::Result<(Value, CommandTally), CommandError> {
         let mut results = Vec::with_capacity(entries.len());
         let mut written = 0u64;
         let mut refused = 0u64;
@@ -488,19 +515,27 @@ impl Commander {
                     if !h.cfg.writes.permits(&id) {
                         refused += 1;
                         failures += 1;
-                        self.audit(h, &id, false, value.as_ref(), Some("not in writes.allow")).await;
-                        results.push(json!({ "signal": id, "ok": false, "error": "not in writes.allow" }));
+                        self.audit(h, &id, false, value.as_ref(), Some("not in writes.allow"))
+                            .await;
+                        results.push(
+                            json!({ "signal": id, "ok": false, "error": "not in writes.allow" }),
+                        );
                         continue;
                     }
                     let Some(value) = value else {
                         failures += 1;
                         self.audit(h, &id, false, None, Some("missing value")).await;
-                        results.push(json!({ "signal": id, "ok": false, "error": "missing value" }));
+                        results
+                            .push(json!({ "signal": id, "ok": false, "error": "missing value" }));
                         continue;
                     };
                     let (tx, rx) = oneshot::channel();
                     h.control
-                        .send(DeviceControl::Write(WriteRequest { signal: spec, value: value.clone(), ack: tx }))
+                        .send(DeviceControl::Write(WriteRequest {
+                            signal: spec,
+                            value: value.clone(),
+                            ack: tx,
+                        }))
                         .await
                         .map_err(|_| device_unavailable())?;
                     match rx.await {
@@ -512,30 +547,45 @@ impl Commander {
                         Ok(Err(e)) => {
                             failures += 1;
                             self.audit(h, &id, false, Some(&value), Some(&e)).await;
-                            results.push(json!({ "signal": id, "value": value, "ok": false, "error": e }));
+                            results.push(
+                                json!({ "signal": id, "value": value, "ok": false, "error": e }),
+                            );
                         }
                         Err(_) => return Err(device_unavailable()),
                     }
                 }
                 Err(label) => {
                     failures += 1;
-                    self.audit(h, &label, false, value.as_ref(), Some("unresolved ref")).await;
-                    results.push(json!({ "signal": label, "ok": false, "error": "unresolved ref" }));
+                    self.audit(h, &label, false, value.as_ref(), Some("unresolved ref"))
+                        .await;
+                    results
+                        .push(json!({ "signal": label, "ok": false, "error": "unresolved ref" }));
                 }
             }
         }
 
         // WRITE_NOT_ALLOWED only when EVERY entry was an allow-list refusal (§7.3).
         if attempted > 0 && refused == attempted {
-            return Err(CommandError::new("WRITE_NOT_ALLOWED", "no entry is in this instance's writes.allow list"));
+            return Err(CommandError::new(
+                "WRITE_NOT_ALLOWED",
+                "no entry is in this instance's writes.allow list",
+            ));
         }
         Ok((
             json!({ "id": h.cfg.id, "written": written, "results": results }),
-            CommandTally { write_signals: attempted, write_failures: failures, ..CommandTally::default() },
+            CommandTally {
+                write_signals: attempted,
+                write_failures: failures,
+                ..CommandTally::default()
+            },
         ))
     }
 
-    async fn write_push(&self, h: &DeviceHandle, entries: &[Value]) -> std::result::Result<(Value, CommandTally), CommandError> {
+    async fn write_push(
+        &self,
+        h: &DeviceHandle,
+        entries: &[Value],
+    ) -> std::result::Result<(Value, CommandTally), CommandError> {
         let io = h
             .cfg
             .io
@@ -554,19 +604,27 @@ impl Commander {
                     if !h.cfg.writes.permits(&id) {
                         refused += 1;
                         failures += 1;
-                        self.audit(h, &id, false, value.as_ref(), Some("not in writes.allow")).await;
-                        results.push(json!({ "signal": id, "ok": false, "error": "not in writes.allow" }));
+                        self.audit(h, &id, false, value.as_ref(), Some("not in writes.allow"))
+                            .await;
+                        results.push(
+                            json!({ "signal": id, "ok": false, "error": "not in writes.allow" }),
+                        );
                         continue;
                     }
                     let Some(value) = value else {
                         failures += 1;
                         self.audit(h, &id, false, None, Some("missing value")).await;
-                        results.push(json!({ "signal": id, "ok": false, "error": "missing value" }));
+                        results
+                            .push(json!({ "signal": id, "ok": false, "error": "missing value" }));
                         continue;
                     };
                     let (tx, rx) = oneshot::channel();
                     h.control
-                        .send(DeviceControl::WriteOutput { field, value: value.clone(), reply: tx })
+                        .send(DeviceControl::WriteOutput {
+                            field,
+                            value: value.clone(),
+                            reply: tx,
+                        })
                         .await
                         .map_err(|_| device_unavailable())?;
                     match rx.await {
@@ -580,32 +638,53 @@ impl Commander {
                         Ok(Err(e)) => {
                             failures += 1;
                             self.audit(h, &id, false, Some(&value), Some(&e)).await;
-                            results.push(json!({ "signal": id, "value": value, "ok": false, "error": e }));
+                            results.push(
+                                json!({ "signal": id, "value": value, "ok": false, "error": e }),
+                            );
                         }
                         Err(_) => return Err(device_unavailable()),
                     }
                 }
                 Err((label, err)) => {
                     failures += 1;
-                    self.audit(h, &label, false, value.as_ref(), Some(&err)).await;
+                    self.audit(h, &label, false, value.as_ref(), Some(&err))
+                        .await;
                     results.push(json!({ "signal": label, "ok": false, "error": err }));
                 }
             }
         }
 
         if attempted > 0 && refused == attempted {
-            return Err(CommandError::new("WRITE_NOT_ALLOWED", "no entry is in this instance's writes.allow list"));
+            return Err(CommandError::new(
+                "WRITE_NOT_ALLOWED",
+                "no entry is in this instance's writes.allow list",
+            ));
         }
         Ok((
             json!({ "id": h.cfg.id, "written": written, "results": results }),
-            CommandTally { write_signals: attempted, write_failures: failures, ..CommandTally::default() },
+            CommandTally {
+                write_signals: attempted,
+                write_failures: failures,
+                ..CommandTally::default()
+            },
         ))
     }
 
     /// The `write-audit` event for one `sb/write` entry (§6.3) — Info on success, Warning on failure
     /// or allow-list refusal.
-    async fn audit(&self, h: &DeviceHandle, signal_id: &str, ok: bool, value: Option<&Value>, error: Option<&str>) {
-        let severity = if ok { Severity::Info } else { Severity::Warning };
+    async fn audit(
+        &self,
+        h: &DeviceHandle,
+        signal_id: &str,
+        ok: bool,
+        value: Option<&Value>,
+        error: Option<&str>,
+    ) {
+        let severity = if ok {
+            Severity::Info
+        } else {
+            Severity::Warning
+        };
         let mut ctx = serde_json::Map::new();
         ctx.insert("instance".into(), json!(h.cfg.id));
         ctx.insert("signalId".into(), json!(signal_id));
@@ -616,7 +695,9 @@ impl Commander {
         if let Some(e) = error {
             ctx.insert("error".into(), json!(e));
         }
-        h.events.emit(severity, "write-audit", None, Some(Value::Object(ctx))).await;
+        h.events
+            .emit(severity, "write-audit", None, Some(Value::Object(ctx)))
+            .await;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -672,12 +753,26 @@ impl Commander {
         if let Some(io) = h.cfg.io.as_ref() {
             let in_asm = io.assemblies.input;
             for f in &io.input.signals {
-                signals.push(field_signal(f, in_asm, "input", mode, &h.cfg, &h.cfg.connection));
+                signals.push(field_signal(
+                    f,
+                    in_asm,
+                    "input",
+                    mode,
+                    &h.cfg,
+                    &h.cfg.connection,
+                ));
             }
             let out_asm = io.assemblies.output;
             if let Some(out) = io.output.as_ref() {
                 for f in &out.signals {
-                    signals.push(field_signal(f, out_asm, "output", mode, &h.cfg, &h.cfg.connection));
+                    signals.push(field_signal(
+                        f,
+                        out_asm,
+                        "output",
+                        mode,
+                        &h.cfg,
+                        &h.cfg.connection,
+                    ));
                 }
             }
         }
@@ -695,7 +790,9 @@ impl Commander {
         // The two request forms are mutually exclusive: `ref`/`depth`/`maxRefs` select the
         // hierarchical panel mode, `cursor`/`max` the paged one — and the hierarchical-only
         // arguments are meaningless without a `ref`.
-        let hierarchical_keys = ["ref", "depth", "maxRefs"].iter().any(|k| body.get(*k).is_some());
+        let hierarchical_keys = ["ref", "depth", "maxRefs"]
+            .iter()
+            .any(|k| body.get(*k).is_some());
         let paged_keys = ["cursor", "max"].iter().any(|k| body.get(*k).is_some());
         if hierarchical_keys && paged_keys {
             h.dm.record_command("sb/browse", false, ms(started), CommandTally::default());
@@ -721,40 +818,62 @@ impl Commander {
                 "sb/browse",
                 ok,
                 ms(started),
-                CommandTally { browsed_tags: browsed, ..CommandTally::default() },
+                CommandTally {
+                    browsed_tags: browsed,
+                    ..CommandTally::default()
+                },
             );
             return result;
         }
-        let cursor = body.get("cursor").and_then(|v| v.as_str()).map(str::to_string);
-        let max = body.get("max").and_then(|v| v.as_u64()).unwrap_or(200).clamp(1, 1000) as usize;
+        let cursor = body
+            .get("cursor")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let max = body
+            .get("max")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(200)
+            .clamp(1, 1000) as usize;
 
-        let result: std::result::Result<Value, CommandError> = if matches!(h.cfg.mode, DeviceMode::Push) {
-            browse_push_layout(&h, cursor.as_deref(), max)
-        } else {
-            let (tx, rx) = oneshot::channel();
-            h.control
-                .send(DeviceControl::Browse { cursor, max, reply: tx })
-                .await
-                .map_err(|_| device_unavailable())?;
-            match rx.await {
-                Ok(Ok(page)) => Ok(browse_page_json(&h, page)),
-                Ok(Err(BrowseError::Unsupported)) => {
-                    Err(CommandError::new("BROWSE_UNSUPPORTED", "device has no tag-list service"))
+        let result: std::result::Result<Value, CommandError> =
+            if matches!(h.cfg.mode, DeviceMode::Push) {
+                browse_push_layout(&h, cursor.as_deref(), max)
+            } else {
+                let (tx, rx) = oneshot::channel();
+                h.control
+                    .send(DeviceControl::Browse {
+                        cursor,
+                        max,
+                        reply: tx,
+                    })
+                    .await
+                    .map_err(|_| device_unavailable())?;
+                match rx.await {
+                    Ok(Ok(page)) => Ok(browse_page_json(&h, page)),
+                    Ok(Err(BrowseError::Unsupported)) => Err(CommandError::new(
+                        "BROWSE_UNSUPPORTED",
+                        "device has no tag-list service",
+                    )),
+                    Ok(Err(BrowseError::Failed(e))) => Err(CommandError::new("BROWSE_FAILED", e)),
+                    Err(_) => Err(device_unavailable()),
                 }
-                Ok(Err(BrowseError::Failed(e))) => Err(CommandError::new("BROWSE_FAILED", e)),
-                Err(_) => Err(device_unavailable()),
-            }
-        };
+            };
 
         let (ok, browsed) = match &result {
-            Ok(v) => (true, v.get("tags").and_then(|t| t.as_array()).map_or(0, Vec::len) as u64),
+            Ok(v) => (
+                true,
+                v.get("tags").and_then(|t| t.as_array()).map_or(0, Vec::len) as u64,
+            ),
             Err(_) => (false, 0),
         };
         h.dm.record_command(
             "sb/browse",
             ok,
             ms(started),
-            CommandTally { browsed_tags: browsed, ..CommandTally::default() },
+            CommandTally {
+                browsed_tags: browsed,
+                ..CommandTally::default()
+            },
         );
         result.map(Some)
     }
@@ -775,11 +894,26 @@ impl Commander {
     /// defence in depth over the protocol crate's own ascending-order check — they also bound a
     /// misbehaving non-CIP backend — and they turn "the handler never returns" into a typed error.
     async fn browse_hierarchical(&self, h: &DeviceHandle, body: &Value) -> Reply {
-        let Some(ref_id) = body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()) else {
-            return Err(CommandError::new("BAD_ARGS", "`ref` must be a non-empty string"));
+        let Some(ref_id) = body
+            .get("ref")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+        else {
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                "`ref` must be a non-empty string",
+            ));
         };
-        let depth = body.get("depth").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4);
-        let max_refs = body.get("maxRefs").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
+        let depth = body
+            .get("depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 4);
+        let max_refs = body
+            .get("maxRefs")
+            .and_then(Value::as_u64)
+            .unwrap_or(200)
+            .clamp(1, 1000) as usize;
 
         // One inventory source per mode — the same one the paged form serves. Each entry:
         // (nodeId, name, dataType, extra fields).
@@ -819,15 +953,24 @@ impl Commander {
                     }
                     let (tx, rx) = oneshot::channel();
                     h.control
-                        .send(DeviceControl::Browse { cursor: cursor.clone(), max: 1000, reply: tx })
+                        .send(DeviceControl::Browse {
+                            cursor: cursor.clone(),
+                            max: 1000,
+                            reply: tx,
+                        })
                         .await
                         .map_err(|_| device_unavailable())?;
                     let page = match rx.await {
                         Ok(Ok(page)) => page,
                         Ok(Err(BrowseError::Unsupported)) => {
-                            return Err(CommandError::new("BROWSE_UNSUPPORTED", "device has no tag-list service"));
+                            return Err(CommandError::new(
+                                "BROWSE_UNSUPPORTED",
+                                "device has no tag-list service",
+                            ));
                         }
-                        Ok(Err(BrowseError::Failed(e))) => return Err(CommandError::new("BROWSE_FAILED", e)),
+                        Ok(Err(BrowseError::Failed(e))) => {
+                            return Err(CommandError::new("BROWSE_FAILED", e))
+                        }
                         Err(_) => return Err(device_unavailable()),
                     };
                     for t in &page.tags {
@@ -888,8 +1031,13 @@ impl Commander {
             })));
         }
 
-        let Some((id, name, data_type, extra)) = entries.into_iter().find(|(id, _, _, _)| id == ref_id) else {
-            return Err(CommandError::new("BAD_ARGS", format!("unknown browse ref `{ref_id}`")));
+        let Some((id, name, data_type, extra)) =
+            entries.into_iter().find(|(id, _, _, _)| id == ref_id)
+        else {
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                format!("unknown browse ref `{ref_id}`"),
+            ));
         };
         let mut root = serde_json::Map::new();
         root.insert("nodeId".into(), json!(id));
@@ -921,7 +1069,9 @@ impl Commander {
             .map_err(|_| device_unavailable())?;
         let changed = rx.await.map_err(|_| device_unavailable())?;
         h.dm.record_command("sb/pause", true, ms(started), CommandTally::default());
-        Ok(Some(json!({ "id": h.cfg.id, "paused": true, "changed": changed })))
+        Ok(Some(
+            json!({ "id": h.cfg.id, "paused": true, "changed": changed }),
+        ))
     }
 
     async fn resume(&self, addressed: Option<&str>, _body: &Value) -> Reply {
@@ -934,7 +1084,9 @@ impl Commander {
             .map_err(|_| device_unavailable())?;
         let changed = rx.await.map_err(|_| device_unavailable())?;
         h.dm.record_command("sb/resume", true, ms(started), CommandTally::default());
-        Ok(Some(json!({ "id": h.cfg.id, "paused": false, "changed": changed })))
+        Ok(Some(
+            json!({ "id": h.cfg.id, "paused": false, "changed": changed }),
+        ))
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -969,11 +1121,17 @@ impl Commander {
         let started = Instant::now();
         if matches!(h.cfg.mode, DeviceMode::Push) {
             h.dm.record_command("repoll", false, ms(started), CommandTally::default());
-            return Err(CommandError::new("BAD_ARGS", "push instance - data arrives cyclically"));
+            return Err(CommandError::new(
+                "BAD_ARGS",
+                "push instance - data arrives cyclically",
+            ));
         }
         if h.health.paused.load(Ordering::Relaxed) {
             h.dm.record_command("repoll", false, ms(started), CommandTally::default());
-            return Err(CommandError::new("PAUSED", "instance is paused - resume first"));
+            return Err(CommandError::new(
+                "PAUSED",
+                "instance is paused - resume first",
+            ));
         }
         let (tx, rx) = oneshot::channel();
         h.control
@@ -1051,16 +1209,26 @@ fn parse_eip_type(s: &str) -> Option<EipType> {
 /// the ref label for the BAD/unresolved entry.
 fn resolve_poll_ref(cfg: &DeviceConfig, r: &Value) -> std::result::Result<SignalSpec, String> {
     if let Some(name) = r.get("name").and_then(|v| v.as_str()) {
-        return cfg.signals().find(|s| s.name == name).cloned().ok_or_else(|| name.to_string());
+        return cfg
+            .signals()
+            .find(|s| s.name == name)
+            .cloned()
+            .ok_or_else(|| name.to_string());
     }
     if let Some(tag) = r.get("tagPath").and_then(|v| v.as_str()) {
-        let ty = r.get("type").and_then(|v| v.as_str()).and_then(parse_eip_type);
+        let ty = r
+            .get("type")
+            .and_then(|v| v.as_str())
+            .and_then(parse_eip_type);
         return match ty {
             Some(eip_type) => Ok(SignalSpec {
                 name: tag.to_string(),
                 tag_path: tag.to_string(),
                 eip_type,
-                array_count: r.get("arrayCount").and_then(|v| v.as_u64()).map(|n| n as u32),
+                array_count: r
+                    .get("arrayCount")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32),
                 scale: None,
                 offset: None,
                 deadband: crate::config::DeadbandSpec::default(),
@@ -1089,9 +1257,16 @@ fn resolve_push_read_ref(
         return None;
     }
     let off = r.get("offset").and_then(|v| v.as_u64())? as usize;
-    let ty = r.get("type").and_then(|v| v.as_str()).and_then(parse_eip_type)?;
+    let ty = r
+        .get("type")
+        .and_then(|v| v.as_str())
+        .and_then(parse_eip_type)?;
     let bit = r.get("bit").and_then(|v| v.as_u64()).map(|b| b as u8);
-    let f = io.input.signals.iter().find(|f| f.offset == off && f.eip_type == ty && f.bit == bit)?;
+    let f = io
+        .input
+        .signals
+        .iter()
+        .find(|f| f.offset == off && f.eip_type == ty && f.bit == bit)?;
     Some((f.signal_id(assembly), f.address_json(assembly, conn)))
 }
 
@@ -1117,20 +1292,33 @@ fn resolve_push_write_ref(
     }
     let asm = r.get("assembly").and_then(|v| v.as_u64()).map(|n| n as u16);
     let off = r.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
-    let ty = r.get("type").and_then(|v| v.as_str()).and_then(parse_eip_type);
+    let ty = r
+        .get("type")
+        .and_then(|v| v.as_str())
+        .and_then(parse_eip_type);
     let bit = r.get("bit").and_then(|v| v.as_u64()).map(|b| b as u8);
     let (Some(asm), Some(off), Some(ty)) = (asm, off, ty) else {
         return Err((ref_label(r), "unresolved ref".to_string()));
     };
     if asm == in_asm {
-        return Err((format!("a{in_asm}/{off}/{}", ty.wire()), "input field".to_string()));
+        return Err((
+            format!("a{in_asm}/{off}/{}", ty.wire()),
+            "input field".to_string(),
+        ));
     }
     if let Some(out) = io.output.as_ref() {
-        if let Some(f) = out.signals.iter().find(|f| f.offset == off && f.eip_type == ty && f.bit == bit) {
+        if let Some(f) = out
+            .signals
+            .iter()
+            .find(|f| f.offset == off && f.eip_type == ty && f.bit == bit)
+        {
             return Ok((f.signal_id(out_asm), f.clone()));
         }
     }
-    Err((format!("a{asm}/{off}/{}", ty.wire()), "unresolved ref".to_string()))
+    Err((
+        format!("a{asm}/{off}/{}", ty.wire()),
+        "unresolved ref".to_string(),
+    ))
 }
 
 /// One `sb/signals` push entry.
@@ -1262,7 +1450,12 @@ fn hier_entry(
     let mut extra = serde_json::Map::new();
     extra.insert("direction".into(), json!(direction));
     extra.insert("configured".into(), json!(true));
-    (f.signal_id(assembly), f.name.clone(), json!(f.eip_type.wire()), extra)
+    (
+        f.signal_id(assembly),
+        f.name.clone(),
+        json!(f.eip_type.wire()),
+        extra,
+    )
 }
 
 fn layout_tag(f: &IoFieldSpec, assembly: u16, direction: &str) -> Value {
@@ -1281,10 +1474,19 @@ fn layout_tag(f: &IoFieldSpec, assembly: u16, direction: &str) -> Value {
 fn type_supported(type_name: &str) -> bool {
     matches!(
         type_name,
-        "BOOL" | "SINT" | "USINT" | "INT" | "UINT" | "DINT" | "UDINT" | "LINT" | "ULINT" | "REAL" | "LREAL"
+        "BOOL"
+            | "SINT"
+            | "USINT"
+            | "INT"
+            | "UINT"
+            | "DINT"
+            | "UDINT"
+            | "LINT"
+            | "ULINT"
+            | "REAL"
+            | "LREAL"
     )
 }
-
 
 /// Normalize an `sb/write` body to a list of `{ref…, value}` entries: a `writes` array, or a single
 /// object carrying `value` (§2.2). `Err(BAD_ARGS)` when neither form is present.
@@ -1295,7 +1497,10 @@ fn write_entries(body: &Value) -> std::result::Result<Vec<Value>, CommandError> 
     if body.get("value").is_some() {
         return Ok(vec![body.clone()]);
     }
-    Err(CommandError::new("BAD_ARGS", "expected a `writes` array or a single write object with `value`"))
+    Err(CommandError::new(
+        "BAD_ARGS",
+        "expected a `writes` array or a single write object with `value`",
+    ))
 }
 
 #[cfg(test)]
@@ -1457,12 +1662,30 @@ mod tests {
             while let Some(ctrl) = rx.recv().await {
                 match ctrl {
                     DeviceControl::Write(req) => {
-                        t_writes.lock().unwrap().push((req.signal.tag_path.clone(), req.value.clone()));
-                        let _ = req.ack.send(if opts.write_ok { Ok(()) } else { Err("write rejected".into()) });
+                        t_writes
+                            .lock()
+                            .unwrap()
+                            .push((req.signal.tag_path.clone(), req.value.clone()));
+                        let _ = req.ack.send(if opts.write_ok {
+                            Ok(())
+                        } else {
+                            Err("write rejected".into())
+                        });
                     }
-                    DeviceControl::WriteOutput { field, value, reply } => {
-                        t_writes.lock().unwrap().push((field.name.clone(), value.clone()));
-                        let _ = reply.send(if opts.write_ok { Ok(()) } else { Err("staging failed".into()) });
+                    DeviceControl::WriteOutput {
+                        field,
+                        value,
+                        reply,
+                    } => {
+                        t_writes
+                            .lock()
+                            .unwrap()
+                            .push((field.name.clone(), value.clone()));
+                        let _ = reply.send(if opts.write_ok {
+                            Ok(())
+                        } else {
+                            Err("staging failed".into())
+                        });
                     }
                     DeviceControl::ReadNow { specs, reply } => {
                         if opts.read_ok {
@@ -1485,25 +1708,44 @@ mod tests {
                         let _ = reply.send(opts.snapshot.clone());
                     }
                     DeviceControl::Pause { by, reply } => {
-                        let c = apply_pause(&t_cfg, &t_health, &t_dm, t_events.as_ref(), true, by.as_deref()).await;
+                        let c = apply_pause(
+                            &t_cfg,
+                            &t_health,
+                            &t_dm,
+                            t_events.as_ref(),
+                            true,
+                            by.as_deref(),
+                        )
+                        .await;
                         let _ = reply.send(c);
                     }
                     DeviceControl::Resume { reply } => {
-                        let c = apply_pause(&t_cfg, &t_health, &t_dm, t_events.as_ref(), false, None).await;
+                        let c =
+                            apply_pause(&t_cfg, &t_health, &t_dm, t_events.as_ref(), false, None)
+                                .await;
                         let _ = reply.send(c);
                     }
                     DeviceControl::Reconnect { reply } => {
-                        let _ = reply.send(if opts.reconnect_ok { Ok(()) } else { Err("no route to host".into()) });
+                        let _ = reply.send(if opts.reconnect_ok {
+                            Ok(())
+                        } else {
+                            Err("no route to host".into())
+                        });
                     }
                     DeviceControl::Repoll { reply } => {
-                        let _ = reply.send(if opts.repoll_ok { Ok(7) } else { Err("link error".into()) });
+                        let _ = reply.send(if opts.repoll_ok {
+                            Ok(7)
+                        } else {
+                            Err("link error".into())
+                        });
                     }
                     DeviceControl::Browse { cursor, max, reply } => match &opts.browse {
                         BrowseKind::Unsupported => {
                             let _ = reply.send(Err(BrowseError::Unsupported));
                         }
                         BrowseKind::Failed => {
-                            let _ = reply.send(Err(BrowseError::Failed("mid-browse link error".into())));
+                            let _ = reply
+                                .send(Err(BrowseError::Failed("mid-browse link error".into())));
                         }
                         BrowseKind::PagedSet(all, page) => {
                             // The §7.3 backend contract, mirrored: the cursor is the symbol instance
@@ -1538,20 +1780,26 @@ mod tests {
                             } else {
                                 None
                             };
-                            let _ = reply.send(Ok(BrowsePage { tags, next_cursor: next }));
+                            let _ = reply.send(Ok(BrowsePage {
+                                tags,
+                                next_cursor: next,
+                            }));
                         }
                         BrowseKind::EndlessAdvancing => {
                             // Each page advances (so the non-advancing guard never fires) and never
                             // ends: only the page cap can stop the walk.
-                            let start: u32 = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(1);
+                            let start: u32 =
+                                cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(1);
                             let tags = vec![BrowsedTag {
                                 name: format!("TAG_{start}"),
                                 type_name: "DINT".to_string(),
                                 array_dim: None,
                                 instance_id: start,
                             }];
-                            let _ = reply
-                                .send(Ok(BrowsePage { tags, next_cursor: Some((start + 1).to_string()) }));
+                            let _ = reply.send(Ok(BrowsePage {
+                                tags,
+                                next_cursor: Some((start + 1).to_string()),
+                            }));
                         }
                         BrowseKind::NonNumericCursor => {
                             let _ = reply.send(Ok(BrowsePage {
@@ -1567,7 +1815,10 @@ mod tests {
                                 array_dim: Some(8),
                                 instance_id: 1,
                             }];
-                            let _ = reply.send(Ok(BrowsePage { tags, next_cursor: Some("42".into()) }));
+                            let _ = reply.send(Ok(BrowsePage {
+                                tags,
+                                next_cursor: Some("42".into()),
+                            }));
                         }
                         BrowseKind::Tags(t) => {
                             let tags = t
@@ -1580,17 +1831,33 @@ mod tests {
                                     instance_id: i as u32 + 1,
                                 })
                                 .collect();
-                            let _ = reply.send(Ok(BrowsePage { tags, next_cursor: None }));
+                            let _ = reply.send(Ok(BrowsePage {
+                                tags,
+                                next_cursor: None,
+                            }));
                         }
                     },
                 }
             }
         });
 
-        let handle = DeviceHandle { cfg, control: tx, health: Arc::clone(&health), dm, events };
+        let handle = DeviceHandle {
+            cfg,
+            control: tx,
+            health: Arc::clone(&health),
+            dm,
+            events,
+        };
         let registry = registry_of(vec![handle]);
         let commander = Arc::new(Commander::new(Arc::clone(&registry)));
-        Harness { commander, registry, writes, events: events_rec, health, _task: task }
+        Harness {
+            commander,
+            registry,
+            writes,
+            events: events_rec,
+            health,
+            _task: task,
+        }
     }
 
     fn ok(reply: Reply) -> Value {
@@ -1609,7 +1876,10 @@ mod tests {
         let out = ok(h.commander.status(None, &json!({})).await);
         assert_eq!(out["id"], json!("filler-plc"));
         // An unknown addressed instance is NO_SUCH_INSTANCE.
-        assert_eq!(err_code(h.commander.status(Some("nope"), &json!({})).await), "NO_SUCH_INSTANCE");
+        assert_eq!(
+            err_code(h.commander.status(Some("nope"), &json!({})).await),
+            "NO_SUCH_INSTANCE"
+        );
 
         // Two devices: an unaddressed request is BAD_ARGS.
         let multi = two_device_commander();
@@ -1624,7 +1894,13 @@ mod tests {
         let health = Arc::new(Health::default());
         let (_m, dm) = device_metrics(cfg.clone(), Arc::clone(&health));
         let events: Arc<dyn EventSink> = Arc::new(RecordingEvents::default());
-        DeviceHandle { cfg, control: tx, health, dm, events }
+        DeviceHandle {
+            cfg,
+            control: tx,
+            health,
+            dm,
+            events,
+        }
     }
 
     /// A second poll device, `second`.
@@ -1636,7 +1912,10 @@ mod tests {
 
     /// Two poll devices: `filler-plc` + `second`.
     fn two_device_commander() -> Commander {
-        commander_of(vec![bare_handle(poll_device()), bare_handle(second_device())])
+        commander_of(vec![
+            bare_handle(poll_device()),
+            bare_handle(second_device()),
+        ])
     }
 
     #[tokio::test]
@@ -1644,12 +1923,21 @@ mod tests {
         let multi = two_device_commander();
         // The library resolves the addressing (topic token, else `body.instance`) and hands it to
         // the handler; it routes even with two devices configured and an empty body.
-        assert_eq!(ok(multi.status(Some("second"), &json!({})).await)["id"], json!("second"));
+        assert_eq!(
+            ok(multi.status(Some("second"), &json!({})).await)["id"],
+            json!("second")
+        );
         // An addressed instance this adapter does not serve is NO_SUCH_INSTANCE.
-        assert_eq!(err_code(multi.status(Some("ghost"), &json!({})).await), "NO_SUCH_INSTANCE");
+        assert_eq!(
+            err_code(multi.status(Some("ghost"), &json!({})).await),
+            "NO_SUCH_INSTANCE"
+        );
         // An addressed instance never falls back to "the only device".
         let single = harness(poll_device(), MockOpts::default());
-        assert_eq!(err_code(single.commander.status(Some("ghost"), &json!({})).await), "NO_SUCH_INSTANCE");
+        assert_eq!(
+            err_code(single.commander.status(Some("ghost"), &json!({})).await),
+            "NO_SUCH_INSTANCE"
+        );
     }
 
     #[tokio::test]
@@ -1659,7 +1947,10 @@ mod tests {
         assert_eq!(err_code(multi.status(None, &json!({})).await), "BAD_ARGS");
         // Exactly one device: the sole configured device answers.
         let single = harness(poll_device(), MockOpts::default());
-        assert_eq!(ok(single.commander.status(None, &json!({})).await)["id"], json!("filler-plc"));
+        assert_eq!(
+            ok(single.commander.status(None, &json!({})).await)["id"],
+            json!("filler-plc")
+        );
     }
 
     /// The describe availability `register_all` and the configuration-change path both apply
@@ -1688,34 +1979,61 @@ mod tests {
     /// them.
     #[tokio::test]
     async fn resolve_follows_the_live_registry() {
-        let registry = registry_of(vec![bare_handle(poll_device()), bare_handle(second_device())]);
+        let registry = registry_of(vec![
+            bare_handle(poll_device()),
+            bare_handle(second_device()),
+        ]);
         let commander = Commander::new(Arc::clone(&registry));
-        assert_eq!(ok(commander.status(Some("second"), &json!({})).await)["id"], json!("second"));
+        assert_eq!(
+            ok(commander.status(Some("second"), &json!({})).await)["id"],
+            json!("second")
+        );
         // Several running: an unaddressed request has to name one.
-        assert_eq!(err_code(commander.status(None, &json!({})).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(commander.status(None, &json!({})).await),
+            "BAD_ARGS"
+        );
 
         // The configuration no longer runs `second`.
         registry.remove("second").expect("second was running");
-        assert_eq!(err_code(commander.status(Some("second"), &json!({})).await), "NO_SUCH_INSTANCE");
+        assert_eq!(
+            err_code(commander.status(Some("second"), &json!({})).await),
+            "NO_SUCH_INSTANCE"
+        );
         // …which makes the survivor the sole instance, so it answers unaddressed requests.
-        assert_eq!(ok(commander.status(None, &json!({})).await)["id"], json!("filler-plc"));
+        assert_eq!(
+            ok(commander.status(None, &json!({})).await)["id"],
+            json!("filler-plc")
+        );
 
         // Nothing running: the truthful answer, not a request to address an instance.
         registry.take_all();
-        assert_eq!(err_code(commander.status(None, &json!({})).await), "DEVICE_UNAVAILABLE");
+        assert_eq!(
+            err_code(commander.status(None, &json!({})).await),
+            "DEVICE_UNAVAILABLE"
+        );
 
         // A configuration change starts it again — same registrations, routable immediately.
         registry.insert(runtime(bare_handle(second_device())));
-        assert_eq!(ok(commander.status(Some("second"), &json!({})).await)["id"], json!("second"));
+        assert_eq!(
+            ok(commander.status(Some("second"), &json!({})).await)["id"],
+            json!("second")
+        );
     }
 
     /// The single-instance default is computed from the live count, so removing one of two devices
     /// makes the survivor answer unaddressed requests — and adding one takes the default away.
     #[tokio::test]
     async fn single_instance_default_tracks_the_live_count() {
-        let registry = registry_of(vec![bare_handle(poll_device()), bare_handle(second_device())]);
+        let registry = registry_of(vec![
+            bare_handle(poll_device()),
+            bare_handle(second_device()),
+        ]);
         let commander = Commander::new(Arc::clone(&registry));
-        assert_eq!(err_code(commander.status(None, &json!({})).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(commander.status(None, &json!({})).await),
+            "BAD_ARGS"
+        );
 
         registry.remove("second").expect("second was running");
         assert_eq!(
@@ -1725,7 +2043,10 @@ mod tests {
         );
 
         registry.insert(runtime(bare_handle(second_device())));
-        assert_eq!(err_code(commander.status(None, &json!({})).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(commander.status(None, &json!({})).await),
+            "BAD_ARGS"
+        );
     }
 
     /// The window a configuration change that restarts every instance opens: for the length of the
@@ -1736,7 +2057,10 @@ mod tests {
     async fn an_unaddressed_request_with_nothing_running_is_device_unavailable() {
         let registry = registry_of(vec![bare_handle(poll_device())]);
         let commander = Commander::new(Arc::clone(&registry));
-        assert_eq!(ok(commander.status(None, &json!({})).await)["id"], json!("filler-plc"));
+        assert_eq!(
+            ok(commander.status(None, &json!({})).await)["id"],
+            json!("filler-plc")
+        );
 
         registry.take_all();
         let err = commander
@@ -1825,7 +2149,10 @@ mod tests {
         );
         assert_eq!(code, "WRITE_NOT_ALLOWED");
         // THE GUARANTEE: no write ever reached the device task.
-        assert!(h.writes.lock().unwrap().is_empty(), "a refused write must not reach device I/O");
+        assert!(
+            h.writes.lock().unwrap().is_empty(),
+            "a refused write must not reach device I/O"
+        );
         // The refusal is still audited on evt (§6.3).
         assert!(h.events.has("write-audit"));
         let ctx = h.events.last_ctx("write-audit").unwrap();
@@ -1836,11 +2163,13 @@ mod tests {
     #[tokio::test]
     async fn a_confirmed_allowed_write_reaches_the_device_and_acks() {
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(
-            h.commander
-                .write(None, &json!({ "writes": [ { "name": "fill-setpoint", "value": 55.5 } ] }))
-                .await,
-        );
+        let out = ok(h
+            .commander
+            .write(
+                None,
+                &json!({ "writes": [ { "name": "fill-setpoint", "value": 55.5 } ] }),
+            )
+            .await);
         assert_eq!(out["written"], json!(1));
         assert_eq!(out["results"][0]["ok"], json!(true));
         // It reached the device (allow-listed), and is audited Info.
@@ -1854,22 +2183,31 @@ mod tests {
     async fn a_push_write_targets_the_output_assembly_and_is_applied_next_frame() {
         let h = harness(push_device(), MockOpts::default());
         // a150/0/real is allow-listed; the friendly name resolves to it.
-        let out = ok(
-            h.commander
-                .write(None, &json!({ "name": "fill-setpoint", "value": 55.5 }))
-                .await,
-        );
+        let out = ok(h
+            .commander
+            .write(None, &json!({ "name": "fill-setpoint", "value": 55.5 }))
+            .await);
         assert_eq!(out["written"], json!(1));
         assert_eq!(out["results"][0]["ok"], json!(true));
-        assert_eq!(out["results"][0]["applied"], json!("next-frame"), "push write confirmation honesty");
-        assert_eq!(h.writes.lock().unwrap().len(), 1, "it reached the output assembly");
+        assert_eq!(
+            out["results"][0]["applied"],
+            json!("next-frame"),
+            "push write confirmation honesty"
+        );
+        assert_eq!(
+            h.writes.lock().unwrap().len(),
+            1,
+            "it reached the output assembly"
+        );
 
         // An INPUT field is never writable (§7.3), even by explicit ref.
-        let out = ok(
-            h.commander
-                .write(None, &json!({ "assembly": 100, "offset": 0, "type": "udint", "value": 1 }))
-                .await,
-        );
+        let out = ok(h
+            .commander
+            .write(
+                None,
+                &json!({ "assembly": 100, "offset": 0, "type": "udint", "value": 1 }),
+            )
+            .await);
         assert_eq!(out["results"][0]["ok"], json!(false));
         assert_eq!(out["results"][0]["error"], json!("input field"));
     }
@@ -1879,11 +2217,13 @@ mod tests {
     #[tokio::test]
     async fn read_poll_is_a_live_read_and_unresolved_refs_come_back_bad() {
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(
-            h.commander
-                .read(None, &json!({ "signals": [ { "name": "line-speed" }, { "name": "ghost" } ] }))
-                .await,
-        );
+        let out = ok(h
+            .commander
+            .read(
+                None,
+                &json!({ "signals": [ { "name": "line-speed" }, { "name": "ghost" } ] }),
+            )
+            .await);
         let reads = out["reads"].as_array().unwrap();
         assert_eq!(reads.len(), 2);
         assert_eq!(reads[0]["value"], json!(42.0), "the live mock read");
@@ -1906,14 +2246,30 @@ mod tests {
             received_at: Instant::now(),
             run_mode: true,
         };
-        let h = harness(push_device(), MockOpts { snapshot: Some(snapshot), ..MockOpts::default() });
-        let out = ok(h.commander.read(None, &json!({ "signals": [ { "name": "motor-run" } ] })).await);
-        assert_eq!(out["reads"][0]["value"], json!(7), "answered from the snapshot, no round-trip");
+        let h = harness(
+            push_device(),
+            MockOpts {
+                snapshot: Some(snapshot),
+                ..MockOpts::default()
+            },
+        );
+        let out = ok(h
+            .commander
+            .read(None, &json!({ "signals": [ { "name": "motor-run" } ] }))
+            .await);
+        assert_eq!(
+            out["reads"][0]["value"],
+            json!(7),
+            "answered from the snapshot, no round-trip"
+        );
         assert_eq!(out["reads"][0]["quality"], json!("GOOD"));
 
         // No frame yet ⇒ BAD/NO_FRAME (§7.2).
         let h = harness(push_device(), MockOpts::default());
-        let out = ok(h.commander.read(None, &json!({ "signals": [ { "name": "motor-run" } ] })).await);
+        let out = ok(h
+            .commander
+            .read(None, &json!({ "signals": [ { "name": "motor-run" } ] }))
+            .await);
         assert_eq!(out["reads"][0]["qualityRaw"], json!("NO_FRAME"));
     }
 
@@ -1924,9 +2280,15 @@ mod tests {
         let h = harness(poll_device(), MockOpts::default());
         let out = ok(h.commander.signals(None, &json!({})).await);
         let sigs = out["signals"].as_array().unwrap();
-        let setpoint = sigs.iter().find(|s| s["id"] == json!("FILL_SETPOINT")).unwrap();
+        let setpoint = sigs
+            .iter()
+            .find(|s| s["id"] == json!("FILL_SETPOINT"))
+            .unwrap();
         assert_eq!(setpoint["writable"], json!(true), "allow-listed ⇒ writable");
-        let speed = sigs.iter().find(|s| s["id"] == json!("LINE_SPEED")).unwrap();
+        let speed = sigs
+            .iter()
+            .find(|s| s["id"] == json!("LINE_SPEED"))
+            .unwrap();
         assert_eq!(speed["writable"], json!(false));
         assert!(speed.get("pollGroup").is_some() && speed.get("pollIntervalMs").is_some());
     }
@@ -1936,17 +2298,33 @@ mod tests {
     #[tokio::test]
     async fn browse_pages_tags_for_poll_and_maps_unsupported() {
         // Poll: a page of tags, with configured/supported flags.
-        let opts = MockOpts { browse: BrowseKind::Tags(vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING")]), ..MockOpts::default() };
+        let opts = MockOpts {
+            browse: BrowseKind::Tags(vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING")]),
+            ..MockOpts::default()
+        };
         let h = harness(poll_device(), opts);
         let out = ok(h.commander.browse(None, &json!({})).await);
         let tags = out["tags"].as_array().unwrap();
-        assert_eq!(tags[0]["configured"], json!(true), "LINE_SPEED is in config");
+        assert_eq!(
+            tags[0]["configured"],
+            json!(true),
+            "LINE_SPEED is in config"
+        );
         assert_eq!(tags[0]["supported"], json!(true));
         assert_eq!(tags[1]["supported"], json!(false), "SSTRING is undecodable");
 
         // A device with no tag-list service ⇒ BROWSE_UNSUPPORTED.
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::Unsupported, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.browse(None, &json!({})).await), "BROWSE_UNSUPPORTED");
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::Unsupported,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({})).await),
+            "BROWSE_UNSUPPORTED"
+        );
 
         // Push: the configured assembly layout, no round-trip.
         let h = harness(push_device(), MockOpts::default());
@@ -1968,7 +2346,13 @@ mod tests {
             ("MOTOR_RUN", "BOOL"),
         ];
         // The device would serve all five in one page; `max` is what cuts them into three.
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::PagedSet(all.clone(), 100), ..MockOpts::default() });
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::PagedSet(all.clone(), 100),
+                ..MockOpts::default()
+            },
+        );
 
         let mut seen: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
@@ -1982,7 +2366,11 @@ mod tests {
             pages += 1;
             assert!(pages <= 10, "the walk must terminate");
             let tags = out["tags"].as_array().unwrap();
-            assert!(tags.len() <= 2, "`max` is honoured truthfully: {}", tags.len());
+            assert!(
+                tags.len() <= 2,
+                "`max` is honoured truthfully: {}",
+                tags.len()
+            );
             for t in tags {
                 seen.push(t["name"].as_str().unwrap().to_string());
             }
@@ -2020,13 +2408,23 @@ mod tests {
         let first_tags = first["tags"].as_array().unwrap();
         assert_eq!(first_tags.len(), 1);
         assert_eq!(first_tags[0]["direction"], json!("input"));
-        assert_eq!(first["cursor"], json!("1"), "the resume index of the next field");
+        assert_eq!(
+            first["cursor"],
+            json!("1"),
+            "the resume index of the next field"
+        );
 
-        let second = ok(h.commander.browse(None, &json!({ "cursor": "1", "max": 1 })).await);
+        let second = ok(h
+            .commander
+            .browse(None, &json!({ "cursor": "1", "max": 1 }))
+            .await);
         let second_tags = second["tags"].as_array().unwrap();
         assert_eq!(second_tags.len(), 1);
         assert_eq!(second_tags[0]["direction"], json!("output"));
-        assert!(second.get("cursor").is_none(), "the last page ends the walk");
+        assert!(
+            second.get("cursor").is_none(),
+            "the last page ends the walk"
+        );
         assert_ne!(first_tags[0]["id"], second_tags[0]["id"], "each field once");
 
         // An unpaged request still returns the whole layout with no cursor.
@@ -2046,14 +2444,21 @@ mod tests {
             .await
             .expect_err("a corrupt cursor is refused");
         assert_eq!(err.code, "BAD_ARGS");
-        assert!(err.message.contains("invalid browse cursor"), "{}", err.message);
+        assert!(
+            err.message.contains("invalid browse cursor"),
+            "{}",
+            err.message
+        );
     }
 
     // --- sb/browse hierarchical (the treeBrowser panel mode) --------------------------------------
 
     #[tokio::test]
     async fn browse_ref_serves_the_hierarchical_panel_mode_over_the_same_inventory() {
-        let opts = MockOpts { browse: BrowseKind::Tags(vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING")]), ..MockOpts::default() };
+        let opts = MockOpts {
+            browse: BrowseKind::Tags(vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING")]),
+            ..MockOpts::default()
+        };
         let h = harness(poll_device(), opts);
 
         // "root" answers the device node with one `contains` ref per browsed tag.
@@ -2065,19 +2470,36 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0]["referenceType"], json!("contains"));
         assert_eq!(refs[0]["target"]["nodeId"], json!("LINE_SPEED"));
-        assert_eq!(refs[0]["target"]["configured"], json!(true), "LINE_SPEED is in config");
-        assert_eq!(refs[1]["target"]["supported"], json!(false), "SSTRING is undecodable");
+        assert_eq!(
+            refs[0]["target"]["configured"],
+            json!(true),
+            "LINE_SPEED is in config"
+        );
+        assert_eq!(
+            refs[1]["target"]["supported"],
+            json!(false),
+            "SSTRING is undecodable"
+        );
         assert_eq!(out["refCount"], json!(2));
         assert_eq!(out["truncated"], json!(false));
 
         // A known tag ref is a leaf; an unknown ref is BAD_ARGS.
-        let out = ok(h.commander.browse(None, &json!({ "ref": "LINE_SPEED" })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "LINE_SPEED" }))
+            .await);
         assert_eq!(out["root"]["nodeClass"], json!("signal"));
         assert_eq!(out["root"]["refs"], json!([]));
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "nope" })).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "ref": "nope" })).await),
+            "BAD_ARGS"
+        );
 
         // `depth` clamps to 1..4 and `maxRefs` to 1..1000 (`truncated` reports the cut).
-        let out = ok(h.commander.browse(None, &json!({ "ref": "root", "depth": 99, "maxRefs": 1 })).await);
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "ref": "root", "depth": 99, "maxRefs": 1 }))
+            .await);
         assert_eq!(out["depth"], json!(4));
         assert_eq!(out["root"]["refs"].as_array().unwrap().len(), 1);
         assert_eq!(out["truncated"], json!(true));
@@ -2088,7 +2510,10 @@ mod tests {
         let refs = out["root"]["refs"].as_array().unwrap();
         assert_eq!(refs.len(), 2, "one input + one output field");
         assert_eq!(refs[0]["target"]["direction"], json!("input"));
-        let out = ok(hp.commander.browse(None, &json!({ "ref": "a150/0/real" })).await);
+        let out = ok(hp
+            .commander
+            .browse(None, &json!({ "ref": "a150/0/real" }))
+            .await);
         assert_eq!(out["root"]["nodeClass"], json!("signal"));
     }
 
@@ -2098,7 +2523,13 @@ mod tests {
     /// which is exactly what this test would do before the guard landed.
     #[tokio::test]
     async fn browse_hierarchical_refuses_a_cursor_that_does_not_advance() {
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::Paged, ..MockOpts::default() });
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::Paged,
+                ..MockOpts::default()
+            },
+        );
         let err = h
             .commander
             .browse(None, &json!({ "ref": "root" }))
@@ -2112,21 +2543,37 @@ mod tests {
     /// back to the device.
     #[tokio::test]
     async fn browse_hierarchical_refuses_a_non_numeric_device_cursor() {
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::NonNumericCursor, ..MockOpts::default() });
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::NonNumericCursor,
+                ..MockOpts::default()
+            },
+        );
         let err = h
             .commander
             .browse(None, &json!({ "ref": "root" }))
             .await
             .expect_err("a non-numeric backend cursor is refused");
         assert_eq!(err.code, "BROWSE_FAILED");
-        assert!(err.message.contains("non-numeric browse cursor"), "{}", err.message);
+        assert!(
+            err.message.contains("non-numeric browse cursor"),
+            "{}",
+            err.message
+        );
     }
 
     /// The second guard, for a backend whose cursors advance honestly but never end: the walk stops
     /// at [`MAX_BROWSE_PAGES`] with a typed error instead of running forever.
     #[tokio::test]
     async fn browse_hierarchical_stops_at_the_page_cap() {
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::EndlessAdvancing, ..MockOpts::default() });
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::EndlessAdvancing,
+                ..MockOpts::default()
+            },
+        );
         let err = h
             .commander
             .browse(None, &json!({ "ref": "root" }))
@@ -2141,10 +2588,20 @@ mod tests {
     /// cursors.
     #[tokio::test]
     async fn browse_hierarchical_follows_legitimate_cursors_to_completion() {
-        let all = vec![("LINE_SPEED", "REAL"), ("RECIPE", "SSTRING"), ("ZONE_TEMPS", "REAL")];
+        let all = vec![
+            ("LINE_SPEED", "REAL"),
+            ("RECIPE", "SSTRING"),
+            ("ZONE_TEMPS", "REAL"),
+        ];
         // The device pages two at a time, so the hierarchical walk must follow a cursor to see all
         // three — the `max: 1000` this mode asks for does not stop the device from paging.
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::PagedSet(all, 2), ..MockOpts::default() });
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::PagedSet(all, 2),
+                ..MockOpts::default()
+            },
+        );
         let out = ok(h.commander.browse(None, &json!({ "ref": "root" })).await);
         let refs = out["root"]["refs"].as_array().unwrap();
         assert_eq!(refs.len(), 3, "every page's records reached the inventory");
@@ -2156,13 +2613,36 @@ mod tests {
     async fn browse_rejects_mixed_modes_and_hierarchical_args_without_ref() {
         let h = harness(poll_device(), MockOpts::default());
         // Mixing the paged and hierarchical arg families is BAD_ARGS.
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "root", "cursor": "1" })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "root", "max": 10 })).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(
+                h.commander
+                    .browse(None, &json!({ "ref": "root", "cursor": "1" }))
+                    .await
+            ),
+            "BAD_ARGS"
+        );
+        assert_eq!(
+            err_code(
+                h.commander
+                    .browse(None, &json!({ "ref": "root", "max": 10 }))
+                    .await
+            ),
+            "BAD_ARGS"
+        );
         // `depth`/`maxRefs` without `ref` is BAD_ARGS.
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "depth": 2 })).await), "BAD_ARGS");
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "maxRefs": 10 })).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "depth": 2 })).await),
+            "BAD_ARGS"
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "maxRefs": 10 })).await),
+            "BAD_ARGS"
+        );
         // A non-string / empty `ref` is BAD_ARGS.
-        assert_eq!(err_code(h.commander.browse(None, &json!({ "ref": "" })).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({ "ref": "" })).await),
+            "BAD_ARGS"
+        );
     }
 
     // --- sb/pause / sb/resume + reflection through the mock task -----------------------------------
@@ -2170,7 +2650,10 @@ mod tests {
     #[tokio::test]
     async fn pause_and_resume_are_idempotent_and_reflect_through_the_task() {
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.pause(None, &json!({}), Some("site/op".into())).await);
+        let out = ok(h
+            .commander
+            .pause(None, &json!({}), Some("site/op".into()))
+            .await);
         assert_eq!(out["paused"], json!(true));
         assert_eq!(out["changed"], json!(true));
         assert!(h.health.paused.load(Ordering::Relaxed));
@@ -2194,8 +2677,17 @@ mod tests {
         let out = ok(h.commander.reconnect(None, &json!({})).await);
         assert_eq!(out["connected"], json!(true));
 
-        let h = harness(poll_device(), MockOpts { reconnect_ok: false, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.reconnect(None, &json!({})).await), "RECONNECT_FAILED");
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                reconnect_ok: false,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.reconnect(None, &json!({})).await),
+            "RECONNECT_FAILED"
+        );
     }
 
     // --- repoll: poll-only, refused on push and while paused --------------------------------------
@@ -2209,12 +2701,18 @@ mod tests {
 
         // Push instance ⇒ BAD_ARGS.
         let hp = harness(push_device(), MockOpts::default());
-        assert_eq!(err_code(hp.commander.repoll(None, &json!({})).await), "BAD_ARGS");
+        assert_eq!(
+            err_code(hp.commander.repoll(None, &json!({})).await),
+            "BAD_ARGS"
+        );
 
         // Paused poll instance ⇒ the dedicated PAUSED code (resume first, §7.4.7).
         let h = harness(poll_device(), MockOpts::default());
         let _ = h.commander.pause(None, &json!({}), None).await;
-        assert_eq!(err_code(h.commander.repoll(None, &json!({})).await), "PAUSED");
+        assert_eq!(
+            err_code(h.commander.repoll(None, &json!({})).await),
+            "PAUSED"
+        );
     }
 
     // --- the describe catalog: 9 verbs + 3 panels -------------------------------------------------
@@ -2230,7 +2728,10 @@ mod tests {
             assert_eq!(p["order"], json!(order));
             assert_eq!(p["scope"], json!("instance"));
         }
-        assert_eq!(panels[1]["verbs"], json!(["sb/signals", "sb/read", "sb/write", "repoll"]));
+        assert_eq!(
+            panels[1]["verbs"],
+            json!(["sb/signals", "sb/read", "sb/write", "repoll"])
+        );
 
         // The renderable-descriptor floor: `summary.rows`, `commandSummary.verbs`, a `signalGrid`
         // naming BOTH `signalsVerb` and `subscriptionsVerb` (→ sb/signals) plus `readVerb`, a
@@ -2238,8 +2739,18 @@ mod tests {
         // on the command-backed widgets — and NO widget advertises a `writeVerb` (the guarded-write
         // console flow does not exist).
         let overview = &panels[0]["widgets"];
-        assert!(overview[0]["rows"].as_array().is_some_and(|r| !r.is_empty()), "summary carries rows");
-        assert!(overview[1]["verbs"].as_array().is_some_and(|v| !v.is_empty()), "commandSummary carries verbs");
+        assert!(
+            overview[0]["rows"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty()),
+            "summary carries rows"
+        );
+        assert!(
+            overview[1]["verbs"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty()),
+            "commandSummary carries verbs"
+        );
         let grid = &panels[1]["widgets"][0];
         assert_eq!(grid["kind"], json!("signalGrid"));
         assert_eq!(grid["scope"], json!("instance"));
@@ -2254,21 +2765,34 @@ mod tests {
         assert_eq!(tree["browseVerb"], json!("sb/browse"));
         for p in &panels {
             for w in p["widgets"].as_array().unwrap() {
-                assert!(w.get("writeVerb").is_none(), "no widget advertises writeVerb");
+                assert!(
+                    w.get("writeVerb").is_none(),
+                    "no widget advertises writeVerb"
+                );
             }
         }
 
         // The nine verbs `register_all` registers == the `EtherNetIpCommand` verb set (§7, §8.6).
         let expected = [
-            "sb/status", "sb/read", "sb/write", "sb/signals", "sb/browse", "sb/pause", "sb/resume",
-            "reconnect", "repoll",
+            "sb/status",
+            "sb/read",
+            "sb/write",
+            "sb/signals",
+            "sb/browse",
+            "sb/pause",
+            "sb/resume",
+            "reconnect",
+            "repoll",
         ];
         assert_eq!(expected.len(), 9);
         let mut got = crate::metrics::COMMAND_VERBS.to_vec();
         let mut want = expected.to_vec();
         got.sort_unstable();
         want.sort_unstable();
-        assert_eq!(got, want, "the registered verbs match the metric verb dimension set");
+        assert_eq!(
+            got, want,
+            "the registered verbs match the metric verb dimension set"
+        );
     }
 
     // --- signal-ref resolution + small helpers (pure, no device) ----------------------------------
@@ -2277,17 +2801,35 @@ mod tests {
     fn resolve_poll_ref_handles_names_explicit_tag_paths_and_misses() {
         let cfg = poll_device();
         // A friendly name resolves to the configured spec.
-        assert_eq!(resolve_poll_ref(&cfg, &json!({ "name": "line-speed" })).unwrap().tag_path, "LINE_SPEED");
+        assert_eq!(
+            resolve_poll_ref(&cfg, &json!({ "name": "line-speed" }))
+                .unwrap()
+                .tag_path,
+            "LINE_SPEED"
+        );
         // A name that matches nothing is Err (the label rides the BAD entry).
-        assert_eq!(resolve_poll_ref(&cfg, &json!({ "name": "ghost" })).unwrap_err(), "ghost");
+        assert_eq!(
+            resolve_poll_ref(&cfg, &json!({ "name": "ghost" })).unwrap_err(),
+            "ghost"
+        );
         // An explicit {tagPath,type,arrayCount} synthesizes a spec.
-        let s = resolve_poll_ref(&cfg, &json!({ "tagPath": "ADHOC", "type": "dint", "arrayCount": 4 })).unwrap();
+        let s = resolve_poll_ref(
+            &cfg,
+            &json!({ "tagPath": "ADHOC", "type": "dint", "arrayCount": 4 }),
+        )
+        .unwrap();
         assert_eq!(s.tag_path, "ADHOC");
         assert_eq!(s.array_count, Some(4));
         // An explicit tagPath with no/invalid type is unresolved.
-        assert_eq!(resolve_poll_ref(&cfg, &json!({ "tagPath": "NOPE" })).unwrap_err(), "NOPE");
+        assert_eq!(
+            resolve_poll_ref(&cfg, &json!({ "tagPath": "NOPE" })).unwrap_err(),
+            "NOPE"
+        );
         // Neither a name nor a tagPath ⇒ the ref label.
-        assert_eq!(resolve_poll_ref(&cfg, &json!({ "junk": 1 })).unwrap_err(), "<invalid ref>");
+        assert_eq!(
+            resolve_poll_ref(&cfg, &json!({ "junk": 1 })).unwrap_err(),
+            "<invalid ref>"
+        );
     }
 
     #[test]
@@ -2295,14 +2837,30 @@ mod tests {
         let cfg = push_device();
         let io = cfg.io.as_ref().unwrap();
         // By name.
-        let (id, _) = resolve_push_read_ref(io, &cfg.connection, &json!({ "name": "motor-run" })).unwrap();
+        let (id, _) =
+            resolve_push_read_ref(io, &cfg.connection, &json!({ "name": "motor-run" })).unwrap();
         assert_eq!(id, "a100/0/udint");
         // By explicit assembly/offset/type.
-        let (id2, _) = resolve_push_read_ref(io, &cfg.connection, &json!({ "assembly": 100, "offset": 0, "type": "udint" })).unwrap();
+        let (id2, _) = resolve_push_read_ref(
+            io,
+            &cfg.connection,
+            &json!({ "assembly": 100, "offset": 0, "type": "udint" }),
+        )
+        .unwrap();
         assert_eq!(id2, "a100/0/udint");
         // Wrong assembly / unknown field ⇒ None.
-        assert!(resolve_push_read_ref(io, &cfg.connection, &json!({ "assembly": 999, "offset": 0, "type": "udint" })).is_none());
-        assert!(resolve_push_read_ref(io, &cfg.connection, &json!({ "assembly": 100, "offset": 4, "type": "real" })).is_none());
+        assert!(resolve_push_read_ref(
+            io,
+            &cfg.connection,
+            &json!({ "assembly": 999, "offset": 0, "type": "udint" })
+        )
+        .is_none());
+        assert!(resolve_push_read_ref(
+            io,
+            &cfg.connection,
+            &json!({ "assembly": 100, "offset": 4, "type": "real" })
+        )
+        .is_none());
     }
 
     #[test]
@@ -2310,23 +2868,67 @@ mod tests {
         let cfg = push_device();
         let io = cfg.io.as_ref().unwrap();
         // Output field by name.
-        assert_eq!(resolve_push_write_ref(io, &json!({ "name": "fill-setpoint" })).unwrap().0, "a150/0/real");
+        assert_eq!(
+            resolve_push_write_ref(io, &json!({ "name": "fill-setpoint" }))
+                .unwrap()
+                .0,
+            "a150/0/real"
+        );
         // Output field by explicit ref.
-        assert_eq!(resolve_push_write_ref(io, &json!({ "assembly": 150, "offset": 0, "type": "real" })).unwrap().0, "a150/0/real");
+        assert_eq!(
+            resolve_push_write_ref(io, &json!({ "assembly": 150, "offset": 0, "type": "real" }))
+                .unwrap()
+                .0,
+            "a150/0/real"
+        );
         // An input field is never writable — by name and by explicit ref.
-        assert_eq!(resolve_push_write_ref(io, &json!({ "name": "motor-run" })).unwrap_err().1, "input field");
-        assert_eq!(resolve_push_write_ref(io, &json!({ "assembly": 100, "offset": 0, "type": "udint" })).unwrap_err().1, "input field");
+        assert_eq!(
+            resolve_push_write_ref(io, &json!({ "name": "motor-run" }))
+                .unwrap_err()
+                .1,
+            "input field"
+        );
+        assert_eq!(
+            resolve_push_write_ref(
+                io,
+                &json!({ "assembly": 100, "offset": 0, "type": "udint" })
+            )
+            .unwrap_err()
+            .1,
+            "input field"
+        );
         // Unknown refs.
-        assert_eq!(resolve_push_write_ref(io, &json!({ "name": "ghost" })).unwrap_err().1, "unresolved ref");
-        assert_eq!(resolve_push_write_ref(io, &json!({ "assembly": 150, "offset": 99, "type": "real" })).unwrap_err().1, "unresolved ref");
-        assert_eq!(resolve_push_write_ref(io, &json!({ "junk": 1 })).unwrap_err().1, "unresolved ref");
+        assert_eq!(
+            resolve_push_write_ref(io, &json!({ "name": "ghost" }))
+                .unwrap_err()
+                .1,
+            "unresolved ref"
+        );
+        assert_eq!(
+            resolve_push_write_ref(
+                io,
+                &json!({ "assembly": 150, "offset": 99, "type": "real" })
+            )
+            .unwrap_err()
+            .1,
+            "unresolved ref"
+        );
+        assert_eq!(
+            resolve_push_write_ref(io, &json!({ "junk": 1 }))
+                .unwrap_err()
+                .1,
+            "unresolved ref"
+        );
     }
 
     #[test]
     fn ref_label_prefers_name_then_tag_path_then_assembly_form() {
         assert_eq!(ref_label(&json!({ "name": "a" })), "a");
         assert_eq!(ref_label(&json!({ "tagPath": "T" })), "T");
-        assert_eq!(ref_label(&json!({ "assembly": 100, "offset": 4, "type": "real" })), "a100/4/real");
+        assert_eq!(
+            ref_label(&json!({ "assembly": 100, "offset": 4, "type": "real" })),
+            "a100/4/real"
+        );
         assert_eq!(ref_label(&json!({ "nope": 1 })), "<invalid ref>");
     }
 
@@ -2336,11 +2938,28 @@ mod tests {
         assert_eq!(quality_str(Quality::Good), "GOOD");
         assert_eq!(quality_str(Quality::Bad), "BAD");
         assert_eq!(quality_str(Quality::Uncertain), "UNCERTAIN");
-        assert_eq!(deadband_json(&DeadbandSpec { kind: DeadbandKind::Percent, value: 1.5 })["type"], json!("percent"));
-        assert_eq!(deadband_json(&DeadbandSpec { kind: DeadbandKind::Absolute, value: 2.0 })["type"], json!("absolute"));
+        assert_eq!(
+            deadband_json(&DeadbandSpec {
+                kind: DeadbandKind::Percent,
+                value: 1.5
+            })["type"],
+            json!("percent")
+        );
+        assert_eq!(
+            deadband_json(&DeadbandSpec {
+                kind: DeadbandKind::Absolute,
+                value: 2.0
+            })["type"],
+            json!("absolute")
+        );
         assert!(type_supported("DINT") && !type_supported("SSTRING"));
         // write_entries: a `writes` array, a single `value` object, or BAD_ARGS.
-        assert_eq!(write_entries(&json!({ "writes": [ { "value": 1 } ] })).unwrap().len(), 1);
+        assert_eq!(
+            write_entries(&json!({ "writes": [ { "value": 1 } ] }))
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(write_entries(&json!({ "value": 1 })).unwrap().len(), 1);
         assert_eq!(write_entries(&json!({})).unwrap_err().code, "BAD_ARGS");
     }
@@ -2351,12 +2970,31 @@ mod tests {
     async fn read_poll_maps_a_device_read_failure_and_reads_by_explicit_tag_path() {
         // An explicit {tagPath,type} ref resolves and reads live.
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.read(None, &json!({ "signals": [ { "tagPath": "LINE_SPEED", "type": "real" } ] })).await);
+        let out = ok(h
+            .commander
+            .read(
+                None,
+                &json!({ "signals": [ { "tagPath": "LINE_SPEED", "type": "real" } ] }),
+            )
+            .await);
         assert_eq!(out["reads"][0]["value"], json!(42.0));
 
         // A live read that fails at the device ⇒ READ_FAILED.
-        let h = harness(poll_device(), MockOpts { read_ok: false, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.read(None, &json!({ "signals": [ { "name": "line-speed" } ] })).await), "READ_FAILED");
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                read_ok: false,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(
+                h.commander
+                    .read(None, &json!({ "signals": [ { "name": "line-speed" } ] }))
+                    .await
+            ),
+            "READ_FAILED"
+        );
     }
 
     #[tokio::test]
@@ -2364,18 +3002,38 @@ mod tests {
         // A missing value + an unresolved ref: both fail, and (since not ALL are allow-list refusals)
         // the call returns 200 with per-entry errors.
         let h = harness(poll_device(), MockOpts::default());
-        let out = ok(h.commander.write(None, &json!({ "writes": [
+        let out = ok(h
+            .commander
+            .write(
+                None,
+                &json!({ "writes": [
             { "name": "fill-setpoint" },              // allow-listed but no value
             { "name": "ghost", "value": 1 }           // unresolved
-        ] })).await);
+        ] }),
+            )
+            .await);
         assert_eq!(out["written"], json!(0));
-        let errs: Vec<&str> = out["results"].as_array().unwrap().iter().map(|r| r["error"].as_str().unwrap()).collect();
+        let errs: Vec<&str> = out["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["error"].as_str().unwrap())
+            .collect();
         assert!(errs.contains(&"missing value"));
         assert!(errs.contains(&"unresolved ref"));
 
         // A device-rejected write ⇒ the entry is ok:false with the device error.
-        let h = harness(poll_device(), MockOpts { write_ok: false, ..MockOpts::default() });
-        let out = ok(h.commander.write(None, &json!({ "name": "fill-setpoint", "value": 55.5 })).await);
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                write_ok: false,
+                ..MockOpts::default()
+            },
+        );
+        let out = ok(h
+            .commander
+            .write(None, &json!({ "name": "fill-setpoint", "value": 55.5 }))
+            .await);
         assert_eq!(out["results"][0]["ok"], json!(false));
         assert_eq!(out["results"][0]["error"], json!("write rejected"));
     }
@@ -2383,15 +3041,34 @@ mod tests {
     #[tokio::test]
     async fn write_push_reports_missing_value_failed_and_unresolved_entries() {
         let h = harness(push_device(), MockOpts::default());
-        let out = ok(h.commander.write(None, &json!({ "writes": [
+        let out = ok(h
+            .commander
+            .write(
+                None,
+                &json!({ "writes": [
             { "name": "fill-setpoint" },   // allow-listed output, no value
             { "name": "ghost", "value": 1 }
-        ] })).await);
+        ] }),
+            )
+            .await);
         assert_eq!(out["written"], json!(0));
 
-        let h = harness(push_device(), MockOpts { write_ok: false, ..MockOpts::default() });
-        let out = ok(h.commander.write(None, &json!({ "name": "fill-setpoint", "value": 55.5 })).await);
-        assert_eq!(out["results"][0]["ok"], json!(false), "staging failure surfaces per-entry");
+        let h = harness(
+            push_device(),
+            MockOpts {
+                write_ok: false,
+                ..MockOpts::default()
+            },
+        );
+        let out = ok(h
+            .commander
+            .write(None, &json!({ "name": "fill-setpoint", "value": 55.5 }))
+            .await);
+        assert_eq!(
+            out["results"][0]["ok"],
+            json!(false),
+            "staging failure surfaces per-entry"
+        );
     }
 
     #[tokio::test]
@@ -2401,25 +3078,54 @@ mod tests {
         assert_eq!(out["mode"], json!("push"));
         let sigs = out["signals"].as_array().unwrap();
         assert!(sigs.iter().any(|s| s["direction"] == json!("input")));
-        assert!(sigs.iter().any(|s| s["direction"] == json!("output") && s["writable"] == json!(true)));
+        assert!(sigs
+            .iter()
+            .any(|s| s["direction"] == json!("output") && s["writable"] == json!(true)));
     }
 
     #[tokio::test]
     async fn browse_maps_failed_and_pages_array_dim_and_cursor() {
         // A mid-browse failure ⇒ BROWSE_FAILED.
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::Failed, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.browse(None, &json!({})).await), "BROWSE_FAILED");
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::Failed,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({})).await),
+            "BROWSE_FAILED"
+        );
 
         // A paged reply carries the array-dim tag and the next-cursor.
-        let h = harness(poll_device(), MockOpts { browse: BrowseKind::Paged, ..MockOpts::default() });
-        let out = ok(h.commander.browse(None, &json!({ "cursor": "1", "max": 50 })).await);
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::Paged,
+                ..MockOpts::default()
+            },
+        );
+        let out = ok(h
+            .commander
+            .browse(None, &json!({ "cursor": "1", "max": 50 }))
+            .await);
         assert_eq!(out["tags"][0]["arrayDim"], json!(8));
         assert_eq!(out["cursor"], json!("42"));
     }
 
     #[tokio::test]
     async fn repoll_maps_a_device_failure_to_unavailable() {
-        let h = harness(poll_device(), MockOpts { repoll_ok: false, ..MockOpts::default() });
-        assert_eq!(err_code(h.commander.repoll(None, &json!({})).await), "DEVICE_UNAVAILABLE");
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                repoll_ok: false,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.repoll(None, &json!({})).await),
+            "DEVICE_UNAVAILABLE"
+        );
     }
 }

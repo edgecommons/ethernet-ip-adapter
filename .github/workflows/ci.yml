@@ -36,6 +36,25 @@ jobs:
       # the C-FFI SDK and is validated on the lab device (DESIGN §12.4), not in this hosted job.
     secrets: inherit
 
+  fmt:
+    # Formatting is a gate, not a preference. Without one the drift is invisible until someone runs
+    # `cargo fmt` and buries a real change under a thousand reformatted hunks — which is exactly how
+    # this repo accumulated 1107 of them. Both workspaces are checked: `crates/enip/fuzz` is a
+    # SEPARATE workspace (its own Cargo.toml, excluded from the root one), so `--all` at the root
+    # does not reach it.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: cargo fmt (workspace)
+        run: cargo fmt --all --check
+      - name: cargo fmt (fuzz workspace)
+        working-directory: crates/enip/fuzz
+        run: cargo fmt --all --check
+
   coverage:
     # The 90%-line coverage gate (NFR / DESIGN §12.1), actually RUN here — the reusable component-ci
     # only does build/test/clippy. Measured WORKSPACE-WIDE (D-EIP-17 folded the protocol crate into

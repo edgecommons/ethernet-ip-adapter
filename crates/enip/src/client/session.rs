@@ -192,7 +192,8 @@ pub(crate) fn match_reply(expected: &ReplyExpectation, header: &EncapHeader) -> 
     if header.command != expected.command {
         return ReplyMatch::HeaderMismatch("command");
     }
-    if !session_handle_exempt(expected.command) && header.session_handle != expected.session_handle {
+    if !session_handle_exempt(expected.command) && header.session_handle != expected.session_handle
+    {
         return ReplyMatch::HeaderMismatch("session handle");
     }
     ReplyMatch::Match
@@ -287,7 +288,9 @@ pub(crate) async fn recv_frame<S: AsyncRead + Unpin>(
 ) -> Result<EncapFrame> {
     match read_outcome(stream, buf, codec, deadline).await {
         ReadOutcome::Frame(frame) => Ok(frame),
-        ReadOutcome::Eof => Err(EnipError::ConnectionLost { context: "eof during handshake" }),
+        ReadOutcome::Eof => Err(EnipError::ConnectionLost {
+            context: "eof during handshake",
+        }),
         ReadOutcome::TimedOut => Err(EnipError::Timeout { op }),
         ReadOutcome::Broken(e) => Err(e),
     }
@@ -408,7 +411,9 @@ where
                     }
                 },
                 ReadOutcome::Eof => {
-                    let _ = t.reply_tx.send(Err(EnipError::ConnectionLost { context: "session eof" }));
+                    let _ = t.reply_tx.send(Err(EnipError::ConnectionLost {
+                        context: "session eof",
+                    }));
                     return Err(());
                 }
                 ReadOutcome::Broken(e) => {

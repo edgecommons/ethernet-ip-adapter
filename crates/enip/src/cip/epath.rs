@@ -63,7 +63,9 @@ impl PortSegment {
         w.put_slice(&self.link);
         // Pad the segment to an even byte count: 1 (+1 if extended) + link_len.
         let base: usize = if extended { 2 } else { 1 };
-        let seg_len = base.checked_add(link_len).ok_or(EnipError::TooLarge { limit: 255 })?;
+        let seg_len = base
+            .checked_add(link_len)
+            .ok_or(EnipError::TooLarge { limit: 255 })?;
         if seg_len % 2 != 0 {
             w.u8(0);
         }
@@ -92,12 +94,7 @@ pub enum Segment {
 }
 
 impl Segment {
-    fn encode_logical(
-        w: &mut WireWriter,
-        code8: u8,
-        code16: u8,
-        value: u16,
-    ) {
+    fn encode_logical(w: &mut WireWriter, code8: u8, code16: u8, value: u16) {
         if value <= u16::from(u8::MAX) {
             w.u8(code8);
             w.u8(value as u8);
@@ -111,13 +108,7 @@ impl Segment {
     /// A logical segment whose type defines all three address formats (§6.2): the format bits of the
     /// segment-type byte select 8-bit (`code8`), 16-bit (`code16`), or 32-bit (`code32`); the wider
     /// forms carry the pad byte the padded EPATH requires before the little-endian value.
-    fn encode_logical_wide(
-        w: &mut WireWriter,
-        code8: u8,
-        code16: u8,
-        code32: u8,
-        value: u32,
-    ) {
+    fn encode_logical_wide(w: &mut WireWriter, code8: u8, code16: u8, code32: u8, value: u32) {
         if value <= u32::from(u8::MAX) {
             w.u8(code8);
             w.u8(value as u8);
@@ -144,7 +135,8 @@ impl Segment {
             Self::Element(v) => Self::encode_logical_wide(w, 0x28, 0x29, 0x2A, *v),
             Self::Symbol(name) => {
                 let bytes = name.as_bytes();
-                let count = u8::try_from(bytes.len()).map_err(|_| EnipError::TooLarge { limit: 255 })?;
+                let count =
+                    u8::try_from(bytes.len()).map_err(|_| EnipError::TooLarge { limit: 255 })?;
                 if count == 0 {
                     return Err(EnipError::Malformed(crate::error::WireError::Malformed {
                         context: CONTEXT,
@@ -461,9 +453,15 @@ mod tests {
         // §6.2 logical segment: type bits 001 (logical) · 001 (instance) · format bits
         // 00 / 01 / 10 ⇒ 0x24 (8-bit), 0x25 (16-bit), 0x26 (32-bit); the wider forms pad before the
         // little-endian value.
-        assert_eq!(EPath::new().instance(0x01).encode().unwrap().as_ref(), &[0x24, 0x01]);
+        assert_eq!(
+            EPath::new().instance(0x01).encode().unwrap().as_ref(),
+            &[0x24, 0x01]
+        );
         // 0xFF is the last id the 8-bit form addresses.
-        assert_eq!(EPath::new().instance(0xFF).encode().unwrap().as_ref(), &[0x24, 0xFF]);
+        assert_eq!(
+            EPath::new().instance(0xFF).encode().unwrap().as_ref(),
+            &[0x24, 0xFF]
+        );
         // 0x100 is the first that needs the 16-bit form.
         assert_eq!(
             EPath::new().instance(0x0100).encode().unwrap().as_ref(),
@@ -476,7 +474,11 @@ mod tests {
         );
         // 0x1_0000 is the first that needs the 32-bit form — the F7 browse-cursor case.
         assert_eq!(
-            EPath::new().instance(0x0001_0000).encode().unwrap().as_ref(),
+            EPath::new()
+                .instance(0x0001_0000)
+                .encode()
+                .unwrap()
+                .as_ref(),
             &[0x26, 0x00, 0x00, 0x00, 0x01, 0x00]
         );
         assert_eq!(
@@ -484,12 +486,22 @@ mod tests {
             &[0x26, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]
         );
         // Every form is even-length, so the path stays word-aligned (§6.2).
-        assert_eq!(EPath::new().class(0x6B).instance(0x0001_0000).word_len().unwrap(), 4);
+        assert_eq!(
+            EPath::new()
+                .class(0x6B)
+                .instance(0x0001_0000)
+                .word_len()
+                .unwrap(),
+            4
+        );
     }
 
     #[test]
     fn element_widths() {
-        assert_eq!(EPath::new().element(3).encode().unwrap().as_ref(), &[0x28, 0x03]);
+        assert_eq!(
+            EPath::new().element(3).encode().unwrap().as_ref(),
+            &[0x28, 0x03]
+        );
         assert_eq!(
             EPath::new().element(300).encode().unwrap().as_ref(),
             &[0x29, 0x00, 0x2C, 0x01]
@@ -520,7 +532,10 @@ mod tests {
     #[test]
     fn parse_simple_and_scoped_and_indexed() {
         let simple = TagAddress::parse("ZONE_TEMPS").unwrap();
-        assert_eq!(simple.path().segments(), &[Segment::Symbol("ZONE_TEMPS".into())]);
+        assert_eq!(
+            simple.path().segments(),
+            &[Segment::Symbol("ZONE_TEMPS".into())]
+        );
 
         let scoped = TagAddress::parse("Program:Main.FillTimer.ACC").unwrap();
         assert_eq!(
@@ -555,15 +570,27 @@ mod tests {
         assert_eq!(TagAddress::parse(""), Err(PathError::Empty));
         assert_eq!(TagAddress::parse("a..b"), Err(PathError::EmptyComponent));
         assert_eq!(TagAddress::parse("1abc"), Err(PathError::InvalidIndex));
-        assert_eq!(TagAddress::parse("ZONE[").err().unwrap(), PathError::InvalidIndex);
-        assert_eq!(TagAddress::parse("ZONE[]").err().unwrap(), PathError::InvalidIndex);
-        assert_eq!(TagAddress::parse("ZONE[a]").err().unwrap(), PathError::InvalidIndex);
+        assert_eq!(
+            TagAddress::parse("ZONE[").err().unwrap(),
+            PathError::InvalidIndex
+        );
+        assert_eq!(
+            TagAddress::parse("ZONE[]").err().unwrap(),
+            PathError::InvalidIndex
+        );
+        assert_eq!(
+            TagAddress::parse("ZONE[a]").err().unwrap(),
+            PathError::InvalidIndex
+        );
     }
 
     #[test]
     fn parsed_symbol_encodes_to_padded_epath() {
         let t = TagAddress::parse("Tag1").unwrap();
         // 0x91, 0x04, 'T','a','g','1'
-        assert_eq!(t.encode().unwrap().as_ref(), &[0x91, 0x04, b'T', b'a', b'g', b'1']);
+        assert_eq!(
+            t.encode().unwrap().as_ref(),
+            &[0x91, 0x04, b'T', b'a', b'g', b'1']
+        );
     }
 }

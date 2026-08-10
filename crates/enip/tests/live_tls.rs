@@ -26,7 +26,12 @@
 //!
 //! Excluded from the coverage denominator (`tests[/\\]live_tls`, §12.2).
 #![cfg(feature = "tls")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::float_cmp)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::float_cmp
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,7 +49,11 @@ const CBC_ADDR: &str = "127.0.0.1:2223";
 /// Probe a TCP port; `false` when nothing is listening (§11.3 self-skip).
 async fn up(addr: &str) -> bool {
     matches!(
-        tokio::time::timeout(Duration::from_millis(400), tokio::net::TcpStream::connect(addr)).await,
+        tokio::time::timeout(
+            Duration::from_millis(400),
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
         Ok(Ok(_))
     )
 }
@@ -58,8 +67,7 @@ fn live_required() -> bool {
 
 fn certs_dir() -> PathBuf {
     // crates/enip/tests -> repo root -> test-infra/enip-tls/certs
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test-infra/enip-tls/certs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-infra/enip-tls/certs")
 }
 
 fn read(path: &str) -> String {
@@ -95,7 +103,10 @@ fn client_config(ca_pem: &str, mtls: bool) -> Arc<ClientConfig> {
         .with_root_certificates(roots);
     let cfg = if mtls {
         builder
-            .with_client_auth_cert(certs_from(&read("client.pem")), key_from(&read("client.key")))
+            .with_client_auth_cert(
+                certs_from(&read("client.pem")),
+                key_from(&read("client.key")),
+            )
             .unwrap()
     } else {
         builder.with_no_client_auth()
@@ -179,7 +190,13 @@ async fn tls_live_mutual_read_write_and_negative_matrix() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, EnipError::Tls { kind: TlsErrorKind::PeerUnverified, .. }),
+        matches!(
+            err,
+            EnipError::Tls {
+                kind: TlsErrorKind::PeerUnverified,
+                ..
+            }
+        ),
         "wrong CA ⇒ PeerUnverified, got {err:?}"
     );
     eprintln!("live_tls: wrong-CA rejection PASSED ({err})");
@@ -213,7 +230,13 @@ async fn tls_live_mutual_read_write_and_negative_matrix() {
             Err(e) => e,
         };
         assert!(
-            matches!(err, EnipError::Tls { kind: TlsErrorKind::NoCipherOverlap, .. }),
+            matches!(
+                err,
+                EnipError::Tls {
+                    kind: TlsErrorKind::NoCipherOverlap,
+                    ..
+                }
+            ),
             "CBC-only ⇒ NoCipherOverlap, got {err:?}"
         );
         eprintln!("live_tls: CBC-only NoCipherOverlap PASSED ({err})");

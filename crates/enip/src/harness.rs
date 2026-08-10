@@ -25,9 +25,9 @@ use bytes::BytesMut;
 use tokio::time::Instant;
 
 use crate::assembly::{AssemblyLayout, FieldSpec};
+use crate::cip::epath::TagAddress;
 use crate::cip::message::MessageReply;
 use crate::cip::types::{CipType, CipValue};
-use crate::cip::epath::TagAddress;
 use crate::cm::{
     io_connection_path, ConnType, ForwardOpenRequest, ForwardOpenSuccess, ForwardRequestFail,
     NetworkConnectionParams, Priority, TimeoutMultiplier, VariableLength,

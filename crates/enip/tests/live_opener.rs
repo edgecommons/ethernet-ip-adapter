@@ -58,12 +58,18 @@ fn opener_addr() -> String {
 /// `ENIP_LIVE_REQUIRED=1`, where its absence is a harness misconfiguration and therefore a failure
 /// ([`live_required`]).
 fn opener_stop_cmd() -> Option<String> {
-    std::env::var("OPENER_STOP_CMD").ok().filter(|s| !s.is_empty())
+    std::env::var("OPENER_STOP_CMD")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 async fn opener_up(addr: &str) -> bool {
     matches!(
-        tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(addr)).await,
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
         Ok(Ok(_))
     )
 }
@@ -86,7 +92,12 @@ fn opener_spec() -> IoConnectionSpec {
 /// functional test needs.
 fn opener_spec_at(rpi: Duration) -> IoConnectionSpec {
     IoConnectionSpec {
-        assembly: AssemblyPath { config: Some(151), output: 150, input: 100, route: vec![] },
+        assembly: AssemblyPath {
+            config: Some(151),
+            output: 150,
+            input: 100,
+            route: vec![],
+        },
         // T→O: OpENer produces the 32-byte input assembly, pure data.
         t2o: DirectionSpec {
             rpi,
@@ -129,7 +140,10 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
     // The owning TCP session (carries the ForwardOpen over UCMM).
     let client = EipClient::connect(
         &addr,
-        ClientOptions { connect_timeout: Duration::from_secs(3), ..ClientOptions::default() },
+        ClientOptions {
+            connect_timeout: Duration::from_secs(3),
+            ..ClientOptions::default()
+        },
     )
     .await
     .expect("connect TCP session to OpENer");
@@ -142,7 +156,10 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
     let manager = IoManager::bind("0.0.0.0:0")
         .await
         .expect("bind implicit-I/O UDP socket");
-    println!("bound implicit-I/O UDP socket at {} (advertised to OpENer via T→O sockaddr)", manager.local_addr());
+    println!(
+        "bound implicit-I/O UDP socket at {} (advertised to OpENer via T→O sockaddr)",
+        manager.local_addr()
+    );
 
     // ---- ForwardOpen the class-1 connection ----------------------------------------------------
     let mut handle = match manager.forward_open(&client, opener_spec()).await {
@@ -150,7 +167,10 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
         Err(e) => panic!("ForwardOpen against OpENer was refused/failed: {e:?}"),
     };
     let (o2t_api, t2o_api) = handle.apis();
-    println!("ForwardOpen ACCEPTED — connection id {:#010x}; APIs o2t={o2t_api:?} t2o={t2o_api:?}", handle.connection_id());
+    println!(
+        "ForwardOpen ACCEPTED — connection id {:#010x}; APIs o2t={o2t_api:?} t2o={t2o_api:?}",
+        handle.connection_id()
+    );
 
     // ---- consume: wait for Up, then collect frames with advancing sequence ---------------------
     let mut up_seen = false;
@@ -176,10 +196,19 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
     }
     println!("consumed {} T→O frames; sequences = {seqs:?}", seqs.len());
     assert!(up_seen, "IoEvent::Up fired on the first accepted frame");
-    assert!(seqs.len() >= 3, "at least a few cyclic T→O frames arrived (got {})", seqs.len());
+    assert!(
+        seqs.len() >= 3,
+        "at least a few cyclic T→O frames arrived (got {})",
+        seqs.len()
+    );
     // The class-1 sequence advances monotonically (the signed-window accept rule, D-ENIP-7).
     for w in seqs.windows(2) {
-        assert!(w[1].wrapping_sub(w[0]) as i16 > 0, "sequence advances: {} -> {}", w[0], w[1]);
+        assert!(
+            w[1].wrapping_sub(w[0]) as i16 > 0,
+            "sequence advances: {} -> {}",
+            w[0],
+            w[1]
+        );
     }
     let stats = handle.stats();
     println!(
@@ -187,8 +216,14 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
         stats.frames_accepted, stats.frames_produced, stats.stale_frames, stats.size_mismatch,
         stats.sequence_gaps, stats.malformed_frames
     );
-    assert!(stats.frames_accepted >= 3, "counters reflect the accepted frames");
-    assert!(stats.frames_produced >= 1, "we produced O→T frames at the API cadence");
+    assert!(
+        stats.frames_accepted >= 3,
+        "counters reflect the accepted frames"
+    );
+    assert!(
+        stats.frames_produced >= 1,
+        "we produced O→T frames at the API cadence"
+    );
 
     // ---- produce: OpENer mirrors our O→T output into its T→O input (sample_application) ---------
     // Send a recognizable output pattern; within a few frames the consumed input reflects it.
@@ -206,13 +241,20 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
     while tokio::time::Instant::now() < mirror_deadline {
         match tokio::time::timeout(Duration::from_secs(3), handle.events().recv()).await {
             Ok(Some(IoEvent::Data(u))) => {
-                if u.data.len() >= 4 && u.data[0] == 0xAB && u.data[1] == 0xCD && u.data[2] == 0x12 && u.data[3] == 0x34 {
+                if u.data.len() >= 4
+                    && u.data[0] == 0xAB
+                    && u.data[1] == 0xCD
+                    && u.data[2] == 0x12
+                    && u.data[3] == 0x34
+                {
                     mirrored = true;
                     println!("O→T produce CONFIRMED via mirror: T→O input now starts [AB CD 12 34] (seq {})", u.sequence);
                     break;
                 }
             }
-            Ok(Some(IoEvent::Lost { reason })) => panic!("unexpected Lost during produce: {reason:?}"),
+            Ok(Some(IoEvent::Lost { reason })) => {
+                panic!("unexpected Lost during produce: {reason:?}")
+            }
             Ok(_) => {}
             Err(_) => break,
         }
@@ -227,7 +269,10 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
     // ---- watchdog: silence the target, assert IoEvent::Lost { Timeout } ------------------------
     if let Some(cmd) = opener_stop_cmd() {
         println!("silencing OpENer via `{cmd}` to fire the inactivity watchdog...");
-        let status = std::process::Command::new("sh").arg("-c").arg(&cmd).status();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .status();
         println!("stop command exited: {status:?}");
         // Watchdog = timeout_multiplier(16) × t2o_api. Give it generous slack.
         let mut lost = false;
@@ -249,7 +294,10 @@ async fn opener_live_class1_forward_open_consume_produce_watchdog() {
                 Err(_) => {}
             }
         }
-        assert!(lost, "the inactivity watchdog fired IoEvent::Lost after the target went silent");
+        assert!(
+            lost,
+            "the inactivity watchdog fired IoEvent::Lost after the target went silent"
+        );
         println!("== live_opener: PASS (ForwardOpen + consume + produce + watchdog) ==");
     } else {
         // Harness configuration, NOT peer reachability — and therefore the one soft path that
@@ -319,7 +367,11 @@ async fn opener_live_class3_idle_survives_the_inactivity_window() {
     };
     // The scenario is the DEFAULT tuning — no knob is set for it, on purpose (there is no adapter
     // config key either): 2 s requested RPI × ×16 ⇒ a 32 s window, probes due every 24 s.
-    assert_eq!(opts.class3_rpi, Duration::from_secs(2), "the default requested class-3 RPI");
+    assert_eq!(
+        opts.class3_rpi,
+        Duration::from_secs(2),
+        "the default requested class-3 RPI"
+    );
     assert_eq!(
         opts.class3_timeout_multiplier,
         TimeoutMultiplier::X16,
@@ -342,7 +394,10 @@ async fn opener_live_class3_idle_survives_the_inactivity_window() {
             return;
         }
     };
-    assert!(client.is_connected_messaging(), "the session rides a class-3 connection");
+    assert!(
+        client.is_connected_messaging(),
+        "the session rides a class-3 connection"
+    );
     println!("class-3 ForwardOpen ACCEPTED — explicit requests now ride SendUnitData");
 
     // Baseline: one ordinary connected request, which also sets the activity clock the keepalive
@@ -351,7 +406,10 @@ async fn opener_live_class3_idle_survives_the_inactivity_window() {
         .get_attribute_single(0x01, 1, 4)
         .await
         .expect("baseline Identity/Revision read over the class-3 connection");
-    println!("baseline Get_Attribute_Single(Identity, 1, 4) -> {} byte(s)", baseline.len());
+    println!(
+        "baseline Get_Attribute_Single(Identity, 1, 4) -> {} byte(s)",
+        baseline.len()
+    );
     let before = client.stats().keepalives_sent;
 
     let idle = Duration::from_secs(75);
@@ -384,7 +442,9 @@ async fn opener_live_class3_idle_survives_the_inactivity_window() {
     );
 
     client.close().await;
-    println!("== live_opener class-3 keepalive: PASS (keepalives flowed; session survived the idle) ==");
+    println!(
+        "== live_opener class-3 keepalive: PASS (keepalives flowed; session survived the idle) =="
+    );
 }
 
 /// **Latest-wins overflow under a real flood (§8.6).** A consumer that stops draining must end up
@@ -413,11 +473,16 @@ async fn opener_live_slow_consumer_receives_fresh_frames() {
 
     let client = EipClient::connect(
         &addr,
-        ClientOptions { connect_timeout: Duration::from_secs(3), ..ClientOptions::default() },
+        ClientOptions {
+            connect_timeout: Duration::from_secs(3),
+            ..ClientOptions::default()
+        },
     )
     .await
     .expect("connect TCP session to OpENer");
-    let manager = IoManager::bind("0.0.0.0:0").await.expect("bind implicit-I/O UDP socket");
+    let manager = IoManager::bind("0.0.0.0:0")
+        .await
+        .expect("bind implicit-I/O UDP socket");
 
     // 10 ms both ways: 10 s of silence from the consumer is ~1000 frames against a 256-deep queue,
     // so the evicted prefix is unambiguously larger than the surviving window.
@@ -460,8 +525,15 @@ async fn opener_live_slow_consumer_receives_fresh_frames() {
         stats.frames_accepted,
         stats.overflowed_events
     );
-    assert!(saw_up, "the Up control event survived the flood — it is never evicted");
-    assert!(seqs.len() >= 2, "the queue held samples for the stalled consumer (got {})", seqs.len());
+    assert!(
+        saw_up,
+        "the Up control event survived the flood — it is never evicted"
+    );
+    assert!(
+        seqs.len() >= 2,
+        "the queue held samples for the stalled consumer (got {})",
+        seqs.len()
+    );
     assert!(
         stats.overflowed_events > 0,
         "a 10 s stall at a 10 ms RPI overflows the 256-deep queue"

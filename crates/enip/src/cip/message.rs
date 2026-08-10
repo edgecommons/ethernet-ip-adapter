@@ -47,7 +47,11 @@ impl MessageRequest {
         // `EPath::encode` already guarantees even length and `<= 255` words.
         let words = path_bytes.len().checked_div(2).unwrap_or(0);
         let words = u8::try_from(words).map_err(|_| EnipError::TooLarge { limit: 255 })?;
-        let mut w = WireWriter::with_capacity(2usize.saturating_add(path_bytes.len()).saturating_add(self.data.len()));
+        let mut w = WireWriter::with_capacity(
+            2usize
+                .saturating_add(path_bytes.len())
+                .saturating_add(self.data.len()),
+        );
         w.u8(self.service);
         w.u8(words);
         w.put_slice(&path_bytes);

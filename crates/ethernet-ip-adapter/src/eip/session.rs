@@ -47,7 +47,11 @@ impl EipSession {
     /// tests).
     #[must_use]
     pub fn new(client: enip::EipClient, request_timeout: Duration) -> Self {
-        Self { client, request_timeout, security: None }
+        Self {
+            client,
+            request_timeout,
+            security: None,
+        }
     }
 
     /// Wrap a connected TLS `enip` client as a poll session, carrying its negotiated security posture
@@ -83,12 +87,18 @@ impl EipSession {
         };
         let elements = spec.array_count.unwrap_or(1).min(u32::from(u16::MAX)) as u16;
 
-        let outcome = tokio::time::timeout(self.defensive(), self.client.read_tag(&addr, elements)).await;
+        let outcome =
+            tokio::time::timeout(self.defensive(), self.client.read_tag(&addr, elements)).await;
         match outcome {
             Ok(Ok(result)) => {
                 match types::decode_value(&result.value, spec.eip_type, spec.scale, spec.offset) {
-                    Ok(Decoded { value, non_finite: false }) => Ok(good(spec, value)),
-                    Ok(Decoded { non_finite: true, .. }) => Ok(uncertain(spec)),
+                    Ok(Decoded {
+                        value,
+                        non_finite: false,
+                    }) => Ok(good(spec, value)),
+                    Ok(Decoded {
+                        non_finite: true, ..
+                    }) => Ok(uncertain(spec)),
                     Err(e) => Ok(bad(spec, e.quality_raw())),
                 }
             }
@@ -258,16 +268,18 @@ impl DeviceSession for EipSession {
         let addr = enip::TagAddress::parse(&signal.tag_path)
             .map_err(|e| DeviceError::Permanent(anyhow::anyhow!("bad tag path: {e}")))?;
 
-        let write = self.client.write_tag(&addr, signal.eip_type.cip_type(), &cip);
+        let write = self
+            .client
+            .write_tag(&addr, signal.eip_type.cip_type(), &cip);
         match tokio::time::timeout(self.defensive(), write).await {
             Ok(Ok(())) => Ok(()),
             // A rejected write (CIP error) is permanent for this value; the link is fine.
-            Ok(Err(enip::EnipError::Cip(status))) => {
-                Err(DeviceError::Permanent(anyhow::anyhow!("write rejected: {status}")))
-            }
-            Ok(Err(enip::EnipError::Timeout { .. })) => Err(DeviceError::Transient(anyhow::anyhow!(
-                "write timed out"
+            Ok(Err(enip::EnipError::Cip(status))) => Err(DeviceError::Permanent(anyhow::anyhow!(
+                "write rejected: {status}"
             ))),
+            Ok(Err(enip::EnipError::Timeout { .. })) => {
+                Err(DeviceError::Transient(anyhow::anyhow!("write timed out")))
+            }
             Ok(Err(e)) => Err(map_enip_error(e)),
             Err(_elapsed) => Err(DeviceError::Transient(anyhow::anyhow!(
                 "write exceeded the defensive request backstop"
@@ -286,7 +298,8 @@ impl DeviceSession for EipSession {
                     .map(|s| BrowsedTag {
                         name: s.name,
                         type_name: symbol_type_name(s.symbol_type),
-                        array_dim: (s.symbol_type.dims() > 0).then_some(u32::from(s.symbol_type.dims())),
+                        array_dim: (s.symbol_type.dims() > 0)
+                            .then_some(u32::from(s.symbol_type.dims())),
                         instance_id: s.instance_id,
                     })
                     .collect();
@@ -365,7 +378,9 @@ mod tests {
     fn spec(name: &str, tag: &str, ty: &str, array: Option<u32>) -> SignalSpec {
         let mut v = json!({ "name": name, "tagPath": tag, "type": ty });
         if let Some(n) = array {
-            v.as_object_mut().unwrap().insert("arrayCount".into(), json!(n));
+            v.as_object_mut()
+                .unwrap()
+                .insert("arrayCount".into(), json!(n));
         }
         serde_json::from_value(v).unwrap()
     }
@@ -446,14 +461,17 @@ mod tests {
         let mut found = (0u32, 0u8);
         while i < path.len() {
             match path[i] {
-                0x20 => i += 2,                                    // 8-bit class
-                0x21 => i += 4,                                    // 16-bit class
+                0x20 => i += 2, // 8-bit class
+                0x21 => i += 4, // 16-bit class
                 0x24 => {
                     found = (u32::from(path[i + 1]), 0x24);
                     i += 2;
                 }
                 0x25 => {
-                    found = (u32::from(u16::from_le_bytes([path[i + 2], path[i + 3]])), 0x25);
+                    found = (
+                        u32::from(u16::from_le_bytes([path[i + 2], path[i + 3]])),
+                        0x25,
+                    );
                     i += 4;
                 }
                 0x26 => {
@@ -480,7 +498,9 @@ mod tests {
         F: FnMut(u32, u8, &[u8]) -> (u8, Vec<u8>) + Send + 'static,
     {
         tokio::spawn(async move {
-            let Some(reg) = read_frame(&mut s).await else { return };
+            let Some(reg) = read_frame(&mut s).await else {
+                return;
+            };
             let reg_reply = EncapFrame::new(
                 EncapHeader::request(Command::RegisterSession, 0, 1, reg.header.sender_context),
                 Bytes::from(vec![1, 0, 0, 0]),
@@ -489,7 +509,9 @@ mod tests {
 
             let mut idx = 0u32;
             loop {
-                let Some(frame) = read_frame(&mut s).await else { return };
+                let Some(frame) = read_frame(&mut s).await else {
+                    return;
+                };
                 match frame.header.command {
                     Command::SendRRData => {
                         let cpf = Cpf::decode(&frame.data[6..]).unwrap();
@@ -497,7 +519,10 @@ mod tests {
                         let service = mr[0];
                         let (status, data) = handler(idx, service, &mr);
                         idx += 1;
-                        let reply = rr_reply(frame.header.sender_context, mr_reply(service, status, &data));
+                        let reply = rr_reply(
+                            frame.header.sender_context,
+                            mr_reply(service, status, &data),
+                        );
                         write_frame(&mut s, &reply).await;
                     }
                     _ => return,
@@ -512,7 +537,9 @@ mod tests {
             request_timeout: Duration::from_millis(500),
             ..Default::default()
         };
-        let client = enip::EipClient::connect_over(client_half, opts).await.unwrap();
+        let client = enip::EipClient::connect_over(client_half, opts)
+            .await
+            .unwrap();
         EipSession::new(client, Duration::from_millis(500))
     }
 
@@ -539,7 +566,11 @@ mod tests {
         assert_eq!(readings[0].value, json!(55.5));
         assert_eq!(readings[0].quality_raw.as_deref(), Some("0x00"));
 
-        assert_eq!(readings[1].quality, Quality::Bad, "one dead tag is BAD, not swallowed");
+        assert_eq!(
+            readings[1].quality,
+            Quality::Bad,
+            "one dead tag is BAD, not swallowed"
+        );
         assert_eq!(readings[1].value, serde_json::Value::Null);
         assert!(readings[1].quality_raw.as_deref().unwrap().contains("0x04"));
     }
@@ -562,7 +593,10 @@ mod tests {
 
         let specs = vec![spec("line-speed", "LINE_SPEED", "real", None)];
         let err = session.read_signals(&specs).await.unwrap_err();
-        assert!(err.is_transient(), "a dropped link is transient (reconnect)");
+        assert!(
+            err.is_transient(),
+            "a dropped link is transient (reconnect)"
+        );
     }
 
     #[tokio::test]
@@ -632,7 +666,10 @@ mod tests {
 
         let p3 = session.browse(p2.next_cursor.clone(), 2).await.unwrap();
         assert_eq!(names(&p3), ["TAG_5"]);
-        assert!(p3.next_cursor.is_none(), "the last, untruncated page ends the walk");
+        assert!(
+            p3.next_cursor.is_none(),
+            "the last, untruncated page ends the walk"
+        );
 
         // Exactly-once: the union across the pages is the whole set, with no repeats and no skips.
         let walked: Vec<String> = [p1, p2, p3].iter().flat_map(names).collect();
@@ -653,13 +690,23 @@ mod tests {
         });
         let mut session = connect(client_half).await;
 
-        let err = session.browse(Some("banana".to_string()), 10).await.unwrap_err();
-        assert!(!err.is_transient(), "a corrupt cursor never fixes itself by reconnecting");
+        let err = session
+            .browse(Some("banana".to_string()), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.is_transient(),
+            "a corrupt cursor never fixes itself by reconnecting"
+        );
         assert!(
             err.to_string().contains("invalid browse cursor"),
             "the error names the cause: {err}"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no tag-list request is issued at all");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no tag-list request is issued at all"
+        );
     }
 
     /// A symbol instance above the 16-bit space survives the round trip: the cursor is reported
@@ -682,15 +729,27 @@ mod tests {
 
         let page = session.browse(None, 100).await.unwrap();
         assert_eq!(page.tags[0].instance_id, 0x0001_0000);
-        assert_eq!(page.next_cursor.as_deref(), Some("65537"), "no 16-bit mask, no wrap");
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("65537"),
+            "no 16-bit mask, no wrap"
+        );
 
         let next = session.browse(page.next_cursor.clone(), 100).await.unwrap();
         assert!(next.tags.is_empty());
         assert!(next.next_cursor.is_none());
 
         let asked = asked.lock().unwrap().clone();
-        assert_eq!(asked[0], (0, 0x24), "the first page starts at instance 0, 8-bit form");
-        assert_eq!(asked[1], (65_537, 0x26), "a 32-bit cursor rides the 0x26 segment");
+        assert_eq!(
+            asked[0],
+            (0, 0x24),
+            "the first page starts at instance 0, 8-bit form"
+        );
+        assert_eq!(
+            asked[1],
+            (65_537, 0x26),
+            "a 32-bit cursor rides the 0x26 segment"
+        );
     }
 
     /// The regression guard for the start of the walk: an uncursored `sb/browse` enumerates from
@@ -782,9 +841,13 @@ mod tests {
             !matches!(err, DeviceError::Unsupported(_)),
             "the service exists — page 1 came from it: {err}"
         );
-        assert!(!err.is_transient(), "the same cursor is refused identically on retry");
         assert!(
-            err.to_string().contains("refused to resume the tag list at symbol instance 4"),
+            !err.is_transient(),
+            "the same cursor is refused identically on retry"
+        );
+        assert!(
+            err.to_string()
+                .contains("refused to resume the tag list at symbol instance 4"),
             "the failure names what was refused: {err}"
         );
     }
@@ -803,7 +866,10 @@ mod tests {
         for bad in ["banana", "-1", "4294967296", "", "3.5", "0x10"] {
             let err = parse_browse_cursor(Some(bad)).unwrap_err();
             assert!(!err.is_transient(), "cursor `{bad}` is a caller error");
-            assert!(err.to_string().contains("invalid browse cursor"), "cursor `{bad}`");
+            assert!(
+                err.to_string().contains("invalid browse cursor"),
+                "cursor `{bad}`"
+            );
         }
     }
 
@@ -847,11 +913,19 @@ mod tests {
     async fn browse_maps_every_elementary_type_a_struct_and_an_unknown() {
         // (name, symbol type code, expected type_name).
         let rows: Vec<(&str, u16, &str)> = vec![
-            ("B", 0x00C1, "BOOL"), ("SI", 0x00C2, "SINT"), ("I", 0x00C3, "INT"),
-            ("DI", 0x00C4, "DINT"), ("LI", 0x00C5, "LINT"), ("USI", 0x00C6, "USINT"),
-            ("UI", 0x00C7, "UINT"), ("UDI", 0x00C8, "UDINT"), ("ULI", 0x00C9, "ULINT"),
-            ("R", 0x00CA, "REAL"), ("LR", 0x00CB, "LREAL"),
-            ("UDT", 0x8100, "STRUCT"), ("MYSTERY", 0x00FF, "UNKNOWN"),
+            ("B", 0x00C1, "BOOL"),
+            ("SI", 0x00C2, "SINT"),
+            ("I", 0x00C3, "INT"),
+            ("DI", 0x00C4, "DINT"),
+            ("LI", 0x00C5, "LINT"),
+            ("USI", 0x00C6, "USINT"),
+            ("UI", 0x00C7, "UINT"),
+            ("UDI", 0x00C8, "UDINT"),
+            ("ULI", 0x00C9, "ULINT"),
+            ("R", 0x00CA, "REAL"),
+            ("LR", 0x00CB, "LREAL"),
+            ("UDT", 0x8100, "STRUCT"),
+            ("MYSTERY", 0x00FF, "UNKNOWN"),
         ];
         let payload = rows.clone();
         let (client_half, server_half) = tokio::io::duplex(8192);
@@ -887,7 +961,10 @@ mod tests {
         .unwrap();
         let readings = session.read_signals(&[sp]).await.unwrap();
         assert_eq!(readings[0].quality, Quality::Uncertain);
-        assert_eq!(readings[0].quality_raw.as_deref(), Some("NON_FINITE_AFTER_SCALE"));
+        assert_eq!(
+            readings[0].quality_raw.as_deref(),
+            Some("NON_FINITE_AFTER_SCALE")
+        );
     }
 
     #[tokio::test]
@@ -897,8 +974,14 @@ mod tests {
         spawn_device(server_half, |_idx, _service, _mr| (0x00, Vec::new()));
         let mut session = connect(client_half).await;
         let sp = spec("fill-setpoint", "FILL_SETPOINT", "real", None);
-        let err = session.write_signal(&sp, &json!("not a number")).await.unwrap_err();
-        assert!(!err.is_transient(), "a coercion failure is permanent, not a link error");
+        let err = session
+            .write_signal(&sp, &json!("not a number"))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.is_transient(),
+            "a coercion failure is permanent, not a link error"
+        );
     }
 
     #[tokio::test]
@@ -911,7 +994,10 @@ mod tests {
         let mut session = connect(client_half).await;
         let sp = spec("fill-setpoint", "FILL_SETPOINT", "real", None);
         let err = session.write_signal(&sp, &json!(55.5)).await.unwrap_err();
-        assert!(!err.is_transient(), "a CIP-rejected write is permanent for this value");
+        assert!(
+            !err.is_transient(),
+            "a CIP-rejected write is permanent for this value"
+        );
     }
 
     #[tokio::test]
@@ -928,6 +1014,9 @@ mod tests {
             write_frame(&mut s, &reply).await;
         });
         let mut session = connect(client_half).await;
-        assert!(session.probe().await.is_err(), "a probe over a dropped link fails");
+        assert!(
+            session.probe().await.is_err(),
+            "a probe over a dropped link fails"
+        );
     }
 }

@@ -298,8 +298,22 @@ pub(crate) async fn poll_until_disconnected(
         } else {
             // 1. Flush any batch windows that closed (a coalescing-window flush → EtherNetIpPublish, §8.5).
             for p in engine.take_due(batch_ms, now.into_std()) {
-                let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| PublishMode::OnChange.as_str());
-                publish_by_id(sink, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, true).await;
+                let mode = mode_of
+                    .get(&p.signal_id)
+                    .copied()
+                    .unwrap_or_else(|| PublishMode::OnChange.as_str());
+                publish_by_id(
+                    sink,
+                    cfg,
+                    adapter,
+                    &p.signal_id,
+                    p.samples,
+                    health,
+                    dm,
+                    mode,
+                    true,
+                )
+                .await;
             }
 
             // 2. Poll the earliest due group (there may be none — we woke for a flush/health tick).
@@ -323,7 +337,18 @@ pub(crate) async fn poll_until_disconnected(
                         tracing::warn!(instance = %cfg.id, error = %e, transient = e.is_transient(), "read failed; reconnecting");
                         health.read_errors.fetch_add(1, Ordering::Relaxed);
                         // An error poll cycle (§8.4 result=error).
-                        dm.record_poll_cycle(&group_id, RESULT_ERROR, 0, tag_reads, false, 0, 0, 0, 0, 0);
+                        dm.record_poll_cycle(
+                            &group_id,
+                            RESULT_ERROR,
+                            0,
+                            tag_reads,
+                            false,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        );
                         session.close().await;
                         return PollExit::LinkLost;
                     }
@@ -337,9 +362,32 @@ pub(crate) async fn poll_until_disconnected(
                 record_cycle(elapsed, intervals[idx], health);
 
                 let now2 = Instant::now().into_std();
-                for p in process_group(&mut engine, group, modes[idx], batch_ms, &readings, now2, &server_ts, health) {
-                    let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| modes[idx].as_str());
-                    publish_by_id(sink, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
+                for p in process_group(
+                    &mut engine,
+                    group,
+                    modes[idx],
+                    batch_ms,
+                    &readings,
+                    now2,
+                    &server_ts,
+                    health,
+                ) {
+                    let mode = mode_of
+                        .get(&p.signal_id)
+                        .copied()
+                        .unwrap_or_else(|| modes[idx].as_str());
+                    publish_by_id(
+                        sink,
+                        cfg,
+                        adapter,
+                        &p.signal_id,
+                        p.samples,
+                        health,
+                        dm,
+                        mode,
+                        false,
+                    )
+                    .await;
                 }
 
                 // Attribute this cycle's samples to its (pollGroup, success) combo (§8.4).
@@ -365,7 +413,11 @@ pub(crate) async fn poll_until_disconnected(
             let stale = if paused {
                 0
             } else {
-                engine.count_stale(cfg.signals().map(|s| s.tag_path.as_str()), stale_secs, now.into_std())
+                engine.count_stale(
+                    cfg.signals().map(|s| s.tag_path.as_str()),
+                    stale_secs,
+                    now.into_std(),
+                )
             };
             health.stale_signals.store(stale, Ordering::Relaxed);
             dm.emit_periodic().await;
@@ -400,9 +452,25 @@ async fn repoll_all_groups(
         let server_ts = publish::now_iso();
         polled += group.signals.len() as u64;
         let now = Instant::now().into_std();
-        for p in process_group(engine, group, modes[idx], batch_ms, &readings, now, &server_ts, health) {
-            let mode = mode_of.get(&p.signal_id).copied().unwrap_or_else(|| modes[idx].as_str());
-            publish_by_id(sink, cfg, adapter, &p.signal_id, p.samples, health, dm, mode, false).await;
+        for p in process_group(
+            engine, group, modes[idx], batch_ms, &readings, now, &server_ts, health,
+        ) {
+            let mode = mode_of
+                .get(&p.signal_id)
+                .copied()
+                .unwrap_or_else(|| modes[idx].as_str());
+            publish_by_id(
+                sink,
+                cfg,
+                adapter,
+                &p.signal_id,
+                p.samples,
+                health,
+                dm,
+                mode,
+                false,
+            )
+            .await;
         }
     }
     Ok(polled)
@@ -426,7 +494,18 @@ async fn publish_by_id(
     let Some(spec) = cfg.find_signal(signal_id) else {
         return;
     };
-    publish_samples(sink, cfg, adapter, spec, samples, health, dm, publish_mode, from_batch).await;
+    publish_samples(
+        sink,
+        cfg,
+        adapter,
+        spec,
+        samples,
+        health,
+        dm,
+        publish_mode,
+        from_batch,
+    )
+    .await;
 }
 
 /// Publish one signal's samples through the mode-agnostic [`crate::publish::publish_via`] path.
@@ -460,7 +539,9 @@ async fn publish_samples(
     match res {
         Ok(()) => {
             health.signals_published.fetch_add(n, Ordering::Relaxed);
-            health.publish_latency_ms.store(latency_ms, Ordering::Relaxed);
+            health
+                .publish_latency_ms
+                .store(latency_ms, Ordering::Relaxed);
             dm.record_publish(publish_mode, n, from_batch, latency_ms, true);
         }
         Err(e) => {
@@ -620,10 +701,24 @@ mod tests {
 
         let exit = rig.run().await;
 
-        assert!(matches!(exit, PollExit::Stopped), "a cancel is a stop, not a lost link");
-        assert_eq!(rig.session.closed(), 1, "the cancel path closes the session on the wire");
-        assert_eq!(rig.session.reads_done(), 2, "it polled until the cancel, then stopped");
-        assert!(!rig.events.has("device-unreachable"), "a stop raises no alarm");
+        assert!(
+            matches!(exit, PollExit::Stopped),
+            "a cancel is a stop, not a lost link"
+        );
+        assert_eq!(
+            rig.session.closed(),
+            1,
+            "the cancel path closes the session on the wire"
+        );
+        assert_eq!(
+            rig.session.reads_done(),
+            2,
+            "it polled until the cancel, then stopped"
+        );
+        assert!(
+            !rig.events.has("device-unreachable"),
+            "a stop raises no alarm"
+        );
     }
 
     /// A closed control channel is the component going down, not a link failure: `Stopped`, session
@@ -654,7 +749,11 @@ mod tests {
         let exit = rig.run().await;
 
         assert!(matches!(exit, PollExit::LinkLost));
-        assert_eq!(rig.session.closed(), 1, "the broken session is closed before backing off");
+        assert_eq!(
+            rig.session.closed(),
+            1,
+            "the broken session is closed before backing off"
+        );
         assert_eq!(rig.health.read_errors.load(Ordering::Relaxed), 1);
         assert_eq!(rig.sink.count(), 0, "a failed read publishes nothing");
 
@@ -744,7 +843,11 @@ mod tests {
 
         let updates = rig.sink.updates();
         assert_eq!(updates.len(), 2, "two 200 ms windows closed in the run");
-        assert_eq!(rig.sink.samples(), 4, "no sample was lost or duplicated across the windows");
+        assert_eq!(
+            rig.sink.samples(),
+            4,
+            "no sample was lost or duplicated across the windows"
+        );
         for u in &updates {
             assert_eq!(
                 u.samples.len(),
@@ -778,20 +881,32 @@ mod tests {
         // The first probe answers; the second fails.
         rig.session.push_probe(Ok(()));
         rig.session
-            .push_probe(Err(DeviceError::Transient(anyhow::anyhow!("no route to host"))));
+            .push_probe(Err(DeviceError::Transient(anyhow::anyhow!(
+                "no route to host"
+            ))));
         let (reply, paused) = oneshot::channel();
         rig.send_after(
             Duration::from_millis(10),
-            DeviceControl::Pause { by: Some("site/op".into()), reply },
+            DeviceControl::Pause {
+                by: Some("site/op".into()),
+                reply,
+            },
         );
 
         let exit = rig.run().await;
 
         assert!(paused.await.expect("the pause was acknowledged"));
-        assert!(matches!(exit, PollExit::LinkLost), "a dead keepalive is a lost link");
+        assert!(
+            matches!(exit, PollExit::LinkLost),
+            "a dead keepalive is a lost link"
+        );
         assert_eq!(rig.session.closed(), 1);
         assert_eq!(rig.health.read_errors.load(Ordering::Relaxed), 1);
-        assert_eq!(rig.session.reads_done(), 0, "no polls flow while paused (D-EIP-14)");
+        assert_eq!(
+            rig.session.reads_done(),
+            0,
+            "no polls flow while paused (D-EIP-14)"
+        );
         assert!(rig.events.has("adapter-paused"));
     }
 
@@ -808,14 +923,26 @@ mod tests {
             vec![reading("LINE_SPEED", json!(1.0), Quality::Good)],
         );
         let (p_tx, p_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(250), DeviceControl::Pause { by: None, reply: p_tx });
+        rig.send_after(
+            Duration::from_millis(250),
+            DeviceControl::Pause {
+                by: None,
+                reply: p_tx,
+            },
+        );
         let (r_tx, r_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(3_000), DeviceControl::Resume { reply: r_tx });
+        rig.send_after(
+            Duration::from_millis(3_000),
+            DeviceControl::Resume { reply: r_tx },
+        );
         rig.cancel_after(Duration::from_millis(3_250));
 
         rig.run().await;
 
-        assert!(p_rx.await.unwrap() && r_rx.await.unwrap(), "both transitions changed state");
+        assert!(
+            p_rx.await.unwrap() && r_rx.await.unwrap(),
+            "both transitions changed state"
+        );
         assert_eq!(
             rig.session.reads_done(),
             4,
@@ -823,7 +950,10 @@ mod tests {
              replayed as ~27 catch-up polls"
         );
         let rows = rig.metrics.all(HEALTH);
-        assert!(rows.len() >= 3, "the health cadence kept emitting while paused");
+        assert!(
+            rows.len() >= 3,
+            "the health cadence kept emitting while paused"
+        );
         assert!(
             rows.iter().all(|v| v["staleSignals"] == 0.0),
             "staleness is suspended while paused and re-based on resume, so the 2.75 s quiet \
@@ -872,8 +1002,14 @@ mod tests {
 
         assert!(matches!(exit, PollExit::Stopped));
         assert!(ok_rx.await.unwrap().is_ok(), "the confirmed write is acked");
-        let err = bad_rx.await.unwrap().expect_err("the rejected write is acked as a failure");
-        assert!(err.contains("object state conflict"), "the device's reason reaches the caller");
+        let err = bad_rx
+            .await
+            .unwrap()
+            .expect_err("the rejected write is acked as a failure");
+        assert!(
+            err.contains("object state conflict"),
+            "the device's reason reaches the caller"
+        );
         assert_eq!(
             rig.session.writes(),
             vec![
@@ -924,21 +1060,32 @@ mod tests {
         rig.session
             .push_browse(Err(DeviceError::Unsupported("no tag-list service")));
         rig.session
-            .push_browse(Err(DeviceError::Transient(anyhow::anyhow!("browse timed out"))));
+            .push_browse(Err(DeviceError::Transient(anyhow::anyhow!(
+                "browse timed out"
+            ))));
 
         let tx = rig.control();
         let (a_tx, a_rx) = oneshot::channel();
         let (b_tx, b_rx) = oneshot::channel();
         let (c_tx, c_rx) = oneshot::channel();
         for reply in [a_tx, b_tx, c_tx] {
-            tx.send(DeviceControl::Browse { cursor: None, max: 50, reply }).await.unwrap();
+            tx.send(DeviceControl::Browse {
+                cursor: None,
+                max: 50,
+                reply,
+            })
+            .await
+            .unwrap();
         }
         drop(tx);
         rig.close_control();
 
         let exit = rig.run().await;
 
-        assert!(matches!(exit, PollExit::Stopped), "a browse failure never breaks the link");
+        assert!(
+            matches!(exit, PollExit::Stopped),
+            "a browse failure never breaks the link"
+        );
         assert_eq!(a_rx.await.unwrap().ok().map(|p| p.tags.len()), Some(1));
         assert!(matches!(b_rx.await.unwrap(), Err(BrowseError::Unsupported)));
         assert!(
@@ -953,13 +1100,24 @@ mod tests {
         let mut rig = Rig::simple(60_000, "always", json!(1.0));
         let tx = rig.control();
         let (p_tx, _p_rx) = oneshot::channel();
-        tx.send(DeviceControl::Pause { by: None, reply: p_tx }).await.unwrap();
+        tx.send(DeviceControl::Pause {
+            by: None,
+            reply: p_tx,
+        })
+        .await
+        .unwrap();
         let (r1_tx, r1_rx) = oneshot::channel();
-        tx.send(DeviceControl::Repoll { reply: r1_tx }).await.unwrap();
+        tx.send(DeviceControl::Repoll { reply: r1_tx })
+            .await
+            .unwrap();
         let (res_tx, _res_rx) = oneshot::channel();
-        tx.send(DeviceControl::Resume { reply: res_tx }).await.unwrap();
+        tx.send(DeviceControl::Resume { reply: res_tx })
+            .await
+            .unwrap();
         let (r2_tx, r2_rx) = oneshot::channel();
-        tx.send(DeviceControl::Repoll { reply: r2_tx }).await.unwrap();
+        tx.send(DeviceControl::Repoll { reply: r2_tx })
+            .await
+            .unwrap();
         drop(tx);
         rig.close_control();
 
@@ -970,7 +1128,11 @@ mod tests {
             r1_rx.await.unwrap().unwrap_err().contains("paused"),
             "a paused instance refuses repoll and says why"
         );
-        assert_eq!(r2_rx.await.unwrap().unwrap(), 1, "the resumed repoll read the group's signal");
+        assert_eq!(
+            r2_rx.await.unwrap().unwrap(),
+            1,
+            "the resumed repoll read the group's signal"
+        );
         assert_eq!(rig.published("LINE_SPEED"), 1, "and published it");
     }
 
@@ -991,17 +1153,32 @@ mod tests {
         };
         let tx = rig.control();
         let (s_tx, s_rx) = oneshot::channel();
-        tx.send(DeviceControl::Snapshot { reply: s_tx }).await.unwrap();
+        tx.send(DeviceControl::Snapshot { reply: s_tx })
+            .await
+            .unwrap();
         let (w_tx, w_rx) = oneshot::channel();
-        tx.send(DeviceControl::WriteOutput { field, value: json!(1), reply: w_tx }).await.unwrap();
+        tx.send(DeviceControl::WriteOutput {
+            field,
+            value: json!(1),
+            reply: w_tx,
+        })
+        .await
+        .unwrap();
         drop(tx);
         rig.close_control();
 
         let exit = rig.run().await;
 
         assert!(matches!(exit, PollExit::Stopped));
-        assert!(s_rx.await.unwrap().is_none(), "a poll instance has no input snapshot");
-        assert!(w_rx.await.unwrap().unwrap_err().contains("not a push instance"));
+        assert!(
+            s_rx.await.unwrap().is_none(),
+            "a poll instance has no input snapshot"
+        );
+        assert!(w_rx
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("not a push instance"));
     }
 
     /// §7.5: an explicit `reconnect` closes the session and **carries its reply out** of the loop,
@@ -1011,16 +1188,25 @@ mod tests {
     async fn reconnect_verb_closes_session_and_carries_reply() {
         let mut rig = Rig::simple(60_000, "always", json!(1.0));
         let (tx, rx) = oneshot::channel();
-        rig.control().send(DeviceControl::Reconnect { reply: tx }).await.unwrap();
+        rig.control()
+            .send(DeviceControl::Reconnect { reply: tx })
+            .await
+            .unwrap();
 
         let exit = rig.run().await;
 
         let PollExit::Reconnect(reply) = exit else {
             panic!("an explicit reconnect must exit as Reconnect, carrying its reply");
         };
-        assert_eq!(rig.session.closed(), 1, "the session is dropped before re-establishing");
+        assert_eq!(
+            rig.session.closed(),
+            1,
+            "the session is dropped before re-establishing"
+        );
         // The ladder fulfils it after the next connect resolves — the channel is still live.
-        reply.send(Ok(())).expect("the reply sender survived the exit");
+        reply
+            .send(Ok(()))
+            .expect("the reply sender survived the exit");
         assert!(rx.await.unwrap().is_ok());
     }
 
@@ -1050,9 +1236,15 @@ mod tests {
         rig.dm.emit_periodic().await;
         let row = rig.metrics.all(PUBLISH).remove(0);
         assert_eq!(row["dataMessagesPublishedTotal"], 2.0);
-        assert_eq!(row["samplesPublishedTotal"], 1.0, "a failed publish contributes no samples");
+        assert_eq!(
+            row["samplesPublishedTotal"], 1.0,
+            "a failed publish contributes no samples"
+        );
         assert_eq!(row["publishFailuresTotal"], 1.0);
-        assert!(row.contains_key("publishLatencyMs"), "the success recorded a latency");
+        assert!(
+            row.contains_key("publishLatencyMs"),
+            "the success recorded a latency"
+        );
     }
 
     /// §8.4: each cycle attributes the *delta* of the shared sample counters, so a second cycle adds
@@ -1102,7 +1294,11 @@ mod tests {
             1.0,
             "a BAD read is also a failed CIP read"
         );
-        assert_eq!(rig.metrics.sum(POLL, "tagReadsTotal"), 4.0, "2 signals × 2 cycles");
+        assert_eq!(
+            rig.metrics.sum(POLL, "tagReadsTotal"),
+            4.0,
+            "2 signals × 2 cycles"
+        );
     }
 
     /// §8.7 cadence + §9.3: the family set emits on `metricsIntervalSecs`, and the stale count is
@@ -1119,13 +1315,22 @@ mod tests {
             vec![reading("LINE_SPEED", json!(1.0), Quality::Good)],
         );
         let (p_tx, _p_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(1_500), DeviceControl::Pause { by: None, reply: p_tx });
+        rig.send_after(
+            Duration::from_millis(1_500),
+            DeviceControl::Pause {
+                by: None,
+                reply: p_tx,
+            },
+        );
         rig.cancel_after(Duration::from_millis(2_500));
 
         rig.run().await;
 
         let rows = rig.metrics.all(HEALTH);
-        assert!(rows.len() >= 3, "one emit per second, plus the pause-transition flush");
+        assert!(
+            rows.len() >= 3,
+            "one emit per second, plus the pause-transition flush"
+        );
         assert_eq!(
             rows[0]["staleSignals"], 1.0,
             "a signal with no GOOD read for staleSignalSecs is stale while running"
@@ -1135,6 +1340,9 @@ mod tests {
             0.0,
             "…and the count is suspended once paused — a paused signal is paused, not stale"
         );
-        assert!(rig.metrics.emits(POLL) >= 1, "the poll family emits on the same cadence");
+        assert!(
+            rig.metrics.emits(POLL) >= 1,
+            "the poll family emits on the same cadence"
+        );
     }
 }

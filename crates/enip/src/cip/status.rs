@@ -228,8 +228,13 @@ impl CipStatus {
     pub fn is_routing_error(&self) -> bool {
         matches!(
             (self.general, self.primary_extended()),
-            (GeneralStatus::ConnectionFailure, Some(0x0204 | 0x0311 | 0x0312 | 0x0315))
-                | (GeneralStatus::ResourceUnavailable | GeneralStatus::PathSegmentError, _)
+            (
+                GeneralStatus::ConnectionFailure,
+                Some(0x0204 | 0x0311 | 0x0312 | 0x0315)
+            ) | (
+                GeneralStatus::ResourceUnavailable | GeneralStatus::PathSegmentError,
+                _
+            )
         )
     }
 
@@ -300,7 +305,10 @@ mod tests {
     #[test]
     fn unknown_code_is_total() {
         assert_eq!(GeneralStatus::from_code(0x77), GeneralStatus::Unknown(0x77));
-        assert_eq!(GeneralStatus::from_code(0x77).description(), "unknown status");
+        assert_eq!(
+            GeneralStatus::from_code(0x77).description(),
+            "unknown status"
+        );
     }
 
     #[test]
@@ -325,6 +333,9 @@ mod tests {
         assert_eq!(s.to_string(), "0x04 (path segment error)");
 
         let ext = CipStatus::with_extended(GeneralStatus::ExtendedError, vec![0x2107]);
-        assert_eq!(ext.to_string(), "0xFF (extended error): tag type mismatch [ext 0x2107]");
+        assert_eq!(
+            ext.to_string(),
+            "0xFF (extended error): tag type mismatch [ext 0x2107]"
+        );
     }
 }

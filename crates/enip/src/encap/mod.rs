@@ -308,11 +308,15 @@ mod tests {
 
     #[test]
     fn command_and_status_are_total_and_roundtrip() {
-        for code in [0x0000u16, 0x0004, 0x0063, 0x0064, 0x0065, 0x0066, 0x006F, 0x0070, 0x1234] {
+        for code in [
+            0x0000u16, 0x0004, 0x0063, 0x0064, 0x0065, 0x0066, 0x006F, 0x0070, 0x1234,
+        ] {
             assert_eq!(Command::from_code(code).code(), code);
         }
         assert_eq!(Command::from_code(0x1234), Command::Unknown(0x1234));
-        for code in [0x0000u32, 0x0001, 0x0002, 0x0003, 0x0064, 0x0065, 0x0069, 0xDEAD] {
+        for code in [
+            0x0000u32, 0x0001, 0x0002, 0x0003, 0x0064, 0x0065, 0x0069, 0xDEAD,
+        ] {
             assert_eq!(EncapStatus::from_code(code).code(), code);
         }
         assert_eq!(EncapStatus::from_code(0xDEAD), EncapStatus::Unknown(0xDEAD));

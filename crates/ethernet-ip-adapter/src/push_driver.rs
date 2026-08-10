@@ -107,7 +107,12 @@ pub(crate) async fn consume_push(
         .input
         .signals
         .iter()
-        .map(|f| (f.signal_id(assembly), f.deadband.clone().unwrap_or_default()))
+        .map(|f| {
+            (
+                f.signal_id(assembly),
+                f.deadband.clone().unwrap_or_default(),
+            )
+        })
         .collect();
 
     let start = Instant::now();
@@ -160,15 +165,23 @@ pub(crate) async fn consume_push(
                     }
                     // A push write stages an OUTPUT-assembly field into the O→T producer buffer
                     // (applied next-frame, §7.3).
-                    DeviceControl::WriteOutput { field, value, reply } => {
-                        let result = session.set_output(&field, &value).await.map_err(|e| e.to_string());
+                    DeviceControl::WriteOutput {
+                        field,
+                        value,
+                        reply,
+                    } => {
+                        let result = session
+                            .set_output(&field, &value)
+                            .await
+                            .map_err(|e| e.to_string());
                         if result.is_err() {
                             health.write_errors.fetch_add(1, Ordering::Relaxed);
                         }
                         let _ = reply.send(result);
                     }
                     DeviceControl::Pause { by, reply } => {
-                        let changed = apply_pause(cfg, health, dm, events, true, by.as_deref()).await;
+                        let changed =
+                            apply_pause(cfg, health, dm, events, true, by.as_deref()).await;
                         paused = true;
                         let _ = reply.send(changed);
                     }
@@ -194,13 +207,19 @@ pub(crate) async fn consume_push(
                     }
                     // Poll-only verbs never route to a push task; answer defensively.
                     DeviceControl::ReadNow { reply, .. } => {
-                        let _ = reply.send(Err("push instance - reads answer from the input snapshot".to_string()));
+                        let _ =
+                            reply
+                                .send(Err("push instance - reads answer from the input snapshot"
+                                    .to_string()));
                     }
                     DeviceControl::Write(req) => {
-                        let _ = req.ack.send(Err("push instance - writes target the output assembly".to_string()));
+                        let _ = req.ack.send(Err(
+                            "push instance - writes target the output assembly".to_string(),
+                        ));
                     }
                     DeviceControl::Repoll { reply } => {
-                        let _ = reply.send(Err("push instance - data arrives cyclically".to_string()));
+                        let _ =
+                            reply.send(Err("push instance - data arrives cyclically".to_string()));
                     }
                     // Push browse is answered from the configured layout by the commander — it never
                     // routes here; answer defensively.
@@ -211,7 +230,10 @@ pub(crate) async fn consume_push(
                 continue;
             }
             Woke::Update(update) => match update {
-                Some(IoUpdate::Up { o2t_api_ms, t2o_api_ms }) => {
+                Some(IoUpdate::Up {
+                    o2t_api_ms,
+                    t2o_api_ms,
+                }) => {
                     health.set_link(LinkState::Online);
                     // The class-1 connection is open (§8.8 ioConnectionState); a transition ⇒
                     // flush southbound_health + connection + io immediately (§8.7).
@@ -221,7 +243,10 @@ pub(crate) async fn consume_push(
                         .emit(
                             Severity::Info,
                             "device-connected",
-                            Some(format!("class-1 connection up to {}", cfg.connection.endpoint)),
+                            Some(format!(
+                                "class-1 connection up to {}",
+                                cfg.connection.endpoint
+                            )),
                             Some(json!({
                                 "instance": cfg.id, "adapter": adapter,
                                 "o2tApiMs": o2t_api_ms, "t2oApiMs": t2o_api_ms
@@ -232,7 +257,12 @@ pub(crate) async fn consume_push(
                         .clear_alarm(Severity::Critical, "device-unreachable", None)
                         .await;
                 }
-                Some(IoUpdate::Data { readings, sequence, run_mode, received_at }) => {
+                Some(IoUpdate::Data {
+                    readings,
+                    sequence,
+                    run_mode,
+                    received_at,
+                }) => {
                     health.frames_consumed.fetch_add(1, Ordering::Relaxed);
                     // §8.8: count the frame, infer sequence gaps, record the lived inter-arrival + run/idle.
                     // Consumption continues while paused (the snapshot + sequence validation stay live);
@@ -247,8 +277,31 @@ pub(crate) async fn consume_push(
                         // receipt instant, so a batchMs flush carries the receipt-time stamp.
                         let server_ts = publish::iso_at(received_at);
                         let now = Instant::now().into_std();
-                        for p in process_frame(&mut engine, &readings, &deadbands, mode, sample_ms, batch_ms, now, &server_ts, health) {
-                            publish_field(sink, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, false).await;
+                        for p in process_frame(
+                            &mut engine,
+                            &readings,
+                            &deadbands,
+                            mode,
+                            sample_ms,
+                            batch_ms,
+                            now,
+                            &server_ts,
+                            health,
+                        ) {
+                            publish_field(
+                                sink,
+                                cfg,
+                                adapter,
+                                &fields,
+                                assembly,
+                                &p.signal_id,
+                                p.samples,
+                                health,
+                                dm,
+                                mode_token,
+                                false,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -278,7 +331,20 @@ pub(crate) async fn consume_push(
         if !paused {
             for p in engine.take_due(batch_ms, now.into_std()) {
                 // A coalescing-window flush (§8.5 batchFlushes/batchSize).
-                publish_field(sink, cfg, adapter, &fields, assembly, &p.signal_id, p.samples, health, dm, mode_token, true).await;
+                publish_field(
+                    sink,
+                    cfg,
+                    adapter,
+                    &fields,
+                    assembly,
+                    &p.signal_id,
+                    p.samples,
+                    health,
+                    dm,
+                    mode_token,
+                    true,
+                )
+                .await;
             }
         }
         if now.saturating_duration_since(since_health) >= metrics_interval {
@@ -286,7 +352,11 @@ pub(crate) async fn consume_push(
             let stale = if paused {
                 0
             } else {
-                engine.count_stale(fields.keys().map(String::as_str), stale_secs, now.into_std())
+                engine.count_stale(
+                    fields.keys().map(String::as_str),
+                    stale_secs,
+                    now.into_std(),
+                )
             };
             health.stale_signals.store(stale, Ordering::Relaxed);
             // Fold the class-1 stack's live drop/produce counters into EtherNetIpIo before the emit,
@@ -299,7 +369,14 @@ pub(crate) async fn consume_push(
                 if dm.record_io_stats(stats) {
                     let msg = "forward-open reply pointed the O→T stream at a foreign address; address refused, sockaddr port honoured";
                     let ctx = json!({ "refusedRedirects": stats.refused_redirects });
-                    events.emit(Severity::Warning, "io-redirect-refused", Some(msg.into()), Some(ctx)).await;
+                    events
+                        .emit(
+                            Severity::Warning,
+                            "io-redirect-refused",
+                            Some(msg.into()),
+                            Some(ctx),
+                        )
+                        .await;
                 }
             }
             // The full §8 family set for this push device (§8.7).
@@ -346,7 +423,9 @@ async fn publish_field(
     match res {
         Ok(()) => {
             health.signals_published.fetch_add(n, Ordering::Relaxed);
-            health.publish_latency_ms.store(latency_ms, Ordering::Relaxed);
+            health
+                .publish_latency_ms
+                .store(latency_ms, Ordering::Relaxed);
             dm.record_publish(publish_mode, n, from_batch, latency_ms, true);
         }
         Err(e) => {
@@ -468,7 +547,9 @@ mod tests {
         }
 
         fn producer(&self) -> mpsc::Sender<IoUpdate> {
-            self.frames.clone().expect("the class-1 producer is still open")
+            self.frames
+                .clone()
+                .expect("the class-1 producer is still open")
         }
 
         /// End the `IoUpdate` stream without a preceding `Lost` (the translator task dying).
@@ -536,7 +617,10 @@ mod tests {
         let mut rig = PushRig::simple();
         rig.frame_after(
             Duration::from_millis(10),
-            IoUpdate::Up { o2t_api_ms: 96, t2o_api_ms: 104 },
+            IoUpdate::Up {
+                o2t_api_ms: 96,
+                t2o_api_ms: 104,
+            },
         );
         rig.cancel_after(Duration::from_millis(50));
 
@@ -544,11 +628,20 @@ mod tests {
 
         assert!(matches!(exit, PushExit::Stopped));
         assert_eq!(rig.health.link(), LinkState::Online);
-        let ctx = rig.events.last_ctx("device-connected").expect("device-connected emitted");
+        let ctx = rig
+            .events
+            .last_ctx("device-connected")
+            .expect("device-connected emitted");
         assert_eq!(ctx["o2tApiMs"], json!(96));
         assert_eq!(ctx["t2oApiMs"], json!(104));
-        assert!(rig.cleared("device-unreachable"), "the Up edge clears the unreachable alarm");
-        let io = rig.metrics.last(IO).expect("the transition flushed EtherNetIpIo immediately");
+        assert!(
+            rig.cleared("device-unreachable"),
+            "the Up edge clears the unreachable alarm"
+        );
+        let io = rig
+            .metrics
+            .last(IO)
+            .expect("the transition flushed EtherNetIpIo immediately");
         assert_eq!(io["ioConnectionState"], 1.0);
     }
 
@@ -559,7 +652,10 @@ mod tests {
         let mut rig = PushRig::simple();
         let (p_tx, p_rx) = oneshot::channel();
         rig.control()
-            .send(DeviceControl::Pause { by: None, reply: p_tx })
+            .send(DeviceControl::Pause {
+                by: None,
+                reply: p_tx,
+            })
             .await
             .unwrap();
         rig.frame_after(Duration::from_millis(10), frame(1, 1));
@@ -579,7 +675,10 @@ mod tests {
         rig.dm.emit_periodic().await;
         let io = rig.metrics.last(IO).unwrap();
         assert_eq!(io["framesConsumedTotal"], 2.0);
-        assert_eq!(io["sequenceGapsTotal"], 1.0, "sequence validation stays live while paused");
+        assert_eq!(
+            io["sequenceGapsTotal"], 1.0,
+            "sequence validation stays live while paused"
+        );
     }
 
     /// A `Lost` and a translator that simply ended must be accounted the SAME way — the second is
@@ -590,7 +689,9 @@ mod tests {
         let mut rig = PushRig::simple();
         rig.frame_after(
             Duration::from_millis(10),
-            IoUpdate::Lost { error: crate::device::DeviceError::Transient(anyhow::anyhow!("watchdog")) },
+            IoUpdate::Lost {
+                error: crate::device::DeviceError::Transient(anyhow::anyhow!("watchdog")),
+            },
         );
         let exit = rig.run().await;
         assert!(matches!(exit, PushExit::LinkLost));
@@ -625,13 +726,19 @@ mod tests {
         }));
         let (p_tx, _p_rx) = oneshot::channel();
         rig.control()
-            .send(DeviceControl::Pause { by: None, reply: p_tx })
+            .send(DeviceControl::Pause {
+                by: None,
+                reply: p_tx,
+            })
             .await
             .unwrap();
         // Drift while paused, then resume, then the same value again, then a real change.
         rig.frame_after(Duration::from_millis(10), frame(5, 1));
         let (r_tx, r_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(20), DeviceControl::Resume { reply: r_tx });
+        rig.send_after(
+            Duration::from_millis(20),
+            DeviceControl::Resume { reply: r_tx },
+        );
         rig.frame_after(Duration::from_millis(30), frame(5, 2));
         rig.frame_after(Duration::from_millis(40), frame(9, 3));
         rig.cancel_after(Duration::from_millis(60));
@@ -653,7 +760,10 @@ mod tests {
     /// metrics interval — and not never.
     #[tokio::test(start_paused = true)]
     async fn io_stats_fold_fires_redirect_event_once_per_forward_open() {
-        let mut rig = PushRig::new(io_device(json!({})), global(json!({ "metricsIntervalSecs": 1 })));
+        let mut rig = PushRig::new(
+            io_device(json!({})),
+            global(json!({ "metricsIntervalSecs": 1 })),
+        );
         rig.push.set_stats(Some(IoLinkStats {
             frames_produced: 10,
             refused_redirects: 1,
@@ -673,7 +783,10 @@ mod tests {
             json!(1)
         );
         let io = rig.metrics.last(IO).unwrap();
-        assert_eq!(io["framesProducedTotal"], 10.0, "the real stack counters are folded in");
+        assert_eq!(
+            io["framesProducedTotal"], 10.0,
+            "the real stack counters are folded in"
+        );
     }
 
     /// §7.3: a push write stages an output-assembly field into the O→T producer buffer, and a
@@ -681,7 +794,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn write_output_stages_field_and_failure_counts() {
         let mut rig = PushRig::simple();
-        let field = rig.cfg.io.as_ref().unwrap().output.as_ref().unwrap().signals[0].clone();
+        let field = rig
+            .cfg
+            .io
+            .as_ref()
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .signals[0]
+            .clone();
         // The first staging is accepted; the device refuses everything after it.
         rig.push.fail_outputs_after(1, "output assembly is full");
         let tx = rig.control();
@@ -694,15 +816,23 @@ mod tests {
         .await
         .unwrap();
         let (bad_tx, bad_rx) = oneshot::channel();
-        tx.send(DeviceControl::WriteOutput { field, value: json!(12), reply: bad_tx })
-            .await
-            .unwrap();
+        tx.send(DeviceControl::WriteOutput {
+            field,
+            value: json!(12),
+            reply: bad_tx,
+        })
+        .await
+        .unwrap();
         rig.cancel_after(Duration::from_millis(50));
 
         rig.run().await;
 
         assert!(ok_rx.await.unwrap().is_ok(), "the first field was staged");
-        assert!(bad_rx.await.unwrap().unwrap_err().contains("output assembly is full"));
+        assert!(bad_rx
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("output assembly is full"));
         assert_eq!(
             rig.push.outputs(),
             vec![
@@ -726,16 +856,25 @@ mod tests {
         }));
         let (p_tx, _p_rx) = oneshot::channel();
         rig.control()
-            .send(DeviceControl::Pause { by: None, reply: p_tx })
+            .send(DeviceControl::Pause {
+                by: None,
+                reply: p_tx,
+            })
             .await
             .unwrap();
         let (s_tx, s_rx) = oneshot::channel();
-        rig.send_after(Duration::from_millis(10), DeviceControl::Snapshot { reply: s_tx });
+        rig.send_after(
+            Duration::from_millis(10),
+            DeviceControl::Snapshot { reply: s_tx },
+        );
         rig.cancel_after(Duration::from_millis(30));
 
         rig.run().await;
 
-        let snap = s_rx.await.unwrap().expect("the snapshot answers while paused");
+        let snap = s_rx
+            .await
+            .unwrap()
+            .expect("the snapshot answers while paused");
         assert_eq!(snap.readings[0].value, json!(7));
     }
 
@@ -755,13 +894,23 @@ mod tests {
 
         let updates = rig.sink.updates();
         assert_eq!(updates.len(), 1, "one window closed ⇒ one publish");
-        assert_eq!(updates[0].samples.len(), 2, "both frames' samples ride the one flush");
+        assert_eq!(
+            updates[0].samples.len(),
+            2,
+            "both frames' samples ride the one flush"
+        );
         assert_eq!(updates[0].signal_id.as_deref(), Some(FIELD_ID));
 
-        assert!(rig.metrics.emits(HEALTH) >= 2, "southbound_health emits once per second");
+        assert!(
+            rig.metrics.emits(HEALTH) >= 2,
+            "southbound_health emits once per second"
+        );
         assert!(rig.metrics.emits(IO) >= 2, "so does EtherNetIpIo");
         // The publish family rides the same cadence; its running totals are read off the last emit.
-        let row = rig.metrics.last(PUBLISH).expect("EtherNetIpPublish emitted on the cadence");
+        let row = rig
+            .metrics
+            .last(PUBLISH)
+            .expect("EtherNetIpPublish emitted on the cadence");
         assert_eq!(row["batchFlushesTotal"], 1.0);
         assert_eq!(row["dataMessagesPublishedTotal"], 1.0);
         assert_eq!(row["batchSize"], 2.0);
@@ -784,7 +933,12 @@ mod tests {
         };
         let tx = rig.control();
         let (r_tx, r_rx) = oneshot::channel();
-        tx.send(DeviceControl::ReadNow { specs: vec![signal.clone()], reply: r_tx }).await.unwrap();
+        tx.send(DeviceControl::ReadNow {
+            specs: vec![signal.clone()],
+            reply: r_tx,
+        })
+        .await
+        .unwrap();
         let (w_tx, w_rx) = oneshot::channel();
         tx.send(DeviceControl::Write(crate::app::WriteRequest {
             signal,
@@ -794,9 +948,17 @@ mod tests {
         .await
         .unwrap();
         let (rp_tx, rp_rx) = oneshot::channel();
-        tx.send(DeviceControl::Repoll { reply: rp_tx }).await.unwrap();
+        tx.send(DeviceControl::Repoll { reply: rp_tx })
+            .await
+            .unwrap();
         let (b_tx, b_rx) = oneshot::channel();
-        tx.send(DeviceControl::Browse { cursor: None, max: 10, reply: b_tx }).await.unwrap();
+        tx.send(DeviceControl::Browse {
+            cursor: None,
+            max: 10,
+            reply: b_tx,
+        })
+        .await
+        .unwrap();
         drop(tx);
         rig.close_control();
 
@@ -816,7 +978,10 @@ mod tests {
             "there is nothing to re-poll on a cyclic connection"
         );
         assert!(
-            matches!(b_rx.await.unwrap(), Err(crate::app::BrowseError::Unsupported)),
+            matches!(
+                b_rx.await.unwrap(),
+                Err(crate::app::BrowseError::Unsupported)
+            ),
             "push browse is answered from the configured layout by the commander, never here"
         );
     }
@@ -863,7 +1028,10 @@ mod tests {
         let exit = rig.run().await;
 
         assert!(matches!(exit, PushExit::Stopped));
-        assert!(!rig.events.has("device-unreachable"), "a stop raises no alarm");
+        assert!(
+            !rig.events.has("device-unreachable"),
+            "a stop raises no alarm"
+        );
         assert_eq!(
             rig.push.closed(),
             0,

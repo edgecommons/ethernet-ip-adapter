@@ -32,7 +32,11 @@ const ADDR: &str = "127.0.0.1:44822";
 
 async fn up(addr: &str) -> bool {
     matches!(
-        tokio::time::timeout(Duration::from_millis(400), tokio::net::TcpStream::connect(addr)).await,
+        tokio::time::timeout(
+            Duration::from_millis(400),
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
         Ok(Ok(_))
     )
 }
@@ -128,7 +132,11 @@ async fn opener_cipsecurity_posture_reads() {
         eip.allowed_cipher_suites.is_some(),
         "0x5E allowed cipher-suite list decodes"
     );
-    assert_eq!(eip.verify_client_certificate, Some(false), "0x5E attr 9 decodes");
+    assert_eq!(
+        eip.verify_client_certificate,
+        Some(false),
+        "0x5E attr 9 decodes"
+    );
     assert_eq!(eip.check_expiration, Some(false), "0x5E attr 11 decodes");
 
     // --- Certificate Management Object (0x5F) ---
@@ -136,15 +144,25 @@ async fn opener_cipsecurity_posture_reads() {
         .certificate_management
         .as_ref()
         .expect("0x5F Certificate Management Object present");
-    let caps = cert.capabilities.expect("0x5F class attr 8 capability flags");
+    let caps = cert
+        .capabilities
+        .expect("0x5F class attr 8 capability flags");
     eprintln!(
         "live_cip_security: 0x5F push={} pull={}",
         caps.push_supported(),
         caps.pull_supported()
     );
     let inst = cert.instance1.as_ref().expect("0x5F instance 1 present");
-    assert_eq!(inst.name.as_deref(), Some("Default Device Certificate"), "0x5F/1/1 name");
-    assert_eq!(inst.encoding, Some(enip::CertificateEncoding::Pem), "0x5F/1/5 encoding");
+    assert_eq!(
+        inst.name.as_deref(),
+        Some("Default Device Certificate"),
+        "0x5F/1/1 name"
+    );
+    assert_eq!(
+        inst.encoding,
+        Some(enip::CertificateEncoding::Pem),
+        "0x5F/1/5 encoding"
+    );
 
     client.close().await;
     eprintln!("live_cip_security: OpENer CIPSecurity posture-read PASSED");

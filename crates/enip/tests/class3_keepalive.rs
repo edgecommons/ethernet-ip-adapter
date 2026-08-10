@@ -28,7 +28,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use enip::cip::types::CipValue;
 use enip::cm::TimeoutMultiplier;
 use enip::encap::{Command, EncapFrame, EncapHeader};
-use enip::{CipType, ClientOptions, Cpf, CpfItem, EipClient, ItemType, TagAddress, WireReader, WireWriter};
+use enip::{
+    CipType, ClientOptions, Cpf, CpfItem, EipClient, ItemType, TagAddress, WireReader, WireWriter,
+};
 
 const SESSION_HANDLE: u32 = 0x00AB_CDEF;
 
@@ -184,8 +186,12 @@ fn parse_connected_request(frame: &EncapFrame) -> ConnectedRequest {
     r.u32().unwrap();
     r.u16().unwrap();
     let cpf = Cpf::decode(r.take_rest()).unwrap();
-    let addr_item = cpf.find(ItemType::ConnectedAddress).expect("connected address item");
-    let data_item = cpf.find(ItemType::ConnectedData).expect("connected data item");
+    let addr_item = cpf
+        .find(ItemType::ConnectedAddress)
+        .expect("connected address item");
+    let data_item = cpf
+        .find(ItemType::ConnectedData)
+        .expect("connected data item");
     let mut ar = WireReader::new(&addr_item.data);
     let address = ar.u32().unwrap();
     let mut dr = WireReader::new(&data_item.data);
@@ -349,7 +355,10 @@ async fn serve(server_side: DuplexStream, api: u32, keepalive_status: u8) -> Obs
             Command::SendRRData => {
                 let (service, _data) = parse_ucmm_request(&frame);
                 obs.ucmm_services.push(service);
-                assert_eq!(service, FORWARD_CLOSE, "the only UCMM traffic after the open");
+                assert_eq!(
+                    service, FORWARD_CLOSE,
+                    "the only UCMM traffic after the open"
+                );
                 mock.send(&rrdata_reply(
                     frame.header.sender_context,
                     &mr_reply(FORWARD_CLOSE, 0x00, &forward_close_success(&open)),
@@ -410,7 +419,11 @@ async fn idle_class3_session_sends_identity_keepalive_at_three_quarters_window()
 
     drop(client);
     let obs = peer.await.unwrap();
-    assert_eq!(obs.requested_rpis, (400_000, 400_000), "both RPIs carry the option");
+    assert_eq!(
+        obs.requested_rpis,
+        (400_000, 400_000),
+        "both RPIs carry the option"
+    );
     assert_eq!(obs.requested_multiplier_code, TimeoutMultiplier::X4.code());
     assert_eq!(obs.connected_services, vec![GET_ATTRIBUTE_SINGLE; 2]);
     assert_eq!(obs.keepalive_addresses, vec![ASSIGNED_O_T_ID; 2]);
@@ -524,7 +537,11 @@ async fn dropping_the_last_client_stops_keepalive_and_actor() {
     // Let the keepalive task run up to its sleep. Window 32 s ⇒ the first probe is due at 24 s, so a
     // second of idling parks the task without waking it.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(client.stats().keepalives_sent, 0, "far too early for a probe");
+    assert_eq!(
+        client.stats().keepalives_sent,
+        0,
+        "far too early for a probe"
+    );
 
     // Five seconds is comfortably short of both the 24 s due point and the 60 s liveness re-check.
     let dropped_at = tokio::time::Instant::now();
@@ -546,7 +563,10 @@ async fn dropping_the_last_client_stops_keepalive_and_actor() {
     // The peer's read side saw EOF, and nothing at all arrived after the open.
     assert!(obs.connected_services.is_empty(), "{obs:?}");
     assert!(obs.ucmm_services.is_empty(), "{obs:?}");
-    assert!(!obs.unregistered, "a dropped client sends no courtesy unregister");
+    assert!(
+        !obs.unregistered,
+        "a dropped client sends no courtesy unregister"
+    );
 }
 
 /// **K6.** A graceful `close()` stops the keepalive too: the target sees the ForwardClose and the
@@ -572,7 +592,10 @@ async fn close_stops_the_keepalive() {
     drop(client);
     let obs = peer.await.unwrap();
     assert_eq!(obs.ucmm_services, vec![FORWARD_CLOSE]);
-    assert!(obs.unregistered, "close() sends the courtesy UnRegisterSession");
+    assert!(
+        obs.unregistered,
+        "close() sends the courtesy UnRegisterSession"
+    );
     assert_eq!(obs.keepalives(), 0, "no probe after the session closed");
 }
 
@@ -596,7 +619,10 @@ async fn keepalive_counts_a_cip_error_reply_as_sent() {
     assert_eq!(client.stats().keepalives_sent, 1);
 
     let tag = TagAddress::parse("A").unwrap();
-    let r = client.read_tag(&tag, 1).await.expect("the session still serves reads");
+    let r = client
+        .read_tag(&tag, 1)
+        .await
+        .expect("the session still serves reads");
     assert_eq!(r.value, CipValue::Dint(555));
     assert_eq!(client.stats().connected_seq_mismatches, 0);
 

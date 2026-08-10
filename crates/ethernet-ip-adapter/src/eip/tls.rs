@@ -21,7 +21,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
+};
 
 use crate::device::{
     ConnectionConfig, SecurityStatus, TargetCertificateSummary, TargetSecurityPosture,
@@ -122,7 +124,12 @@ impl SecretRef {
         let secret = creds
             .get(&self.secret)
             .map_err(|e| format!("vault get(`{}`) for {what}: {e}", self.secret))?
-            .ok_or_else(|| format!("vault secret `{}` (referenced by {what}) not found", self.secret))?;
+            .ok_or_else(|| {
+                format!(
+                    "vault secret `{}` (referenced by {what}) not found",
+                    self.secret
+                )
+            })?;
         match &self.field {
             None => secret
                 .as_str()
@@ -135,7 +142,10 @@ impl SecretRef {
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .ok_or_else(|| {
-                    format!("secret `{}` field `{f}` (for {what}) missing or not a string", self.secret)
+                    format!(
+                        "secret `{}` field `{f}` (for {what}) missing or not a string",
+                        self.secret
+                    )
                 }),
         }
     }
@@ -333,8 +343,9 @@ impl SecurityConfig {
         // (certFile+keyFile), or inline (cert+key {"$secret": …}). Mixing them is ambiguous (which
         // wins?), so it is a startup error, and each chosen style must be complete.
         if let Some(c) = &self.client {
-            let styles =
-                usize::from(c.has_bundle()) + usize::from(c.has_files()) + usize::from(c.has_inline());
+            let styles = usize::from(c.has_bundle())
+                + usize::from(c.has_files())
+                + usize::from(c.has_inline());
             if styles > 1 {
                 return Err(format!(
                     "device `{device_id}`: security.client mixes sourcing styles — use exactly ONE of \
@@ -406,7 +417,10 @@ fn read_pem_file(path: &str, what: &str) -> std::result::Result<String, String> 
 }
 
 /// Parse a PEM blob into a DER certificate chain.
-pub(super) fn certs_from_pem(pem: &str, what: &str) -> std::result::Result<Vec<CertificateDer<'static>>, String> {
+pub(super) fn certs_from_pem(
+    pem: &str,
+    what: &str,
+) -> std::result::Result<Vec<CertificateDer<'static>>, String> {
     let mut rd = std::io::Cursor::new(pem.as_bytes());
     rustls_pemfile::certs(&mut rd)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -813,7 +827,9 @@ pub(super) fn source_ca_pems(
             .versions(name)
             .map_err(|e| format!("vault versions(`{name}`) for ca.trustStore: {e}"))?;
         if versions.is_empty() {
-            return Err(format!("vault trust-store secret `{name}` (ca.trustStore) not found"));
+            return Err(format!(
+                "vault trust-store secret `{name}` (ca.trustStore) not found"
+            ));
         }
         // All retained versions — a CA rollover keeps old+new roots live during the grace window.
         for v in &versions {
@@ -864,10 +880,13 @@ impl ServerCertVerifier for ExpiryTolerantVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, TlsError> {
-        match self
-            .inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-        {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
             Err(TlsError::InvalidCertificate(
                 CertificateError::Expired | CertificateError::NotValidYet,
             )) => Ok(ServerCertVerified::assertion()),
@@ -1014,7 +1033,9 @@ mod tests {
 
     #[test]
     fn tls_on_push_is_rejected() {
-        let s = sec_of(json!({ "mode": "tls", "client": { "certSecret": "x" }, "ca": { "secret": "y" } }));
+        let s = sec_of(
+            json!({ "mode": "tls", "client": { "certSecret": "x" }, "ca": { "secret": "y" } }),
+        );
         let err = s.validate("io-1", true).unwrap_err();
         assert!(err.contains("push"), "{err}");
         assert!(err.contains("DTLS"), "{err}");
@@ -1029,21 +1050,26 @@ mod tests {
 
     #[test]
     fn tls_with_partial_file_identity_is_rejected() {
-        let s = sec_of(json!({ "mode": "tls", "client": { "certFile": "c.pem" }, "verifyPeer": false }));
+        let s = sec_of(
+            json!({ "mode": "tls", "client": { "certFile": "c.pem" }, "verifyPeer": false }),
+        );
         let err = s.validate("plc", false).unwrap_err();
         assert!(err.contains("BOTH certFile and keyFile"), "{err}");
     }
 
     #[test]
     fn tls_verify_peer_without_ca_is_rejected() {
-        let s = sec_of(json!({ "mode": "tls", "client": { "certFile": "c.pem", "keyFile": "k.pem" } }));
+        let s =
+            sec_of(json!({ "mode": "tls", "client": { "certFile": "c.pem", "keyFile": "k.pem" } }));
         let err = s.validate("plc", false).unwrap_err();
         assert!(err.contains("CA source"), "{err}");
     }
 
     #[test]
     fn tls_verify_peer_false_without_ca_is_allowed() {
-        let s = sec_of(json!({ "mode": "tls", "client": { "certFile": "c.pem", "keyFile": "k.pem" }, "verifyPeer": false }));
+        let s = sec_of(
+            json!({ "mode": "tls", "client": { "certFile": "c.pem", "keyFile": "k.pem" }, "verifyPeer": false }),
+        );
         assert!(s.validate("plc", false).is_ok());
     }
 
@@ -1073,7 +1099,10 @@ mod tests {
         let client = s.client.as_ref().unwrap();
         assert_eq!(client.cert.as_ref().unwrap().secret, "tls/cip-client-cert");
         assert_eq!(client.key.as_ref().unwrap().secret, "tls/cip-client-key");
-        assert_eq!(s.ca.as_ref().unwrap().cert.as_ref().unwrap().secret, "tls/plant-root");
+        assert_eq!(
+            s.ca.as_ref().unwrap().cert.as_ref().unwrap().secret,
+            "tls/plant-root"
+        );
         assert!(s.validate("plc", false).is_ok());
     }
 
@@ -1154,7 +1183,10 @@ mod tests {
         let c = conn(json!({ "endpoint": "192.168.10.60:2221" }));
         let s = sec_of(json!({ "mode": "tls" }));
         let name = resolve_server_name(&s, &c).unwrap();
-        assert!(matches!(name, ServerName::IpAddress(_)), "IP endpoint ⇒ IP SAN name");
+        assert!(
+            matches!(name, ServerName::IpAddress(_)),
+            "IP endpoint ⇒ IP SAN name"
+        );
     }
 
     #[test]
@@ -1245,19 +1277,39 @@ mod tests {
         // A CA rollover: two versions of one trust-store secret ⇒ both roots trusted (grace window).
         let fx = mint();
         let creds = empty_vault(21);
-        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/trust", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put(
+                "ot/cert",
+                fx.client_cert_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put(
+                "ot/key",
+                fx.client_key_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put("ot/trust", fx.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         // Roll the trust store: add a new root as a second version.
         let new_root = mint_ca();
-        creds.put("ot/trust", new_root.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put("ot/trust", new_root.as_bytes(), PutOptions::default())
+            .unwrap();
 
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
         let s = sec_of(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
             "ca": { "trustStore": "ot/trust" } }));
         let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
-        assert_eq!(meta.trust_anchors.len(), 2, "old + new root both live during grace");
+        assert_eq!(
+            meta.trust_anchors.len(),
+            2,
+            "old + new root both live during grace"
+        );
         assert!(meta.trust_anchors.iter().all(|a| a.subject.is_some()));
     }
 
@@ -1265,8 +1317,20 @@ mod tests {
     fn trust_store_missing_secret_errors() {
         let fx = mint();
         let creds = empty_vault(22);
-        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put(
+                "ot/cert",
+                fx.client_cert_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put(
+                "ot/key",
+                fx.client_key_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
         let c = conn(json!({ "endpoint": "h" }));
         let s = sec_of(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
@@ -1280,16 +1344,36 @@ mod tests {
         let fx = mint();
         let root2 = mint_ca();
         let creds = empty_vault(23);
-        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/root-a", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/root-b", root2.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put(
+                "ot/cert",
+                fx.client_cert_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put(
+                "ot/key",
+                fx.client_key_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put("ot/root-a", fx.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("ot/root-b", root2.as_bytes(), PutOptions::default())
+            .unwrap();
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
         let s = sec_of(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
             "ca": { "list": [ { "$secret": "ot/root-a" }, { "$secret": "ot/root-b" } ] } }));
         let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
-        assert_eq!(meta.trust_anchors.len(), 2, "both listed roots in the trust store");
+        assert_eq!(
+            meta.trust_anchors.len(),
+            2,
+            "both listed roots in the trust store"
+        );
     }
 
     #[test]
@@ -1319,9 +1403,23 @@ mod tests {
     fn client_cert_serial_and_expiry_days_are_surfaced() {
         let fx = mint_expiring(400);
         let creds = empty_vault(24);
-        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put(
+                "ot/cert",
+                fx.client_cert_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put(
+                "ot/key",
+                fx.client_key_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put("ot/root", fx.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
         let s = sec_of(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
@@ -1336,29 +1434,61 @@ mod tests {
     fn expired_client_cert_is_refused_when_check_expiration() {
         let fx = mint_expiring(-5);
         let creds = empty_vault(25);
-        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put(
+                "ot/cert",
+                fx.client_cert_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put(
+                "ot/key",
+                fx.client_key_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put("ot/root", fx.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
         let s = sec_of(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
             "ca": { "cert": { "$secret": "ot/root" } } }));
         let err = build_client_config(&s, &c, Some(&creds)).unwrap_err();
-        assert!(err.contains("expired") && err.contains("refusing to connect"), "{err}");
+        assert!(
+            err.contains("expired") && err.contains("refusing to connect"),
+            "{err}"
+        );
     }
 
     #[test]
     fn expired_client_cert_is_tolerated_when_check_expiration_false() {
         let fx = mint_expiring(-5);
         let creds = empty_vault(26);
-        creds.put("ot/cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put(
+                "ot/cert",
+                fx.client_cert_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        creds
+            .put(
+                "ot/key",
+                fx.client_key_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
         let s = sec_of(json!({ "mode": "tls",
             "client": { "cert": { "$secret": "ot/cert" }, "key": { "$secret": "ot/key" } },
             "verifyPeer": false, "checkExpiration": false }));
         let (_opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
-        assert!(meta.client_cert_expiry_days.unwrap() < 0, "expired cert accepted (RTC-less tolerance)");
+        assert!(
+            meta.client_cert_expiry_days.unwrap() < 0,
+            "expired cert accepted (RTC-less tolerance)"
+        );
     }
 
     #[test]
@@ -1390,7 +1520,10 @@ mod tests {
     // §4.1) so the CI live gate cannot pass vacuously.
 
     const TLS_LIVE_ADDR: &str = "127.0.0.1:2221";
-    const CERT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-infra/enip-tls/certs");
+    const CERT_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-infra/enip-tls/certs"
+    );
 
     fn read_cert(name: &str) -> Option<String> {
         std::fs::read_to_string(format!("{CERT_DIR}/{name}")).ok()
@@ -1415,9 +1548,15 @@ mod tests {
 
     fn live_vault(cert: &str, key: &str, ca: &str) -> Arc<dyn CredentialService> {
         let creds = empty_vault(90);
-        creds.put("ot/cert", cert.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", key.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/ca", ca.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put("ot/cert", cert.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("ot/key", key.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("ot/ca", ca.as_bytes(), PutOptions::default())
+            .unwrap();
         creds
     }
 
@@ -1428,9 +1567,13 @@ mod tests {
             "serverName": "127.0.0.1" }))
     }
 
-    async fn connect_once(sec: &SecurityConfig, creds: &Arc<dyn CredentialService>) -> Option<String> {
+    async fn connect_once(
+        sec: &SecurityConfig,
+        creds: &Arc<dyn CredentialService>,
+    ) -> Option<String> {
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
-        let (tls_opts, meta) = build_client_config(sec, &c, Some(creds)).expect("build ClientConfig");
+        let (tls_opts, meta) =
+            build_client_config(sec, &c, Some(creds)).expect("build ClientConfig");
         let opts = enip::ClientOptions {
             connect_timeout: std::time::Duration::from_secs(5),
             request_timeout: std::time::Duration::from_secs(2),
@@ -1475,20 +1618,39 @@ mod tests {
 
         // Baseline connect with cert A.
         let serial_a = connect_once(&sec, &creds).await.expect("client A serial");
-        let state_a = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
+        let state_a = crate::eip::rotation::read_reload_state(
+            &sec,
+            Some(&creds),
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
 
         // Rotate the vault to cert B (fresh cert, same CA) — the ec-secrets rotation shape.
-        creds.put("ot/cert", c2.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("ot/key", k2.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put("ot/cert", c2.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("ot/key", k2.as_bytes(), PutOptions::default())
+            .unwrap();
 
         // The lifecycle watcher detects the rotation from the vault re-read.
-        let state_b = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
-        assert_ne!(state_a.fingerprint, state_b.fingerprint, "rotation changed the material fingerprint");
+        let state_b = crate::eip::rotation::read_reload_state(
+            &sec,
+            Some(&creds),
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_ne!(
+            state_a.fingerprint, state_b.fingerprint,
+            "rotation changed the material fingerprint"
+        );
         let mut watcher = crate::eip::rotation::CertWatcher::default();
         watcher.observe(&state_a, 30);
         let out = watcher.observe(&state_b, 30);
         assert!(
-            out.actions.iter().any(|a| matches!(a, crate::eip::rotation::WatchAction::Rotated { .. })),
+            out.actions
+                .iter()
+                .any(|a| matches!(a, crate::eip::rotation::WatchAction::Rotated { .. })),
             "watcher reports the rotation"
         );
 
@@ -1525,12 +1687,21 @@ mod tests {
         let creds = live_vault(&ce, &ke, &ca);
         let sec = tls_sec();
         // The near-expiry cert (20 days) still connects (valid), but crosses the 30-day threshold.
-        let _ = connect_once(&sec, &creds).await.expect("near-expiry cert still connects");
-        let state = crate::eip::rotation::read_reload_state(&sec, Some(&creds), time::OffsetDateTime::now_utc()).unwrap();
+        let _ = connect_once(&sec, &creds)
+            .await
+            .expect("near-expiry cert still connects");
+        let state = crate::eip::rotation::read_reload_state(
+            &sec,
+            Some(&creds),
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let mut watcher = crate::eip::rotation::CertWatcher::default();
         let out = watcher.observe(&state, 30);
         assert!(
-            out.actions.iter().any(|a| matches!(a, crate::eip::rotation::WatchAction::Expiring { .. })),
+            out.actions
+                .iter()
+                .any(|a| matches!(a, crate::eip::rotation::WatchAction::Expiring { .. })),
             "a ~20-day cert fires cert-expiring at the 30-day threshold: {:?}",
             out.actions
         );
@@ -1572,7 +1743,10 @@ mod tests {
         let (opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
         assert!(matches!(opts.server_name, ServerName::IpAddress(_)));
         assert!(meta.verify_peer);
-        assert!(meta.client_cert_not_after.is_some(), "client cert notAfter parsed");
+        assert!(
+            meta.client_cert_not_after.is_some(),
+            "client cert notAfter parsed"
+        );
     }
 
     #[test]
@@ -1583,9 +1757,18 @@ mod tests {
         let cert_path = dir.path().join("client.pem");
         let key_path = dir.path().join("client.key");
         let ca_path = dir.path().join("ca.pem");
-        std::fs::File::create(&cert_path).unwrap().write_all(fx.client_cert_pem.as_bytes()).unwrap();
-        std::fs::File::create(&key_path).unwrap().write_all(fx.client_key_pem.as_bytes()).unwrap();
-        std::fs::File::create(&ca_path).unwrap().write_all(fx.ca_pem.as_bytes()).unwrap();
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(fx.client_cert_pem.as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(fx.client_key_pem.as_bytes())
+            .unwrap();
+        std::fs::File::create(&ca_path)
+            .unwrap()
+            .write_all(fx.ca_pem.as_bytes())
+            .unwrap();
 
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
         let s = sec_of(json!({
@@ -1604,9 +1787,24 @@ mod tests {
         let provider = Arc::new(FileKeyProvider::from_bytes([9u8; 32])) as Arc<dyn KeyProvider>;
         let vault = LocalVault::open(dir.path().join("vault"), provider, 2).unwrap();
         let svc = DefaultCredentialService::new(vault);
-        svc.put("tls/cip-client-cert", fx.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        svc.put("tls/cip-client-key", fx.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-        svc.put("tls/plant-root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        svc.put(
+            "tls/cip-client-cert",
+            fx.client_cert_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+        svc.put(
+            "tls/cip-client-key",
+            fx.client_key_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
+        svc.put(
+            "tls/plant-root",
+            fx.ca_pem.as_bytes(),
+            PutOptions::default(),
+        )
+        .unwrap();
         std::mem::forget(dir);
         Arc::new(svc)
     }
@@ -1627,7 +1825,10 @@ mod tests {
         let (opts, meta) = build_client_config(&s, &c, Some(&creds)).unwrap();
         assert!(matches!(opts.server_name, ServerName::IpAddress(_)));
         assert!(meta.verify_peer);
-        assert!(meta.client_cert_not_after.is_some(), "inline client cert notAfter parsed");
+        assert!(
+            meta.client_cert_not_after.is_some(),
+            "inline client cert notAfter parsed"
+        );
     }
 
     #[test]
@@ -1639,8 +1840,14 @@ mod tests {
         let vault = LocalVault::open(dir.path().join("vault"), provider, 2).unwrap();
         let svc = DefaultCredentialService::new(vault);
         let bundle = json!({ "certPem": fx.client_cert_pem, "keyPem": fx.client_key_pem });
-        svc.put("tls/bundle", serde_json::to_vec(&bundle).unwrap().as_slice(), PutOptions::default()).unwrap();
-        svc.put("tls/root", fx.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        svc.put(
+            "tls/bundle",
+            serde_json::to_vec(&bundle).unwrap().as_slice(),
+            PutOptions::default(),
+        )
+        .unwrap();
+        svc.put("tls/root", fx.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         std::mem::forget(dir);
         let creds: Arc<dyn CredentialService> = Arc::new(svc);
 
@@ -1715,8 +1922,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("client.pem");
         let key_path = dir.path().join("client.key");
-        std::fs::File::create(&cert_path).unwrap().write_all(fx.client_cert_pem.as_bytes()).unwrap();
-        std::fs::File::create(&key_path).unwrap().write_all(fx.client_key_pem.as_bytes()).unwrap();
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(fx.client_cert_pem.as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(fx.client_key_pem.as_bytes())
+            .unwrap();
         let c = conn(json!({ "endpoint": "127.0.0.1:2221" }));
         let s = sec_of(json!({
             "mode": "tls",
@@ -1731,7 +1944,9 @@ mod tests {
         let fx = mint();
         let creds = vault_with("pki/eip", "pki/root", &fx);
         let c = conn(json!({ "endpoint": "127.0.0.1" }));
-        let s = sec_of(json!({ "mode": "tls", "client": { "certSecret": "pki/absent" }, "verifyPeer": false }));
+        let s = sec_of(
+            json!({ "mode": "tls", "client": { "certSecret": "pki/absent" }, "verifyPeer": false }),
+        );
         let err = build_client_config(&s, &c, Some(&creds)).unwrap_err();
         assert!(err.contains("not found"), "{err}");
     }
@@ -1739,7 +1954,9 @@ mod tests {
     #[test]
     fn cert_secret_without_vault_errors() {
         let c = conn(json!({ "endpoint": "h" }));
-        let s = sec_of(json!({ "mode": "tls", "client": { "certSecret": "pki/eip" }, "verifyPeer": false }));
+        let s = sec_of(
+            json!({ "mode": "tls", "client": { "certSecret": "pki/eip" }, "verifyPeer": false }),
+        );
         let err = build_client_config(&s, &c, None).unwrap_err();
         assert!(err.contains("no credentials vault"), "{err}");
     }
@@ -1780,15 +1997,26 @@ mod tests {
             cipher_suite: Some("TLS13_AES_128_GCM_SHA256".to_string()),
             peer_cert_der: None,
         };
-        let meta = TlsMeta { client_cert_not_after: Some("2027-01-01T00:00:00Z".to_string()), verify_peer: true, ..TlsMeta::default() };
+        let meta = TlsMeta {
+            client_cert_not_after: Some("2027-01-01T00:00:00Z".to_string()),
+            verify_peer: true,
+            ..TlsMeta::default()
+        };
         let c = conn(json!({ "endpoint": "192.168.10.60:2221" }));
         let st = security_status(Some(&info), &meta, &c);
         assert!(st.tls);
         assert_eq!(st.tls_version.as_deref(), Some("1.3"));
         assert_eq!(st.cipher_suite.as_deref(), Some("TLS13_AES_128_GCM_SHA256"));
         assert!(st.peer_verified);
-        assert_eq!(st.peer.as_deref(), Some("192.168.10.60"), "falls back to endpoint host");
-        assert_eq!(st.client_cert_not_after.as_deref(), Some("2027-01-01T00:00:00Z"));
+        assert_eq!(
+            st.peer.as_deref(),
+            Some("192.168.10.60"),
+            "falls back to endpoint host"
+        );
+        assert_eq!(
+            st.client_cert_not_after.as_deref(),
+            Some("2027-01-01T00:00:00Z")
+        );
     }
 
     // ---- Phase 2a: enip posture → seam mapping ----
@@ -1825,7 +2053,10 @@ mod tests {
         };
         let mapped = map_target_posture(&posture).expect("available posture maps");
         assert_eq!(mapped.state.as_deref(), Some("Configured"));
-        assert_eq!(mapped.profiles, vec!["EtherNet/IP Confidentiality".to_string()]);
+        assert_eq!(
+            mapped.profiles,
+            vec!["EtherNet/IP Confidentiality".to_string()]
+        );
         assert_eq!(
             mapped.allowed_cipher_suites,
             vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".to_string()]

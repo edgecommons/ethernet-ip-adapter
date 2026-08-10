@@ -317,15 +317,17 @@ impl DeviceLauncher for RuntimeLauncher {
                 .flatten()
                 .is_some_and(|s| s.is_tls());
         if tls_poll {
-            tasks.push(tokio::spawn(crate::security_lifecycle::run_security_lifecycle(
-                cfg.clone(),
-                self.creds.clone(),
-                control_tx,
-                Arc::clone(&events),
-                Arc::clone(&dm),
-                Some(Arc::clone(&health)),
-                cancel.clone(),
-            )));
+            tasks.push(tokio::spawn(
+                crate::security_lifecycle::run_security_lifecycle(
+                    cfg.clone(),
+                    self.creds.clone(),
+                    control_tx,
+                    Arc::clone(&events),
+                    Arc::clone(&dm),
+                    Some(Arc::clone(&health)),
+                    cancel.clone(),
+                ),
+            ));
         }
 
         tasks.push(tokio::spawn(crate::reconnect::run_device(
@@ -377,7 +379,14 @@ struct DroppedEvents;
 #[async_trait::async_trait]
 impl EventSink for DroppedEvents {
     async fn emit(&self, _: Severity, _: &str, _: Option<String>, _: Option<serde_json::Value>) {}
-    async fn raise_alarm(&self, _: Severity, _: &str, _: Option<String>, _: Option<serde_json::Value>) {}
+    async fn raise_alarm(
+        &self,
+        _: Severity,
+        _: &str,
+        _: Option<String>,
+        _: Option<serde_json::Value>,
+    ) {
+    }
     async fn clear_alarm(&self, _: Severity, _: &str, _: Option<serde_json::Value>) {}
 }
 
@@ -387,13 +396,39 @@ pub struct FacadeEventSink(pub EventsFacade);
 
 #[async_trait::async_trait]
 impl EventSink for FacadeEventSink {
-    async fn emit(&self, severity: Severity, event_type: &str, message: Option<String>, context: Option<serde_json::Value>) {
-        let _ = self.0.emit(severity, event_type.to_string(), message, context).await;
+    async fn emit(
+        &self,
+        severity: Severity,
+        event_type: &str,
+        message: Option<String>,
+        context: Option<serde_json::Value>,
+    ) {
+        let _ = self
+            .0
+            .emit(severity, event_type.to_string(), message, context)
+            .await;
     }
-    async fn raise_alarm(&self, severity: Severity, event_type: &str, message: Option<String>, context: Option<serde_json::Value>) {
-        let _ = self.0.raise_alarm(severity, event_type.to_string(), message, context).await;
+    async fn raise_alarm(
+        &self,
+        severity: Severity,
+        event_type: &str,
+        message: Option<String>,
+        context: Option<serde_json::Value>,
+    ) {
+        let _ = self
+            .0
+            .raise_alarm(severity, event_type.to_string(), message, context)
+            .await;
     }
-    async fn clear_alarm(&self, severity: Severity, event_type: &str, context: Option<serde_json::Value>) {
-        let _ = self.0.clear_alarm(severity, event_type.to_string(), context).await;
+    async fn clear_alarm(
+        &self,
+        severity: Severity,
+        event_type: &str,
+        context: Option<serde_json::Value>,
+    ) {
+        let _ = self
+            .0
+            .clear_alarm(severity, event_type.to_string(), context)
+            .await;
     }
 }

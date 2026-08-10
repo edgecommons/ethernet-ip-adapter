@@ -211,8 +211,8 @@ async fn run(weak_tx: mpsc::WeakSender<SessionCommand>, inner: Weak<Inner>) {
         if let Some(conn) = strong.connected.as_ref() {
             if window_is_implausibly_short(conn.inactivity_window) {
                 let now = Instant::now();
-                let probe_interval = next_keepalive_at(now, conn.inactivity_window)
-                    .saturating_duration_since(now);
+                let probe_interval =
+                    next_keepalive_at(now, conn.inactivity_window).saturating_duration_since(now);
                 tracing::warn!(
                     negotiated_o_t_interval_us = conn.negotiated_interval.as_micros(),
                     timeout_multiplier = conn.timeout_multiplier.multiplier(),

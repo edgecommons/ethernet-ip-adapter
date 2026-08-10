@@ -510,7 +510,11 @@ impl ForwardOpenRequest {
         Ok(w.into_bytes())
     }
 
-    fn write_params(&self, w: &mut WireWriter, p: NetworkConnectionParams) -> Result<(), EnipError> {
+    fn write_params(
+        &self,
+        w: &mut WireWriter,
+        p: NetworkConnectionParams,
+    ) -> Result<(), EnipError> {
         if self.large {
             w.u32(p.encode_u32());
         } else {
@@ -555,7 +559,9 @@ impl ForwardOpenSuccess {
         let t_o_api = r.u32()?;
         let app_words = r.u8()? as usize;
         let _reserved = r.u8()?;
-        let app_bytes = app_words.checked_mul(2).ok_or(WireError::Overflow { context: CONTEXT })?;
+        let app_bytes = app_words
+            .checked_mul(2)
+            .ok_or(WireError::Overflow { context: CONTEXT })?;
         let app_data = Bytes::copy_from_slice(r.take(app_bytes)?);
         Ok(Self {
             o_t_connection_id,
@@ -695,14 +701,23 @@ impl ForwardCloseRequest {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )]
     use super::*;
 
     #[test]
     fn ncp_u16_roundtrip_exhaustive_fields() {
         for &size in &[0u16, 1, 500, 504, 0x01FF] {
             for variable in [VariableLength::Fixed, VariableLength::Variable] {
-                for priority in [Priority::Low, Priority::High, Priority::Scheduled, Priority::Urgent] {
+                for priority in [
+                    Priority::Low,
+                    Priority::High,
+                    Priority::Scheduled,
+                    Priority::Urgent,
+                ] {
                     for conn_type in [ConnType::Null, ConnType::Multicast, ConnType::P2P] {
                         for redundant_owner in [false, true] {
                             let p = NetworkConnectionParams {
@@ -715,10 +730,7 @@ mod tests {
                             let packed = p.encode_u16().unwrap();
                             assert_eq!(NetworkConnectionParams::decode_u16(packed), p);
                             // The large form must survive the wider fields too.
-                            assert_eq!(
-                                NetworkConnectionParams::decode_u32(p.encode_u32()),
-                                p
-                            );
+                            assert_eq!(NetworkConnectionParams::decode_u32(p.encode_u32()), p);
                         }
                     }
                 }
@@ -731,7 +743,10 @@ mod tests {
         let p = NetworkConnectionParams::p2p(0x0200);
         assert!(matches!(p.encode_u16(), Err(EnipError::TooLarge { .. })));
         // But it fits the large form.
-        assert_eq!(NetworkConnectionParams::decode_u32(p.encode_u32()).size, 0x0200);
+        assert_eq!(
+            NetworkConnectionParams::decode_u32(p.encode_u32()).size,
+            0x0200
+        );
     }
 
     #[test]
@@ -831,8 +846,14 @@ mod tests {
     fn class1_trigger_bytes() {
         assert_eq!(TRANSPORT_CLASS1_TRIGGER, 0x01);
         assert_eq!(transport_class1_trigger(ProductionTrigger::Cyclic), 0x01);
-        assert_eq!(transport_class1_trigger(ProductionTrigger::ChangeOfState), 0x11);
-        assert_eq!(transport_class1_trigger(ProductionTrigger::Application), 0x21);
+        assert_eq!(
+            transport_class1_trigger(ProductionTrigger::ChangeOfState),
+            0x11
+        );
+        assert_eq!(
+            transport_class1_trigger(ProductionTrigger::Application),
+            0x21
+        );
         // Each decodes as direction=originator(0), class=1.
         for t in [
             ProductionTrigger::Cyclic,
@@ -867,7 +888,10 @@ mod tests {
             for variable in [VariableLength::Fixed, VariableLength::Variable] {
                 for priority in [Priority::Low, Priority::Scheduled, Priority::Urgent] {
                     let p = NetworkConnectionParams::io(38, variable, priority, conn_type);
-                    assert_eq!(NetworkConnectionParams::decode_u16(p.encode_u16().unwrap()), p);
+                    assert_eq!(
+                        NetworkConnectionParams::decode_u16(p.encode_u16().unwrap()),
+                        p
+                    );
                     assert_eq!(NetworkConnectionParams::decode_u32(p.encode_u32()), p);
                     assert!(!p.redundant_owner);
                 }
@@ -881,8 +905,18 @@ mod tests {
         // serial 7, vendor 0x1337, orig serial 0xDEADBEEF, ×16 multiplier (code 2), 20 ms RPIs
         // (20000 µs), O→T P2P fixed size 6 (2 seq + 4 header, heartbeat data), T→O P2P fixed size
         // 34 (2 seq + 32 data, modeless), path config 151 / output 150 / input 100.
-        let o_t = NetworkConnectionParams::io(6, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
-        let t_o = NetworkConnectionParams::io(34, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let o_t = NetworkConnectionParams::io(
+            6,
+            VariableLength::Fixed,
+            Priority::Scheduled,
+            ConnType::P2P,
+        );
+        let t_o = NetworkConnectionParams::io(
+            34,
+            VariableLength::Fixed,
+            Priority::Scheduled,
+            ConnType::P2P,
+        );
         let req = ForwardOpenRequest::class1(
             0x1122_3344,
             0x0007,
@@ -915,7 +949,10 @@ mod tests {
         assert_eq!(&bytes[32..34], &t_o.encode_u16().unwrap().to_le_bytes());
         assert_eq!(bytes[34], TRANSPORT_CLASS1_TRIGGER);
         assert_eq!(bytes[35], 4); // path words: 8 bytes / 2
-        assert_eq!(&bytes[36..44], &[0x20, 0x04, 0x24, 151, 0x2C, 150, 0x2C, 100]);
+        assert_eq!(
+            &bytes[36..44],
+            &[0x20, 0x04, 0x24, 151, 0x2C, 150, 0x2C, 100]
+        );
         // Round-trip the reply that would answer it (actual PIs differ from requested RPIs).
         let mut w = WireWriter::new();
         w.u32(0xAABB_CCDD); // O→T id target-assigned
@@ -937,11 +974,31 @@ mod tests {
     #[test]
     fn large_forward_open_widens_ncp_to_u32() {
         // O→T size 1000 (> 505) forces LargeForwardOpen; the NCP fields become u32.
-        let o_t = NetworkConnectionParams::io(1000, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
-        let t_o = NetworkConnectionParams::io(34, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let o_t = NetworkConnectionParams::io(
+            1000,
+            VariableLength::Fixed,
+            Priority::Scheduled,
+            ConnType::P2P,
+        );
+        let t_o = NetworkConnectionParams::io(
+            34,
+            VariableLength::Fixed,
+            Priority::Scheduled,
+            ConnType::P2P,
+        );
         let req = ForwardOpenRequest::class1(
-            0x1, 0x2, 0x3, 0x4, TimeoutMultiplier::X16, 20_000, o_t, 20_000, t_o,
-            TRANSPORT_CLASS1_TRIGGER, io_connection_path(Some(151), 150, 100), true,
+            0x1,
+            0x2,
+            0x3,
+            0x4,
+            TimeoutMultiplier::X16,
+            20_000,
+            o_t,
+            20_000,
+            t_o,
+            TRANSPORT_CLASS1_TRIGGER,
+            io_connection_path(Some(151), 150, 100),
+            true,
         );
         assert_eq!(req.service(), service::LARGE_FORWARD_OPEN);
         let bytes = req.encode().unwrap();
@@ -957,7 +1014,12 @@ mod tests {
 
     /// A reference class-1 open plus the faithful success reply that answers it.
     fn echo_pair() -> (ForwardOpenRequest, ForwardOpenSuccess) {
-        let ncp = NetworkConnectionParams::io(10, VariableLength::Fixed, Priority::Scheduled, ConnType::P2P);
+        let ncp = NetworkConnectionParams::io(
+            10,
+            VariableLength::Fixed,
+            Priority::Scheduled,
+            ConnType::P2P,
+        );
         let open = ForwardOpenRequest::class1(
             0x1122_3344,
             0x0007,
@@ -1020,7 +1082,10 @@ mod tests {
 
     #[test]
     fn connection_manager_path_is_canonical() {
-        assert_eq!(connection_manager_path().encode().unwrap().as_ref(), &[0x20, 0x06, 0x24, 0x01]);
+        assert_eq!(
+            connection_manager_path().encode().unwrap().as_ref(),
+            &[0x20, 0x06, 0x24, 0x01]
+        );
     }
 
     #[test]

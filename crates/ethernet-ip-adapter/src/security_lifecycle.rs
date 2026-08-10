@@ -54,7 +54,9 @@ pub(crate) async fn run_security_lifecycle(
 ) {
     use crate::eip::est::{enroll_once, next_renew_rfc3339, EstDecision, EstScheduler, EstStatus};
     use crate::eip::rotation::{read_reload_state, CertWatcher, WatchAction};
-    use crate::eip::tls::{SecurityConfig, DEFAULT_RELOAD_INTERVAL_SECS, DEFAULT_RENEW_BEFORE_DAYS};
+    use crate::eip::tls::{
+        SecurityConfig, DEFAULT_RELOAD_INTERVAL_SECS, DEFAULT_RENEW_BEFORE_DAYS,
+    };
 
     let Some(sec) = SecurityConfig::from_connection(&cfg.connection)
         .ok()
@@ -63,12 +65,18 @@ pub(crate) async fn run_security_lifecycle(
     else {
         return;
     };
-    let interval_secs = sec.reload_interval_secs.unwrap_or(DEFAULT_RELOAD_INTERVAL_SECS);
+    let interval_secs = sec
+        .reload_interval_secs
+        .unwrap_or(DEFAULT_RELOAD_INTERVAL_SECS);
 
     // CIP Security Phase 2c: EST enrollment/renewal (off unless `est.enabled`).
     let est = sec.est_enabled().cloned();
-    let est_renew_days = est.as_ref().map_or(DEFAULT_RENEW_BEFORE_DAYS, |e| e.renew_before_days(&sec));
-    let est_backoff = est.as_ref().map_or(Duration::from_secs(3600), |e| e.retry_backoff());
+    let est_renew_days = est
+        .as_ref()
+        .map_or(DEFAULT_RENEW_BEFORE_DAYS, |e| e.renew_before_days(&sec));
+    let est_backoff = est
+        .as_ref()
+        .map_or(Duration::from_secs(3600), |e| e.retry_backoff());
     // A generous fixed deadline for the whole EST exchange (connect + handshake + request/reply); EST
     // is a background provisioning step, never on the polling hot path.
     let connect_timeout = Duration::from_secs(20);
@@ -87,7 +95,11 @@ pub(crate) async fn run_security_lifecycle(
         return;
     }
     // When only EST is on but the reload watcher is disabled, still tick (default cadence) to enroll.
-    let tick_secs = if interval_secs == 0 { DEFAULT_RELOAD_INTERVAL_SECS } else { interval_secs };
+    let tick_secs = if interval_secs == 0 {
+        DEFAULT_RELOAD_INTERVAL_SECS
+    } else {
+        interval_secs
+    };
     let renew_before_days = sec
         .client
         .as_ref()
@@ -144,7 +156,11 @@ pub(crate) async fn run_security_lifecycle(
                                 "cert-enrolled",
                                 Some(format!(
                                     "EST {} succeeded for {} — wrote the new certificate to `{}`",
-                                    if reenroll { "re-enrollment" } else { "enrollment" },
+                                    if reenroll {
+                                        "re-enrollment"
+                                    } else {
+                                        "enrollment"
+                                    },
                                     cfg.connection.endpoint,
                                     out.written_to
                                 )),
@@ -278,12 +294,10 @@ mod tests {
 
     use super::*;
     use crate::app::Health;
+    use crate::config::GlobalConfig;
     use crate::device::ConnectionConfig;
     use crate::metrics::CONNECTION;
-    use crate::testutil::{
-        device_metrics_with, pki, RecordingEvents, RecordingMetrics,
-    };
-    use crate::config::GlobalConfig;
+    use crate::testutil::{device_metrics_with, pki, RecordingEvents, RecordingMetrics};
     use edgecommons::credentials::{
         CredentialService, DefaultCredentialService, FileKeyProvider, KeyProvider, LocalVault,
         PutOptions,
@@ -343,9 +357,15 @@ mod tests {
 
     /// Write `m` into the vault as the inline-`$secret` client identity + trust root.
     fn put_material(creds: &Arc<dyn CredentialService>, m: &Material) {
-        creds.put("tls/cert", m.cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/key", m.key_pem.as_bytes(), PutOptions::default()).unwrap();
-        creds.put("tls/root", m.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        creds
+            .put("tls/cert", m.cert_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/key", m.key_pem.as_bytes(), PutOptions::default())
+            .unwrap();
+        creds
+            .put("tls/root", m.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
     }
 
     /// Write `m` into the vault as a `{certPem, keyPem}` bundle at `name` (the `certSecret` style
@@ -353,7 +373,11 @@ mod tests {
     fn put_bundle(creds: &Arc<dyn CredentialService>, name: &str, m: &Material) {
         let bundle = json!({ "certPem": m.cert_pem, "keyPem": m.key_pem });
         creds
-            .put(name, serde_json::to_vec(&bundle).unwrap().as_slice(), PutOptions::default())
+            .put(
+                name,
+                serde_json::to_vec(&bundle).unwrap().as_slice(),
+                PutOptions::default(),
+            )
             .unwrap();
     }
 
@@ -429,7 +453,9 @@ mod tests {
         /// The `certExpiryDays` gauge as the metric surface would report it right now.
         async fn cert_expiry_gauge(&self) -> Option<f64> {
             self.dm.emit_now().await;
-            self.metrics.last(CONNECTION).and_then(|v| v.get("certExpiryDays").copied())
+            self.metrics
+                .last(CONNECTION)
+                .and_then(|v| v.get("certExpiryDays").copied())
         }
 
         /// One `<measure>Total` from the last `EtherNetIpConnection` row (§8's Total/Interval pair
@@ -472,7 +498,10 @@ mod tests {
         }))
         .unwrap();
         let rig = Rig::new(cfg, 72);
-        tokio::time::timeout(Duration::from_secs(5), rig.spawn()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rig.spawn())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     // ---- Phase 2b: rotation + expiry ----
@@ -488,7 +517,10 @@ mod tests {
 
         // Tick 1 (immediate) establishes the baseline; then rotate the vault material.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(!rig.events.has("cert-rotated"), "the first observation is a baseline, not a rotation");
+        assert!(
+            !rig.events.has("cert-rotated"),
+            "the first observation is a baseline, not a rotation"
+        );
         put_material(&rig.creds, &mint(500));
 
         // Tick 2 sees the change.
@@ -498,7 +530,10 @@ mod tests {
             .expect("the control channel is open");
         assert!(matches!(msg, DeviceControl::Reconnect { .. }));
         assert!(rig.events.has("cert-rotated"));
-        assert_eq!(rig.events.last_ctx("cert-rotated").unwrap()["security"], json!("tls"));
+        assert_eq!(
+            rig.events.last_ctx("cert-rotated").unwrap()["security"],
+            json!("tls")
+        );
         rig.cancel.cancel();
         driver.await.unwrap();
         assert!(
@@ -519,7 +554,10 @@ mod tests {
         // startup warns immediately rather than one cadence later.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(rig.events.count("cert-expiring"), 1);
-        let days = rig.cert_expiry_gauge().await.expect("the gauge is set on the first tick");
+        let days = rig
+            .cert_expiry_gauge()
+            .await
+            .expect("the gauge is set on the first tick");
         assert!((9.0..=10.0).contains(&days), "≈10 days to expiry: {days}");
 
         // Rotate to an already-expired cert: Rotated + Expired, each once.
@@ -530,9 +568,20 @@ mod tests {
             .unwrap();
         // Let the tick that follows re-observe the same (expired) material.
         tokio::time::sleep(Duration::from_millis(1_500)).await;
-        assert_eq!(rig.events.count("cert-expired"), 1, "expired warns once, not every tick");
-        assert_eq!(rig.events.count("cert-expiring"), 1, "and the earlier warning does not repeat");
-        let days = rig.cert_expiry_gauge().await.expect("the gauge follows the rotated cert");
+        assert_eq!(
+            rig.events.count("cert-expired"),
+            1,
+            "expired warns once, not every tick"
+        );
+        assert_eq!(
+            rig.events.count("cert-expiring"),
+            1,
+            "and the earlier warning does not repeat"
+        );
+        let days = rig
+            .cert_expiry_gauge()
+            .await
+            .expect("the gauge follows the rotated cert");
         assert!(days < 0.0, "an expired cert reports negative days: {days}");
         rig.cancel.cancel();
         driver.await.unwrap();
@@ -547,7 +596,10 @@ mod tests {
         // Nothing in the vault yet ⇒ the first tick's read fails.
         let driver = rig.spawn();
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(rig.events.events.lock().unwrap().is_empty(), "a failed read emits nothing");
+        assert!(
+            rig.events.events.lock().unwrap().is_empty(),
+            "a failed read emits nothing"
+        );
 
         // Provide material (tick 2 baselines it), then rotate it (tick 3 must still be running).
         put_material(&rig.creds, &mint(400));
@@ -596,7 +648,10 @@ mod tests {
             .await
             .expect("the lifecycle task ended with its device task")
             .unwrap();
-        assert!(rig.events.has("cert-rotated"), "it did observe the rotation before returning");
+        assert!(
+            rig.events.has("cert-rotated"),
+            "it did observe the rotation before returning"
+        );
     }
 
     // ---- Phase 2c: EST enrollment (real clock — real loopback TLS) ----
@@ -624,16 +679,33 @@ mod tests {
             }
         });
         let mut rig = Rig::new(tls_device(security), 78);
-        rig.creds.put("boot/cert", certs.client_cert_pem.as_bytes(), PutOptions::default()).unwrap();
-        rig.creds.put("boot/key", certs.client_key_pem.as_bytes(), PutOptions::default()).unwrap();
-        rig.creds.put("est/ca", certs.ca_pem.as_bytes(), PutOptions::default()).unwrap();
+        rig.creds
+            .put(
+                "boot/cert",
+                certs.client_cert_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        rig.creds
+            .put(
+                "boot/key",
+                certs.client_key_pem.as_bytes(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        rig.creds
+            .put("est/ca", certs.ca_pem.as_bytes(), PutOptions::default())
+            .unwrap();
         // A healthy certificate: tick 1 enrolls nothing and just baselines the watcher.
         put_bundle(&rig.creds, "ot/originator", &mint(400));
         let driver = rig.spawn();
 
         // Mid-cadence, the cert moves inside the renew window — tick 2 must re-enroll.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!rig.events.has("cert-enrolled"), "a healthy certificate is not renewed");
+        assert!(
+            !rig.events.has("cert-enrolled"),
+            "a healthy certificate is not renewed"
+        );
         put_bundle(&rig.creds, "ot/originator", &mint(5));
 
         let msg = tokio::time::timeout(Duration::from_secs(15), rig.rx.recv())
@@ -645,12 +717,21 @@ mod tests {
         driver.await.unwrap();
 
         // The enrollment itself.
-        let enrolled = rig.events.last_ctx("cert-enrolled").expect("cert-enrolled emitted");
+        let enrolled = rig
+            .events
+            .last_ctx("cert-enrolled")
+            .expect("cert-enrolled emitted");
         assert_eq!(enrolled["serial"], json!(pki::GOLDEN_SERIAL));
-        assert_eq!(enrolled["reenroll"], json!(true), "a current cert re-enrolls, not enrolls");
+        assert_eq!(
+            enrolled["reenroll"],
+            json!(true),
+            "a current cert re-enrolls, not enrolls"
+        );
         // …observed by the watcher on the same tick, naming the ENROLLED certificate.
         assert_eq!(
-            rig.events.last_ctx("cert-rotated").expect("cert-rotated emitted")["serial"],
+            rig.events
+                .last_ctx("cert-rotated")
+                .expect("cert-rotated emitted")["serial"],
             json!(pki::GOLDEN_SERIAL),
             "the watcher saw the enrolled material, not the pre-enrollment cert"
         );
@@ -704,7 +785,10 @@ mod tests {
         assert_eq!(rig.conn_total("estEnrollments").await, 0.0);
         let est = rig.health.est().expect("est status");
         assert_eq!((est.enrollments, est.failures), (0, 1));
-        assert!(est.last_error.is_some(), "the failure is surfaced on sb/status");
+        assert!(
+            est.last_error.is_some(),
+            "the failure is surfaced on sb/status"
+        );
         assert!(
             !rig.events.has("cert-enrolled"),
             "a failed enrollment keeps the current certificate"

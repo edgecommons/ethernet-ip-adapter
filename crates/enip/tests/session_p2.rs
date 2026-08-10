@@ -172,7 +172,12 @@ fn unitdata_reply(ctx: [u8; 8], addr: u32, seq: u16, mr: &[u8]) -> EncapFrame {
     w.u32(0);
     w.u16(0);
     w.put_slice(&cpf_bytes);
-    mk_frame(Command::SendUnitData, SESSION_HANDLE, ctx, w.into_bytes().to_vec())
+    mk_frame(
+        Command::SendUnitData,
+        SESSION_HANDLE,
+        ctx,
+        w.into_bytes().to_vec(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -234,19 +239,27 @@ async fn read_and_write_scalar_roundtrip() {
         let req = peer.recv().await.unwrap();
         let (svc, _data) = parse_ucmm_request(&req);
         assert_eq!(svc, 0x4C);
-        peer.send(&rrdata_reply(req.header.sender_context, &read_dint_mr(4242)))
-            .await;
+        peer.send(&rrdata_reply(
+            req.header.sender_context,
+            &read_dint_mr(4242),
+        ))
+        .await;
         // Write it back.
         let req = peer.recv().await.unwrap();
         let (svc, data) = parse_ucmm_request(&req);
         assert_eq!(svc, 0x4D);
         // data = type(2) + count(2) + value(4)
         assert_eq!(&data[0..2], &CipType::Dint.code().to_le_bytes());
-        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x4D, 0x00, &[], &[])))
-            .await;
+        peer.send(&rrdata_reply(
+            req.header.sender_context,
+            &mr_reply(0x4D, 0x00, &[], &[]),
+        ))
+        .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("PRODUCT_COUNT").unwrap();
     let r = client.read_tag(&tag, 1).await.unwrap();
     assert_eq!(r.value, CipValue::Dint(4242));
@@ -274,10 +287,13 @@ async fn read_array_roundtrip() {
             v.i32(x);
         }
         let mr = mr_reply(0x4C, 0x00, &[], v.as_slice());
-        peer.send(&rrdata_reply(req.header.sender_context, &mr)).await;
+        peer.send(&rrdata_reply(req.header.sender_context, &mr))
+            .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("ZONE_TEMPS").unwrap();
     let r = client.read_tag(&tag, 4).await.unwrap();
     assert_eq!(
@@ -312,18 +328,29 @@ async fn stale_reply_is_quarantined_never_answers_next_request() {
         // reply for request 1 first, immediately followed by request 2's real reply — TCP ordering
         // guarantees the client reads the stale one first and must discard it.
         let req2 = peer.recv().await.unwrap();
-        peer.send(&rrdata_reply(req1.header.sender_context, &read_dint_mr(111)))
-            .await;
-        peer.send(&rrdata_reply(req2.header.sender_context, &read_dint_mr(222)))
-            .await;
+        peer.send(&rrdata_reply(
+            req1.header.sender_context,
+            &read_dint_mr(111),
+        ))
+        .await;
+        peer.send(&rrdata_reply(
+            req2.header.sender_context,
+            &read_dint_mr(222),
+        ))
+        .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("A").unwrap();
 
     // Request 1 times out (reply withheld).
     let r1 = client.read_tag(&tag, 1).await;
-    assert!(matches!(r1, Err(enip::EnipError::Timeout { .. })), "got {r1:?}");
+    assert!(
+        matches!(r1, Err(enip::EnipError::Timeout { .. })),
+        "got {r1:?}"
+    );
     assert_eq!(client.stats().stale_replies, 0);
 
     // Request 2 must return ITS OWN value (222), not the stale 111.
@@ -353,10 +380,15 @@ async fn wrong_sender_context_reply_is_discarded() {
         let _ = peer.recv().await; // drain until client drops
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("A").unwrap();
     let r = client.read_tag(&tag, 1).await;
-    assert!(matches!(r, Err(enip::EnipError::Timeout { .. })), "got {r:?}");
+    assert!(
+        matches!(r, Err(enip::EnipError::Timeout { .. })),
+        "got {r:?}"
+    );
     assert_eq!(client.stats().stale_replies, 1);
     drop(client);
     server.abort();
@@ -387,9 +419,15 @@ async fn three_consecutive_timeouts_yield_connection_lost() {
     tokio::time::pause();
 
     let r1 = client.read_tag(&tag, 1).await;
-    assert!(matches!(r1, Err(enip::EnipError::Timeout { .. })), "1: {r1:?}");
+    assert!(
+        matches!(r1, Err(enip::EnipError::Timeout { .. })),
+        "1: {r1:?}"
+    );
     let r2 = client.read_tag(&tag, 1).await;
-    assert!(matches!(r2, Err(enip::EnipError::Timeout { .. })), "2: {r2:?}");
+    assert!(
+        matches!(r2, Err(enip::EnipError::Timeout { .. })),
+        "2: {r2:?}"
+    );
     let r3 = client.read_tag(&tag, 1).await;
     assert!(
         matches!(r3, Err(enip::EnipError::ConnectionLost { .. })),
@@ -457,7 +495,9 @@ async fn fragmented_read_reassembles_all_chunks() {
         }
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("BIG_ARRAY").unwrap();
     let r = client.read_tag(&tag, ELEMS as u16).await.unwrap();
     assert!(r.fragmented, "the read must have been fragmented");
@@ -519,7 +559,10 @@ async fn fragmented_read_respects_max_value_bytes_cap() {
     let client = EipClient::connect_over(client_io, opts).await.unwrap();
     let tag = TagAddress::parse("BIG_ARRAY").unwrap();
     let r = client.read_tag(&tag, 300).await;
-    assert!(matches!(r, Err(enip::EnipError::TooLarge { .. })), "got {r:?}");
+    assert!(
+        matches!(r, Err(enip::EnipError::TooLarge { .. })),
+        "got {r:?}"
+    );
     drop(client);
     server.abort();
 }
@@ -560,7 +603,9 @@ async fn tag_list_enumeration_pages() {
         .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let (page1, next) = client.list_tags(1, &Scope::Controller).await.unwrap();
     assert_eq!(page1.len(), 2);
     assert_eq!(page1[0].name, "PRODUCT_COUNT");
@@ -570,7 +615,10 @@ async fn tag_list_enumeration_pages() {
     assert!(!page1[1].symbol_type.is_value_supported()); // array
     assert_eq!(next, Some(3));
 
-    let (page2, next2) = client.list_tags(next.unwrap(), &Scope::Controller).await.unwrap();
+    let (page2, next2) = client
+        .list_tags(next.unwrap(), &Scope::Controller)
+        .await
+        .unwrap();
     assert_eq!(page2.len(), 1);
     assert_eq!(page2[0].name, "MOTOR");
     assert!(page2[0].symbol_type.is_struct());
@@ -598,7 +646,9 @@ async fn generic_get_attribute_single() {
         .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let raw = client.get_attribute_single(0x01, 1, 7).await.unwrap();
     assert_eq!(raw.as_ref(), &[0xDE, 0xAD, 0xBE, 0xEF]);
     drop(client);
@@ -622,7 +672,9 @@ async fn cip_error_status_surfaces_as_cip_error() {
         .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("NOPE").unwrap();
     let r = client.read_tag(&tag, 1).await;
     match r {
@@ -646,8 +698,13 @@ async fn connected_class3_read_sequence_match() {
         let req = peer.recv().await.unwrap();
         let (seq, svc, _d) = parse_connected_request(&req);
         assert_eq!(svc, 0x4C);
-        peer.send(&unitdata_reply(req.header.sender_context, t_o, seq, &read_dint_mr(555)))
-            .await;
+        peer.send(&unitdata_reply(
+            req.header.sender_context,
+            t_o,
+            seq,
+            &read_dint_mr(555),
+        ))
+        .await;
     });
 
     let opts = ClientOptions {
@@ -715,20 +772,31 @@ async fn connected_close_sends_forward_close() {
 
         let req = peer.recv().await.unwrap();
         let (seq, _svc, _d) = parse_connected_request(&req);
-        peer.send(&unitdata_reply(req.header.sender_context, t_o, seq, &read_dint_mr(7)))
-            .await;
+        peer.send(&unitdata_reply(
+            req.header.sender_context,
+            t_o,
+            seq,
+            &read_dint_mr(7),
+        ))
+        .await;
 
         // Graceful close: ForwardClose over UCMM, then UnRegisterSession.
         let close = peer.recv().await.unwrap();
         let (svc, _d) = parse_ucmm_request(&close);
         assert_eq!(svc, 0x4E, "expected ForwardClose");
-        peer.send(&rrdata_reply(close.header.sender_context, &mr_reply(0x4E, 0x00, &[], &[])))
-            .await;
+        peer.send(&rrdata_reply(
+            close.header.sender_context,
+            &mr_reply(0x4E, 0x00, &[], &[]),
+        ))
+        .await;
         let unreg = peer.recv().await.unwrap();
         assert_eq!(unreg.header.command, Command::UnRegisterSession);
     });
 
-    let opts = ClientOptions { connected_messaging: true, ..base_opts() };
+    let opts = ClientOptions {
+        connected_messaging: true,
+        ..base_opts()
+    };
     let client = EipClient::connect_over(client_io, opts).await.unwrap();
     let tag = TagAddress::parse("A").unwrap();
     client.read_tag(&tag, 1).await.unwrap();
@@ -747,12 +815,18 @@ async fn connected_forward_open_rejected() {
         let (svc, _d) = parse_ucmm_request(&req);
         assert_eq!(svc, 0x54);
         // Reject: general status 0x01 (connection failure), no fail body.
-        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x54, 0x01, &[], &[])))
-            .await;
+        peer.send(&rrdata_reply(
+            req.header.sender_context,
+            &mr_reply(0x54, 0x01, &[], &[]),
+        ))
+        .await;
         let _ = peer.recv().await;
     });
 
-    let opts = ClientOptions { connected_messaging: true, ..base_opts() };
+    let opts = ClientOptions {
+        connected_messaging: true,
+        ..base_opts()
+    };
     match EipClient::connect_over(client_io, opts).await {
         Err(enip::EnipError::ForwardOpenRejected { .. }) => {}
         Err(other) => panic!("expected ForwardOpenRejected, got {other:?}"),
@@ -770,7 +844,10 @@ async fn routed_ucmm_wraps_unconnected_send() {
         peer.handle_register().await;
         let req = peer.recv().await.unwrap();
         let (svc, _d) = parse_ucmm_request(&req);
-        assert_eq!(svc, 0x52, "routed request must be wrapped in Unconnected_Send");
+        assert_eq!(
+            svc, 0x52,
+            "routed request must be wrapped in Unconnected_Send"
+        );
         // The target executes the embedded read and returns its reply (service 0xCC).
         peer.send(&rrdata_reply(req.header.sender_context, &read_dint_mr(321)))
             .await;
@@ -803,7 +880,9 @@ async fn close_sends_unregister() {
         assert_eq!(unreg.header.command, Command::UnRegisterSession);
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("A").unwrap();
     client.read_tag(&tag, 1).await.unwrap();
     client.close().await;
@@ -822,17 +901,25 @@ async fn generic_set_and_get_all_attributes() {
         let (svc, data) = parse_ucmm_request(&req);
         assert_eq!(svc, 0x10); // Set_Attribute_Single
         assert_eq!(data.as_slice(), &[0xCA, 0xFE]);
-        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x10, 0x00, &[], &[])))
-            .await;
+        peer.send(&rrdata_reply(
+            req.header.sender_context,
+            &mr_reply(0x10, 0x00, &[], &[]),
+        ))
+        .await;
 
         let req = peer.recv().await.unwrap();
         let (svc, _d) = parse_ucmm_request(&req);
         assert_eq!(svc, 0x01); // Get_Attribute_All
-        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x01, 0x00, &[], &[1, 2, 3, 4])))
-            .await;
+        peer.send(&rrdata_reply(
+            req.header.sender_context,
+            &mr_reply(0x01, 0x00, &[], &[1, 2, 3, 4]),
+        ))
+        .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     client
         .set_attribute_single(0x01, 1, 4, Bytes::from_static(&[0xCA, 0xFE]))
         .await
@@ -857,11 +944,16 @@ async fn list_tags_program_scope() {
         assert!(data.is_empty() || !data.is_empty());
         let mut b = WireWriter::new();
         push_symbol(&mut b, 10, "LocalTimer", 0x00C4);
-        peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x55, 0x00, &[], b.as_slice())))
-            .await;
+        peer.send(&rrdata_reply(
+            req.header.sender_context,
+            &mr_reply(0x55, 0x00, &[], b.as_slice()),
+        ))
+        .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let (page, next) = client
         .list_tags(1, &Scope::Program("Main".to_string()))
         .await
@@ -891,8 +983,11 @@ async fn fragmented_struct_read_builds_struct_value() {
             let (svc, data) = parse_ucmm_request(&req);
             match svc {
                 0x4C => {
-                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x4C, 0x11, &[], &[])))
-                        .await;
+                    peer.send(&rrdata_reply(
+                        req.header.sender_context,
+                        &mr_reply(0x4C, 0x11, &[], &[]),
+                    ))
+                    .await;
                 }
                 0x52 => {
                     let mut dr = WireReader::new(&data);
@@ -907,15 +1002,20 @@ async fn fragmented_struct_read_builds_struct_value() {
                     body.u16(HANDLE);
                     body.put_slice(&full[offset..end]);
                     let status = if more { 0x06 } else { 0x00 };
-                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x52, status, &[], body.as_slice())))
-                        .await;
+                    peer.send(&rrdata_reply(
+                        req.header.sender_context,
+                        &mr_reply(0x52, status, &[], body.as_slice()),
+                    ))
+                    .await;
                 }
                 other => panic!("unexpected service 0x{other:02X}"),
             }
         }
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("MOTOR").unwrap();
     let r = client.read_tag(&tag, 1).await.unwrap();
     assert!(r.fragmented);
@@ -949,15 +1049,26 @@ async fn fragmented_write_chunks_large_array() {
             let (svc, _data) = parse_ucmm_request(&req);
             assert_eq!(svc, 0x53, "large write must fragment");
             chunks += 1;
-            peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x53, 0x00, &[], &[])))
-                .await;
+            peer.send(&rrdata_reply(
+                req.header.sender_context,
+                &mr_reply(0x53, 0x00, &[], &[]),
+            ))
+            .await;
         }
-        assert!(chunks >= 2, "expected multiple write fragments, got {chunks}");
+        assert!(
+            chunks >= 2,
+            "expected multiple write fragments, got {chunks}"
+        );
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("BIG_OUT").unwrap();
-    let value = CipValue::Array(CipType::Dint, (0..ELEMS as i32).map(CipValue::Dint).collect());
+    let value = CipValue::Array(
+        CipType::Dint,
+        (0..ELEMS as i32).map(CipValue::Dint).collect(),
+    );
     client.write_tag(&tag, CipType::Dint, &value).await.unwrap();
     drop(client);
     server.await.unwrap();
@@ -979,8 +1090,11 @@ async fn fragmented_string_read_is_unsupported_marker() {
             let (svc, data) = parse_ucmm_request(&req);
             match svc {
                 0x4C => {
-                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x4C, 0x06, &[], &[])))
-                        .await;
+                    peer.send(&rrdata_reply(
+                        req.header.sender_context,
+                        &mr_reply(0x4C, 0x06, &[], &[]),
+                    ))
+                    .await;
                 }
                 0x52 => {
                     let mut dr = WireReader::new(&data);
@@ -993,20 +1107,31 @@ async fn fragmented_string_read_is_unsupported_marker() {
                     body.u16(CipType::String.code());
                     body.put_slice(&full[offset..end]);
                     let status = if more { 0x06 } else { 0x00 };
-                    peer.send(&rrdata_reply(req.header.sender_context, &mr_reply(0x52, status, &[], body.as_slice())))
-                        .await;
+                    peer.send(&rrdata_reply(
+                        req.header.sender_context,
+                        &mr_reply(0x52, status, &[], body.as_slice()),
+                    ))
+                    .await;
                 }
                 other => panic!("unexpected service 0x{other:02X}"),
             }
         }
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("MESSAGE").unwrap();
     let r = client.read_tag(&tag, 1).await.unwrap();
     assert!(r.fragmented);
     assert_eq!(r.wire_type, CipType::String);
-    assert!(matches!(r.value, CipValue::Unsupported { type_code: 0xD0, .. }));
+    assert!(matches!(
+        r.value,
+        CipValue::Unsupported {
+            type_code: 0xD0,
+            ..
+        }
+    ));
     drop(client);
     server.await.unwrap();
 }
@@ -1022,12 +1147,24 @@ async fn write_struct_value_is_unsupported() {
         let _ = peer.recv().await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("MOTOR").unwrap();
     let r = client
-        .write_tag(&tag, CipType::Struct, &CipValue::Struct { handle: 1, bytes_len: 4 })
+        .write_tag(
+            &tag,
+            CipType::Struct,
+            &CipValue::Struct {
+                handle: 1,
+                bytes_len: 4,
+            },
+        )
         .await;
-    assert!(matches!(r, Err(enip::EnipError::Unsupported { .. })), "got {r:?}");
+    assert!(
+        matches!(r, Err(enip::EnipError::Unsupported { .. })),
+        "got {r:?}"
+    );
     drop(client);
     server.abort();
 }
@@ -1054,7 +1191,9 @@ async fn send_stall_severs_session_as_connection_lost() {
         std::future::pending::<()>().await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("A").unwrap();
     let value = CipValue::Array(CipType::Dint, (0..30i32).map(CipValue::Dint).collect());
     let r = client.write_tag(&tag, CipType::Dint, &value).await;
@@ -1066,7 +1205,10 @@ async fn send_stall_severs_session_as_connection_lost() {
     // The actor is gone, so the next request fails fast instead of speaking into a stream whose
     // framing we can no longer trust.
     let r2 = client.read_tag(&tag, 1).await;
-    assert!(matches!(r2, Err(enip::EnipError::Closed)), "follow-up: {r2:?}");
+    assert!(
+        matches!(r2, Err(enip::EnipError::Closed)),
+        "follow-up: {r2:?}"
+    );
 
     server.abort();
 }
@@ -1162,11 +1304,16 @@ async fn reply_with_matching_context_but_wrong_command_is_discarded() {
         ))
         .await;
         // Then the true reply.
-        peer.send(&rrdata_reply(req.header.sender_context, &read_dint_mr(4242)))
-            .await;
+        peer.send(&rrdata_reply(
+            req.header.sender_context,
+            &read_dint_mr(4242),
+        ))
+        .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("A").unwrap();
     let r = client.read_tag(&tag, 1).await.unwrap();
     assert_eq!(r.value, CipValue::Dint(4242));
@@ -1195,7 +1342,9 @@ async fn reply_with_wrong_session_handle_is_discarded() {
             .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let tag = TagAddress::parse("A").unwrap();
     let r = client.read_tag(&tag, 1).await.unwrap();
     assert_eq!(
@@ -1228,7 +1377,9 @@ async fn list_identity_reply_with_zero_handle_is_accepted() {
         .await;
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let id = client.identity().await.unwrap();
     assert_eq!(id.product_name, "1756-L71/B ");
     assert_eq!(id.serial_number, 0x1234_5678);
@@ -1265,7 +1416,9 @@ async fn expired_at_dequeue_completes_timeout_without_wire_io() {
     });
 
     // `base_opts()` gives a 200 ms request deadline and the default 3-timeout kill threshold.
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
 
     let first = tokio::spawn({
         let client = client.clone();
@@ -1281,9 +1434,15 @@ async fn expired_at_dequeue_completes_timeout_without_wire_io() {
 
     let tag = TagAddress::parse("A").unwrap();
     let r2 = client.read_tag(&tag, 1).await;
-    assert!(matches!(r2, Err(enip::EnipError::Timeout { .. })), "2: {r2:?}");
+    assert!(
+        matches!(r2, Err(enip::EnipError::Timeout { .. })),
+        "2: {r2:?}"
+    );
     let r1 = first.await.unwrap();
-    assert!(matches!(r1, Err(enip::EnipError::Timeout { .. })), "1: {r1:?}");
+    assert!(
+        matches!(r1, Err(enip::EnipError::Timeout { .. })),
+        "1: {r1:?}"
+    );
 
     // Request 2 expired in the queue: no wire I/O for it...
     assert_eq!(
@@ -1297,7 +1456,10 @@ async fn expired_at_dequeue_completes_timeout_without_wire_io() {
     // And the session is still alive: had the queue-expiry bumped `consecutive_timeouts`, this third
     // request would be the third strike and come back `ConnectionLost` instead.
     let r3 = client.read_tag(&tag, 1).await;
-    assert!(matches!(r3, Err(enip::EnipError::Timeout { .. })), "3: {r3:?}");
+    assert!(
+        matches!(r3, Err(enip::EnipError::Timeout { .. })),
+        "3: {r3:?}"
+    );
     assert_eq!(
         frames.load(Ordering::SeqCst),
         2,
@@ -1325,7 +1487,9 @@ async fn every_request_timeout_is_counted_whichever_path_it_takes() {
         while peer.recv().await.is_some() {}
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
 
     let mut tasks = Vec::with_capacity(REQUESTS);
     for _ in 0..REQUESTS {
@@ -1337,7 +1501,10 @@ async fn every_request_timeout_is_counted_whichever_path_it_takes() {
     }
     for (i, t) in tasks.into_iter().enumerate() {
         let r = t.await.unwrap();
-        assert!(matches!(r, Err(enip::EnipError::Timeout { .. })), "{i}: {r:?}");
+        assert!(
+            matches!(r, Err(enip::EnipError::Timeout { .. })),
+            "{i}: {r:?}"
+        );
     }
 
     assert_eq!(

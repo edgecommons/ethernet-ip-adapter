@@ -141,7 +141,12 @@ fn rrdata_reply(ctx: [u8; 8], mr: &[u8]) -> EncapFrame {
     w.u32(0); // interface handle
     w.u16(0); // timeout
     w.put_slice(&cpf_bytes);
-    mk_frame(Command::SendRRData, SESSION_HANDLE, ctx, w.into_bytes().to_vec())
+    mk_frame(
+        Command::SendRRData,
+        SESSION_HANDLE,
+        ctx,
+        w.into_bytes().to_vec(),
+    )
 }
 
 /// One `0x55` record: `u32 instance · u16 name length · name · u16 symbol type` (§7.3).
@@ -188,10 +193,13 @@ async fn list_tags_next_cursor_crosses_the_u16_boundary() {
         let mut peer = MockPeer::new(server_io);
         peer.handle_register().await;
         // status 0x06 — "more data", so a next cursor is derived.
-        peer.answer_tag_list(0x06, 0x0001_0005, "HIGH_INSTANCE_TAG").await
+        peer.answer_tag_list(0x06, 0x0001_0005, "HIGH_INSTANCE_TAG")
+            .await
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let (page, next) = client
         .list_tags(0x0001_0000, &Scope::Controller)
         .await
@@ -220,7 +228,9 @@ async fn list_tags_rejects_a_non_advancing_page() {
         peer.answer_tag_list(0x06, 100, "BACKWARDS").await
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let err = client
         .list_tags(500, &Scope::Controller)
         .await
@@ -256,7 +266,9 @@ async fn list_tags_rejects_an_out_of_order_page() {
             .await
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let err = client
         .list_tags(0, &Scope::Controller)
         .await
@@ -290,7 +302,9 @@ async fn list_tags_rejects_a_duplicated_instance_id() {
             .await
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let err = client
         .list_tags(0, &Scope::Controller)
         .await
@@ -320,7 +334,9 @@ async fn list_tags_end_of_instance_space_ends_the_walk() {
         peer.answer_tag_list(0x06, u32::MAX, "LAST").await
     });
 
-    let client = EipClient::connect_over(client_io, base_opts()).await.unwrap();
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
     let (page, next) = client
         .list_tags(0xFFFF_0000, &Scope::Controller)
         .await

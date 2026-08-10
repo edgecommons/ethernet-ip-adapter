@@ -122,7 +122,8 @@ impl CpfItem {
     }
 
     fn write(&self, w: &mut WireWriter) -> Result<(), WireError> {
-        let len = u16::try_from(self.data.len()).map_err(|_| WireError::Overflow { context: CONTEXT })?;
+        let len =
+            u16::try_from(self.data.len()).map_err(|_| WireError::Overflow { context: CONTEXT })?;
         w.u16(self.type_id.code());
         w.u16(len);
         w.put_slice(&self.data);
@@ -195,7 +196,8 @@ impl Cpf {
 
     /// Encode the item list. Fails only if an item's payload exceeds `u16::MAX` (our own value).
     pub fn encode(&self) -> Result<Bytes, WireError> {
-        let count = u16::try_from(self.items.len()).map_err(|_| WireError::Overflow { context: CONTEXT })?;
+        let count = u16::try_from(self.items.len())
+            .map_err(|_| WireError::Overflow { context: CONTEXT })?;
         let mut w = WireWriter::new();
         w.u16(count);
         for item in &self.items {
@@ -333,7 +335,9 @@ mod tests {
 
     #[test]
     fn item_type_is_total_and_roundtrips() {
-        for code in [0x0000u16, 0x000C, 0x00A1, 0x00B1, 0x00B2, 0x8000, 0x8001, 0x8002, 0xABCD] {
+        for code in [
+            0x0000u16, 0x000C, 0x00A1, 0x00B1, 0x00B2, 0x8000, 0x8001, 0x8002, 0xABCD,
+        ] {
             assert_eq!(ItemType::from_code(code).code(), code);
         }
         assert_eq!(ItemType::from_code(0xABCD), ItemType::Unknown(0xABCD));

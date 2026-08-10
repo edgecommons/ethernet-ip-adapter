@@ -79,7 +79,11 @@ const NOTIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Await one best-effort operator notification under [`NOTIFY_BUDGET`], logging (never failing) when
 /// it does not make it out in time.
-async fn notify(publish: impl std::future::Future<Output = ()>, instance: Option<&str>, what: &str) {
+async fn notify(
+    publish: impl std::future::Future<Output = ()>,
+    instance: Option<&str>,
+    what: &str,
+) {
     if tokio::time::timeout(NOTIFY_BUDGET, publish).await.is_err() {
         tracing::warn!(
             instance = instance.unwrap_or("-"),
@@ -228,7 +232,11 @@ pub(crate) fn launch_startup_set(
         ));
     }
 
-    StartupLaunch { launched, skipped, fatal }
+    StartupLaunch {
+        launched,
+        skipped,
+        fatal,
+    }
 }
 
 /// Why a candidate cannot be planned at all — the candidate is rejected and the running generation
@@ -969,7 +977,12 @@ mod tests {
         /// Build a runtime exactly as the production launcher does — handle, child token, spawned
         /// task — but with a stub task instead of a device loop. The stub records its own
         /// cancellation, which is what makes the stop-before-launch ordering assertable.
-        fn runtime(&self, cfg: &DeviceConfig, raw: &Value, cancel: CancellationToken) -> DeviceRuntime {
+        fn runtime(
+            &self,
+            cfg: &DeviceConfig,
+            raw: &Value,
+            cancel: CancellationToken,
+        ) -> DeviceRuntime {
             let health = Arc::new(Health::default());
             let (control, rx) = tokio::sync::mpsc::channel::<DeviceControl>(4);
             self.channels.lock().unwrap().push(rx);
@@ -1062,9 +1075,8 @@ mod tests {
         root: &CancellationToken,
     ) -> (Arc<DeviceRegistry>, Arc<Config>, Arc<GlobalConfig>) {
         let snap = snapshot(doc);
-        let global = Arc::new(
-            GlobalConfig::from_value(snap.global()).expect("the fixture global parses"),
-        );
+        let global =
+            Arc::new(GlobalConfig::from_value(snap.global()).expect("the fixture global parses"));
         let registry = Arc::new(DeviceRegistry::default());
         registry.set_global(Arc::clone(&global));
         for (id, raw) in candidate_instances(doc) {
@@ -1126,7 +1138,10 @@ mod tests {
         assert_eq!(p.keep, vec!["keep-me"]);
         assert_eq!(p.stop, vec!["change-me", "remove-me"]);
         assert_eq!(
-            p.start.iter().map(|(c, _)| c.id.clone()).collect::<Vec<_>>(),
+            p.start
+                .iter()
+                .map(|(c, _)| c.id.clone())
+                .collect::<Vec<_>>(),
             vec!["change-me", "add-me"]
         );
         assert_eq!(
@@ -1155,7 +1170,10 @@ mod tests {
         assert!(p.keep.is_empty(), "nothing survives a global change");
         assert_eq!(p.stop, vec!["plc-1", "plc-2"]);
         assert_eq!(
-            p.start.iter().map(|(c, _)| c.id.clone()).collect::<Vec<_>>(),
+            p.start
+                .iter()
+                .map(|(c, _)| c.id.clone())
+                .collect::<Vec<_>>(),
             vec!["plc-1", "plc-2"]
         );
         assert!(p.removed.is_empty(), "a restart is not a removal");
@@ -1270,9 +1288,16 @@ mod tests {
 
         let out = launch_startup_set(launcher.as_ref(), &devices, &global, &snap);
 
-        assert!(out.fatal.is_none(), "one bad instance is not a startup failure");
+        assert!(
+            out.fatal.is_none(),
+            "one bad instance is not a startup failure"
+        );
         assert_eq!(out.launched.len(), 2, "the healthy instances started");
-        let started: Vec<String> = out.launched.iter().map(|r| r.handle.cfg.id.clone()).collect();
+        let started: Vec<String> = out
+            .launched
+            .iter()
+            .map(|r| r.handle.cfg.id.clone())
+            .collect();
         assert_eq!(started, vec!["plc-1".to_string(), "io-1".to_string()]);
         assert_eq!(out.skipped.len(), 1);
         assert_eq!(out.skipped[0].0, "typo");
@@ -1300,8 +1325,14 @@ mod tests {
 
         assert!(out.launched.is_empty());
         assert_eq!(out.skipped.len(), 2);
-        let e = out.fatal.expect("a component that can serve nothing must not start").to_string();
-        assert!(e.contains("plc-1") && e.contains("plc-2"), "it names what it skipped: {e}");
+        let e = out
+            .fatal
+            .expect("a component that can serve nothing must not start")
+            .to_string();
+        assert!(
+            e.contains("plc-1") && e.contains("plc-2"),
+            "it names what it skipped: {e}"
+        );
     }
 
     /// A construction failure that is NOT a bad instance (a UNS-token violation, a runtime already
@@ -1319,7 +1350,10 @@ mod tests {
 
         let out = launch_startup_set(launcher.as_ref(), &devices, &global, &snap);
 
-        assert!(out.skipped.is_empty(), "a broken runtime is not a bad instance");
+        assert!(
+            out.skipped.is_empty(),
+            "a broken runtime is not a bad instance"
+        );
         assert!(out.fatal.is_some(), "it is fatal to startup");
         assert_eq!(
             out.launched.len(),
@@ -1336,8 +1370,10 @@ mod tests {
         let before = document(json!({}), vec![poll_instance("plc-1", 500)]);
         let all_bad = document(
             json!({}),
-            vec![json!({ "id": "broken", "adapter": "sim", "connection": { "endpoint": "x:1" },
-                         "pollGroups": [], "nonsense": true })],
+            vec![
+                json!({ "id": "broken", "adapter": "sim", "connection": { "endpoint": "x:1" },
+                         "pollGroups": [], "nonsense": true }),
+            ],
         );
         assert_eq!(
             plan(&running_of(&before), &non_instance_view(&before), &all_bad).unwrap_err(),
@@ -1434,7 +1470,10 @@ mod tests {
 
         let (startup, skipped) = parse_instances(&doc);
         assert_eq!(
-            startup.iter().map(|(c, _)| c.id.clone()).collect::<Vec<_>>(),
+            startup
+                .iter()
+                .map(|(c, _)| c.id.clone())
+                .collect::<Vec<_>>(),
             vec!["plc-1", "plc-2"],
             "the duplicate id is launched once, and the id-less entry not at all"
         );
@@ -1443,7 +1482,11 @@ mod tests {
             Some(500),
             "first declaration wins, exactly as `Config::instance` resolves it"
         );
-        assert_eq!(skipped.len(), 1, "the malformed entry is skipped, not fatal");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the malformed entry is skipped, not fatal"
+        );
         assert_eq!(skipped[0].0, "broken");
 
         // …and the plan agrees with that startup set: re-applying the same document moves nothing.
@@ -1474,7 +1517,10 @@ mod tests {
         assert!(!p.restart_all);
         assert_eq!(p.keep, vec!["plc-1"]);
         assert_eq!(
-            p.start.iter().map(|(c, _)| c.id.clone()).collect::<Vec<_>>(),
+            p.start
+                .iter()
+                .map(|(c, _)| c.id.clone())
+                .collect::<Vec<_>>(),
             vec!["plc-2"],
             "the instance that is not running starts, unchanged raw or not"
         );
@@ -1495,11 +1541,17 @@ mod tests {
     async fn commit_stops_then_swaps_global_then_launches_in_order() {
         let before = document(
             json!({}),
-            vec![poll_instance("keep-me", 500), poll_instance("change-me", 500)],
+            vec![
+                poll_instance("keep-me", 500),
+                poll_instance("change-me", 500),
+            ],
         );
         let after = document(
             json!({ "timeouts": { "requestTimeoutMs": 1500 } }),
-            vec![poll_instance("keep-me", 500), poll_instance("change-me", 250)],
+            vec![
+                poll_instance("keep-me", 500),
+                poll_instance("change-me", 250),
+            ],
         );
 
         let launcher = FakeLauncher::new();
@@ -1545,9 +1597,16 @@ mod tests {
             .filter(|(kind, _)| *kind == "launch")
             .map(|(_, id)| id.clone())
             .collect();
-        assert_eq!(launched, vec!["keep-me", "change-me"], "launches in plan order");
+        assert_eq!(
+            launched,
+            vec!["keep-me", "change-me"],
+            "launches in plan order"
+        );
         let last_stop = order.iter().rposition(|(kind, _)| *kind == "stop").unwrap();
-        let first_launch = order.iter().position(|(kind, _)| *kind == "launch").unwrap();
+        let first_launch = order
+            .iter()
+            .position(|(kind, _)| *kind == "launch")
+            .unwrap();
         assert!(
             last_stop < first_launch,
             "every replaced instance stopped BEFORE any successor launched: {order:?}"
@@ -1573,11 +1632,17 @@ mod tests {
     async fn commit_keeps_untouched_runtimes_by_identity() {
         let before = document(
             json!({}),
-            vec![poll_instance("paused-one", 500), poll_instance("other", 500)],
+            vec![
+                poll_instance("paused-one", 500),
+                poll_instance("other", 500),
+            ],
         );
         let after = document(
             json!({}),
-            vec![poll_instance("paused-one", 500), poll_instance("other", 250)],
+            vec![
+                poll_instance("paused-one", 500),
+                poll_instance("other", 250),
+            ],
         );
 
         let launcher = FakeLauncher::new();
@@ -1677,7 +1742,9 @@ mod tests {
 
         let budget = crate::lifecycle::stop_budget(&global.timeouts);
         let started = tokio::time::Instant::now();
-        tx.commit().await.expect("a wedged stop is not a commit failure");
+        tx.commit()
+            .await
+            .expect("a wedged stop is not a commit failure");
         let elapsed = tokio::time::Instant::now().saturating_duration_since(started);
 
         assert!(
@@ -1779,12 +1846,20 @@ mod tests {
             .await
             .unwrap();
         launcher.fail_all();
-        let err = tx.commit().await.expect_err("nothing runs after the commit");
+        let err = tx
+            .commit()
+            .await
+            .expect_err("nothing runs after the commit");
         assert_eq!(err.code, CODE_NO_RUNNING_INSTANCES);
-        assert!(registry.is_empty(), "the failed commit left nothing running");
+        assert!(
+            registry.is_empty(),
+            "the failed commit left nothing running"
+        );
 
         launcher.fail_none();
-        tx.rollback().await.expect("the prior generation is restored");
+        tx.rollback()
+            .await
+            .expect("the prior generation is restored");
 
         assert_eq!(
             registry.ids(),
@@ -1800,7 +1875,11 @@ mod tests {
         assert_eq!(
             launches
                 .iter()
-                .map(|l| (l.id.clone(), l.snapshot == prior_snapshot, l.global == prior_global))
+                .map(|l| (
+                    l.id.clone(),
+                    l.snapshot == prior_snapshot,
+                    l.global == prior_global
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 ("plc-1".to_string(), true, true),
@@ -1996,8 +2075,10 @@ mod tests {
 
         let no_instances = document(
             json!({}),
-            vec![json!({ "id": "broken", "adapter": "sim", "connection": { "endpoint": "x:1" },
-                         "pollGroups": [], "nonsense": true })],
+            vec![
+                json!({ "id": "broken", "adapter": "sim", "connection": { "endpoint": "x:1" },
+                         "pollGroups": [], "nonsense": true }),
+            ],
         );
         let err = refusal(
             coord
@@ -2013,7 +2094,9 @@ mod tests {
             vec![poll_instance("plc-1", 500)],
         );
         let err = refusal(
-            coord.prepare_configuration_apply(snapshot(&bad_global)).await,
+            coord
+                .prepare_configuration_apply(snapshot(&bad_global))
+                .await,
             "a candidate with a malformed global must be refused",
         );
         assert_eq!(err.code, CODE_INVALID_GLOBAL);
@@ -2039,7 +2122,9 @@ mod tests {
 
         let starting = coordinator(&launcher, &registry, &root, &snap, &global, false);
         let err = refusal(
-            starting.prepare_configuration_apply(snapshot(&before)).await,
+            starting
+                .prepare_configuration_apply(snapshot(&before))
+                .await,
             "a reload before startup finished must be refused",
         );
         assert_eq!(err.code, CODE_STARTING);

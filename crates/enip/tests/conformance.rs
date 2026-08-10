@@ -64,10 +64,8 @@ fn sweep_no_panic<T, E>(full: &[u8], decode: impl Fn(&[u8]) -> Result<T, E>) {
 }
 
 // Real bytes captured from a live cpppo simulator (mirrored in the §12.4 manifest, `tests/vectors`).
-const REGISTER_SESSION_REQUEST: &str =
-    "65000400000000000000000052454749535445520000000001000000";
-const REGISTER_SESSION_REPLY: &str =
-    "65000400dfab99c60000000052454749535445520000000001000000";
+const REGISTER_SESSION_REQUEST: &str = "65000400000000000000000052454749535445520000000001000000";
+const REGISTER_SESSION_REPLY: &str = "65000400dfab99c60000000052454749535445520000000001000000";
 const READ_TAG_REPLY_FRAME: &str =
     "6f001a00dfab99c600000000524541445441475f00000000000000000000020000000000b2000a00cc000000c40000000000";
 const READ_TAG_REPLY_MISSING_FRAME: &str =
@@ -111,7 +109,10 @@ fn sweep_cpf() {
 
 #[test]
 fn sweep_sockaddr_and_sequenced_address() {
-    sweep_truncated(&hx("0002 08ae c0a80132 0000000000000000"), SockAddrInfo::decode);
+    sweep_truncated(
+        &hx("0002 08ae c0a80132 0000000000000000"),
+        SockAddrInfo::decode,
+    );
     sweep_truncated(&hx("11223344 00000007"), SequencedAddress::decode);
 }
 
@@ -126,8 +127,14 @@ fn sweep_identity() {
 
 #[test]
 fn sweep_message_reply_and_values() {
-    sweep_no_panic(&mr_reply_from_frame(READ_TAG_REPLY_FRAME), MessageReply::decode);
-    sweep_no_panic(&mr_reply_from_frame(READ_TAG_REPLY_MISSING_FRAME), MessageReply::decode);
+    sweep_no_panic(
+        &mr_reply_from_frame(READ_TAG_REPLY_FRAME),
+        MessageReply::decode,
+    );
+    sweep_no_panic(
+        &mr_reply_from_frame(READ_TAG_REPLY_MISSING_FRAME),
+        MessageReply::decode,
+    );
     sweep_no_panic(&hx("c40000000000"), CipValue::decode_tagged);
     sweep_no_panic(&hx("01000000020000000300000004000000"), |b| {
         CipValue::decode(CipType::Dint, b)
@@ -136,7 +143,11 @@ fn sweep_message_reply_and_values() {
 
 #[test]
 fn sweep_tag_path_parser_never_panics() {
-    for tag in ["Program:Main.FillTimer.ACC", "ZONE_TEMPS[3]", "PROFILE[0,1,257]"] {
+    for tag in [
+        "Program:Main.FillTimer.ACC",
+        "ZONE_TEMPS[3]",
+        "PROFILE[0,1,257]",
+    ] {
         let bytes = tag.as_bytes();
         for n in 0..=bytes.len() {
             let prefix = std::str::from_utf8(&bytes[..n]).unwrap();
