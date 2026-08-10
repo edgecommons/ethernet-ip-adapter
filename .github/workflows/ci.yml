@@ -116,8 +116,12 @@ jobs:
       - name: Coverage gate (90% lines, workspace-wide; no product file excluded — live-peer suites + fuzz workspace + test doubles only)
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        # `--locked` is load-bearing, not tidiness: the committed lock had been generated with the
+        # gitignored local-path `[patch]` active, so it carried no git source for `edgecommons` at
+        # all. Every clean build silently re-resolved and rewrote a tracked file, and a genuinely
+        # reproducible build was impossible. Without this flag CI cannot tell the difference.
         run: >
-          cargo llvm-cov --workspace
+          cargo llvm-cov --workspace --locked
           --ignore-filename-regex '(tests[/\\]live_(cpppo|opener|ab_server|ethernetipsharp|tls|cip_security)\.rs|testutil\.rs|fuzz[/\\])'
           --fail-under-lines 90
           --cobertura --output-path target/cobertura.xml
@@ -310,9 +314,9 @@ jobs:
         env:
           ENIP_LIVE_REQUIRED: "1"
         run: |
-          cargo test -p ec-enip --test live_cpppo --test live_ab_server \
+          cargo test --locked -p ec-enip --test live_cpppo --test live_ab_server \
             --test live_ethernetipsharp --test live_cip_security -- --nocapture
-          cargo test -p ec-enip --features tls --test live_tls -- --nocapture
+          cargo test --locked -p ec-enip --features tls --test live_tls -- --nocapture
       - name: adapter in-source live tests — EST enrollment + TLS cert rotation, skip-free
         env:
           ENIP_LIVE_REQUIRED: "1"
@@ -320,7 +324,7 @@ jobs:
         # named `live_…`. It sweeps in a handful of ordinary unit tests whose names happen to contain
         # the substring (`…keepalive_…`, `…the_live_…`); they are fast and hermetic, and running them
         # twice costs nothing next to letting a live test sit outside the gate.
-        run: cargo test -p ethernet-ip-adapter live_ -- --nocapture
+        run: cargo test --locked -p ethernet-ip-adapter live_ -- --nocapture
       - name: live_opener — class-3 idle + latest-wins flood (the peer must stay alive)
         env:
           ENIP_LIVE_REQUIRED: "1"

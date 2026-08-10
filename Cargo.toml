@@ -27,7 +27,7 @@ license = "BUSL-1.1"
 # edgecommons Rust library — pinned by git rev (rust-lib/v0.5.0). The gitignored `.cargo/config.toml`
 # patches this to the local sibling checkout for dev; CI builds the pinned rev. The `enip` crate never
 # depends on it.
-edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false }
+edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "cdbebad8d97ba8477ee828df328c62edfe4e2486", default-features = false }
 tokio = { version = "1" }
 tokio-util = { version = "0.7" }
 bytes = { version = "1" }
