@@ -13,7 +13,15 @@
 //!   commands (`ListIdentity`/`ListServices`/`ListInterfaces`) are sessionless-capable per §5.2, so
 //!   their replies are matched on context + command only (live targets commonly answer them with
 //!   handle 0). Everything that fails a check is counted and discarded, never delivered
-//!   ([`match_reply`]).
+//!   ([`match_reply`]). Ahead of all of it sits the §5.1 `options` gate: the field is always 0, so a
+//!   frame carrying anything else is discarded and counted (`discarded_options`) before correlation
+//!   is even attempted (D-ENIP-21).
+//! * **Session poisoning** (§5.6, D-ENIP-22): a correlated reply whose encapsulation status is
+//!   `InvalidSessionHandle` (`0x0064`) completes its caller with `Err(Encap(..))` and then **kills
+//!   the actor**. The target has forgotten our registration, so nothing later on this stream can
+//!   succeed; severing hands recovery to the owner's reconnect immediately instead of deferring it
+//!   to an arbitrary later failure, and keeps a dead session's replies from feeding the class-3
+//!   keepalive clock (§7.6 — `send_connected` touches it only after a transaction returns `Ok`).
 //! * **Per-request deadlines** (§10.4): the deadline is **absolute** and computed at *enqueue* time in
 //!   [`crate::client::EipClient::transaction`], so queue wait counts against the caller's budget and
 //!   every phase — actor hand-off, frame write, reply read — is bounded by the same instant. On expiry
@@ -73,6 +81,10 @@ pub(crate) struct SessionStats {
     /// the observable evidence that the session is feeding the target's connection watchdog. A
     /// keepalive whose reply carried a CIP error still counts: the exchange flowed.
     pub keepalives_sent: AtomicU64,
+    /// Replies discarded because the encapsulation `options` field was not 0 (§5.1, D-ENIP-21) — a
+    /// distinct cause from staleness, so a peer that stamps the field is diagnosable on its own
+    /// counter rather than hidden inside `stale_replies`.
+    pub discarded_options: AtomicU64,
 }
 
 /// A single request/reply transaction for the actor to run.
@@ -391,25 +403,58 @@ where
         };
         loop {
             match read_outcome(&mut self.stream, &mut self.buf, &mut self.codec, deadline).await {
-                ReadOutcome::Frame(reply) => match match_reply(&expected, &reply.header) {
-                    ReplyMatch::Match => {
-                        self.consecutive_timeouts = 0;
-                        let _ = t.reply_tx.send(Ok(reply));
-                        return Ok(());
+                ReadOutcome::Frame(reply) => {
+                    // §5.1 (D-ENIP-21) — the encapsulation `options` field is always 0, and a
+                    // received packet carrying anything else is discarded per spec. Checked BEFORE
+                    // correlation: the frame is malformed at the encapsulation layer, so which
+                    // request it claims to answer is not yet a meaningful question, and the cause
+                    // gets its own counter instead of being filed as ordinary staleness. The
+                    // absolute deadline still bounds the wait, so a peer cannot extend a request by
+                    // dribbling such frames.
+                    if reply.header.options != 0 {
+                        self.stats.discarded_options.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            options = reply.header.options,
+                            "discarding reply with non-zero encapsulation options"
+                        );
+                        continue;
                     }
-                    // Stale reply from a timed-out predecessor (§10.3/§10.4): drop + count, keep
-                    // waiting for the reply that actually matches this request's context.
-                    ReplyMatch::StaleContext => {
-                        self.stats.stale_replies.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!("discarding stale reply: context mismatch");
+                    match match_reply(&expected, &reply.header) {
+                        ReplyMatch::Match => {
+                            self.consecutive_timeouts = 0;
+                            // §5.6 (D-ENIP-22) — `InvalidSessionHandle` says the target no longer
+                            // recognises our registration, whatever command asked. Deliver the
+                            // typed status to this caller AND sever: no later request on this
+                            // stream can succeed, so limping on would only defer recovery to some
+                            // arbitrary later failure. The owner's reconnect re-registers — the
+                            // adapter maps a session-poisoning `Encap` status to transient; the
+                            // crate never re-registers in place.
+                            if reply.header.status.poisons_session() {
+                                tracing::warn!(
+                                    status = %reply.header.status,
+                                    "severing the session: the target no longer recognises our \
+                                     session handle"
+                                );
+                                let _ = t.reply_tx.send(Err(EnipError::Encap(reply.header.status)));
+                                return Err(());
+                            }
+                            let _ = t.reply_tx.send(Ok(reply));
+                            return Ok(());
+                        }
+                        // Stale reply from a timed-out predecessor (§10.3/§10.4): drop + count,
+                        // keep waiting for the reply that actually matches this request's context.
+                        ReplyMatch::StaleContext => {
+                            self.stats.stale_replies.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!("discarding stale reply: context mismatch");
+                        }
+                        // Our context, but a field a compliant target must echo disagrees — a peer
+                        // defect. Never delivered; the deadline still bounds the wait.
+                        ReplyMatch::HeaderMismatch(field) => {
+                            self.stats.stale_replies.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(field, "reply header mismatch on a correlated context");
+                        }
                     }
-                    // Our context, but a field a compliant target must echo disagrees — a peer
-                    // defect. Never delivered; the deadline still bounds the wait.
-                    ReplyMatch::HeaderMismatch(field) => {
-                        self.stats.stale_replies.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(field, "reply header mismatch on a correlated context");
-                    }
-                },
+                }
                 ReadOutcome::Eof => {
                     let _ = t.reply_tx.send(Err(EnipError::ConnectionLost {
                         context: "session eof",

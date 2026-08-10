@@ -34,7 +34,7 @@ Grounding artifacts (verified 2026-07-18, do not work from memory):
 ## Table of contents
 
 1. [Goals, non-goals & isolation contract](#1-goals-non-goals--isolation-contract)
-2. [Decisions register (D-ENIP-1…D-ENIP-18)](#2-decisions-register)
+2. [Decisions register (D-ENIP-1…D-ENIP-22)](#2-decisions-register)
 3. [Workspace & crate layout](#3-workspace--crate-layout)
 4. [Memory-safe decoding: the `WireReader` invariant](#4-memory-safe-decoding-the-wirereader-invariant)
 5. [Encapsulation layer](#5-encapsulation-layer)
@@ -148,6 +148,8 @@ throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.
 | **D-ENIP-17** | **A ForwardOpen reply cannot steer our class-1 traffic.** (a) The O→T Sockaddr Info item retargets the **port only**: the transmit address is always the target's own. A sockaddr naming `0.0.0.0` contributes its port; one naming the target's address is honoured as written; one naming any other address — foreign unicast, broadcast, multicast, loopback — has its address **refused** (warned, naming the address) and only its port kept. With no known target address a redirect is unresolvable and the open fails. (b) The T→O multicast group is joined **only** when the ForwardOpen requested `ConnType::Multicast` for T→O; a multicast T→O sockaddr answering any other request is a `ProtocolViolation` whose detail names the type that was requested (`"multicast T→O sockaddr on a point-to-point request"`, `"multicast T→O sockaddr on a null (reconfigure) request"`) — the adapter only ever requests P2P, but the crate API accepts either, and a violation must not misreport which one it refused. A requested-multicast connection whose reply carries a unicast or absent T→O sockaddr consumes unicast. Both paths keep the D-ENIP-16 teardown invariant (best-effort ForwardClose before the typed error). Strict by default, with no opt-out knob. | Honouring a concrete foreign address let any target aim our cyclic O→T stream at a third party — a reflection/amplification primitive driven entirely by an attacker-controlled reply — and a multicast offer subscribed our socket to an arbitrary group on a connection we asked to keep point-to-point. The address is the one field the originator already knows (it opened the TCP session); the port is the only field a target legitimately needs to move, which is why the split is address-refuse/port-honour rather than reject-the-reply — real targets that relocate the port keep working. No config knob ships: a strict default needs none, and if field interop ever demands honouring a foreign redirect, that is a `ClientOptions` opt-in to be argued on evidence, not a hedge built in advance. **The refusal is observable, not just logged:** it increments `refused_redirects` on the connection (`enip::IoStats`, 0 or 1 per connection), and the adapter surfaces it as the `refusedRedirects` measure (DESIGN §8.8) plus a one-shot `io-redirect-refused` warning event per ForwardOpen. That closes the one narrow silent failure mode the address-refusal leaves: a device that both *requires* the redirect to receive O→T **and** never enforces its own O→T inactivity watchdog keeps producing inputs while its outputs are dead, and the local `send_to` still succeeds — so `sendErrors` cannot catch it and the adapter would otherwise report the link healthy. |
 | **D-ENIP-18** | **The class-3 inactivity keepalive is crate-owned and window-derived, with no adapter knob.** A class-3 ForwardOpen arms an inactivity watchdog on the target (`timeout_multiplier × O→T API`), so the crate keeps the connection off it: when no request has flowed for **¾ of the window** the session sends a connected `Get_Attribute_Single` of the Identity object (`0x01`, instance 1, attribute 4 = Revision). The window comes from the negotiated values — the reply's actual O→T API when it lies in [100 µs, 600 s], else the clamped requested RPI — and the requested pair is `ClientOptions.class3_rpi` / `class3_timeout_multiplier` (defaults 2 s / ×16, the values the crate previously hard-coded, so a caller that changes nothing emits a byte-identical ForwardOpen). An implausible reply API falls back; it never fails the open (§7.6). Any completed exchange, CIP-error replies included, counts as activity; `ClientStats.keepalives_sent` is the observable face. **No adapter config-schema key is added.** | Feeding the connection's own watchdog is a protocol obligation of the connection's owner, and the owner is this crate — an adapter that has to remember to poll fast enough is a defect waiting for the first paused instance or slow poll group (the adapter's only idle traffic is a `ListIdentity` encapsulation command, which never rides the connected path and so cannot feed the watchdog at any cadence). Deriving the window from the negotiated values rather than a constant means a target that shortens the interval is honoured instead of outlived. The values become options because they are what arms the watchdog and a field device may need them moved; they stay out of the adapter's schema because nothing about a correct default needs operator attention, and the adapter's `keepaliveProbeIntervalMs` is a different surface entirely (paused-state health reporting) that stays as it is. |
 | **D-ENIP-19** | **Tag-enumeration cursors are full 32-bit symbol-instance ids, never masked, and the walk is bounded by the crate.** `list_tags(start_instance: u32, ..) -> (Vec<SymbolInfo>, Option<u32>)` carries the cursor at the same width as `SymbolInfo.instance_id`, and `Segment::Instance` widens to the 32-bit logical form (`0x26`, §6.2) so the request can address it. Three crate-side rules bound the walk regardless of the peer: the records of one page must be **strictly ascending** in instance id or the page is `ProtocolViolation { detail: "tag list page is not in ascending instance order" }`; a `0x06` page whose derived resume point does not advance past `start_instance` is `ProtocolViolation { detail: "tag list page did not advance" }`; and a last record at `u32::MAX` ends the enumeration rather than wrapping (§7.3). | The 16-bit cursor was not a capacity limit but a **liveness** bug: real Logix controllers exceed 65 535 symbol instances, and masking the resume point back into 16 bits sent a caller that pages to completion around the same pages forever — the adapter's hierarchical browse did exactly that, so the observable failure was a command handler that never returned. Widening alone would have left the loop reachable from a merely non-compliant peer, so the ordering the reply already promises is checked instead of trusted — **both** of the things that ordering buys, not just one: the *resume point* must move forward (or the walk revisits pages, the hang), and the page's *own records* must ascend (or every resume point derived from the last one — this crate's `last_id + 1` and any page size a caller cuts to on top of it — silently strands whatever sat behind it, the exact defect the truthful-`max` contract exists to kill, DESIGN D-EIP-29). Each costs one comparison per record and converts a hang or a silent skip into a typed error at the layer that can name the cause. The `0x26` form is the ODVA-defined third width of the same logical segment (the `Element` segment already emitted its `0x2A` analogue), so nothing new is invented on the wire — and because no container sim serves instances that high, it is pinned by hand-assembled golden vectors (§12.4) and cross-checked live against EthernetIPSharp, which parses the segment and answers at the CIP layer (DESIGN §11.7). |
+| **D-ENIP-21** | **Encapsulation-header validation is complete, not partial.** (a) `options ≠ 0` is enforced, not just documented: inside a session the frame is discarded **before** correlation and counted on its own cause (`ClientStats.discarded_options`, warn-logged); at the RegisterSession handshake it is a refusal (`ProtocolViolation`). (b) The **RegisterSession reply is correlated** — it must echo the request's `sender_context` (`ECREGIST`), checked *first*, ahead of command/options/status/handle/version (§5.5). (c) A **non-zero CIP interface handle** in a `SendRRData`, `SendUnitData`, or Connection-Manager UCMM reply is a `ProtocolViolation` at all three decode sites (§5.2). | The header was matched on context, command and handle but never on `options`, and the one exchange with no correlation at all was the handshake that establishes the session: any RegisterSession-shaped frame already on the stream could be adopted as our session, and a peer stamping `options` could answer a request with a frame the spec says to drop. The interface handle was read and thrown away at three sites while §5.2 declares it 0 — a peer addressing another interface is not speaking the CIP encapsulation we asked for, so its payload is not a Message Router reply we may decode and nothing in it may bind a connection. The asymmetry between the two `options` dispositions is deliberate: mid-session the actor has a deadline and other frames may follow, so discard-and-keep-waiting is right; pre-actor exactly one frame is expected, so looping over discards buys nothing and adopting a session from a peer this broken is worse. The counter is its own field rather than folded into `stale_replies` because the two say different things about the peer (§10.2, never silent). **Interop arbitration:** the context echo and the interface-handle refusals are spec-correct but strict, so the live-sims gate (cpppo, OpENer, ab_server, EthernetIPSharp, stunnel-TLS ×2, OpENer-CIPSec, EST) is the false-positive check; the pre-approved concessions, to be taken only on evidence of a real peer failing, are accepting an all-zero context on RegisterSession with a one-time warn and/or demoting the interface-handle refusal to a counted warn. **No concession is taken: no fallback is implemented.** |
+| **D-ENIP-22** | **Encapsulation status `0x0064` (`InvalidSessionHandle`) severs the session at the actor.** The caller that provoked it still gets `Err(Encap(InvalidSessionHandle))`; the actor then exits, so every pending and subsequent request completes `Err(Closed)` without stream I/O. The rule applies to **any** correlated reply, discovery commands included. Recovery is the owner's reconnect — the adapter's classification maps a session-poisoning `Encap` status to transient (DESIGN §10.1) — and the crate never re-registers in place. | The status is a statement about our *registration*, not about the command that provoked it: once the target has forgotten the handle, nothing later on that stream can succeed. Delivering the typed error and then carrying on merely deferred recovery to whatever arbitrary later failure happened next, and left a *live* actor speaking into a session the device had already torn down. It also fed the class-3 inactivity keepalive: `send_connected` touches the activity clock only after the transaction returns `Ok`, so while the poisoned frame was delivered as `Ok` the clock was refreshed by a dead session's reply and the probe cadence went on "keeping alive" a handle that no longer existed (§7.6). Severing at the actor fixes both with one rule, in the one place that owns the stream. In-crate re-registration was rejected as a non-goal: the adapter's reconnect ladder already classifies the status as transient and owns backoff, alarms and instance state — a second, silent recovery path inside the crate would race it. |
 
 ---
 
@@ -288,6 +290,13 @@ items, §5.4):
 | 12 | 8 | `sender_context` | opaque to the target, echoed verbatim in the reply — our correlation key (§10.3) |
 | 20 | 4 | `options` | always 0; a received packet with options ≠ 0 is discarded per spec |
 
+The `options` rule is enforced, not merely documented (D-ENIP-21). Inside a session the actor drops
+such a frame **before** it attempts correlation — the frame is malformed at the encapsulation layer,
+so which request it claims to answer is not yet a meaningful question — counts it on its own cause
+(`ClientStats.discarded_options`, never folded into `stale_replies`), logs it at warn, and keeps
+waiting inside the request's absolute deadline. During the RegisterSession handshake the same value
+is a **refusal** instead: see §5.5.
+
 TCP framing (`encap/codec.rs`): read 24 bytes → validate `length ≤ 65511` → read `length` bytes →
 one `EncapFrame`. The codec enforces the cap *before* buffering (a hostile `length` cannot cause
 over-allocation), skips `NOP` (0x0000) frames, and treats a header that cannot arrive (EOF
@@ -306,9 +315,16 @@ mid-frame) as `EnipError::ConnectionLost`.
 | `SendRRData` | `0x006F` | req/reply, TCP | carries unconnected CIP (UCMM); data = interface handle `u32=0` + timeout `u16=0` + CPF |
 | `SendUnitData` | `0x0070` | send only (either direction), TCP | carries connected class-3 CIP; same interface-handle/timeout prefix + CPF |
 
-`SendRRData`/`SendUnitData` reply decode reads interface handle (must be 0) and timeout through the
+`SendRRData`/`SendUnitData` reply decode reads the CIP interface handle and timeout through the
 cursor, then hands the remainder to the CPF decoder — a `< 6`-byte data portion is
-`WireError::Truncated` (invariant 6).
+`WireError::Truncated` (invariant 6). The interface handle is **0 by Vol 2**, and a reply carrying
+anything else is `ProtocolViolation` at each of the three decode sites — the `SendRRData` reply, the
+connected `SendUnitData` reply, and the Connection-Manager UCMM reply the class-1 I/O layer opens
+connections through (D-ENIP-21). A peer addressing another interface is not speaking the CIP
+encapsulation we asked for, so its payload is not a Message Router reply we may decode, and nothing
+in it may bind a connection. `ProtocolViolation` is non-transient in `is_transient()`: a peer that
+mislabels its interface will keep doing so, so the failure surfaces rather than driving a reconnect
+ladder.
 
 ### 5.3 ListIdentity reply (discovery)
 
@@ -350,23 +366,48 @@ Explicit replies must contain exactly the expected 2-item shape (address + data)
 
 ```text
 TCP connect (endpoint, default port 44818)
-  → RegisterSession { data: u16 protocol_version = 1, u16 options = 0 }
+  → RegisterSession { sender_context = "ECREGIST", data: u16 protocol_version = 1, u16 options = 0 }
   ← reply: same 4-byte data; session_handle in the HEADER (must be ≠ 0), status must be 0
   … SendRRData / SendUnitData requests, sender_context-correlated …
   → UnRegisterSession { session_handle } (no reply) → close socket
 ```
 
-State machine in `client/session.rs`: `Connecting → Registered → Closing → Closed`; the reply's
-protocol version must be 1 (`Unsupported` otherwise — encap status `0x0069` also maps there).
-Requests during `Closing/Closed` fail fast with `EnipError::Closed`.
+The reply is validated in this order, and every check is a refusal (D-ENIP-21):
+
+1. **context echo** — the reply must carry back the request's `sender_context`. The handshake runs
+   before the actor owns the stream, so the session-scoped monotonic context of §10.3 does not exist
+   yet and a fixed 8-byte tag (`ECREGIST`) stands in for it. This check is **first**: a frame that is
+   not even our reply must not be diagnosed by its other fields, and without the echo any
+   RegisterSession-shaped frame already on the stream could be adopted as our session.
+2. **command echo** — `RegisterSession`.
+3. **options = 0** — §5.1. Deliberately asymmetric with the session actor, which discards such a
+   frame and keeps waiting: pre-actor there is exactly one expected frame on the stream, so looping
+   over discards during a handshake buys nothing against a peer this broken, and adopting a session
+   from it would be worse.
+4. **status ok** — a non-zero status is `EnipError::Encap(status)`.
+5. **session handle ≠ 0**.
+6. **protocol version = 1** (`Unsupported` otherwise — encap status `0x0069` also maps there).
+
+State machine in `client/session.rs`: `Connecting → Registered → Closing → Closed`. Requests during
+`Closing/Closed` fail fast with `EnipError::Closed`.
 
 ### 5.6 Encapsulation status codes (typed `EncapStatus`)
 
 `0x0000` Success · `0x0001` unsupported command · `0x0002` insufficient memory ·
 `0x0003` incorrect data · `0x0064` invalid session handle · `0x0065` invalid length ·
 `0x0069` unsupported protocol version · else `Unknown(u32)`. A non-zero status on a reply
-completes the request with `EnipError::Encap(status)`; `0x0064` additionally poisons the session
-(the handle is gone — reconnect).
+completes the request with `EnipError::Encap(status)`.
+
+**`0x0064` additionally severs the session, at the actor** (D-ENIP-22). The status is a statement
+about our *registration*, not about the command that provoked it, so it applies to any correlated
+reply — discovery commands included. The caller that provoked it still receives
+`Err(Encap(InvalidSessionHandle))`; the actor then exits, its command receiver drops, and every
+pending and subsequent request completes `Err(Closed)` without touching the stream. Recovery is the
+session owner's: the adapter's reconnect classification maps a session-poisoning `Encap` status to
+*transient* (DESIGN §10.1) and re-registers on a fresh stream. The crate never re-registers in
+place, and the crate-side `EnipError::is_transient()` default leaves `Encap` non-transient except
+for `InsufficientMemory` — the reconnect decision belongs to the owner that holds the backoff ladder
+and the instance state (§10.1, §7.6).
 
 ---
 
@@ -616,6 +657,11 @@ is exactly what the target's watchdog measures. A request that timed out or brok
 not count as activity — the keepalive may then fire though bytes did flow, which costs one tiny read.
 `ClientStats.keepalives_sent` (from `SessionStats`) counts probes that completed an exchange, a CIP
 error reply included.
+
+**A dead session's reply feeds nothing.** The clock is touched only after the transaction returns
+`Ok`, so a reply carrying encapsulation status `0x0064` — which severs the session at the actor
+(§5.6, D-ENIP-22) — refreshes no activity and arms no further probe. The connection is not "kept
+alive" against a handle the target has already disowned; the owner reconnects instead.
 
 The keepalive task holds only a `Weak` reference to the client's inner state plus a `WeakSender` for
 the session actor's command channel, so it keeps neither alive: it returns when the last `EipClient`
@@ -897,24 +943,37 @@ etc.) are *values* to the adapter (BAD samples), not session failures — the cr
   affect any connection; a dead socket loses **all** its connections with a typed `Lost{Io}`, never
   silently.
 - Peer-driven counters (`stale_frames`, `malformed_frames`, `overflowed_events`,
-  `refused_redirects`, …) are exposed on the handles (`stats()`), so the adapter can alarm on a
+  `refused_redirects`, `discarded_options`, …) are exposed on the handles (`stats()`), so the adapter can alarm on a
   noisy/hostile peer without the crate knowing what an alarm is. `refused_redirects` is 0 or 1 per
   connection and records that the ForwardOpen reply's O→T sockaddr named a foreign address, whose
   address half was refused and only its port honoured (D-ENIP-17) — the one disposition a healthy
   link would otherwise hide. `keepalives_sent` on `ClientStats` is the explicit-side equivalent for
-  the class-3 keepalive (§7.6).
+  the class-3 keepalive (§7.6). `discarded_options` on `ClientStats` counts replies dropped for a
+  non-zero encapsulation `options` field (§5.1, D-ENIP-21) — its own cause, kept out of
+  `stale_replies` so the peer defect is diagnosable rather than hidden inside ordinary staleness.
 
 ### 10.3 Explicit correlation (D-ENIP-5)
 
 `sender_context` carries a session-scoped monotonically increasing `u64` (LE in the 8-byte field).
 The session task holds at most **one** outstanding request `{context, deadline, reply_tx}`. Reader
-loop, per inbound frame: a reply completes the outstanding request iff its `sender_context`, its
-command, and (for session-scoped `SendRRData`/`SendUnitData`) its session handle all match;
-discovery replies (`ListIdentity`/`ListServices`/`ListInterfaces`) are exempt from the handle check
-(§5.2 — sessionless-capable; live targets answer with handle 0). Any non-matching frame is discarded
-and counted (`stale_replies`); a context-matched frame with a wrong command or handle is
-additionally logged at warn. Class-3 additionally matches the connected-data sequence count (hard
-`Err`-on-mismatch → drop + count, never `debug_assert!`).
+loop, per inbound frame:
+
+1. **`options` gate** (§5.1, D-ENIP-21) — a frame with `options ≠ 0` is discarded and counted
+   (`discarded_options`) with a warn, *before* correlation is attempted. The order is deliberate:
+   such a frame is malformed at the encapsulation layer, so which request it claims to answer is not
+   yet a meaningful question — a foreign-context frame with non-zero options counts as a discarded
+   options frame, not as staleness.
+2. **Correlation** — a reply completes the outstanding request iff its `sender_context`, its
+   command, and (for session-scoped `SendRRData`/`SendUnitData`) its session handle all match;
+   discovery replies (`ListIdentity`/`ListServices`/`ListInterfaces`) are exempt from the handle
+   check (§5.2 — sessionless-capable; live targets answer with handle 0). Any non-matching frame is
+   discarded and counted (`stale_replies`); a context-matched frame with a wrong command or handle
+   is additionally logged at warn.
+3. **Poison check** (§5.6, D-ENIP-22) — a correlated reply whose status is `InvalidSessionHandle`
+   completes its caller with `Err(Encap(..))` and kills the actor.
+
+Class-3 additionally matches the connected-data sequence count (hard `Err`-on-mismatch → drop +
+count, never `debug_assert!`).
 
 ### 10.4 Timeouts & stale-reply quarantine (D-ENIP-6)
 
@@ -1092,6 +1151,18 @@ a `0x06` page that resumes before where it started is the typed `ProtocolViolati
 page (`[10, 2, 3]`, whose last record still derives an advancing cursor) and a page repeating an
 instance id are the typed ordering `ProtocolViolation`, the second on a *final* page so the guard is
 shown not to be gated on `0x06`; and a last record at `u32::MAX` ends the enumeration.
+
+**Session hygiene** (§5.1/§5.2/§5.5/§5.6, D-ENIP-21/22) rides the same fixtures
+(`tests/session_p2.rs`): a correlated `0x0064` reply delivers `Encap(InvalidSessionHandle)` and the
+next request is `Closed` with nothing further reaching the peer; a reply that is otherwise perfectly
+ours but carries `options ≠ 0` is never delivered and lands on `discarded_options`; the same frame
+with a *foreign* context still lands on `discarded_options` and not on `stale_replies`, pinning the
+gate ahead of correlation; a RegisterSession reply with a foreign context, and one with non-zero
+options, are each refused with no actor spawned (asserted by the peer's EOF); and a non-zero
+interface handle is refused at each of the three decode sites — `SendRRData`, `SendUnitData`, and
+`ForwardOpenService::cm_ucmm`. The keepalive half of the poison rule is in
+`tests/class3_keepalive.rs`, waiting causally on the peer's EOF rather than on a clock: a surviving
+session would instead go on probing and trip the bound.
 
 ### 12.3 Fuzzing (the safety claim, made executable)
 
