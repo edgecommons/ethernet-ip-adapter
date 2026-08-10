@@ -37,7 +37,14 @@ impl ForwardOpenService for EipClient {
             return Err(EnipError::Encap(frame.header.status));
         }
         let mut r = WireReader::with_context(&frame.data, "sendrrdata reply");
-        let _interface_handle = r.u32().map_err(EnipError::Malformed)?;
+        // §5.2 (D-ENIP-21) — the CIP interface handle is 0 by Vol 2; a non-zero value means the peer
+        // is answering on some other interface, so nothing in this reply may bind a connection.
+        let interface_handle = r.u32().map_err(EnipError::Malformed)?;
+        if interface_handle != 0 {
+            return Err(EnipError::ProtocolViolation {
+                detail: "non-zero interface handle in forward-open reply",
+            });
+        }
         let _timeout = r.u16().map_err(EnipError::Malformed)?;
         // Decode by the CPF item count WITHOUT asserting end-of-buffer: a real target (OpENer) may
         // append the echoed O→T/T→O Sockaddr Info items to a ForwardOpen *reply* beyond the declared

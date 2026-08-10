@@ -22,10 +22,10 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use enip::cip::types::CipValue;
-use enip::encap::{Command, EncapFrame, EncapHeader};
+use enip::encap::{Command, EncapFrame, EncapHeader, EncapStatus};
 use enip::{
-    CipType, ClientOptions, Cpf, CpfItem, EipClient, ItemType, RoutePath, Scope, SockAddrInfo,
-    TagAddress, WireReader, WireWriter,
+    CipType, ClientOptions, Cpf, CpfItem, EipClient, ForwardOpenService, ItemType, MessageRequest,
+    RoutePath, Scope, SockAddrInfo, TagAddress, WireReader, WireWriter,
 };
 
 const SESSION_HANDLE: u32 = 0x00AB_CDEF;
@@ -139,6 +139,47 @@ fn rrdata_reply_as(handle: u32, ctx: [u8; 8], mr: &[u8]) -> EncapFrame {
     mk_frame(Command::SendRRData, handle, ctx, w.into_bytes().to_vec())
 }
 
+/// As [`rrdata_reply`], but stamping an arbitrary value into the CIP **interface handle** of the
+/// encapsulation data prefix — the field a compliant target always sets to 0 (§5.2, D-ENIP-21).
+fn rrdata_reply_with_interface_handle(
+    ctx: [u8; 8],
+    mr: &[u8],
+    interface_handle: u32,
+) -> EncapFrame {
+    let cpf = Cpf::from_items(vec![
+        CpfItem::null_address(),
+        CpfItem::unconnected_data(Bytes::copy_from_slice(mr)),
+    ]);
+    let cpf_bytes = cpf.encode().unwrap();
+    let mut w = WireWriter::new();
+    w.u32(interface_handle);
+    w.u16(0); // timeout
+    w.put_slice(&cpf_bytes);
+    mk_frame(
+        Command::SendRRData,
+        SESSION_HANDLE,
+        ctx,
+        w.into_bytes().to_vec(),
+    )
+}
+
+/// Stamp a non-zero encapsulation `options` value onto a frame — the field §5.1 fixes at 0, so a
+/// receiver must discard whatever carries it (D-ENIP-21).
+fn with_options(mut frame: EncapFrame, options: u32) -> EncapFrame {
+    frame.header.options = options;
+    frame
+}
+
+/// A **correlated** `SendRRData` reply — the context is echoed by the caller, the command and
+/// session handle are the ones we registered — carrying encapsulation status `0x0064`
+/// InvalidSessionHandle: the target announcing it has forgotten our registration (§5.6). Per §5.1 a
+/// reply with a non-zero status carries no usable data, so the data portion is empty.
+fn poisoned_reply(ctx: [u8; 8]) -> EncapFrame {
+    let mut frame = mk_frame(Command::SendRRData, SESSION_HANDLE, ctx, Vec::new());
+    frame.header.status = EncapStatus::InvalidSessionHandle;
+    frame
+}
+
 /// A §5.3 ListIdentity reply data portion: a CPF carrying one Identity (`0x000C`) item.
 fn identity_reply_data() -> Vec<u8> {
     let mut item = WireWriter::new();
@@ -160,6 +201,18 @@ fn identity_reply_data() -> Vec<u8> {
 
 /// Wrap MR bytes in a `SendUnitData` reply frame (connected CPF `[connected-address, connected-data]`).
 fn unitdata_reply(ctx: [u8; 8], addr: u32, seq: u16, mr: &[u8]) -> EncapFrame {
+    unitdata_reply_with_interface_handle(ctx, addr, seq, mr, 0)
+}
+
+/// As [`unitdata_reply`], but stamping an arbitrary CIP **interface handle** into the encapsulation
+/// data prefix (§5.2, D-ENIP-21).
+fn unitdata_reply_with_interface_handle(
+    ctx: [u8; 8],
+    addr: u32,
+    seq: u16,
+    mr: &[u8],
+    interface_handle: u32,
+) -> EncapFrame {
     let mut cd = WireWriter::new();
     cd.u16(seq);
     cd.put_slice(mr);
@@ -169,7 +222,7 @@ fn unitdata_reply(ctx: [u8; 8], addr: u32, seq: u16, mr: &[u8]) -> EncapFrame {
     ]);
     let cpf_bytes = cpf.encode().unwrap();
     let mut w = WireWriter::new();
-    w.u32(0);
+    w.u32(interface_handle);
     w.u16(0);
     w.put_slice(&cpf_bytes);
     mk_frame(
@@ -1512,6 +1565,335 @@ async fn every_request_timeout_is_counted_whichever_path_it_takes() {
         REQUESTS as u64,
         "every timed-out request is counted exactly once, on whichever path it expired"
     );
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// session hygiene: poisoning (§5.6, D-ENIP-22) and complete encapsulation-header
+// validation (§5.1/§5.2/§5.5/§10.3, D-ENIP-21)
+// ---------------------------------------------------------------------------
+
+/// §5.6 / D-ENIP-22 — a correlated reply carrying encapsulation status `0x0064`
+/// (`InvalidSessionHandle`) **severs the session at the actor**.
+///
+/// The status is a statement about our *registration*, not about the command that provoked it: the
+/// target has forgotten the handle, so nothing later on this stream can succeed. The caller still
+/// gets the typed status, and the actor then dies — so the very next request fails fast with
+/// `Closed` instead of being written to a session the device has already torn down (which is what
+/// deferred recovery to some arbitrary later failure).
+#[tokio::test]
+async fn an_invalid_session_handle_reply_poisons_the_session() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        peer.send(&poisoned_reply(req.header.sender_context)).await;
+        // Everything that still arrives after the poison, counted. The loop ends at EOF — which is
+        // itself the causal evidence that the actor severed and dropped the stream.
+        let mut after_poison = 0usize;
+        while peer.recv().await.is_some() {
+            after_poison += 1;
+        }
+        after_poison
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+
+    let r = client.read_tag(&tag, 1).await;
+    assert!(
+        matches!(
+            r,
+            Err(enip::EnipError::Encap(EncapStatus::InvalidSessionHandle))
+        ),
+        "the typed status must still reach the caller that provoked it: {r:?}"
+    );
+
+    let r2 = client.read_tag(&tag, 1).await;
+    assert!(
+        matches!(r2, Err(enip::EnipError::Closed)),
+        "a poisoned session must refuse the next request outright, not retry it on the wire: {r2:?}"
+    );
+
+    drop(client);
+    let after_poison = server.await.unwrap();
+    assert_eq!(
+        after_poison, 0,
+        "not one byte may be written to a session the target has disowned"
+    );
+}
+
+/// §5.1 / D-ENIP-21 — the encapsulation `options` field is always 0, and a received frame carrying
+/// anything else is discarded per spec. Even a reply that is otherwise perfectly ours — context,
+/// command and session handle all echoed — is dropped and counted on its own cause, never
+/// delivered; the request runs out its deadline instead.
+#[tokio::test]
+async fn a_correlated_reply_with_nonzero_options_is_discarded_and_counted() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        peer.send(&with_options(
+            rrdata_reply(req.header.sender_context, &read_dint_mr(4242)),
+            0xDEAD,
+        ))
+        .await;
+        // Never send a compliant reply → the request times out.
+        let _ = peer.recv().await; // drain until the client drops
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await;
+    assert!(
+        matches!(r, Err(enip::EnipError::Timeout { .. })),
+        "an options-stamped frame must never answer a request: {r:?}"
+    );
+    assert_eq!(client.stats().discarded_options, 1);
+    assert_eq!(
+        client.stats().stale_replies,
+        0,
+        "the discard has its own cause; it must not be filed as ordinary staleness"
+    );
+    drop(client);
+    server.abort();
+}
+
+/// §5.1 / §10.3 / D-ENIP-21 — **precedence**: the `options` gate sits ahead of correlation. A frame
+/// with a foreign context *and* non-zero options is malformed at the encapsulation layer, so which
+/// request it claims to answer is not yet a meaningful question: it counts as `discarded_options`,
+/// not `stale_replies`. (This is what pins the check to the read loop rather than to `match_reply`,
+/// where the context test would have claimed the frame first.)
+#[tokio::test]
+async fn a_foreign_context_reply_with_nonzero_options_counts_as_options_not_stale() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let _req = peer.recv().await.unwrap();
+        peer.send(&with_options(
+            rrdata_reply(*b"BOGUSCTX", &read_dint_mr(7)),
+            1,
+        ))
+        .await;
+        let _ = peer.recv().await; // drain until the client drops
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await;
+    assert!(
+        matches!(r, Err(enip::EnipError::Timeout { .. })),
+        "got {r:?}"
+    );
+    assert_eq!(client.stats().discarded_options, 1);
+    assert_eq!(client.stats().stale_replies, 0);
+    drop(client);
+    server.abort();
+}
+
+/// §5.5 / D-ENIP-21 — the RegisterSession reply is **correlated**. A well-formed register reply that
+/// does not echo the context we stamped on the request is not our reply, and adopting the session
+/// handle out of it would bind us to somebody else's registration.
+#[tokio::test]
+async fn register_reply_with_a_foreign_context_is_refused() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        let req = peer.recv().await.unwrap();
+        assert_eq!(req.header.command, Command::RegisterSession);
+        // Impeccable in every respect except the one that makes it *ours*.
+        peer.send(&mk_frame(
+            Command::RegisterSession,
+            SESSION_HANDLE,
+            *b"NOTOURS!",
+            vec![0x01, 0x00, 0x00, 0x00],
+        ))
+        .await;
+        peer.recv().await.is_none()
+    });
+
+    let r = EipClient::connect_over(client_io, base_opts()).await;
+    assert!(
+        matches!(
+            r.as_ref(),
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "register reply context mismatch"
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+    assert!(
+        server.await.unwrap(),
+        "a refused handshake spawns no session actor, so the stream drops and the peer sees EOF"
+    );
+}
+
+/// §5.5 / D-ENIP-21 — a RegisterSession reply carrying non-zero `options` is **refused**, not
+/// discarded-and-retried. Pre-actor there is exactly one expected frame on the stream, so looping
+/// over discards buys nothing against a peer this broken — and adopting a session from it is worse.
+#[tokio::test]
+async fn register_reply_with_nonzero_options_is_refused() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        let req = peer.recv().await.unwrap();
+        peer.send(&with_options(
+            mk_frame(
+                Command::RegisterSession,
+                SESSION_HANDLE,
+                req.header.sender_context,
+                vec![0x01, 0x00, 0x00, 0x00],
+            ),
+            1,
+        ))
+        .await;
+        peer.recv().await.is_none()
+    });
+
+    let r = EipClient::connect_over(client_io, base_opts()).await;
+    assert!(
+        matches!(
+            r.as_ref(),
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "register reply carries non-zero options"
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+    assert!(server.await.unwrap(), "no session actor owns the stream");
+}
+
+/// §5.2 / D-ENIP-21 — the CIP interface handle in a `SendRRData` reply is 0 by Vol 2. A non-zero
+/// value means the peer is answering on some other interface, so the payload is not a CIP Message
+/// Router reply we may decode: `ProtocolViolation` (non-transient — a peer that mislabels its
+/// interface will keep doing so).
+#[tokio::test]
+async fn an_explicit_reply_with_a_nonzero_interface_handle_is_refused() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        peer.send(&rrdata_reply_with_interface_handle(
+            req.header.sender_context,
+            &read_dint_mr(4242),
+            7,
+        ))
+        .await;
+        let _ = peer.recv().await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await;
+    assert!(
+        matches!(
+            r,
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "non-zero interface handle in SendRRData reply"
+            })
+        ),
+        "got {r:?}"
+    );
+    drop(client);
+    server.abort();
+}
+
+/// §5.2 / D-ENIP-21 — the same rule on the connected class-3 path (`SendUnitData`).
+#[tokio::test]
+async fn a_connected_reply_with_a_nonzero_interface_handle_is_refused() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let t_o = handle_forward_open(&mut peer).await;
+        let req = peer.recv().await.unwrap();
+        let (seq, _svc, _d) = parse_connected_request(&req);
+        peer.send(&unitdata_reply_with_interface_handle(
+            req.header.sender_context,
+            t_o,
+            seq,
+            &read_dint_mr(555),
+            7,
+        ))
+        .await;
+        let _ = peer.recv().await;
+    });
+
+    let opts = ClientOptions {
+        connected_messaging: true,
+        ..base_opts()
+    };
+    let client = EipClient::connect_over(client_io, opts).await.unwrap();
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await;
+    assert!(
+        matches!(
+            r,
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "non-zero interface handle in SendUnitData reply"
+            })
+        ),
+        "got {r:?}"
+    );
+    drop(client);
+    server.abort();
+}
+
+/// §5.2 / §8.2 / D-ENIP-21 — and on the Connection-Manager UCMM path the class-1 I/O layer opens
+/// connections through (`ForwardOpenService::cm_ucmm`). Nothing in a reply that mislabels its
+/// interface may bind a connection.
+#[tokio::test]
+async fn a_forward_open_reply_with_a_nonzero_interface_handle_is_refused() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let req = peer.recv().await.unwrap();
+        let (svc, _d) = parse_ucmm_request(&req);
+        assert_eq!(svc, 0x54, "expected ForwardOpen");
+        peer.send(&rrdata_reply_with_interface_handle(
+            req.header.sender_context,
+            &mr_reply(0x54, 0x00, &[], &[]),
+            7,
+        ))
+        .await;
+        let _ = peer.recv().await;
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
+    let request = MessageRequest::new(
+        0x54,
+        enip::connection_manager_path(),
+        Bytes::from_static(&[0u8; 4]),
+    );
+    let r = client.cm_ucmm(request, Vec::new()).await;
+    assert!(
+        matches!(
+            r,
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "non-zero interface handle in forward-open reply"
+            })
+        ),
+        "got {:?}",
+        r.err()
+    );
+    drop(client);
     server.abort();
 }
 

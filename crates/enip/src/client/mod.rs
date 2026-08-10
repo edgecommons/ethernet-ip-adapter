@@ -63,6 +63,16 @@ pub(crate) const CLOSE_HANDOFF_DEADLINE: Duration = Duration::from_secs(2);
 /// deadline and collapse every failure class into a bare `Timeout`.
 pub(crate) const REPLY_BACKSTOP_GRACE: Duration = Duration::from_millis(50);
 
+/// The correlation context stamped on the RegisterSession request, and required back on its reply
+/// (§5.5, D-ENIP-21).
+///
+/// The handshake runs *before* the actor owns the stream, so the session-scoped monotonic context of
+/// §10.3 does not exist yet — this fixed 8-byte tag stands in for it. Requiring the echo is what
+/// makes the handshake correlated at all: without it, any RegisterSession-shaped frame already
+/// sitting on the stream (a reply to somebody else's request on a proxied/multiplexed path, or a
+/// peer that simply speaks first) could be adopted as *our* session.
+pub(crate) const REGISTER_CONTEXT: [u8; 8] = *b"ECREGIST";
+
 /// The Connection Manager object path `[0x20 0x06 0x24 0x01]` as an [`EPath`] (§7.1).
 pub(crate) fn connection_manager_path() -> EPath {
     EPath::new().class(0x06).instance(0x01)
@@ -212,6 +222,8 @@ pub struct ClientStats {
     pub connected_seq_mismatches: u64,
     /// Class-3 inactivity keepalives that completed an exchange with the target (§7.6, D-ENIP-18).
     pub keepalives_sent: u64,
+    /// Replies discarded because the encapsulation `options` field was not 0 (§5.1, D-ENIP-21).
+    pub discarded_options: u64,
 }
 
 /// The explicit-messaging client handle (§11.2). Cheap to clone.
@@ -266,7 +278,7 @@ impl EipClient {
         reg_data.u16(PROTOCOL_VERSION);
         reg_data.u16(0); // options
         let reg_frame = EncapFrame::new(
-            EncapHeader::request(Command::RegisterSession, 0, 0, *b"ECREGIST"),
+            EncapHeader::request(Command::RegisterSession, 0, 0, REGISTER_CONTEXT),
             reg_data.into_bytes(),
         );
         send_frame_by(&mut stream, &reg_frame, handshake_deadline).await?;
@@ -282,9 +294,29 @@ impl EipClient {
         )
         .await?;
 
+        // §5.5 (D-ENIP-21) — the RegisterSession reply validation list, in order: context echo,
+        // command echo, options 0, status ok, non-zero handle, protocol version 1.
+        //
+        // The **context echo comes first**: a frame that is not even our reply must not be
+        // diagnosed by its other fields, and every check below is only meaningful once the frame
+        // claims to answer the request we just wrote.
+        if reply.header.sender_context != REGISTER_CONTEXT {
+            return Err(EnipError::ProtocolViolation {
+                detail: "register reply context mismatch",
+            });
+        }
         if !matches!(reply.header.command, Command::RegisterSession) {
             return Err(EnipError::ProtocolViolation {
                 detail: "register reply command mismatch",
+            });
+        }
+        // Deliberately asymmetric with the session actor, which discards a non-zero-`options` frame
+        // and keeps waiting (§5.1): pre-actor there is exactly one expected frame on the stream, so
+        // looping over discards during a handshake buys nothing against a peer this broken — and
+        // adopting a session from it would be worse.
+        if reply.header.options != 0 {
+            return Err(EnipError::ProtocolViolation {
+                detail: "register reply carries non-zero options",
             });
         }
         if !reply.header.status.is_ok() {
@@ -378,6 +410,7 @@ impl EipClient {
                 .connected_seq_mismatches
                 .load(Ordering::Relaxed),
             keepalives_sent: self.inner.stats.keepalives_sent.load(Ordering::Relaxed),
+            discarded_options: self.inner.stats.discarded_options.load(Ordering::Relaxed),
         }
     }
 
@@ -560,7 +593,17 @@ fn parse_explicit_reply(frame: &EncapFrame) -> Result<crate::cip::message::Messa
         return Err(EnipError::Encap(frame.header.status));
     }
     let mut r = WireReader::with_context(&frame.data, "sendrrdata reply");
-    let _interface_handle = r.u32()?;
+    // §5.2 (D-ENIP-21) — the CIP interface handle is 0 by Vol 2. A non-zero value means the peer is
+    // addressing some other interface, i.e. speaking something that is not the CIP encapsulation we
+    // asked for; the reply's contents cannot be trusted to be a CIP Message Router reply at all.
+    // `ProtocolViolation` is non-transient by design: a peer that mislabels its interface will keep
+    // doing so, so surfacing beats hammering.
+    let interface_handle = r.u32()?;
+    if interface_handle != 0 {
+        return Err(EnipError::ProtocolViolation {
+            detail: "non-zero interface handle in SendRRData reply",
+        });
+    }
     let _timeout = r.u16()?;
     let cpf = Cpf::decode(r.take_rest()).map_err(EnipError::Malformed)?;
     let mr_bytes = cpf.expect_explicit_data().map_err(EnipError::Malformed)?;
