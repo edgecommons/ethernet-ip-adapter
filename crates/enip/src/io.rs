@@ -19,7 +19,11 @@
 //! * [`IoManager`] — the thin UDP socket task: recv → route by connection id → drive
 //!   [`IoConnection::consume`]; and a scheduler tick that drives [`IoConnection::poll_produce`] /
 //!   [`IoConnection::poll_watchdog`]. It exposes [`IoConnectionHandle`] (`events`, `set_output`,
-//!   `set_run`, `stats`, `close`).
+//!   `stage_output`, `set_run`, `stats`, `close`). Commands that can fail inside the task —
+//!   registering a connection (the multicast join), and the confirmed form of output staging —
+//!   carry a `oneshot` acknowledgement, so `forward_open` returns only once the connection is
+//!   **armed** and `stage_output` reports whether the buffer will actually ride a frame
+//!   (D-ENIP-20).
 //!
 //! **Socket errors are classified, never swallowed** (§8.6–§8.7, D-ENIP-7). Every `recv_from` /
 //! `send_to` failure increments a counter (`recv_errors` manager-wide, `send_errors` per
@@ -49,7 +53,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::cip::epath::Segment;
@@ -1249,14 +1253,26 @@ pub trait ForwardOpenService {
 // ---------------------------------------------------------------------------
 
 /// A command from a handle (or `forward_open`) to the manager task.
+///
+/// `Add` and the confirmed form of `SetOutput` carry a `oneshot` acknowledgement (D-ENIP-20): the
+/// manager's verdict travels back to the caller instead of being inferred from the fact that a
+/// message was queued. Arming a connection can fail *inside* the task (the multicast join), and
+/// staging an output can be aimed at a connection the task has already removed — neither is
+/// knowable from the send side.
 enum ManagerCommand {
     Add {
         conn: Box<IoConnection>,
         events_tx: IoEventSender,
+        /// Armed-or-not verdict: `Ok(())` once the connection is registered (and any multicast
+        /// group joined); `Err` carries the join failure. Never silent.
+        ack: oneshot::Sender<Result<()>>,
     },
     SetOutput {
         connection_id: u32,
         bytes: Bytes,
+        /// `None` preserves the fire-and-forget [`IoConnectionHandle::set_output`]; `Some` is the
+        /// confirmed path ([`IoConnectionHandle::stage_output`]).
+        ack: Option<oneshot::Sender<Result<()>>>,
     },
     SetRun {
         connection_id: u32,
@@ -1305,13 +1321,20 @@ impl IoManager {
     /// ids and **actual** packet intervals come from the ForwardOpen reply (§8.2), not the request.
     /// A refusal is [`EnipError::ForwardOpenRejected`].
     ///
+    /// **Post-condition: when this returns `Ok`, the connection is armed** (D-ENIP-20) — the socket
+    /// task has registered it and has joined any multicast T→O group, so a datagram arriving
+    /// immediately after cannot be dropped as `unknown_connection`. The wait for that verdict is
+    /// causal, not timed: the manager task either services its queue or has exited, and both
+    /// complete the await.
+    ///
     /// **Invariant: any failure after a successful ForwardOpen issues a best-effort ForwardClose**
     /// ([`best_effort_forward_close`]) before the typed error propagates. Past the target's success
     /// reply the target believes a connection is open and will produce into it until its own
     /// watchdog expires; every way this function can still fail — a reply that fails echo
     /// verification or API validation, an unresolvable O→T transmit endpoint, a multicast T→O
-    /// sockaddr on a connection that did not request multicast T→O, a manager task that has already
-    /// exited — leaves that same stranded connection, so all of them tear it down.
+    /// sockaddr on a connection that did not request multicast T→O, a multicast group the socket
+    /// could not join, a manager task that has already exited — leaves that same stranded
+    /// connection, so all of them tear it down.
     pub async fn forward_open<S: ForwardOpenService>(
         &self,
         session: &S,
@@ -1441,19 +1464,35 @@ impl IoManager {
         }
         let (events_tx, events_rx) = io_event_channel(EVENT_CHANNEL_DEPTH, counters.clone());
 
-        // The manager task has exited, so nothing will ever service this connection — but the target
-        // is already producing into it. Tear it down before reporting the closure.
+        // Arming is acknowledged (D-ENIP-20). A send failure means the manager task has exited, so
+        // nothing will ever service this connection; an `Err` verdict means the task refused to arm
+        // it (the multicast join failed); a dropped ack sender means the task died mid-command. In
+        // all three the target is already producing into a connection nobody owns, so the same
+        // best-effort teardown runs before the typed error propagates.
+        let (ack_tx, ack_rx) = oneshot::channel();
         if self
             .tx
             .send(ManagerCommand::Add {
                 conn: Box::new(conn),
                 events_tx,
+                ack: ack_tx,
             })
             .await
             .is_err()
         {
             best_effort_forward_close(session, &open).await;
             return Err(EnipError::Closed);
+        }
+        match ack_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                best_effort_forward_close(session, &open).await;
+                return Err(e);
+            }
+            Err(_manager_gone) => {
+                best_effort_forward_close(session, &open).await;
+                return Err(EnipError::Closed);
+            }
         }
 
         Ok(IoConnectionHandle {
@@ -1513,10 +1552,11 @@ impl IoConnectionHandle {
         &mut self.events
     }
 
-    /// Set the O→T output buffer, validated against the negotiated O→T size (§8.7). A fixed-size
-    /// connection requires an exact match; a variable-size one caps at the negotiated size.
-    pub fn set_output(&self, bytes: impl Into<Bytes>) -> Result<()> {
-        let bytes = bytes.into();
+    /// Validate a candidate O→T buffer against the negotiated O→T size (§8.7). A fixed-size
+    /// connection requires an exact match; a variable-size one caps at the negotiated size. Shared
+    /// by [`set_output`](Self::set_output) and [`stage_output`](Self::stage_output) so the two
+    /// paths can never drift apart on what a legal buffer is.
+    fn validate_output(&self, bytes: &Bytes) -> Result<()> {
         if self.o2t_carries_data {
             if self.o2t_fixed && bytes.len() != self.o2t_data_size {
                 return Err(EnipError::ProtocolViolation {
@@ -1529,12 +1569,50 @@ impl IoConnectionHandle {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Set the O→T output buffer, validated against the negotiated O→T size (§8.7). A fixed-size
+    /// connection requires an exact match; a variable-size one caps at the negotiated size.
+    ///
+    /// **Unconfirmed** (§11.2): `Ok` says the command was queued for the manager task, not that the
+    /// buffer was accepted — a connection the task has already removed swallows it. Callers that
+    /// must know the buffer will ride a frame use [`stage_output`](Self::stage_output).
+    pub fn set_output(&self, bytes: impl Into<Bytes>) -> Result<()> {
+        let bytes = bytes.into();
+        self.validate_output(&bytes)?;
         self.cmd
             .try_send(ManagerCommand::SetOutput {
                 connection_id: self.connection_id,
                 bytes,
+                ack: None,
             })
             .map_err(|_| EnipError::Closed)
+    }
+
+    /// Stage the O→T output buffer and confirm the manager accepted it for a live connection
+    /// (D-ENIP-20). Same validation as [`set_output`](Self::set_output); the difference is the
+    /// verdict — this awaits the manager task's answer instead of assuming one.
+    ///
+    /// # Errors
+    ///
+    /// [`EnipError::ProtocolViolation`] / [`EnipError::TooLarge`] when the buffer does not fit the
+    /// negotiated O→T size, and [`EnipError::Closed`] when the manager task has shut down or no
+    /// longer holds this connection (lost or closed) — in that case the buffer will never ride a
+    /// frame. The wait is causal: the manager either answers or is gone.
+    pub async fn stage_output(&self, bytes: impl Into<Bytes>) -> Result<()> {
+        let bytes = bytes.into();
+        self.validate_output(&bytes)?;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd
+            .send(ManagerCommand::SetOutput {
+                connection_id: self.connection_id,
+                bytes,
+                ack: Some(ack_tx),
+            })
+            .await
+            .map_err(|_| EnipError::Closed)?;
+        ack_rx.await.map_err(|_manager_gone| EnipError::Closed)?
     }
 
     /// Set the O→T run/idle bit (§8.7 / D-ENIP-9).
@@ -1753,17 +1831,40 @@ async fn manager_task(
             cmd = rx.recv() => {
                 match cmd {
                     None | Some(ManagerCommand::Shutdown) => break,
-                    Some(ManagerCommand::Add { conn, events_tx }) => {
+                    Some(ManagerCommand::Add { conn, events_tx, ack }) => {
                         let id = conn.connection_id();
                         if let Some(group) = conn.multicast_group() {
-                            let _ = socket.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED);
+                            if let Err(e) = socket.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED) {
+                                // The join is load-bearing (D-ENIP-20): without membership the T→O
+                                // stream never arrives and the operator would see only a delayed
+                                // watchdog timeout instead of the interface error. Refuse to arm.
+                                tracing::warn!(
+                                    %group,
+                                    error = %e,
+                                    "class-1 multicast join failed; refusing to arm the connection"
+                                );
+                                let _ = ack.send(Err(EnipError::Io(e)));
+                                continue;
+                            }
                         }
                         registry.conns.insert(id, *conn);
                         events.insert(id, events_tx);
+                        if ack.send(Ok(())).is_err() {
+                            // The opener vanished between send and ack (its future was cancelled):
+                            // nothing owns this connection, so unregister it — leaving any group —
+                            // rather than produce O→T into it forever.
+                            remove_connection(&socket, &mut registry, &mut events, id);
+                        }
                     }
-                    Some(ManagerCommand::SetOutput { connection_id, bytes }) => {
-                        if let Some(conn) = registry.conns.get_mut(&connection_id) {
-                            conn.set_output(bytes);
+                    Some(ManagerCommand::SetOutput { connection_id, bytes, ack }) => {
+                        let verdict = match registry.conns.get_mut(&connection_id) {
+                            Some(conn) => { conn.set_output(bytes); Ok(()) }
+                            // The connection was removed (lost or closed): the buffer will never
+                            // ride a frame, and a confirmed caller must be told so.
+                            None => Err(EnipError::Closed),
+                        };
+                        if let Some(ack) = ack {
+                            let _ = ack.send(verdict);
                         }
                     }
                     Some(ManagerCommand::SetRun { connection_id, run }) => {
@@ -1916,6 +2017,7 @@ fn remove_connection(
 mod tests {
     #![allow(
         clippy::unwrap_used,
+        clippy::expect_used,
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects
     )]
@@ -3539,11 +3641,11 @@ mod tests {
 
         // (1) The peer produces T→O frames until the loop routes one and delivers Up.
         //
-        // Deliberately a retry, not a single datagram: the manager's `select!` is unbiased, so a
-        // datagram that lands before the `Add` command has been dequeued is dropped as an unknown
-        // connection and there is nothing to redeliver it. That ordering is not part of the contract
-        // this test is proving — recv → route → deliver is — so the test must not rest on it. Each
-        // attempt carries the next sequence, so a retry is never rejected as a stale duplicate.
+        // A retry, not a single datagram: the contract this test proves is recv → route → deliver,
+        // so it does not rest on any one datagram surviving the loopback. (The registration race
+        // this loop used to absorb is gone — `forward_open` returns only once the connection is
+        // armed, D-ENIP-20, which `forward_open_returns_only_after_the_connection_is_armed` pins.)
+        // Each attempt carries the next sequence, so a retry is never rejected as a stale duplicate.
         let mut sent: u16 = 0;
         loop {
             sent += 1;
@@ -3619,6 +3721,289 @@ mod tests {
         assert!(stats.frames_accepted >= 1, "consume path: {stats:?}");
         assert!(stats.frames_produced >= 1, "produce path: {stats:?}");
         mgr.shutdown().await;
+    }
+
+    // -- arming acknowledgements (D-ENIP-20) -------------------------------
+
+    /// `sample_spec()` with a **multicast** T→O direction — the only shape whose reply may name a
+    /// group to join (D-ENIP-17).
+    fn multicast_spec() -> IoConnectionSpec {
+        let base = sample_spec();
+        IoConnectionSpec {
+            t2o: DirectionSpec {
+                conn_type: ConnType::Multicast,
+                ..base.t2o
+            },
+            ..base
+        }
+    }
+
+    /// A T→O sockaddr naming `group` on the standard implicit-I/O port.
+    fn multicast_sock(group: Ipv4Addr) -> SockAddrInfo {
+        SockAddrInfo::ipv4(u32::from(group), IO_UDP_PORT)
+    }
+
+    /// A live class-1 connection over loopback whose O→T frames land on `peer`: a faithful reply
+    /// with a 20 ms O→T API (so the produce scheduler ticks promptly) and a 1 s T→O API (so the
+    /// ×16 watchdog cannot fire inside a test).
+    async fn open_against_peer(mgr: &IoManager, peer_port: u16) -> (FoFixture, IoConnectionHandle) {
+        let fixture =
+            FoFixture::new(None, 20_000, 1_000_000).with_o2t_sock(SockAddrInfo::ipv4(0, peer_port));
+        let handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
+        (fixture, handle)
+    }
+
+    /// The next O→T datagram at `peer`, decoded as a 32-bit-header frame — bounded by `deadline`.
+    async fn next_o2t_frame(peer: &UdpSocket, deadline: Instant) -> IoFrame {
+        let mut buf = vec![0u8; 2048];
+        let Ok(received) = tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await else {
+            panic!("no O→T datagram reached the peer before the deadline");
+        };
+        let (n, _src) = received.unwrap();
+        let cpf = Cpf::decode(&buf[..n]).unwrap();
+        let data = &cpf.find(ItemType::ConnectedData).unwrap().data;
+        IoFrame::decode(RealTimeFormat::Header32Bit, data).unwrap()
+    }
+
+    /// **P2-7 regression (D-ENIP-20).** The T→O multicast join is load-bearing: a connection whose
+    /// group could not be joined is NOT armed, `forward_open` fails with the socket error, and the
+    /// connection the target believes it opened is torn down. Before the fix the join result was
+    /// discarded (`let _ = socket.join_multicast_v4(..)`), so the open reported success and the
+    /// operator's first symptom was a `Lost { Timeout }` a watchdog period later — the interface
+    /// error that actually caused it thrown away at the one point it was known.
+    ///
+    /// The join is forced to fail by joining the same group twice on one manager socket — the
+    /// deliberate fail-fast of the no-refcounting decision (D-ENIP-20): the adapter runs one
+    /// `IoManager` per push session, so a shared group never occurs in product use.
+    #[tokio::test]
+    async fn forward_open_fails_typed_when_the_multicast_join_fails() {
+        let group = Ipv4Addr::new(239, 192, 1, 1);
+        let mgr = IoManager::bind("0.0.0.0:0").await.unwrap();
+
+        // (a) The first open joins the group and arms normally.
+        let first = FoFixture::new(None, 20_000, 1_000_000).with_t2o_sock(multicast_sock(group));
+        let handle = mgr
+            .forward_open(&first, multicast_spec())
+            .await
+            .expect("the first multicast open joins the group and arms");
+        assert_eq!(
+            first.requests().len(),
+            1,
+            "no ForwardClose on the armed path"
+        );
+
+        // (b) The second open on the SAME manager socket re-joins the same group: the OS refuses
+        // the duplicate membership, so the connection must not be armed.
+        let second = FoFixture::new(None, 20_000, 1_000_000).with_t2o_sock(multicast_sock(group));
+        match mgr.forward_open(&second, multicast_spec()).await {
+            Err(EnipError::Io(_)) => {}
+            other => panic!(
+                "expected the join failure as a typed Io error, got {:?}",
+                other.map(|h| h.apis())
+            ),
+        }
+        assert_forward_closed(&second.requests());
+
+        // The refusal is the second connection's alone — the first is still armed and producing.
+        assert_eq!(handle.stats().refused_redirects, 0);
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-20 post-condition.** `forward_open` returns only once the socket task has
+    /// registered the connection, so a T→O datagram sent the instant it returns is routed, not
+    /// dropped as an unknown connection.
+    ///
+    /// This is the **guarantee's** pin, not the fix's discriminator. Before the ack, `Add` was
+    /// fire-and-forget and nothing in the contract stopped an early datagram from being counted as
+    /// `unknown_connection`; in practice the manager's `select!` could not lose that race in-process
+    /// (a freshly created `recv_from` future is `Pending` until the reactor reports readability,
+    /// while a queued command is ready synchronously), so the hole was a latent contract gap rather
+    /// than an observable flake. What proves the ack itself is
+    /// `forward_open_fails_typed_when_the_multicast_join_fails` — the manager's verdict cannot be
+    /// reported without awaiting it. This test locks the ordering down so no later scheduling or
+    /// `select!` change can quietly reopen it.
+    ///
+    /// Six independent opens rather than one, and a **std** sender, so the datagram genuinely
+    /// precedes any hand-off to the manager task.
+    #[tokio::test]
+    async fn forward_open_returns_only_after_the_connection_is_armed() {
+        // A **std** socket, deliberately: its `send_to` is a plain syscall, so the datagram reaches
+        // the manager's socket without ever handing the runtime to the manager task. An awaited
+        // `tokio::net::UdpSocket::send_to` would yield and let the task drain the `Add` first — the
+        // very ordering under test — and `try_send_to` would depend on tokio write-readiness that
+        // has not been established yet.
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+
+        let mut opened = Vec::new();
+        for attempt in 1..=6u32 {
+            let (fixture, mut handle) = open_against_peer(&mgr, peer_port).await;
+            peer.send_to(
+                &datagram(handle.connection_id(), 1, &modeless_payload(1, &[0u8; 8])),
+                mgr.local_addr(),
+            )
+            .unwrap();
+
+            match tokio::time::timeout(Duration::from_secs(5), handle.events().recv()).await {
+                Ok(Some(IoEvent::Up { .. })) => {}
+                other => panic!(
+                    "attempt {attempt}: expected Up from the very first datagram, got {other:?} \
+                     (unknown_connection = {})",
+                    handle.stats().unknown_connection
+                ),
+            }
+            match tokio::time::timeout(Duration::from_secs(5), handle.events().recv()).await {
+                Ok(Some(IoEvent::Data(u))) => assert_eq!(u.sequence, 1),
+                other => panic!("attempt {attempt}: expected the accepted sample, got {other:?}"),
+            }
+            opened.push((fixture, handle));
+        }
+
+        assert_eq!(
+            mgr.stats.unknown_connection.load(Ordering::Relaxed),
+            0,
+            "no datagram was ever seen against an unregistered connection"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-20, the cancelled-opener path.** If the caller's `forward_open` future is dropped
+    /// between the `Add` and its ack, nobody owns the connection — so the manager unregisters it
+    /// (leaving any group) instead of producing O→T into it for the rest of the process's life.
+    #[tokio::test]
+    async fn an_abandoned_forward_open_does_not_leave_a_producing_connection() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+
+        let mut p = params(RealTimeFormat::Header32Bit, RealTimeFormat::Modeless);
+        p.tx_endpoint = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            peer.local_addr().unwrap().port(),
+        );
+        let cid = p.t2o_connection_id;
+        let conn = IoConnection::new(p, Instant::now());
+        let (events_tx, mut events_rx) =
+            io_event_channel(EVENT_CHANNEL_DEPTH, conn.counters.clone());
+
+        // The opener vanishes: its ack receiver is gone before the manager services the command.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        drop(ack_rx);
+        mgr.tx
+            .send(ManagerCommand::Add {
+                conn: Box::new(conn),
+                events_tx,
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
+
+        // Causal wait: the event stream ends exactly when the manager drops the sender, which only
+        // happens because it unregistered the connection it had just inserted.
+        match tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await {
+            Ok(None) => {}
+            other => panic!("expected the abandoned connection's stream to end, got {other:?}"),
+        }
+
+        // And a datagram for it now counts as unknown rather than feeding a live connection.
+        peer.send_to(
+            &datagram(cid, 1, &modeless_payload(1, &[0u8; 8])),
+            mgr.local_addr(),
+        )
+        .await
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mgr.stats.unknown_connection.load(Ordering::Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the datagram was never counted as unknown — the connection is still registered"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            events_rx.try_recv().is_err(),
+            "no sample was ever delivered to the abandoned stream"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-20, the confirmed staging path.** `stage_output` returns `Ok` only after the
+    /// manager has taken the buffer for a live connection — and the very next produced frame
+    /// carries it.
+    #[tokio::test]
+    async fn stage_output_confirms_against_a_live_connection() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let (_fixture, handle) = open_against_peer(&mgr, peer_port).await;
+
+        handle
+            .stage_output(Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]))
+            .await
+            .expect("the manager accepts the buffer for a live connection");
+
+        // Every frame produced after the ack carries the staged bytes; frames already in flight
+        // when it landed carry the initial empty buffer, so drain past those.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let frame = next_o2t_frame(&peer, deadline).await;
+            if frame.data.as_ref() == [0xDE, 0xAD, 0xBE, 0xEF] {
+                break;
+            }
+            assert!(
+                frame.data.is_empty(),
+                "an O→T frame carried neither the initial nor the staged buffer: {frame:?}"
+            );
+        }
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-20, the honest refusal.** Once the connection is gone, staging cannot succeed —
+    /// and says so. The unconfirmed `set_output` reports `Ok` here (the command is merely queued),
+    /// which is exactly the silent success this API exists to replace.
+    #[tokio::test]
+    async fn stage_output_errors_once_the_connection_is_removed() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let (fixture, handle) = open_against_peer(&mgr, peer_port).await;
+
+        handle.close(&fixture).await.unwrap();
+        // The contrast, pinned: the unconfirmed setter still answers `Ok` — its command is merely
+        // queued, and the manager drops it on the floor. That is the silent success `stage_output`
+        // replaces, not a bug in `set_output`'s own (documented) contract.
+        assert!(handle.set_output(Bytes::from_static(&[1, 2, 3, 4])).is_ok());
+        // The channel is FIFO, so the manager has processed `Remove` before it reads this command.
+        match handle.stage_output(Bytes::from_static(&[1, 2, 3, 4])).await {
+            Err(EnipError::Closed) => {}
+            other => panic!("expected Closed for a removed connection, got {other:?}"),
+        }
+        // Validation still runs first: a mis-sized buffer is refused on its own terms.
+        match handle.stage_output(Bytes::from_static(&[1, 2])).await {
+            Err(EnipError::ProtocolViolation { detail }) => assert_eq!(
+                detail,
+                "output size does not match the negotiated fixed O→T size"
+            ),
+            other => panic!("expected the size violation, got {other:?}"),
+        }
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-20, the dead-manager verdict.** A staging call after the socket task has gone
+    /// reports `Closed` — whether the command channel is already closed or the command is dropped
+    /// unserviced with its ack sender.
+    #[tokio::test]
+    async fn stage_output_errors_after_manager_shutdown() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let (_fixture, handle) = open_against_peer(&mgr, peer_port).await;
+
+        mgr.shutdown().await;
+        match handle.stage_output(Bytes::from_static(&[1, 2, 3, 4])).await {
+            Err(EnipError::Closed) => {}
+            other => panic!("expected Closed after the manager shut down, got {other:?}"),
+        }
     }
 
     // -- manager smoke (bind, no live peer) --------------------------------
