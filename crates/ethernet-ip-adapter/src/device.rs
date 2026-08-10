@@ -395,13 +395,16 @@ pub trait PushSession: Send + Sync {
     fn last_input(&self) -> Option<InputSnapshot>;
 
     /// Set one output-assembly field (already coerced/validated by the codec) into the producer
-    /// buffer; it rides the next O→T frame. `Ok(())` means the field is staged (§7.3 honesty note).
+    /// buffer; it rides the next O→T frame. `Ok(())` means the field is staged (§7.3 honesty note) —
+    /// **confirmed by whatever owns the producer buffer**, never merely handed to a channel.
     /// The full write path drives this in slice S6; it is exposed now.
     ///
     /// # Errors
     ///
     /// [`DeviceError::Unsupported`] when the device has no output assembly; [`DeviceError::Permanent`]
-    /// when the value does not fit the field (a coercion/range error).
+    /// when the value does not fit the field (a coercion/range error); [`DeviceError::Transient`]
+    /// when the session is closing, the backend's translator has ended, or the I/O manager no longer
+    /// holds the class-1 connection — **the value was NOT staged** and will never ride a frame.
     // SLICE S6: dispatched by the `sb/write` command handler for push instances.
     #[allow(dead_code)]
     async fn set_output(&mut self, field: &IoFieldSpec, value: &serde_json::Value) -> Result<()>;
@@ -416,6 +419,12 @@ pub trait PushSession: Send + Sync {
     }
 
     /// Close the connection (ForwardClose + socket teardown). Must be safe to call twice.
+    ///
+    /// **On return, the session's background work has ended.** An implementation must not return
+    /// while a task it spawned still holds the transport: a bounded handoff that overruns has to be
+    /// aborted and joined, not abandoned. Trading the courtesy teardown frames for that guarantee is
+    /// allowed (the device times the connection out on its own watchdog); reporting the close
+    /// complete while the work continues is not.
     async fn close(&mut self);
 }
 
