@@ -1007,6 +1007,15 @@ mod tests {
     /// once. With a minute-long ceiling, getting either wrong wedges the instance for that minute.
     #[tokio::test(start_paused = true)]
     async fn stop_or_reconnect_during_the_poll_backoff_is_honoured_immediately() {
+        // The backoff is FULL jitter — `delay = rand01 * cap` — so `reconnectBackoffMinMs: 30_000`
+        // buys a wait sampled from [0, 30 s), NOT a 30 s wait. Unpinned, this test is a lottery:
+        // whenever the sample lands under the 200 ms below, the ladder finishes the backoff first,
+        // reconnects on its own, burns the second session on its read error, and the reconnect that
+        // arrives later gets a connect with an empty session pool — answered `Err`, so `answered`
+        // reads `Some(false)`. That is a test defect, not a ladder defect, and it is what made this
+        // test flaky in CI. Pinning the fraction at 1.0 makes the first wait exactly 30 s, so
+        // "the request arrived mid-backoff" is true by construction rather than by luck.
+        let _jitter = crate::testutil::JitterGuard::pin(1.0);
         let slow = json!({ "timeouts": {
             "connectMs": 500, "reconnectBackoffMinMs": 30_000, "reconnectBackoffMaxMs": 60_000 } });
         let mut rig = Rig::new(poll_device(20, None), global(slow));
@@ -1017,7 +1026,7 @@ mod tests {
             rig.backend.push_session(Box::new(s));
         }
 
-        // Inside the first (30 s+) backoff, ask for a reconnect …
+        // Inside the first (exactly 30 s, jitter pinned) backoff, ask for a reconnect …
         let (reply, reply_rx) = oneshot::channel();
         rig.send_after(
             Duration::from_millis(200),

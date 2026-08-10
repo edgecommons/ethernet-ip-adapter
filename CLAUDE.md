@@ -18,6 +18,13 @@ agent tool. It is imported here in full:
   git dep to the local `../edgecommons/core/libs/rust` checkout, so a plain `cargo build` /
   `cargo test` uses your working copy. CI keeps the pinned `rev` in `Cargo.toml`. Do NOT edit
   `.cargo/config.toml` or the `edgecommons` pin as part of feature work.
+- **Never commit the `Cargo.lock` a local build produces.** Any cargo command run with that override
+  active rewrites the lock to the *path* resolve, deleting the `source = "git+…"` line for
+  `edgecommons`. A lock in that state cannot build a clean clone, which is why CI now runs
+  `--locked`. Check `git diff Cargo.lock` before every commit and `git checkout -- Cargo.lock` if it
+  moved. To change the pin deliberately, edit `Cargo.toml`, then re-resolve in a copy of the tree
+  placed **outside** this repo — cargo discovers `.cargo/config.toml` by walking *upward*, so moving
+  the worktree's own copy aside is not enough when a parent checkout has one.
 - **The `greengrass` feature is Linux-only** (the IPC SDK). Ordinary `cargo build` / `cargo test` /
   `cargo clippy` use the default `standalone` feature and run on Windows. The owned `crates/enip`
   protocol crate is pure Rust and builds natively on Windows/MSVC — no C toolchain needed.
