@@ -61,8 +61,13 @@ const CODE_INVALID_GLOBAL: &str = "INVALID_GLOBAL";
 /// The candidate declares no instance this adapter can run — the reload-time analog of startup's
 /// refuse-to-start. The running generation keeps operating.
 const CODE_NO_VALID_INSTANCES: &str = "NO_VALID_INSTANCES";
-/// Every launch failed and nothing was kept, so the commit would leave the adapter with no device.
+/// Every launch was skipped and nothing was kept, so the commit would leave the adapter with no
+/// device.
 const CODE_NO_RUNNING_INSTANCES: &str = "NO_RUNNING_INSTANCES";
+/// A candidate instance could not be constructed for a reason that is **not** a bad instance (a
+/// UNS-token violation in the id, a runtime already shutting down). The commit fails and core's
+/// fully-awaited rollback restores the prior generation.
+const CODE_LAUNCH_FAILED: &str = "LAUNCH_FAILED";
 /// A rollback could not relaunch one of the instances it stopped. Core wraps this in its own
 /// `CONFIG_APPLICATION_ROLLBACK_FAILED` validation error.
 const CODE_ROLLBACK_RELAUNCH_FAILED: &str = "ROLLBACK_RELAUNCH_FAILED";
@@ -183,8 +188,8 @@ pub(crate) struct StartupLaunch {
 /// class of defect: an instance whose `adapter` token no backend implements is a *bad instance*,
 /// exactly like one whose subtree does not parse. It is skipped with a warning and the healthy
 /// instances beside it keep running — one typo in a ten-device document must not cost nine live PLC
-/// connections. Startup and reload therefore agree about this error class; the reload path already
-/// reports a refused launch as a skip.
+/// connections. Startup and reload apply **one** classification, not two: the reload transaction's
+/// launch stage skips exactly this class and fails the commit on anything else.
 ///
 /// Two things are deliberately *not* skipped:
 ///
@@ -205,6 +210,8 @@ pub(crate) fn launch_startup_set(
     let mut fatal = None;
 
     for (cfg, raw) in devices {
+        // The skip/fatal classification below is the SAME rule the reload transaction's launch stage
+        // applies (`ReloadTransaction::commit`, stage 6) — change them together.
         match launcher.launch(cfg, raw, global, snapshot) {
             Ok(runtime) => launched.push(runtime),
             Err(e) if crate::reconnect::UnknownAdapter::is_cause(&e) => {
@@ -377,8 +384,10 @@ pub(crate) trait DeviceLauncher: Send + Sync {
     ///
     /// # Errors
     /// Whatever construction failed — an adapter token no backend implements, a UNS-token violation
-    /// in the instance id, or the runtime already shutting down. On this (reload) path a failure is
-    /// skipped-with-a-warning and joins the plan's skip report, never failing the transaction.
+    /// in the instance id, or the runtime already shutting down. Both callers classify that failure
+    /// the same way: an [`crate::reconnect::UnknownAdapter`] cause is a *bad instance*, skipped with
+    /// a warning and reported; anything else is a broken runtime — fatal to startup, and fatal to a
+    /// reload commit, which then rolls back to the prior generation.
     fn launch(
         &self,
         cfg: &DeviceConfig,
@@ -625,9 +634,14 @@ impl PreparedConfigurationApply for ReloadTransaction {
         //    spawned with — they are kept precisely because nothing they bound has changed.
         self.registry.set_global(Arc::clone(&self.plan.global));
 
-        // 6. Launch, bound to the candidate snapshot. A launch failure is skipped with a warning
-        //    (launch-time skip-bad parity), not a transaction failure — and it joins the plan's
+        // 6. Launch, bound to the candidate snapshot. The skip/fatal classification here is the SAME
+        //    rule [`launch_startup_set`] applies — change them together. A *bad instance* (an
+        //    `adapter` token no backend implements) is skipped with a warning and joins the plan's
         //    parse-time skips, so no instance id can silently vanish from the `config-applied` event.
+        //    **Any other construction failure is a broken runtime**: it fails the commit on the spot
+        //    (fail-fast, as startup does), and core's fully-awaited `rollback` restores the prior
+        //    generation. Reporting such a failure as a skip would let a working device disappear from
+        //    the live registry while the reload still reported success.
         let mut skipped = self.plan.skipped.clone();
         for (cfg, raw) in &self.plan.start {
             match self
@@ -638,15 +652,29 @@ impl PreparedConfigurationApply for ReloadTransaction {
                     self.undo.launched.push(cfg.id.clone());
                     self.registry.insert(rt);
                 }
-                Err(e) => {
+                Err(e) if crate::reconnect::UnknownAdapter::is_cause(&e) => {
                     tracing::warn!(
                         instance = %cfg.id, error = %e,
                         "skipping device that could not be launched from the reloaded configuration"
                     );
                     skipped.push((cfg.id.clone(), e.to_string()));
                 }
+                Err(e) => {
+                    tracing::error!(
+                        instance = %cfg.id, error = %e,
+                        "launch failed during commit; failing the reload so rollback restores the prior generation"
+                    );
+                    return Err(ConfigurationApplicationError::new(
+                        CODE_LAUNCH_FAILED,
+                        format!(
+                            "instance `{}` could not be launched: {e}; the previous configuration is being restored",
+                            cfg.id
+                        ),
+                    ));
+                }
             }
         }
+        // Still reachable: every start was an `UnknownAdapter` skip and nothing was kept.
         if self.registry.is_empty() {
             return Err(ConfigurationApplicationError::new(
                 CODE_NO_RUNNING_INSTANCES,
@@ -654,7 +682,11 @@ impl PreparedConfigurationApply for ReloadTransaction {
             ));
         }
 
-        // 7. The surfaces that describe the new generation.
+        // 7. The surfaces that describe the new generation. Everything from here on is reached only
+        //    once the swap has actually succeeded: a `LAUNCH_FAILED` return above emits no
+        //    `config-applied` and recomputes no `repoll` availability, so a failed reload never
+        //    leaves a success surface behind. Core carries the failure outward itself
+        //    (`RELOAD_FAILED` / `lastErrors`, wrapping the code above).
         tracing::info!(
             instances = ?self.registry.ids(),
             restart_all = self.plan.restart_all,
@@ -706,11 +738,12 @@ impl PreparedConfigurationApply for ReloadTransaction {
     async fn rollback(&mut self) -> ConfigurationApplicationResult<()> {
         let budget = crate::lifecycle::stop_budget(&self.undo.prior.global.timeouts);
 
-        // Currently unreachable in practice: commit() can only fail before any launch (shutting down)
-        // or with an empty registry (zero successful launches), so `undo.launched` is empty whenever
-        // core calls rollback. Kept deliberately — it is the correct inverse for any future commit
-        // failure mode added after the launch stage, and its cost is nil. Re-verify this note if a
-        // new `Err` path is added to commit().
+        // `undo.launched` is reachably non-empty: a `LAUNCH_FAILED` commit fails at the FIRST broken
+        // runtime, so every candidate instance ahead of it in plan order is already launched and
+        // inserted. Undoing that partial launch is what makes the commit atomic — leaving half the
+        // new generation up beside half the old one dead is worse than the failure it reports. (It is
+        // empty only on the paths that fail before or without launching anything: shutting down, and
+        // a launch pass in which every start was skipped.)
         let mut stopping: Vec<DeviceRuntime> = Vec::new();
         for id in std::mem::take(&mut self.undo.launched) {
             if let Some(rt) = self.registry.remove(&id) {
@@ -1818,8 +1851,9 @@ mod tests {
         );
     }
 
-    /// The failure path end to end: every launch fails and nothing was kept, so the commit reports
-    /// `NO_RUNNING_INSTANCES` and the rollback puts the prior set back — bound to the PRIOR snapshot
+    /// The total-failure path end to end: a restart-all candidate in which every launch is a broken
+    /// runtime. The commit fails at the **first** of them with `LAUNCH_FAILED` — it never reaches the
+    /// registry-empty check — and the rollback puts the prior set back, bound to the PRIOR snapshot
     /// and global, which is what core keeps active.
     #[tokio::test(start_paused = true)]
     async fn commit_fails_and_rollback_restores_the_prior_set_when_nothing_runs() {
@@ -1827,8 +1861,9 @@ mod tests {
             json!({}),
             vec![poll_instance("plc-1", 500), poll_instance("plc-2", 500)],
         );
-        // A global change ⇒ restart-all ⇒ nothing is kept, so a total launch failure empties the
-        // registry — the only way a commit can fail after it has already stopped instances.
+        // A global change ⇒ restart-all ⇒ nothing is kept, so both instances are stopped before the
+        // launch stage runs: the commit fails with instances already torn down, which is exactly the
+        // state rollback exists for.
         let after = document(
             json!({ "timeouts": { "requestTimeoutMs": 1500 } }),
             vec![poll_instance("plc-1", 500), poll_instance("plc-2", 500)],
@@ -1849,8 +1884,13 @@ mod tests {
         let err = tx
             .commit()
             .await
-            .expect_err("nothing runs after the commit");
-        assert_eq!(err.code, CODE_NO_RUNNING_INSTANCES);
+            .expect_err("a broken runtime fails the commit");
+        assert_eq!(err.code, CODE_LAUNCH_FAILED);
+        assert!(
+            err.message.contains("plc-1"),
+            "the refusal names the instance that could not be launched: {}",
+            err.message
+        );
         assert!(
             registry.is_empty(),
             "the failed commit left nothing running"
@@ -1889,10 +1929,210 @@ mod tests {
         );
     }
 
+    /// **Commit atomicity (D-EIP-28).** A launch failure that is *not* a bad instance is a broken
+    /// runtime: the commit fails with `LAUNCH_FAILED`, and rollback undoes the **partial** launch, so
+    /// what the operator is left with is the generation that was running — not a half-swapped mixture
+    /// of the two. Skipping such a failure (the behavior this replaces) let a healthy, configured
+    /// device silently vanish from the live registry while the reload still reported success.
+    #[tokio::test(start_paused = true)]
+    async fn a_generic_launch_failure_fails_the_commit_and_rollback_restores_everything() {
+        let before = document(
+            json!({}),
+            vec![poll_instance("stays", 500), poll_instance("goes", 500)],
+        );
+        // `io-1` launches and `wont-start` then fails, so the commit fails with one candidate
+        // instance already running and one prior instance already stopped — the partially-applied
+        // state that makes "did rollback really roll back?" a real question.
+        let after = document(
+            json!({}),
+            vec![
+                poll_instance("stays", 500),
+                push_instance("io-1"),
+                poll_instance("wont-start", 500),
+            ],
+        );
+
+        let launcher = FakeLauncher::new();
+        let root = CancellationToken::new();
+        let (registry, snap, global) = running_registry(&launcher, &before, &root);
+        let prior_snapshot = Arc::as_ptr(&snap) as usize;
+        let prior_global = Arc::as_ptr(&global) as usize;
+        let coord = coordinator(&launcher, &registry, &root, &snap, &global, true);
+
+        let mut tx = coord
+            .prepare_configuration_apply(snapshot(&after))
+            .await
+            .unwrap();
+        launcher.fail_instance("wont-start");
+
+        let err = tx
+            .commit()
+            .await
+            .expect_err("a broken runtime fails the commit instead of vanishing from the registry");
+        assert_eq!(err.code, CODE_LAUNCH_FAILED);
+        assert!(
+            err.message.contains("wont-start"),
+            "the refusal names the instance that could not be launched: {}",
+            err.message
+        );
+        assert!(
+            launcher.events.last_ctx("config-applied").is_none(),
+            "a failed commit emits no success surface"
+        );
+        assert!(
+            launcher.journal.lock().unwrap().availability.is_empty(),
+            "…and recomputes no repoll availability"
+        );
+
+        // Core awaits rollback fully before it rejects the candidate and keeps the prior snapshot.
+        launcher.fail_none();
+        tx.rollback()
+            .await
+            .expect("the prior generation is restored");
+
+        assert_eq!(
+            registry.ids(),
+            vec!["stays", "goes"],
+            "the PREVIOUS device set is the one running afterwards"
+        );
+        assert!(
+            Arc::ptr_eq(&registry.global(), &global),
+            "the prior global is published again"
+        );
+
+        // The partial launch was really undone, in that order — a final-state assertion alone could
+        // not tell "never launched" from "launched and stopped again".
+        let order = launcher.order();
+        let launched_io = order
+            .iter()
+            .position(|(kind, id)| *kind == "launch" && id == "io-1")
+            .expect("the candidate instance ahead of the failure did launch");
+        let stopped_io = order
+            .iter()
+            .position(|(kind, id)| *kind == "stop" && id == "io-1")
+            .expect("rollback stopped it again");
+        assert!(
+            launched_io < stopped_io,
+            "the partially-applied candidate was undone: {order:?}"
+        );
+
+        // …and the relaunch is bound to the PRIOR snapshot and global, which is what core keeps.
+        let launches = launcher.journal.lock().unwrap().launches.clone();
+        let restored = launches
+            .iter()
+            .find(|l| l.id == "goes")
+            .expect("the stopped instance was relaunched");
+        assert_eq!(
+            (
+                restored.snapshot == prior_snapshot,
+                restored.global == prior_global
+            ),
+            (true, true),
+            "the restored instance is bound to the prior snapshot and global"
+        );
+        let during_commit = launches
+            .iter()
+            .find(|l| l.id == "io-1")
+            .expect("the candidate instance was launched during the commit");
+        assert!(
+            during_commit.snapshot != prior_snapshot,
+            "the commit-path launch had been bound to the CANDIDATE snapshot"
+        );
+    }
+
+    /// The other side of the boundary, pinned: an `adapter` token no backend implements is a **bad
+    /// instance** at commit exactly as it is at startup, so it is skipped and reported while the
+    /// healthy candidate instances start. One typo must not cost a whole reload.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_adapter_launch_failure_is_still_a_skip_at_commit() {
+        let before = document(json!({}), vec![poll_instance("stays", 500)]);
+        let after = document(
+            json!({}),
+            vec![
+                poll_instance("stays", 500),
+                poll_instance("typo", 500),
+                push_instance("io-1"),
+            ],
+        );
+
+        let launcher = FakeLauncher::new();
+        let root = CancellationToken::new();
+        let (registry, snap, global) = running_registry(&launcher, &before, &root);
+        let coord = coordinator(&launcher, &registry, &root, &snap, &global, true);
+
+        let mut tx = coord
+            .prepare_configuration_apply(snapshot(&after))
+            .await
+            .unwrap();
+        launcher.bad_adapter_instance("typo");
+        tx.commit()
+            .await
+            .expect("a bad instance is not a broken runtime");
+
+        assert_eq!(
+            registry.ids(),
+            vec!["stays", "io-1"],
+            "the healthy candidate instances are running"
+        );
+        let ctx = launcher
+            .events
+            .last_ctx("config-applied")
+            .expect("the reload applied, and said so");
+        assert_eq!(ctx["skipped"][0][0], json!("typo"));
+        assert!(
+            ctx["skipped"][0][1]
+                .as_str()
+                .is_some_and(|reason| reason.contains("unknown adapter")),
+            "the skip names the defect an operator has to fix: {}",
+            ctx["skipped"]
+        );
+    }
+
+    /// `NO_RUNNING_INSTANCES` is still reachable, and this is now the only shape that reaches it: a
+    /// restart-all candidate whose every start is skipped as a bad instance, so nothing is kept and
+    /// nothing launched. A single *broken runtime* fails earlier, with `LAUNCH_FAILED`.
+    #[tokio::test(start_paused = true)]
+    async fn a_candidate_of_only_unknown_adapters_with_nothing_kept_fails_with_no_running_instances(
+    ) {
+        let before = document(
+            json!({}),
+            vec![poll_instance("plc-1", 500), poll_instance("plc-2", 500)],
+        );
+        // A global change ⇒ restart-all ⇒ nothing is kept.
+        let after = document(
+            json!({ "timeouts": { "requestTimeoutMs": 1500 } }),
+            vec![poll_instance("plc-1", 500), poll_instance("plc-2", 500)],
+        );
+
+        let launcher = FakeLauncher::new();
+        let root = CancellationToken::new();
+        let (registry, snap, global) = running_registry(&launcher, &before, &root);
+        let coord = coordinator(&launcher, &registry, &root, &snap, &global, true);
+
+        let mut tx = coord
+            .prepare_configuration_apply(snapshot(&after))
+            .await
+            .unwrap();
+        launcher.bad_adapter_instance("*");
+
+        let err = tx
+            .commit()
+            .await
+            .expect_err("a component serving no device is not a running component");
+        assert_eq!(err.code, CODE_NO_RUNNING_INSTANCES);
+        assert!(registry.is_empty(), "every start was skipped");
+
+        launcher.bad_adapter.lock().unwrap().clear();
+        tx.rollback()
+            .await
+            .expect("the prior generation is restored");
+        assert_eq!(registry.ids(), vec!["plc-1", "plc-2"]);
+    }
+
     /// The operator surfaces of a successful reload: the `config-applied` event describing what
     /// happened, and the recomputed `repoll` availability for the new instance set. Every id in the
-    /// candidate is accounted for — including one that parsed cleanly but failed to launch, which
-    /// would otherwise appear in no list at all and simply vanish from the event.
+    /// candidate is accounted for — including one that parsed cleanly but was refused at launch as a
+    /// bad instance, which would otherwise appear in no list at all and simply vanish from the event.
     #[tokio::test(start_paused = true)]
     async fn commit_emits_config_applied_and_recomputes_repoll_availability() {
         let before = document(
@@ -1919,9 +2159,11 @@ mod tests {
             .prepare_configuration_apply(snapshot(&after))
             .await
             .unwrap();
-        // A valid instance whose launch fails — the production analog is a UNS-token violation in
-        // the id, which only the facade mint can detect.
-        launcher.fail_instance("wont-start");
+        // A valid instance the launcher refuses as a BAD INSTANCE — the production analog is an
+        // `adapter` token no backend implements, which only the launcher can detect. That is the one
+        // launch failure a commit skips; anything else fails the commit (see
+        // `a_generic_launch_failure_fails_the_commit_and_rollback_restores_everything`).
+        launcher.bad_adapter_instance("wont-start");
         tx.commit().await.unwrap();
 
         let ctx = launcher

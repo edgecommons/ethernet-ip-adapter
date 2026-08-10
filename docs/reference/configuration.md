@@ -322,7 +322,12 @@ entry and the later one is ignored, as at startup.
 that contains no valid `component.instances[]` entry is rejected: the running configuration stays in
 effect and the component keeps operating on it. A single malformed instance inside an otherwise valid
 candidate is skipped with a warning and the rest of the document applies — the same skip-bad rule as
-startup, where the component instead refuses to start if no instance is valid.
+startup, where the component instead refuses to start if no instance is valid. A candidate that passes
+those checks but includes an instance that cannot be started is rejected as a whole; the one exception
+is an instance naming an adapter this build does not provide, which is still skipped with a warning
+rather than failing the candidate. When a candidate is rejected at this stage, the previous
+configuration is restored: the instances stopped to make way for it come back up on their previous
+settings.
 
 **Pause.** Pause state lives in memory. An instance that a change restarts comes back running; an
 instance the change leaves untouched keeps its pause.

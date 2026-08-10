@@ -194,7 +194,14 @@ fn parse_connected_reply(
         return Err(EnipError::Encap(frame.header.status));
     }
     let mut r = WireReader::with_context(&frame.data, "sendunitdata reply");
-    let _interface_handle = r.u32()?;
+    // §5.2 (D-ENIP-21) — the CIP interface handle is 0 by Vol 2; a non-zero value means the peer is
+    // answering on some other interface and the connected payload cannot be trusted.
+    let interface_handle = r.u32()?;
+    if interface_handle != 0 {
+        return Err(EnipError::ProtocolViolation {
+            detail: "non-zero interface handle in SendUnitData reply",
+        });
+    }
     let _timeout = r.u16()?;
     let cpf = Cpf::decode(r.take_rest()).map_err(EnipError::Malformed)?;
 

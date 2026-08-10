@@ -27,9 +27,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use enip::cip::types::CipValue;
 use enip::cm::TimeoutMultiplier;
-use enip::encap::{Command, EncapFrame, EncapHeader};
+use enip::encap::{Command, EncapFrame, EncapHeader, EncapStatus};
 use enip::{
-    CipType, ClientOptions, Cpf, CpfItem, EipClient, ItemType, TagAddress, WireReader, WireWriter,
+    CipType, ClientOptions, Cpf, CpfItem, EipClient, EnipError, ItemType, TagAddress, WireReader,
+    WireWriter,
 };
 
 const SESSION_HANDLE: u32 = 0x00AB_CDEF;
@@ -153,6 +154,16 @@ fn unitdata_reply(ctx: [u8; 8], t_o_id: u32, seq: u16, mr: &[u8]) -> EncapFrame 
     w.u16(0);
     w.put_slice(&cpf_bytes);
     mk_frame(Command::SendUnitData, ctx, w.into_bytes().to_vec())
+}
+
+/// A **correlated** `SendUnitData` reply — the context is echoed, the command and session handle are
+/// the ones we registered — carrying encapsulation status `0x0064` InvalidSessionHandle: the target
+/// announcing it has forgotten our registration (§5.6). Per §5.1 a non-zero status carries no usable
+/// data, so the data portion is empty.
+fn poisoned_unitdata_reply(ctx: [u8; 8]) -> EncapFrame {
+    let mut frame = mk_frame(Command::SendUnitData, ctx, Vec::new());
+    frame.header.status = EncapStatus::InvalidSessionHandle;
+    frame
 }
 
 /// Split a UCMM (`SendRRData`) request frame into `(service, service-data)`.
@@ -359,6 +370,85 @@ async fn serve(server_side: DuplexStream, api: u32, keepalive_status: u8) -> Obs
                     service, FORWARD_CLOSE,
                     "the only UCMM traffic after the open"
                 );
+                mock.send(&rrdata_reply(
+                    frame.header.sender_context,
+                    &mr_reply(FORWARD_CLOSE, 0x00, &forward_close_success(&open)),
+                ))
+                .await;
+            }
+            other => panic!("unexpected encapsulation command {other:?}"),
+        }
+    }
+    obs
+}
+
+/// As [`serve`], but the **first connected request** is answered with encapsulation status `0x0064`
+/// (InvalidSessionHandle) instead of a value — the target announcing mid-session that it no longer
+/// recognises our registration (§5.6).
+///
+/// Afterwards the peer keeps reading and answers faithfully: anything that still arrives — a
+/// keepalive probe above all — is recorded in `Observed` rather than provoking a panic, so a
+/// regression shows up as the keepalive assertion it really is. The loop ends at EOF, which is the
+/// causal evidence that the session actor severed and dropped the stream.
+async fn serve_poisoning_the_first_connected_request(
+    server_side: DuplexStream,
+    api: u32,
+) -> Observed {
+    let mut mock = MockPeer::new(server_side);
+    let mut obs = Observed::default();
+    mock.handle_register().await;
+
+    let open_frame = mock.recv().await.expect("forward open request");
+    let (service, data) = parse_ucmm_request(&open_frame);
+    assert_eq!(service, FORWARD_OPEN);
+    let open = parse_open_request(&data);
+    obs.requested_rpis = (open.o_t_rpi, open.t_o_rpi);
+    obs.requested_multiplier_code = open.timeout_multiplier_code;
+    let body = forward_open_success(&open, api);
+    mock.send(&rrdata_reply(
+        open_frame.header.sender_context,
+        &mr_reply(FORWARD_OPEN, 0x00, &body),
+    ))
+    .await;
+
+    let mut poisoned = false;
+    while let Some(frame) = mock.recv().await {
+        match frame.header.command {
+            Command::UnRegisterSession => obs.unregistered = true,
+            Command::SendUnitData => {
+                let req = parse_connected_request(&frame);
+                obs.connected_services.push(req.service);
+                if !poisoned {
+                    poisoned = true;
+                    mock.send(&poisoned_unitdata_reply(frame.header.sender_context))
+                        .await;
+                    continue;
+                }
+                let mr = match req.service {
+                    GET_ATTRIBUTE_SINGLE => {
+                        obs.keepalive_addresses.push(req.address);
+                        obs.keepalive_sequences.push(req.sequence);
+                        obs.keepalive_paths.push(req.path.clone());
+                        mr_reply(GET_ATTRIBUTE_SINGLE, 0x00, &[0x01, 0x02])
+                    }
+                    _ => {
+                        let mut v = WireWriter::new();
+                        v.u16(CipType::Dint.code());
+                        v.i32(555);
+                        mr_reply(READ_TAG, 0x00, v.as_slice())
+                    }
+                };
+                mock.send(&unitdata_reply(
+                    frame.header.sender_context,
+                    open.t_o_connection_id,
+                    req.sequence,
+                    &mr,
+                ))
+                .await;
+            }
+            Command::SendRRData => {
+                let (service, _data) = parse_ucmm_request(&frame);
+                obs.ucmm_services.push(service);
                 mock.send(&rrdata_reply(
                     frame.header.sender_context,
                     &mr_reply(FORWARD_CLOSE, 0x00, &forward_close_success(&open)),
@@ -597,6 +687,70 @@ async fn close_stops_the_keepalive() {
         "close() sends the courtesy UnRegisterSession"
     );
     assert_eq!(obs.keepalives(), 0, "no probe after the session closed");
+}
+
+/// **K9.** §5.6 / §7.6 / D-ENIP-22 — **a dead session's reply must never feed the keepalive clock.**
+///
+/// `send_connected` touches the activity clock only after `transaction()` returns `Ok`, so once an
+/// `InvalidSessionHandle` reply severs the session at the actor, the poisoned exchange refreshes
+/// nothing and no probe can follow it. Before that rule the frame was delivered `Ok`, the clock was
+/// refreshed by a session the target had already torn down, and the connection went on being
+/// "kept alive" against a handle that no longer existed.
+///
+/// The wait is **causal and bounded**, never a sleep-then-assert: the peer's read loop ends at EOF,
+/// which only the actor's death can produce. A surviving session instead leaves every task idle, so
+/// virtual time auto-advances to the probe due point (1.2 s of the 1.6 s window), the probes keep
+/// the peer's loop alive, and this bound trips — which is exactly how the old behaviour fails here.
+#[tokio::test(start_paused = true)]
+async fn a_poisoned_reply_does_not_feed_the_class3_keepalive() {
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let peer = tokio::spawn(serve_poisoning_the_first_connected_request(
+        server_side,
+        400_000,
+    ));
+
+    let client = EipClient::connect_over(
+        client_side,
+        opts(Duration::from_millis(400), TimeoutMultiplier::X4),
+    )
+    .await
+    .expect("the class-3 open succeeds");
+
+    let tag = TagAddress::parse("A").unwrap();
+    let r = client.read_tag(&tag, 1).await;
+    assert!(
+        matches!(r, Err(EnipError::Encap(EncapStatus::InvalidSessionHandle))),
+        "the typed status must reach the caller: {r:?}"
+    );
+
+    let obs = tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .expect(
+            "the peer never saw EOF — the poisoned reply left the session alive, so its refreshed \
+             activity clock went on arming keepalive probes against a handle the target has \
+             already disowned",
+        )
+        .unwrap();
+
+    assert_eq!(
+        obs.keepalives(),
+        0,
+        "no probe may follow a poisoned reply: {obs:?}"
+    );
+    assert_eq!(client.stats().keepalives_sent, 0);
+    assert_eq!(
+        obs.connected_services,
+        vec![READ_TAG],
+        "the poisoned read is the last thing the target ever sees on the connected path"
+    );
+    assert!(
+        !obs.unregistered,
+        "a severed session cannot send a courtesy unregister — the actor is already gone"
+    );
+
+    // …and the session really is severed, not merely quiet.
+    let r2 = client.read_tag(&tag, 1).await;
+    assert!(matches!(r2, Err(EnipError::Closed)), "{r2:?}");
 }
 
 /// **K7.** A target that refuses the attribute read must not wedge or kill the session: a CIP error
