@@ -148,6 +148,7 @@ throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.
 | **D-ENIP-17** | **A ForwardOpen reply cannot steer our class-1 traffic.** (a) The O→T Sockaddr Info item retargets the **port only**: the transmit address is always the target's own. A sockaddr naming `0.0.0.0` contributes its port; one naming the target's address is honoured as written; one naming any other address — foreign unicast, broadcast, multicast, loopback — has its address **refused** (warned, naming the address) and only its port kept. With no known target address a redirect is unresolvable and the open fails. (b) The T→O multicast group is joined **only** when the ForwardOpen requested `ConnType::Multicast` for T→O; a multicast T→O sockaddr answering any other request is a `ProtocolViolation` whose detail names the type that was requested (`"multicast T→O sockaddr on a point-to-point request"`, `"multicast T→O sockaddr on a null (reconfigure) request"`) — the adapter only ever requests P2P, but the crate API accepts either, and a violation must not misreport which one it refused. A requested-multicast connection whose reply carries a unicast or absent T→O sockaddr consumes unicast. Both paths keep the D-ENIP-16 teardown invariant (best-effort ForwardClose before the typed error). Strict by default, with no opt-out knob. | Honouring a concrete foreign address let any target aim our cyclic O→T stream at a third party — a reflection/amplification primitive driven entirely by an attacker-controlled reply — and a multicast offer subscribed our socket to an arbitrary group on a connection we asked to keep point-to-point. The address is the one field the originator already knows (it opened the TCP session); the port is the only field a target legitimately needs to move, which is why the split is address-refuse/port-honour rather than reject-the-reply — real targets that relocate the port keep working. No config knob ships: a strict default needs none, and if field interop ever demands honouring a foreign redirect, that is a `ClientOptions` opt-in to be argued on evidence, not a hedge built in advance. **The refusal is observable, not just logged:** it increments `refused_redirects` on the connection (`enip::IoStats`, 0 or 1 per connection), and the adapter surfaces it as the `refusedRedirects` measure (DESIGN §8.8) plus a one-shot `io-redirect-refused` warning event per ForwardOpen. That closes the one narrow silent failure mode the address-refusal leaves: a device that both *requires* the redirect to receive O→T **and** never enforces its own O→T inactivity watchdog keeps producing inputs while its outputs are dead, and the local `send_to` still succeeds — so `sendErrors` cannot catch it and the adapter would otherwise report the link healthy. |
 | **D-ENIP-18** | **The class-3 inactivity keepalive is crate-owned and window-derived, with no adapter knob.** A class-3 ForwardOpen arms an inactivity watchdog on the target (`timeout_multiplier × O→T API`), so the crate keeps the connection off it: when no request has flowed for **¾ of the window** the session sends a connected `Get_Attribute_Single` of the Identity object (`0x01`, instance 1, attribute 4 = Revision). The window comes from the negotiated values — the reply's actual O→T API when it lies in [100 µs, 600 s], else the clamped requested RPI — and the requested pair is `ClientOptions.class3_rpi` / `class3_timeout_multiplier` (defaults 2 s / ×16, the values the crate previously hard-coded, so a caller that changes nothing emits a byte-identical ForwardOpen). An implausible reply API falls back; it never fails the open (§7.6). Any completed exchange, CIP-error replies included, counts as activity; `ClientStats.keepalives_sent` is the observable face. **No adapter config-schema key is added.** | Feeding the connection's own watchdog is a protocol obligation of the connection's owner, and the owner is this crate — an adapter that has to remember to poll fast enough is a defect waiting for the first paused instance or slow poll group (the adapter's only idle traffic is a `ListIdentity` encapsulation command, which never rides the connected path and so cannot feed the watchdog at any cadence). Deriving the window from the negotiated values rather than a constant means a target that shortens the interval is honoured instead of outlived. The values become options because they are what arms the watchdog and a field device may need them moved; they stay out of the adapter's schema because nothing about a correct default needs operator attention, and the adapter's `keepaliveProbeIntervalMs` is a different surface entirely (paused-state health reporting) that stays as it is. |
 | **D-ENIP-19** | **Tag-enumeration cursors are full 32-bit symbol-instance ids, never masked, and the walk is bounded by the crate.** `list_tags(start_instance: u32, ..) -> (Vec<SymbolInfo>, Option<u32>)` carries the cursor at the same width as `SymbolInfo.instance_id`, and `Segment::Instance` widens to the 32-bit logical form (`0x26`, §6.2) so the request can address it. Three crate-side rules bound the walk regardless of the peer: the records of one page must be **strictly ascending** in instance id or the page is `ProtocolViolation { detail: "tag list page is not in ascending instance order" }`; a `0x06` page whose derived resume point does not advance past `start_instance` is `ProtocolViolation { detail: "tag list page did not advance" }`; and a last record at `u32::MAX` ends the enumeration rather than wrapping (§7.3). | The 16-bit cursor was not a capacity limit but a **liveness** bug: real Logix controllers exceed 65 535 symbol instances, and masking the resume point back into 16 bits sent a caller that pages to completion around the same pages forever — the adapter's hierarchical browse did exactly that, so the observable failure was a command handler that never returned. Widening alone would have left the loop reachable from a merely non-compliant peer, so the ordering the reply already promises is checked instead of trusted — **both** of the things that ordering buys, not just one: the *resume point* must move forward (or the walk revisits pages, the hang), and the page's *own records* must ascend (or every resume point derived from the last one — this crate's `last_id + 1` and any page size a caller cuts to on top of it — silently strands whatever sat behind it, the exact defect the truthful-`max` contract exists to kill, DESIGN D-EIP-29). Each costs one comparison per record and converts a hang or a silent skip into a typed error at the layer that can name the cause. The `0x26` form is the ODVA-defined third width of the same logical segment (the `Element` segment already emitted its `0x2A` analogue), so nothing new is invented on the wire — and because no container sim serves instances that high, it is pinned by hand-assembled golden vectors (§12.4) and cross-checked live against EthernetIPSharp, which parses the segment and answers at the CIP layer (DESIGN §11.7). |
+| **D-ENIP-20** | **ForwardOpen arming is acknowledged, and output staging is confirmable.** `forward_open` completes only after the socket task has registered the connection **and** joined any multicast T→O group; a join failure is a typed `EnipError::Io` with the usual best-effort ForwardClose, and an opener whose future is cancelled before its acknowledgement has the connection unregistered rather than left producing. The handle gains `stage_output`, which carries the manager's verdict back — the same validation as `set_output`, then `Ok` only when the buffer is held for a live connection, `Err(Closed)` when the manager has shut down or the connection is gone. `set_output` keeps its signature and its unconfirmed semantics. Multicast group membership is **not** refcounted: a second connection joining a group its manager socket already holds fails fast and is refused. | The join result was discarded (`let _ = socket.join_multicast_v4(..)`), so a connection whose membership never happened was armed anyway and received nothing: the operator's only symptom was a delayed watchdog timeout naming `Timeout`, with the interface error that caused it thrown away at the point it was known. Making the join load-bearing means the verdict has to travel back, and once `Add` is acknowledged the return-before-registration gap closes with it — a datagram arriving the instant `forward_open` returns can no longer be counted as `unknown_connection`. The same reasoning applies one step further out: `SetOutput` was fire-and-forget, so a write aimed at a connection the task had already removed was reported as success, the crate-side link in the `sb/write` silent-success chain (DESIGN D-EIP-31). Alternatives rejected: refcounting shared groups (the adapter opens one `IoManager` per push session, so sharing never occurs in product use — a refcount would exist only to be tested, where the fail-fast refusal is itself the honest answer), and making `set_output` async (it would break every existing caller to confirm something most of them cannot act on). **Scope limit, stated:** multicast T→O is proven here only by crate tests (join failure, armed post-condition) — no sim in the bench matrix serves a real multicast T→O stream, so true multicast conformance remains real-hardware territory. |
 | **D-ENIP-21** | **Encapsulation-header validation is complete, not partial.** (a) `options ≠ 0` is enforced, not just documented: inside a session the frame is discarded **before** correlation and counted on its own cause (`ClientStats.discarded_options`, warn-logged); at the RegisterSession handshake it is a refusal (`ProtocolViolation`). (b) The **RegisterSession reply is correlated** — it must echo the request's `sender_context` (`ECREGIST`), checked *first*, ahead of command/options/status/handle/version (§5.5). (c) A **non-zero CIP interface handle** in a `SendRRData`, `SendUnitData`, or Connection-Manager UCMM reply is a `ProtocolViolation` at all three decode sites (§5.2). | The header was matched on context, command and handle but never on `options`, and the one exchange with no correlation at all was the handshake that establishes the session: any RegisterSession-shaped frame already on the stream could be adopted as our session, and a peer stamping `options` could answer a request with a frame the spec says to drop. The interface handle was read and thrown away at three sites while §5.2 declares it 0 — a peer addressing another interface is not speaking the CIP encapsulation we asked for, so its payload is not a Message Router reply we may decode and nothing in it may bind a connection. The asymmetry between the two `options` dispositions is deliberate: mid-session the actor has a deadline and other frames may follow, so discard-and-keep-waiting is right; pre-actor exactly one frame is expected, so looping over discards buys nothing and adopting a session from a peer this broken is worse. The counter is its own field rather than folded into `stale_replies` because the two say different things about the peer (§10.2, never silent). **Interop arbitration:** the context echo and the interface-handle refusals are spec-correct but strict, so the live-sims gate (cpppo, OpENer, ab_server, EthernetIPSharp, stunnel-TLS ×2, OpENer-CIPSec, EST) is the false-positive check; the pre-approved concessions, to be taken only on evidence of a real peer failing, are accepting an all-zero context on RegisterSession with a one-time warn and/or demoting the interface-handle refusal to a counted warn. **No concession is taken: no fallback is implemented.** |
 | **D-ENIP-22** | **Encapsulation status `0x0064` (`InvalidSessionHandle`) severs the session at the actor.** The caller that provoked it still gets `Err(Encap(InvalidSessionHandle))`; the actor then exits, so every pending and subsequent request completes `Err(Closed)` without stream I/O. The rule applies to **any** correlated reply, discovery commands included. Recovery is the owner's reconnect — the adapter's classification maps a session-poisoning `Encap` status to transient (DESIGN §10.1) — and the crate never re-registers in place. | The status is a statement about our *registration*, not about the command that provoked it: once the target has forgotten the handle, nothing later on that stream can succeed. Delivering the typed error and then carrying on merely deferred recovery to whatever arbitrary later failure happened next, and left a *live* actor speaking into a session the device had already torn down. It also fed the class-3 inactivity keepalive: `send_connected` touches the activity clock only after the transaction returns `Ok`, so while the poisoned frame was delivered as `Ok` the clock was refreshed by a dead session's reply and the probe cadence went on "keeping alive" a handle that no longer existed (§7.6). Severing at the actor fixes both with one rule, in the one place that owns the stream. In-crate re-registration was rejected as a non-goal: the adapter's reconnect ladder already classifies the status as transient and owns backoff, alarms and instance state — a second, silent recovery path inside the crate would race it. |
 
@@ -746,6 +747,17 @@ that was requested (`"multicast T→O sockaddr on a point-to-point request"` /
 `"… on a null (reconfigure) request"`), and a requested-multicast connection whose reply names a
 unicast address (or carries no T→O sockaddr) consumes unicast.
 
+**Joining that group is part of arming the connection** (D-ENIP-20). The socket task performs the
+`IP_ADD_MEMBERSHIP` join as it registers the connection, and a join failure refuses to arm it: the
+ForwardOpen fails with the socket error (`EnipError::Io`) and the target-side connection is torn
+down by the same best-effort ForwardClose as every other post-success failure. Without membership
+the T→O stream never reaches the socket, so an armed-anyway connection would show the operator a
+delayed watchdog timeout instead of the interface error that caused it. Group membership is **not**
+refcounted across connections: a second connection asking the same manager socket to join a group it
+already holds fails that join and is refused. The adapter runs one `IoManager` per push session, so
+a shared group never arises in product use, and a fail-fast refusal is preferable to a refcount
+whose only exercise would be a test.
+
 The client verifies a success reply before arming anything: the echoed T→O connection id,
 connection serial, vendor id, and originator serial must equal the request's
 (`verify_forward_open_echo`), and for class-1 both reply APIs must lie within [100 µs, 600 s]
@@ -758,8 +770,8 @@ error propagates. Past the target's success reply the target believes a connecti
 produces into it until its own watchdog expires, so every remaining failure path tears it down: a
 reply that fails echo verification, a reply whose APIs are out of range, an O→T transmit endpoint
 that cannot be resolved (no known target address), a multicast T→O sockaddr on a connection that did
-not request multicast T→O, and a manager task that has already exited so the connection could never
-be serviced. The ForwardClose is best-effort throughout
+not request multicast T→O, a multicast group the socket could not join, and a manager task that has
+already exited so the connection could never be serviced. The ForwardClose is best-effort throughout
 — its encode, round trip, and reply status are all discarded, because the caller is already leaving
 with a more specific error that must not be replaced.
 
@@ -812,6 +824,14 @@ item 0x00B1 (connected data), length N:
 (`RealTimeFormat::{Modeless, Header32Bit, Heartbeat, ZeroLength}`).
 
 ### 8.6 Consume loop (validation gauntlet — every step counted)
+
+**Registration is acknowledged, so routing has no start-up hole** (D-ENIP-20). `forward_open`
+completes only after the socket task has inserted the connection into the routing table and joined
+any multicast group, so a T→O datagram that arrives the instant it returns is routed rather than
+counted as `unknown_connection`. The wait is causal, not timed: the task either services its command
+queue or has exited, and both complete it. If the opener's future is cancelled between the command
+and its acknowledgement, nobody owns the connection, so the task unregisters it — leaving any group —
+instead of producing O→T into it for the life of the process.
 
 One `IoManager` task owns the UDP socket. Per datagram: CPF decode (`WireReader`; runt/malformed →
 `malformed_frames` counter, drop) → sequenced-address lookup by `connection_id` against live
@@ -869,8 +889,10 @@ Via UCMM to the Connection Manager: `u8 priority/time_tick, u8 timeout_ticks, u1
 u16 vendor, u32 orig serial, u8 path_size (words), u8 reserved, connection path` (same path as the
 open — note the reserved byte after path size, absent in ForwardOpen). Sent on `close()`, on
 drop of the last handle (best-effort, spawned), and after a watchdog timeout (the target may
-already consider it dead; a failure reply is logged, not fatal). Multicast T→O additionally
-leaves the IGMP group when the last connection using it closes.
+already consider it dead; a failure reply is logged, not fatal). Removing a multicast T→O connection
+additionally leaves its IGMP group. There is no membership refcount, and none is needed: a group is
+held by exactly one connection per manager socket, because a second connection's join of a group the
+socket already holds fails and that connection is refused at ForwardOpen (§8.2, D-ENIP-20).
 
 ---
 
@@ -1029,7 +1051,9 @@ best-effort with a short fixed deadline so shutdown never hangs.
 - **One `IoManager` task per bound UDP socket** (usually one per adapter process): owns the
   socket, the connection registry, the consume loop, and all produce timers (spawned per
   connection, aborted on close). `IoConnectionHandle` exposes `events` (a bounded latest-wins
-  receiver, §8.6), `set_output`, `set_run`, `stats`, `close`.
+  receiver, §8.6), `set_output`, `stage_output`, `set_run`, `stats`, `close`. Commands that can
+  fail inside the task — registering a connection, and the confirmed form of output staging — carry
+  a `oneshot` acknowledgement so the verdict reaches the caller (D-ENIP-20).
 - **Graceful teardown**: `EipClient::close()` → UnRegisterSession → socket close;
   `IoConnectionHandle::close()` → ForwardClose (needs the `EipClient`) → produce timer aborted →
   registry removal. `Drop` is non-async: it aborts tasks and closes sockets (RAII), spawning
@@ -1075,9 +1099,10 @@ let conn = io.forward_open(&client, IoConnectionSpec {
     o2t: DirectionSpec { rpi: Duration::from_millis(20), data_size: 4,
                          format: RealTimeFormat::Header32Bit, .. },        // data_size 0 ⇒ heartbeat
     timeout_multiplier: TimeoutMultiplier::X16,
-}).await?;                                            // Err(ForwardOpenRejected{..}) on refusal
+}).await?;    // Err(ForwardOpenRejected{..}) on refusal; Ok ⇒ the connection is ARMED (§8.6)
 
-conn.set_output(&bytes)?;            // validated against negotiated O→T size
+conn.set_output(&bytes)?;            // validated against negotiated O→T size; UNCONFIRMED
+conn.stage_output(&bytes).await?;    // same validation, plus the manager's accept/refuse verdict
 conn.set_run(true);
 // `events()` is an IoEventReceiver: bounded + latest-wins on Data, Up/Lost never evicted (§8.6);
 // `None` is the authoritative "connection is gone".
@@ -1090,6 +1115,14 @@ while let Some(ev) = conn.events().recv().await {
 }
 conn.close(&client).await;
 ```
+
+**Output staging comes in two forms** (D-ENIP-20). `set_output` is synchronous and *unconfirmed*:
+its `Ok` says the command was queued for the socket task, and a connection the task has already
+removed swallows it. `stage_output` runs the same size validation and then awaits the task's
+verdict, so its `Ok` means the buffer is held for a live connection and will ride the next produced
+frame; `Err(Closed)` names a manager that has shut down or a connection that is gone, and says
+plainly that the value was never staged. Callers answering a write command use `stage_output`; the
+fire-and-forget setter stays for callers with nothing to report to.
 
 Everything is deadline-bounded — including writes, connect/close, shutdown, and the TLS handshake at
 both `connect_tls` and the `connect_tls_over` stream-injection entry point — returns
