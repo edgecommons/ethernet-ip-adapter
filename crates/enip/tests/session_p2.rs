@@ -1774,6 +1774,146 @@ async fn register_reply_with_nonzero_options_is_refused() {
     assert!(server.await.unwrap(), "no session actor owns the stream");
 }
 
+// ---------------------------------------------------------------------------
+// §5.5 / D-ENIP-21 — the RegisterSession reply **body**: `u16 protocol_version = 1`,
+// `u16 options = 0`, and nothing after it. Every one of these bodies was accepted while only the
+// first word was read, so each test below fails against that code and passes against the whole-body
+// validation. The 4-byte reply is what every live peer in the bench actually sends (cpppo,
+// libplctag's ab_server, EthernetIPSharp, OpENer, OpENer-CIPSecurity all answer `01 00 00 00`), so
+// none of these shapes is a real device's behaviour being outlawed.
+// ---------------------------------------------------------------------------
+
+/// Drive one handshake whose reply carries `body`. Returns the client's verdict plus the peer task,
+/// which resolves to whether the peer saw EOF next — a refused handshake spawns no session actor, so
+/// the stream must drop rather than leave a live reader on a session we rejected.
+async fn register_reply_body_verdict(
+    body: Vec<u8>,
+) -> (enip::Result<EipClient>, tokio::task::JoinHandle<bool>) {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        let req = peer.recv().await.unwrap();
+        assert_eq!(req.header.command, Command::RegisterSession);
+        peer.send(&mk_frame(
+            Command::RegisterSession,
+            SESSION_HANDLE,
+            req.header.sender_context,
+            body,
+        ))
+        .await;
+        peer.recv().await.is_none()
+    });
+    let r = EipClient::connect_over(client_io, base_opts()).await;
+    (r, server)
+}
+
+/// The reviewer's case: a **two-byte** body carrying only `01 00`. The protocol version is right,
+/// but the options word the request sent — and §5.5 says comes back — is simply not there. Reading
+/// the version and stopping accepted this frame and adopted the session out of it.
+#[tokio::test]
+async fn register_reply_with_a_two_byte_body_is_refused() {
+    let (r, server) = register_reply_body_verdict(vec![0x01, 0x00]).await;
+    assert!(
+        matches!(
+            r.as_ref(),
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "register reply body ends before the session options word"
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+    assert!(server.await.unwrap(), "no session actor owns the stream");
+}
+
+/// A reply with **no** command-specific data at all. The status is OK and the handle is non-zero, so
+/// nothing before the body catches it; the missing version must be named as a missing field rather
+/// than silently read as 0 and reported as an unsupported protocol version.
+#[tokio::test]
+async fn register_reply_with_an_empty_body_is_refused() {
+    let (r, server) = register_reply_body_verdict(Vec::new()).await;
+    assert!(
+        matches!(
+            r.as_ref(),
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "register reply body ends before the protocol version"
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+    assert!(server.await.unwrap(), "no session actor owns the stream");
+}
+
+/// The body's **session options** word is reserved and fixed at 0 (§5.5) — the same rule the header
+/// `options` check applies one layer out. A peer setting bits there is negotiating something we
+/// never offered, so the session is refused rather than adopted with the option ignored.
+#[tokio::test]
+async fn register_reply_with_nonzero_session_options_is_refused() {
+    let (r, server) = register_reply_body_verdict(vec![0x01, 0x00, 0x01, 0x00]).await;
+    assert!(
+        matches!(
+            r.as_ref(),
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "register reply body carries non-zero session options"
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+    assert!(server.await.unwrap(), "no session actor owns the stream");
+}
+
+/// An otherwise-perfect body with bytes appended. The layout is exact, so trailing data is not a
+/// larger version of the same structure — it is a frame whose length disagrees with the command it
+/// claims to answer, and nothing downstream would ever look at those bytes.
+#[tokio::test]
+async fn register_reply_with_trailing_body_bytes_is_refused() {
+    let (r, server) = register_reply_body_verdict(vec![0x01, 0x00, 0x00, 0x00, 0xFF]).await;
+    assert!(
+        matches!(
+            r.as_ref(),
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "register reply body has trailing bytes after the 4-byte payload"
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+    assert!(server.await.unwrap(), "no session actor owns the stream");
+}
+
+/// The variant split, pinned: a body of the right *shape* whose protocol version is not 1 is
+/// `Unsupported`, not `ProtocolViolation` — the peer is speaking a generation of the encapsulation
+/// layer this crate does not implement, the same thing encapsulation status `0x0069` says. The
+/// malformed-body refusals above must stay distinguishable from it by variant alone.
+#[tokio::test]
+async fn register_reply_with_an_unsupported_protocol_version_is_refused() {
+    let (r, server) = register_reply_body_verdict(vec![0x02, 0x00, 0x00, 0x00]).await;
+    assert!(
+        matches!(
+            r.as_ref(),
+            Err(enip::EnipError::Unsupported {
+                what: "encapsulation protocol version"
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+    assert!(server.await.unwrap(), "no session actor owns the stream");
+}
+
+/// The conforming body — `01 00 00 00`, exactly what every live peer in the bench sends — still
+/// registers. The whole-body validation must reject the shapes above **without** tightening the one
+/// shape a compliant target actually emits.
+#[tokio::test]
+async fn register_reply_with_the_exact_four_byte_body_is_accepted() {
+    let (r, server) = register_reply_body_verdict(vec![0x01, 0x00, 0x00, 0x00]).await;
+    assert!(r.is_ok(), "{:?}", r.err());
+    drop(r);
+    server.abort();
+}
+
 /// §5.2 / D-ENIP-21 — the CIP interface handle in a `SendRRData` reply is 0 by Vol 2. A non-zero
 /// value means the peer is answering on some other interface, so the payload is not a CIP Message
 /// Router reply we may decode: `ProtocolViolation` (non-transient — a peer that mislabels its
