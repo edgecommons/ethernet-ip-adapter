@@ -65,8 +65,9 @@ library.
 
 ### 1.1 EtherNet/IP + CIP background (what an implementer must know)
 
-- **EtherNet/IP** encapsulates CIP over TCP port **44818** (explicit messaging) and UDP 2222
-  (implicit class-1 I/O). A TCP session is opened with an EtherNet/IP *RegisterSession*, then CIP
+- **EtherNet/IP** encapsulates CIP over TCP port **44818** (explicit messaging) and UDP **2222**
+  (implicit class-1 I/O — the registered port a *device* is reached on; an originator's own I/O
+  socket is ephemeral, see below). A TCP session is opened with an EtherNet/IP *RegisterSession*, then CIP
   requests ride *SendRRData* (unconnected) or *SendUnitData* (connected, after a CIP
   *ForwardOpen*).
 - **Explicit messaging** is request/response: the client sends a CIP service (Read Tag `0x4C`,
@@ -75,7 +76,9 @@ library.
 - **Implicit I/O** (class-1 cyclic UDP produced/consumed assemblies) is the device-push model:
   the adapter (as scanner/originator) ForwardOpens an I/O connection against the device's
   assembly instances; the device then produces its input assembly cyclically at the negotiated
-  RPI over UDP :2222, and the adapter produces an output assembly (or heartbeat) back. This is
+  RPI (T→O, sent to the ephemeral UDP port the adapter bound and advertised in the ForwardOpen's
+  Sockaddr Info items), and the adapter produces an output assembly (or heartbeat) back to the
+  device's UDP :2222 (O→T). The registered port is the *target's*; see §3.4 and §13. This is
   the adapter's **push** mode. Assemblies are raw bytes; config maps byte offsets to typed,
   named signals (§4.6). Mode is selected **per instance** (`mode: poll | push`, D-EIP-2).
 - **The AB tag model**: Logix controllers expose *tags* — named, typed variables
@@ -899,8 +902,12 @@ and no `target`.
 A push instance answers the same shape plus an `io` object:
 `"io": { "o2tApiMs": 100, "t2oApiMs": 100, "run": true, "peerRun": true,
 "framesConsumed": {...}, "staleDropped": {...}, "sequenceGaps": {...}, "sendErrors": {...},
-"recvErrors": {...}, "refusedRedirects": {...} }` (negotiated APIs from the ForwardOpen reply,
-run/idle both directions, and the §8.8 counters as `{interval, total}` pairs).
+"recvErrors": {...}, "sourceMismatchDatagrams": {...}, "refusedRedirects": {...} }` (negotiated APIs
+from the ForwardOpen reply, run/idle both directions, and the §8.8 counters as `{interval, total}`
+pairs). The two D-ENIP-decision counters are here and not only on the metric family because both name
+a failure the rest of the status object reports as healthy: `refusedRedirects` (outputs going nowhere,
+D-ENIP-17) and `sourceMismatchDatagrams` (a target producing T→O from an address that is not the one
+we opened the session to, D-ENIP-24 — which otherwise presents only as a link that never comes up).
 
 `connected`/`state`/`paused` come from the SAME shared Health/Paused state the connectivity
 provider reads — ask or watch, same answer. (The universal `status` built-in already returns
@@ -1239,6 +1246,7 @@ Dimensions: `instance`. Sourced from the engine plus the protocol crate's per-co
 | `produceOverrunsTotal` / `produceOverrunsInterval` | Count | 60 (missed O→T ticks) |
 | `sendErrorsTotal` / `sendErrorsInterval` | Count | 60 (O→T datagram send failures) |
 | `recvErrorsTotal` / `recvErrorsInterval` | Count | 60 (socket receive errors) |
+| `sourceMismatchDatagramsTotal` / `sourceMismatchDatagramsInterval` | Count | 60 (T→O datagrams that named a live connection but arrived from an IP that is not that connection's target — dropped before the consume gauntlet, delivering nothing and **not** feeding the watchdog; PROTOCOL-DESIGN D-ENIP-24. Nonzero means either something else on the segment is producing into our connection id, or the target genuinely sources its T→O stream from a second interface) |
 | `refusedRedirectsTotal` / `refusedRedirectsInterval` | Count | 60 (ForwardOpen replies whose foreign O→T sockaddr address was refused — 0 or 1 per connection; also fires the one-shot `io-redirect-refused` event, §6.3, PROTOCOL-DESIGN D-ENIP-17) |
 | `interFrameMs` | Milliseconds | 1 (gauge: last observed T→O inter-arrival **within one connection** — the lived RPI. An interval spanning a reconnect is not a lived RPI and is never recorded as one) |
 | `runMode` | Count | 1 (gauge: 1 = we produce Run; 0 = Idle) |
@@ -2154,7 +2162,7 @@ the human follow-up.
 | CIP Security Phases 2b/2c on the adapter side: client-cert rotation-without-restart, the near-expiry event, and EST enrollment against a live RFC 7030 server | local Docker: `test-infra/enip-tls/` stunnel on `:2221` + `test-infra/est/` globalsign/est on `:8443` **+ CI `live-sims` (per PR, skip-free)** | **in scope**, as the three **in-source** live tests (§11.3): `eip/tls.rs`'s `live_client_cert_rotation_presents_the_new_cert` (rotate the vault ⇒ the next `connect_tls` presents the new serial to the `verify=2` peer) and `live_near_expiry_cert_fires_expiring`, and `eip/est/tests.rs`'s `live_est_enroll_against_globalsign_estserver` (a real issued cert lands in the vault). These live inside the coverage denominator, so they read uncovered when the containers are down. |
 | CIP Security against a **certified Vol 8 device** (44818-closed port policy, Vol-8-exact suite lists, `Send Certificate Chain` / `Verify Client Certificate` corner semantics, device-side commissioning; **EST enrollment against a real plant/device pull-model PKI**, Phase 2c) | lab CIP-Security PLC (none on the bench) | **deferred to lab hardware** (§14.6) — the stunnel terminator + globalsign/est `estserver` cover the changed *layers* faithfully (independent TLS/EtherNet/IP + independent RFC 7030 server) but neither is a real CIP-Security device. Acquire a CompactLogix 5380 / ControlLogix 5580 v32+ or a 1756-EN4TR (commissioned with FactoryTalk Policy Manager) when CIP Security becomes a shipping claim (DESIGN-cip-security.md §5.2/§6.3). |
 | HOST/dual-MQTT smoke | local | **in scope** (S9) |
-| Kubernetes | kind cluster, `k8s/` manifests + cpppo & OpENer as cluster services (UDP :2222 pod-to-pod for push) | **in scope** (S9, smoke: pod Ready, data on bus both modes, probes green) |
+| Kubernetes | kind cluster, `k8s/` manifests + cpppo & OpENer as cluster services (class-1 UDP pod-to-pod for push: O→T to the OpENer pod's `:2222`, T→O back to the ephemeral port the adapter pod advertises in the ForwardOpen — no inbound port is declared, §13) | **in scope** (S9, smoke: pod Ready, data on bus both modes, probes green) |
 | Greengrass deployed regression | `lab-5950x` (build via WSL `--features greengrass`, `greengrass-cli` local deploy) | **required before the component is "done"** (org rule: new capability ⇒ deployed GG regression). Scheduled S9; if the lab is unreachable in a session, report a **blocking validation gap** — do not claim completion. |
 | True `slot`/backplane **routing semantics** + connected class-3 messaging (incl. whether a real Logix Connection Manager enforces the class-3 idle window the §7.6 keepalive covers) + real-Logix browse (hundreds of tags, UDT/`RECIPE` `supported:false` on real Rockwell symbol types) + push against a real Logix/adapter device | lab PLC (none currently on the bench) | **deferred to lab hardware** — explicitly listed in §14.6. `enip` now *emits* a well-formed Unconnected_Send route (validated vs ab_server, §11.6) and *decodes* a real `0x55` browse page (validated vs EthernetIPSharp, §11.7), but ab_server ignores the route content (no real slot-routing) and sim browse is a handful of atomic tags — so plant-grade backplane routing and real-Logix browse semantics still need a physical controller; push conformance beyond OpENer likewise stays sim-grade. |
 

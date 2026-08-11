@@ -258,6 +258,7 @@ pub fn family_defs() -> Vec<FamilyDef> {
     io.extend(pair("produceOverruns"));
     io.extend(pair("sendErrors"));
     io.extend(pair("recvErrors"));
+    io.extend(pair("sourceMismatchDatagrams"));
     io.extend(pair("refusedRedirects"));
     io.push(m("interFrameMs", UNIT_MS, 1));
     io.push(m("runMode", UNIT_COUNT, 1));
@@ -470,6 +471,9 @@ struct IoCounters {
     produce_overruns: Pair,
     send_errors: Pair,
     recv_errors: Pair,
+    /// T→O datagrams dropped because their source IP was not the connection's target (D-ENIP-24,
+    /// §8.8) — a drop that delivers nothing and does not feed the watchdog.
+    source_mismatch_datagrams: Pair,
     /// O→T sockaddr redirects refused at ForwardOpen (D-ENIP-17, §8.8) — 0 or 1 per connection.
     refused_redirects: Pair,
     inter_frame_ms: f64,
@@ -486,6 +490,7 @@ struct IoCounters {
     last_stats_produce_overruns: u64,
     last_stats_send_errors: u64,
     last_stats_recv_errors: u64,
+    last_stats_source_mismatch: u64,
     last_stats_refused_redirects: u64,
     /// Negotiated APIs from the ForwardOpen reply (ms), surfaced by `sb/status` (§7.1).
     o2t_api_ms: u32,
@@ -514,6 +519,8 @@ impl IoCounters {
         self.produce_overruns.drain_into(&mut v, "produceOverruns");
         self.send_errors.drain_into(&mut v, "sendErrors");
         self.recv_errors.drain_into(&mut v, "recvErrors");
+        self.source_mismatch_datagrams
+            .drain_into(&mut v, "sourceMismatchDatagrams");
         self.refused_redirects
             .drain_into(&mut v, "refusedRedirects");
         v.insert("interFrameMs".to_string(), self.inter_frame_ms);
@@ -550,6 +557,7 @@ impl IoCounters {
         self.last_stats_produce_overruns = 0;
         self.last_stats_send_errors = 0;
         self.last_stats_recv_errors = 0;
+        self.last_stats_source_mismatch = 0;
         self.last_stats_refused_redirects = 0;
     }
 }
@@ -1011,6 +1019,7 @@ impl DeviceMetrics {
             "sequenceGaps": pair(&io.sequence_gaps),
             "sendErrors": pair(&io.send_errors),
             "recvErrors": pair(&io.recv_errors),
+            "sourceMismatchDatagrams": pair(&io.source_mismatch_datagrams),
             "refusedRedirects": pair(&io.refused_redirects),
         })
     }
@@ -1090,6 +1099,11 @@ impl DeviceMetrics {
             &mut io.recv_errors,
             &mut io.last_stats_recv_errors,
             s.recv_errors,
+        );
+        feed(
+            &mut io.source_mismatch_datagrams,
+            &mut io.last_stats_source_mismatch,
+            s.source_mismatch_datagrams,
         );
         feed(
             &mut io.refused_redirects,
@@ -1709,6 +1723,7 @@ mod tests {
             "produceOverruns",
             "sendErrors",
             "recvErrors",
+            "sourceMismatchDatagrams",
             "refusedRedirects",
         ] {
             io.extend(cp(p));
@@ -2091,6 +2106,90 @@ mod tests {
             "reconnect counts fold in from 0"
         );
         assert_eq!(last["recvErrorsTotal"], 2.0);
+    }
+
+    /// **D-ENIP-24 end to end.** A class-1 datagram dropped because its source IP was not the
+    /// connection's target is counted inside the stack; this pins that the count does not dead-end
+    /// at the seam. It must be a declared `EtherNetIpIo` measure, fold as a delta of the cumulative
+    /// snapshot, rebase on a lost link like every other stack counter, and show up in the push
+    /// `sb/status` `io` object — the surface an operator actually reaches for when a link never
+    /// comes up, which is exactly what a target producing from a second interface looks like.
+    #[tokio::test]
+    async fn source_mismatch_datagrams_reach_the_io_family_and_status() {
+        use crate::device::IoLinkStats;
+
+        // The measure is declared, so the emit below is not an undefined name.
+        let fam = family_defs()
+            .into_iter()
+            .find(|f| f.name == IO)
+            .expect("EtherNetIpIo is defined");
+        let got: BTreeSet<(String, String, u32)> = fam
+            .measures
+            .iter()
+            .map(|x| (x.name.clone(), x.unit.clone(), x.res))
+            .collect();
+        for want in [
+            "sourceMismatchDatagramsTotal",
+            "sourceMismatchDatagramsInterval",
+        ] {
+            assert!(
+                got.contains(&(want.to_string(), UNIT_COUNT.to_string(), 60)),
+                "EtherNetIpIo carries the {want} Count measure"
+            );
+        }
+
+        let (svc, m) = dm(push_device());
+        m.record_io_stats(IoLinkStats {
+            source_mismatch_datagrams: 4,
+            ..Default::default()
+        });
+        m.emit_io(false).await;
+        // Cumulative: three more spoofed/misdirected datagrams since the last read.
+        m.record_io_stats(IoLinkStats {
+            source_mismatch_datagrams: 7,
+            ..Default::default()
+        });
+        m.emit_io(false).await;
+        // A lost link rebases the baseline, so the next connection's lower cumulative snapshot folds
+        // in from 0 rather than going negative.
+        m.on_io_lost();
+        m.record_io_stats(IoLinkStats {
+            source_mismatch_datagrams: 2,
+            ..Default::default()
+        });
+        m.emit_io(false).await;
+
+        let io_emits: Vec<HashMap<String, f64>> = {
+            let emitted = svc.emitted.lock().unwrap();
+            emitted
+                .iter()
+                .filter(|(n, _)| n == IO)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        assert_eq!(io_emits.len(), 3, "three EtherNetIpIo emits");
+        assert_eq!(io_emits[0]["sourceMismatchDatagramsTotal"], 4.0);
+        assert_eq!(io_emits[0]["sourceMismatchDatagramsInterval"], 4.0);
+        assert_eq!(
+            io_emits[1]["sourceMismatchDatagramsTotal"], 7.0,
+            "4 + (7-4)"
+        );
+        assert_eq!(
+            io_emits[1]["sourceMismatchDatagramsInterval"], 3.0,
+            "delta only"
+        );
+        assert_eq!(
+            io_emits[2]["sourceMismatchDatagramsInterval"], 2.0,
+            "reconnect counts fold in from 0"
+        );
+        assert_eq!(
+            io_emits[2]["sourceMismatchDatagramsTotal"], 9.0,
+            "total stays monotonic across the reconnect"
+        );
+
+        // …and the push `sb/status` io object answers with the same running pair.
+        let iov = m.io_view();
+        assert_eq!(iov["sourceMismatchDatagrams"]["total"], 9.0);
     }
 
     /// The push `sb/status` `io` object reports the socket-error pairs alongside the frame counters.
