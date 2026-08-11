@@ -176,9 +176,11 @@ any device I/O**. A poll write is CIP-acked; a push write reports `applied: "nex
 the O→T buffer). A push write that cannot be staged reports `ok: false` with the reason, and the reason
 distinguishes a class-1 connection that was **lost** — naming the loss (inactivity watchdog timeout,
 peer close, socket error) — from one that was **closed**, from a session that is closing or could not
-confirm the staging in time. Entries without a `value`, an unresolvable ref, an
-input-side push field, or a device rejection are reported per-entry `{"ok": false, "error": …}`. Every
-entry emits a `write-audit` event.
+confirm the staging in time. A push write is bounded by `timeouts.requestTimeoutMs` end to end, and a
+refusal is final: a value reported `ok: false` is never staged afterwards, and never rides out inside
+a later write to another field of the same output assembly. Entries without a `value`, an unresolvable
+ref, an input-side push field, or a device rejection are reported per-entry `{"ok": false, "error": …}`.
+Every entry emits a `write-audit` event.
 
 ## Control plane
 
