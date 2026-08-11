@@ -410,6 +410,19 @@ async fn opener_live_class3_idle_survives_the_inactivity_window() {
         "baseline Get_Attribute_Single(Identity, 1, 4) -> {} byte(s)",
         baseline.len()
     );
+    // **The connect-time identity read (D-ENIP-26 / D-EIP-34), against OpENer.** Folded into this
+    // leg rather than given a test of its own so it rides the class-3 path *and* the CI name filter
+    // that selects this test; what OpENer answers is recorded, not demanded — an identity or a
+    // tolerated refusal — and either way the connection must still serve requests, which the whole
+    // rest of this leg then proves across a 75 s idle.
+    match client.read_identity().await {
+        Ok(id) => println!("live_opener identity: {id}"),
+        Err(enip::EnipError::Cip(status)) => {
+            println!("live_opener identity: REFUSED by the peer ({status}) — tolerated by design");
+        }
+        Err(e) => panic!("the identity read failed at the connection level: {e:?}"),
+    }
+
     let before = client.stats().keepalives_sent;
 
     let idle = Duration::from_secs(75);

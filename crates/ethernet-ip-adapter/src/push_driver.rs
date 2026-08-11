@@ -248,6 +248,17 @@ pub(crate) async fn consume_push(
                     // flush southbound_health + connection + io immediately (§8.7).
                     dm.on_io_up(o2t_api_ms, t2o_api_ms);
                     dm.emit_now().await;
+                    let mut connected_ctx = json!({
+                        "instance": cfg.id, "adapter": adapter,
+                        "o2tApiMs": o2t_api_ms, "t2oApiMs": t2o_api_ms
+                    });
+                    // D-EIP-34: the identity read over the explicit session that carried the
+                    // ForwardOpen, stored on `Health` by the push ladder before this loop started.
+                    // Same renderer as the poll `device-connected` and `sb/status`, so a consumer
+                    // parses one shape wherever identity appears.
+                    if let Some(id) = health.identity() {
+                        connected_ctx["identity"] = crate::metrics::identity_json(&id);
+                    }
                     events
                         .emit(
                             Severity::Info,
@@ -256,10 +267,7 @@ pub(crate) async fn consume_push(
                                 "class-1 connection up to {}",
                                 cfg.connection.endpoint
                             )),
-                            Some(json!({
-                                "instance": cfg.id, "adapter": adapter,
-                                "o2tApiMs": o2t_api_ms, "t2oApiMs": t2o_api_ms
-                            })),
+                            Some(connected_ctx),
                         )
                         .await;
                     events

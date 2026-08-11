@@ -309,6 +309,14 @@ impl Commander {
         // CIP Security posture (DESIGN-cip-security.md §3.4): always present so a console can render
         // the security column unconditionally (`{"mode":"plaintext"}` on a plaintext instance).
         out.insert("security".into(), h.dm.security_view());
+        // What the device says it is, read once at connect (D-EIP-34) — always present, `null` when
+        // the session is down or the device refused the read. Answered from the captured value, so a
+        // status query never costs a device round-trip. It is a label: nothing in this adapter
+        // dispatches on it.
+        out.insert("identity".into(), h.dm.identity_view());
+        // What ordinary operations have taught us about the device's dialect (D-EIP-34). Always
+        // present, `"unknown"` until something exercised it — never probed for.
+        out.insert("dialect".into(), h.dm.dialect_view());
         if matches!(h.cfg.mode, DeviceMode::Push) {
             out.insert("io".into(), h.dm.io_view());
         }
@@ -856,12 +864,19 @@ impl Commander {
                     .await
                     .map_err(|_| device_unavailable())?;
                 match rx.await {
-                    Ok(Ok(page)) => Ok(browse_page_json(&h, page)),
-                    Ok(Err(BrowseError::Unsupported)) => Err(CommandError::new(
-                        "BROWSE_UNSUPPORTED",
-                        "device has no tag-list service",
-                    )),
-                    Ok(Err(BrowseError::Failed(e))) => Err(CommandError::new("BROWSE_FAILED", e)),
+                    Ok(outcome) => {
+                        record_browse_dialect(&h, &outcome);
+                        match outcome {
+                            Ok(page) => Ok(browse_page_json(&h, page)),
+                            Err(BrowseError::Unsupported) => Err(CommandError::new(
+                                "BROWSE_UNSUPPORTED",
+                                "device has no tag-list service",
+                            )),
+                            Err(BrowseError::Failed(e)) => {
+                                Err(CommandError::new("BROWSE_FAILED", e))
+                            }
+                        }
+                    }
                     Err(_) => Err(device_unavailable()),
                 }
             };
@@ -968,15 +983,20 @@ impl Commander {
                         .await
                         .map_err(|_| device_unavailable())?;
                     let page = match rx.await {
-                        Ok(Ok(page)) => page,
-                        Ok(Err(BrowseError::Unsupported)) => {
-                            return Err(CommandError::new(
-                                "BROWSE_UNSUPPORTED",
-                                "device has no tag-list service",
-                            ));
-                        }
-                        Ok(Err(BrowseError::Failed(e))) => {
-                            return Err(CommandError::new("BROWSE_FAILED", e))
+                        Ok(outcome) => {
+                            record_browse_dialect(h, &outcome);
+                            match outcome {
+                                Ok(page) => page,
+                                Err(BrowseError::Unsupported) => {
+                                    return Err(CommandError::new(
+                                        "BROWSE_UNSUPPORTED",
+                                        "device has no tag-list service",
+                                    ));
+                                }
+                                Err(BrowseError::Failed(e)) => {
+                                    return Err(CommandError::new("BROWSE_FAILED", e))
+                                }
+                            }
                         }
                         Err(_) => return Err(device_unavailable()),
                     };
@@ -1401,6 +1421,27 @@ fn deadband_json(db: &crate::config::DeadbandSpec) -> Value {
         DeadbandKind::Percent => "percent",
     };
     json!({ "type": kind, "value": db.value })
+}
+
+/// **Passive dialect memory** (D-EIP-34): record what a browse that ran anyway just taught us about
+/// this device's Logix tag-list service (Symbol Object `0x55`), for `sb/status.dialect`.
+///
+/// The rule is what makes it *passive*: a device is never asked a question it was not otherwise
+/// going to be asked. Some field devices answer an unimplemented service badly — a reset, a wedged
+/// session, a fault log entry — so a connect-time capability probe buys a nice status field at the
+/// cost of poking every device on the network with a service it may not implement. Nothing here
+/// initiates anything; it reads the outcome of an operator's own `sb/browse`.
+///
+/// Only two outcomes teach anything. A page is proof the service answered; `Unsupported` is proof
+/// the device refused the service itself. `Failed` is a link error or a mid-walk fault, which says
+/// nothing about the dialect — recording it as "unsupported" would turn one bad cable into a
+/// permanent, wrong claim about the device.
+fn record_browse_dialect(h: &DeviceHandle, outcome: &std::result::Result<BrowsePage, BrowseError>) {
+    match outcome {
+        Ok(_) => h.health.record_tag_list_support(true),
+        Err(BrowseError::Unsupported) => h.health.record_tag_list_support(false),
+        Err(BrowseError::Failed(_)) => {}
+    }
 }
 
 /// The `sb/browse` reply for a poll page (§7.5): each tag with `configured`/`supported` flags.
@@ -2221,6 +2262,104 @@ mod tests {
         let out = ok(hp.commander.status(None, &json!({})).await);
         assert_eq!(out["mode"], json!("push"));
         assert!(out["io"].get("framesConsumed").is_some());
+    }
+
+    /// **`sb/status` reports what the device said it is, and admits when it does not know**
+    /// (D-EIP-34). Both keys are unconditional so a console can render the column without probing
+    /// for their existence: `identity` is `null` until a session has read one, `dialect` says
+    /// `"unknown"` until an operation has taught it something.
+    #[tokio::test]
+    async fn status_reports_the_identity_and_the_dialect_memory() {
+        let h = harness(poll_device(), MockOpts::default());
+
+        // Before any session read one: present, and honestly empty.
+        let out = ok(h.commander.status(None, &json!({})).await);
+        assert_eq!(
+            out["identity"],
+            Value::Null,
+            "unknown is `null`, never an invented nameplate"
+        );
+        assert_eq!(out["dialect"], json!({ "tagListService": "unknown" }));
+
+        // Once the connect edge has stored one, every field is rendered.
+        h.health
+            .set_identity(Some(crate::testutil::scripted_identity("1756-L71/B")));
+        let out = ok(h.commander.status(None, &json!({})).await);
+        assert_eq!(
+            out["identity"],
+            json!({
+                "vendorId": 0x1337,
+                "vendorName": Value::Null,
+                "deviceType": 0x000E,
+                "deviceTypeName": "Programmable Logic Controller",
+                "productCode": 0x0042,
+                "revision": "7.3",
+                "serialNumber": "0x00C0FFEE",
+                "productName": "1756-L71/B",
+            }),
+            "the whole nameplate, with an unregistered vendor left unnamed rather than guessed"
+        );
+    }
+
+    /// **Passive dialect memory reflects what a browse actually did** (D-EIP-34) — and nothing else.
+    /// A page proves the tag-list service answered; a `BROWSE_UNSUPPORTED` proves the device refused
+    /// the service; a `BROWSE_FAILED` (a link error mid-walk) proves nothing about the dialect and
+    /// must leave the memory exactly as it found it.
+    #[tokio::test]
+    async fn a_browse_teaches_the_dialect_memory_and_a_link_failure_does_not() {
+        // A device that serves the tag list.
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::Tags(vec![("LINE_SPEED", "REAL")]),
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            ok(h.commander.status(None, &json!({})).await)["dialect"]["tagListService"],
+            json!("unknown"),
+            "nothing is claimed before anything has been asked"
+        );
+        ok(h.commander.browse(None, &json!({})).await);
+        assert_eq!(
+            ok(h.commander.status(None, &json!({})).await)["dialect"]["tagListService"],
+            json!("supported")
+        );
+
+        // A device that refuses the service itself.
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::Unsupported,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({})).await),
+            "BROWSE_UNSUPPORTED"
+        );
+        assert_eq!(
+            ok(h.commander.status(None, &json!({})).await)["dialect"]["tagListService"],
+            json!("unsupported")
+        );
+
+        // A link error mid-browse: a fact about the cable, not about the device's dialect.
+        let h = harness(
+            poll_device(),
+            MockOpts {
+                browse: BrowseKind::Failed,
+                ..MockOpts::default()
+            },
+        );
+        assert_eq!(
+            err_code(h.commander.browse(None, &json!({})).await),
+            "BROWSE_FAILED"
+        );
+        assert_eq!(
+            ok(h.commander.status(None, &json!({})).await)["dialect"]["tagListService"],
+            json!("unknown"),
+            "one bad cable must not become a permanent claim about the device"
+        );
     }
 
     // --- sb/write: allow-list BEFORE any device I/O (the security guarantee) -----------------------

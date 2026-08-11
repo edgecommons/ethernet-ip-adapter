@@ -84,6 +84,50 @@ pub(crate) fn backend_for(
     }
 }
 
+/// The connect log line (D-EIP-34): `connected to <endpoint>`, and when the device named itself,
+/// `connected to <endpoint> (<product name> rev <major.minor>)`.
+///
+/// A device that refused the identity read yields the bare form rather than `(unknown)` — the
+/// absence of a nameplate is not worth a word in the line an operator reads on every reconnect.
+fn connect_line(endpoint: &str, identity: Option<&crate::device::DeviceIdentity>) -> String {
+    match identity {
+        Some(id) => format!("connected to {endpoint} ({})", id.summary()),
+        None => format!("connected to {endpoint}"),
+    }
+}
+
+/// One line, at connect, when this instance carries **experimental** signals (D-EIP-16 / D-EIP-34):
+/// name them, and name the device they are about to be read from.
+///
+/// The value of saying it here rather than only at config-parse time is the device: an operator
+/// reading a support ticket needs to know which controller the experimental readings came off, and
+/// the product name only exists once a session is up.
+///
+/// It states a **status**, not a prediction. BOOL arrays are an experimental capability whose
+/// behaviour is not established across controller families; whether a given device answers them
+/// well is what the reading itself will show, and this line stays true either way — including after
+/// packed-BOOL decoding lands, when the capability is still labelled experimental until validated.
+fn warn_experimental_signals(cfg: &DeviceConfig, identity: Option<&crate::device::DeviceIdentity>) {
+    let experimental = cfg.experimental_signal_warnings();
+    if experimental.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = experimental.iter().map(|(name, _)| name.as_str()).collect();
+    let product = identity.map_or_else(
+        || "a device that did not identify itself".to_string(),
+        |id| id.summary(),
+    );
+    tracing::warn!(
+        instance = %cfg.id,
+        signals = %names.join(", "),
+        product = %product,
+        endpoint = %cfg.connection.endpoint,
+        "this instance polls signals that use an EXPERIMENTAL capability (BOOL arrays, D-EIP-16); \
+         how they behave on this device is not established, so treat their readings as unvalidated \
+         and report what you observe"
+    );
+}
+
 /// One device's lifecycle: connect, poll, publish, reconnect — also servicing the device's
 /// [`DeviceControl`] channel so every `sb/*` verb serializes with the engine loop (§7).
 ///
@@ -165,6 +209,11 @@ pub(crate) async fn run_device(
                 // clear any prior handshake-failing state.
                 let security = session.security();
                 health.set_security(security.clone());
+                // D-EIP-34: and what the device says it is. One source for the status object, the
+                // event context, and the log line below — so no two surfaces can name a different
+                // device. `None` (refused / not read) is ordinary and never blocks anything.
+                let identity = session.identity();
+                health.set_identity(identity.clone());
                 // Phase 2b: surface the connected cert's days-to-expiry as a gauge immediately, even
                 // before the lifecycle task's first re-read (§4.2).
                 if let Some(days) = security.as_ref().and_then(|s| s.client_cert_expiry_days) {
@@ -174,7 +223,16 @@ pub(crate) async fn run_device(
                 health.set_link(LinkState::Online);
                 // A transition: flush southbound_health + connection immediately (§8.7).
                 dm.emit_now().await;
+                tracing::info!(
+                    instance = %cfg.id,
+                    "{}",
+                    connect_line(&cfg.connection.endpoint, identity.as_ref())
+                );
+                warn_experimental_signals(&cfg, identity.as_ref());
                 let mut connected_ctx = json!({ "instance": cfg.id, "adapter": backend.kind() });
+                if let Some(id) = &identity {
+                    connected_ctx["identity"] = crate::metrics::identity_json(id);
+                }
                 if let Some(sec) = &security {
                     connected_ctx["security"] = json!(if sec.tls { "tls" } else { "plaintext" });
                     if !sec.peer_verified && sec.tls {
@@ -226,6 +284,12 @@ pub(crate) async fn run_device(
 
                 dm.on_connection_dropped(Instant::now());
                 health.set_security(None);
+                // The identity belonged to the session that just ended. A device can be swapped at
+                // the same address between one connect and the next, so a stale nameplate on a
+                // disconnected instance would be worse than none: `sb/status` reports `null` until
+                // the next session reads it again. (The dialect memory is deliberately NOT cleared —
+                // that is a fact about the device, learned, not a property of the session.)
+                health.set_identity(None);
                 match exit {
                     // The driver already closed the session on its way out — nothing to reconnect.
                     crate::poll_driver::PollExit::Stopped => return,
@@ -372,6 +436,16 @@ async fn run_push(
                 dm.on_forward_open(true);
                 let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 dm.on_connected(latency_ms, Instant::now());
+                // D-EIP-34: the identity the backend read over the explicit session that carried the
+                // ForwardOpen. Stored here, before the engine loop, so the `device-connected` event
+                // the push driver emits on the first frame can name the device.
+                let identity = session.identity();
+                health.set_identity(identity.clone());
+                tracing::info!(
+                    instance = %cfg.id,
+                    "{}",
+                    connect_line(&cfg.connection.endpoint, identity.as_ref())
+                );
                 if let Some(reply) = pending_reconnect.take() {
                     let _ = reply.send(Ok(()));
                 }
@@ -394,6 +468,8 @@ async fn run_push(
                 session.close().await;
 
                 dm.on_connection_dropped(Instant::now());
+                // The nameplate belonged to the connection that just ended (see the poll ladder).
+                health.set_identity(None);
                 match exit {
                     crate::push_driver::PushExit::Stopped => return,
                     crate::push_driver::PushExit::LinkLost => {
@@ -489,8 +565,9 @@ mod tests {
     use crate::device::{DeviceError, IoLinkStats, IoUpdate, Quality, SecurityStatus};
     use crate::metrics::{CONNECTION, HEALTH, IO};
     use crate::testutil::{
-        device_metrics_with, reading, RecordingEvents, RecordingMetrics, RecordingPublisher,
-        ScriptedBackend, ScriptedPush, ScriptedSession, SecureSession, SharedPush,
+        device_metrics_with, reading, scripted_identity, RecordingEvents, RecordingMetrics,
+        RecordingPublisher, ScriptedBackend, ScriptedPush, ScriptedSession, SecureSession,
+        SharedPush, WarnLog,
     };
     use serde_json::{json, Value};
     use std::sync::atomic::AtomicUsize;
@@ -715,6 +792,210 @@ mod tests {
                 .copied(),
             Some(1.0),
             "the connection gauge flushed at the transition (§8.7)"
+        );
+    }
+
+    // ---- identity at connect (D-EIP-34) ----
+
+    /// **The identity the session read reaches every surface the connect owns**, from one source:
+    /// the `Health` object `sb/status` answers from, and the `device-connected` event's context. It
+    /// is the same rendered shape in both places, so a fleet consumer parses one thing.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_publishes_the_identity_on_the_event_and_stores_it_for_status() {
+        let mut rig = Rig::new(poll_device(60_000, None), global(json!({})));
+        rig.backend.push_session(Box::new(
+            good_session().with_identity(scripted_identity("1756-L71/B")),
+        ));
+        // Read the stored identity while the session is still up — the ladder clears it on the way
+        // out, so a post-run read would prove the wrong thing.
+        let health = Arc::clone(&rig.health);
+        let seen: Arc<Mutex<Option<crate::device::DeviceIdentity>>> = Arc::new(Mutex::new(None));
+        let seen_task = Arc::clone(&seen);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            *seen_task.lock().unwrap() = health.identity();
+        });
+        rig.cancel_after(Duration::from_millis(50));
+
+        rig.run().await;
+
+        let ctx = rig.events.last_ctx("device-connected").expect("the event");
+        assert_eq!(ctx["identity"]["productName"], json!("1756-L71/B"));
+        assert_eq!(ctx["identity"]["revision"], json!("7.3"));
+        assert_eq!(ctx["identity"]["vendorId"], json!(0x1337));
+        assert_eq!(
+            ctx["identity"]["serialNumber"],
+            json!("0x00C0FFEE"),
+            "the serial is the hex label an operator reads off a nameplate, not a number"
+        );
+
+        let stored = seen.lock().unwrap().clone().expect("stored on Health");
+        assert_eq!(stored.product_name, "1756-L71/B");
+        assert_eq!(
+            crate::metrics::identity_json(&stored),
+            ctx["identity"],
+            "one renderer: the status object and the event context cannot disagree"
+        );
+    }
+
+    /// A device that refused the read simply has none: the connect announces itself exactly as it
+    /// always did, with no `identity` key and nothing invented.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_without_an_identity_announces_itself_unchanged() {
+        let mut rig = Rig::new(poll_device(60_000, None), global(json!({})));
+        rig.backend.push_session(Box::new(good_session()));
+        rig.cancel_after(Duration::from_millis(50));
+
+        rig.run().await;
+
+        let ctx = rig.events.last_ctx("device-connected").expect("the event");
+        assert_eq!(ctx["adapter"], json!("ethernet-ip"));
+        assert!(
+            ctx.get("identity").is_none(),
+            "no identity key rather than a null or a placeholder: {ctx}"
+        );
+    }
+
+    /// **A nameplate belongs to a session, not to an address.** When the link drops, the stored
+    /// identity goes with it — a device can be swapped at the same endpoint between one connect and
+    /// the next, and a stale product name on a disconnected instance is worse than none.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_link_clears_the_stored_identity() {
+        let mut rig = Rig::new(poll_device(20, None), global(fast_backoff()));
+        let first = good_session().with_identity(scripted_identity("1756-L71/B"));
+        first.push_read_err(DeviceError::Transient(anyhow::anyhow!("connection reset")));
+        rig.backend.push_session(Box::new(first));
+        // The ladder reconnects into a session that never resolves, so the run ends while the
+        // instance is between sessions — exactly the window the claim is about.
+        rig.backend.hang_connects();
+        rig.cancel_after(Duration::from_secs(2));
+
+        rig.run().await;
+
+        assert!(
+            rig.health.identity().is_none(),
+            "the identity of a session that ended must not outlive it"
+        );
+    }
+
+    /// **Push instances carry an identity too.** The class-1 ladder stores what the backend read over
+    /// the explicit session, and the push driver's `device-connected` (emitted on the first frame,
+    /// not at open) names it.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_connect_publishes_the_identity_on_the_event() {
+        let mut rig = Rig::new(push_device(), global(json!({})));
+        let (tx, push) = ScriptedPush::new();
+        push.set_identity(Some(scripted_identity("1734-AENTR")));
+        rig.backend.push_io(Box::new(push));
+        tokio::spawn(async move {
+            let _ = tx
+                .send(IoUpdate::Up {
+                    o2t_api_ms: 100,
+                    t2o_api_ms: 100,
+                })
+                .await;
+            // Held open so the driver keeps consuming until the cancel.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(tx);
+        });
+        rig.cancel_after(Duration::from_millis(100));
+
+        rig.run().await;
+
+        let ctx = rig.events.last_ctx("device-connected").expect("the event");
+        assert_eq!(ctx["identity"]["productName"], json!("1734-AENTR"));
+        assert_eq!(
+            ctx["o2tApiMs"],
+            json!(100),
+            "the class-1 facts are still there — identity is added beside them, not instead"
+        );
+    }
+
+    /// **The connect line names the product**, and stays readable when the device did not name
+    /// itself: `connected to <endpoint> (<product> rev <maj.min>)`, else the bare form. No
+    /// `(unknown)` filler on a line an operator reads at every reconnect.
+    #[test]
+    fn the_connect_line_names_the_product_when_there_is_one() {
+        assert_eq!(
+            connect_line("10.0.0.5:44818", Some(&scripted_identity("1756-L71/B"))),
+            "connected to 10.0.0.5:44818 (1756-L71/B rev 7.3)"
+        );
+        assert_eq!(
+            connect_line("10.0.0.5:44818", None),
+            "connected to 10.0.0.5:44818"
+        );
+    }
+
+    /// **The experimental-signal note fires at connect, names the signals AND the device** (D-EIP-16
+    /// / D-EIP-34), and states a status rather than a prediction — so it stays true whatever the
+    /// device does with the reading, and after packed-BOOL decoding lands.
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_with_experimental_signals_is_warned_about_naming_the_device() {
+        let cfg = device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "10.0.0.5:44818" },
+            "pollGroups": [ { "id": "fast", "pollIntervalMs": 60000, "signals": [
+                { "name": "alarms", "tagPath": "ALARM_BITS", "type": "bool", "arrayCount": 8 },
+                { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" }
+            ] } ]
+        }));
+        let warns = WarnLog::default();
+        {
+            let _guard = tracing::subscriber::set_default(warns.clone());
+            warn_experimental_signals(&cfg, Some(&scripted_identity("1756-L71/B")));
+        }
+        let messages = warns.messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "one line, not one per signal: {messages:?}"
+        );
+        let line = &messages[0];
+        assert!(line.contains("EXPERIMENTAL"), "{line}");
+        for forbidden in ["will fail", "expected BAD", "BAD on", "will read"] {
+            assert!(
+                !line.contains(forbidden),
+                "the note states the experimental STATUS; it must not predict an outcome the \
+                 reading itself will report — and must stay true if packed-BOOL decoding lands: \
+                 {line}"
+            );
+        }
+
+        // A configuration with no experimental signal says nothing at all.
+        let quiet = WarnLog::default();
+        {
+            let _guard = tracing::subscriber::set_default(quiet.clone());
+            warn_experimental_signals(&poll_device(60_000, None), None);
+        }
+        assert!(quiet.is_empty(), "{:?}", quiet.messages());
+    }
+
+    /// The note travels with the connect, so the structured fields carry the signal names and the
+    /// product — which is what makes a support ticket answerable.
+    #[tokio::test(start_paused = true)]
+    async fn the_experimental_note_is_emitted_on_the_connect_edge() {
+        let cfg = device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "10.0.0.5:44818" },
+            "pollGroups": [ { "id": "fast", "pollIntervalMs": 60000, "signals": [
+                { "name": "alarms", "tagPath": "ALARM_BITS", "type": "bool", "arrayCount": 8 }
+            ] } ]
+        }));
+        let mut rig = Rig::new(cfg, global(json!({})));
+        rig.backend.push_session(Box::new(
+            good_session().with_identity(scripted_identity("1756-L71/B")),
+        ));
+        rig.cancel_after(Duration::from_millis(50));
+
+        let warns = WarnLog::default();
+        {
+            let _guard = tracing::subscriber::set_default(warns.clone());
+            rig.run().await;
+        }
+        assert!(
+            warns.contains("EXPERIMENTAL"),
+            "the connect edge says it: {:?}",
+            warns.messages()
         );
     }
 

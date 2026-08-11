@@ -391,3 +391,51 @@ async fn cpppo_live_class3_idle_survives_the_inactivity_window() {
         "== live_cpppo class-3 keepalive: PASS (keepalives flowed; session survived the idle) =="
     );
 }
+
+/// **The connect-time identity read (D-ENIP-26 / D-EIP-34), against a real peer.**
+///
+/// The adapter reads the CIP Identity Object once per connect and lets it inform status, events and
+/// logs — never behaviour. This leg records what *this* peer actually answers, and asserts the two
+/// properties the adapter depends on: whatever comes back (an identity, or a refusal) the **session
+/// survives it**, and an identity that does come back is a real one, not an empty shell.
+///
+/// A refusal is not a failure here. Identity is CIP-mandatory, but the whole point of the
+/// tolerate-refusal rule is that bench peers and field devices fall short of the standard in their
+/// own ways; the leg prints which happened, so the gate's output says what this peer is.
+#[tokio::test]
+async fn cpppo_live_identity_is_read_or_tolerably_refused() {
+    if !sim_up().await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no cpppo on {CPPPO_ADDR} — docker compose up -d enip-sim"
+        );
+        eprintln!("live_cpppo: skipped (no cpppo on {CPPPO_ADDR})");
+        return;
+    }
+    let client = EipClient::connect(CPPPO_ADDR, opts())
+        .await
+        .expect("session against live cpppo");
+
+    match client.read_identity().await {
+        Ok(id) => {
+            println!("live_cpppo identity: {id}");
+            assert!(
+                !id.product_name.is_empty(),
+                "an identity that decoded must name a product"
+            );
+        }
+        Err(EnipError::Cip(status)) => {
+            println!("live_cpppo identity: REFUSED by the peer ({status}) — tolerated by design");
+        }
+        Err(e) => panic!("the identity read failed at the connection level: {e:?}"),
+    }
+
+    // The claim that matters: reading identity never costs the session. A poll works immediately
+    // after, on the same link.
+    let after = client.read_tag(&tag("LINE_SPEED"), 1).await;
+    assert!(
+        after.is_ok(),
+        "the session must survive the identity read: {after:?}"
+    );
+    client.close().await;
+}

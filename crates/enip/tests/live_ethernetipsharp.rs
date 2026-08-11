@@ -491,3 +491,49 @@ async fn sharp_live_browse_cursor_walk_and_32bit_instance_segment() {
         "== live_ethernetipsharp browse cursor: PASS (exactly-once walk + live 0x26 segment) =="
     );
 }
+
+/// **The connect-time identity read (D-ENIP-26 / D-EIP-34), against a third implementation.**
+///
+/// The same Identity Object read the adapter performs on every connect, against the C#
+/// EthernetIPSharp server. What it answers is recorded rather than demanded — an identity, or a
+/// tolerated refusal — and either way the session must still poll afterwards.
+#[tokio::test]
+async fn sharp_live_identity_is_read_or_tolerably_refused() {
+    let addr = sharp_addr();
+    if !sim_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no EthernetIPSharp on {addr} — \
+             docker compose up -d --build enip-sharp"
+        );
+        eprintln!("live_ethernetipsharp: skipped (no EthernetIPSharp on {addr})");
+        return;
+    }
+    let client = EipClient::connect(&addr, opts())
+        .await
+        .expect("session against live EthernetIPSharp");
+
+    match client.read_identity().await {
+        Ok(id) => {
+            println!("live_ethernetipsharp identity: {id}");
+            assert!(
+                !id.product_name.is_empty(),
+                "an identity that decoded must name a product"
+            );
+        }
+        Err(EnipError::Cip(status)) => {
+            println!(
+                "live_ethernetipsharp identity: REFUSED by the peer ({status}) — \
+                 tolerated by design"
+            );
+        }
+        Err(e) => panic!("the identity read failed at the connection level: {e:?}"),
+    }
+
+    let after = client.read_tag(&tag("LINE_SPEED"), 1).await;
+    assert!(
+        after.is_ok(),
+        "the session must survive the identity read: {after:?}"
+    );
+    client.close().await;
+}

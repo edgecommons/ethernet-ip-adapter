@@ -26,7 +26,8 @@ use async_trait::async_trait;
 
 use crate::config::{EipType, SignalSpec};
 use crate::device::{
-    BrowsePage, BrowsedTag, DeviceError, DeviceSession, Quality, Reading, Result, SecurityStatus,
+    BrowsePage, BrowsedTag, DeviceError, DeviceIdentity, DeviceSession, Quality, Reading, Result,
+    SecurityStatus,
 };
 
 use super::map_enip_error;
@@ -41,6 +42,9 @@ pub struct EipSession {
     /// The negotiated security posture (CIP Security Phase 1) — `Some` for a `mode: tls` session,
     /// `None` for a plaintext session (DESIGN-cip-security.md §3.4).
     security: Option<SecurityStatus>,
+    /// What the device said it is, read once at connect (D-EIP-34). `None` when it refused the read.
+    /// Captured, never re-read: a status query must not cost a device round-trip.
+    identity: Option<DeviceIdentity>,
 }
 
 impl EipSession {
@@ -53,7 +57,17 @@ impl EipSession {
             client,
             request_timeout,
             security: None,
+            identity: None,
         }
+    }
+
+    /// Attach the identity read at connect (D-EIP-34). A builder step rather than a constructor
+    /// argument because it is orthogonal to how the session was opened — plaintext or TLS, both
+    /// carry one, and `None` (the device refused) is an ordinary outcome, not a variant.
+    #[must_use]
+    pub fn with_identity(mut self, identity: Option<DeviceIdentity>) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Wrap a connected TLS `enip` client as a poll session, carrying its negotiated security posture
@@ -68,6 +82,7 @@ impl EipSession {
             client,
             request_timeout,
             security: Some(security),
+            identity: None,
         }
     }
 
@@ -427,6 +442,10 @@ impl DeviceSession for EipSession {
 
     fn security(&self) -> Option<SecurityStatus> {
         self.security.clone()
+    }
+
+    fn identity(&self) -> Option<DeviceIdentity> {
+        self.identity.clone()
     }
 
     async fn close(&mut self) {

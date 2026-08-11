@@ -140,6 +140,20 @@ pub struct Health {
     /// `None` when EST is not enabled for this instance. Updated by the `security_lifecycle` driver;
     /// read by the `sb/status` `security.est` object. One source for the status surface.
     pub est: std::sync::Mutex<Option<crate::eip::est::EstStatus>>,
+    /// What the device said it is on the current connection (D-EIP-34), or `None` when down / the
+    /// device refused the read. Set on connect, cleared on drop, exactly like `security` — and for
+    /// the same reason: the status object, the `device-connected` event, and the connect log line all
+    /// derive from one source, so no two surfaces can name a different device.
+    pub identity: std::sync::Mutex<Option<crate::device::DeviceIdentity>>,
+    /// **Passive dialect memory** (D-EIP-34): what ordinary operations have taught us about this
+    /// device's CIP dialect, as a [`DialectFact`]. Today that is one fact — whether the Logix
+    /// tag-list service (Symbol Object `0x55`) answered — learned from an `sb/browse` that ran
+    /// anyway. Nothing here is probed for: a connect never asks a device a question it was not
+    /// otherwise going to ask, because some field devices answer an unimplemented service badly.
+    ///
+    /// It outlives a reconnect on purpose. It is memory about the *device*, not about the session;
+    /// a link that dropped teaches us nothing that would unlearn it.
+    tag_list_dialect: AtomicU8,
 
     // ---- engine counters (consumed by the S5 metric families; §8) ----
     /// Publish latency of the last `data.publish().await`, ms (§6.2).
@@ -218,6 +232,73 @@ impl Health {
     #[must_use]
     pub fn est(&self) -> Option<crate::eip::est::EstStatus> {
         self.est.lock().unwrap().clone()
+    }
+
+    /// Store what the device said it is on a freshly-established session (D-EIP-34).
+    pub fn set_identity(&self, identity: Option<crate::device::DeviceIdentity>) {
+        *self.identity.lock().unwrap() = identity;
+    }
+
+    /// What the device said it is, if the current session read it (D-EIP-34).
+    #[must_use]
+    pub fn identity(&self) -> Option<crate::device::DeviceIdentity> {
+        self.identity.lock().unwrap().clone()
+    }
+
+    /// Record what a browse just taught us about the device's tag-list service (D-EIP-34).
+    ///
+    /// `supported` ⇒ the device answered Get Instance Attribute List; `!supported` ⇒ it refused the
+    /// service outright (`BROWSE_UNSUPPORTED`). A browse that failed for any *other* reason — a link
+    /// error, a mid-walk fault, a bad cursor — teaches nothing about the dialect and must not be
+    /// routed here: "the link broke" is not "the device has no tag list".
+    pub fn record_tag_list_support(&self, supported: bool) {
+        let fact = if supported {
+            DialectFact::Supported
+        } else {
+            DialectFact::Unsupported
+        };
+        self.tag_list_dialect.store(fact as u8, Ordering::Relaxed);
+    }
+
+    /// What is known about the device's tag-list service, from operations that already ran.
+    #[must_use]
+    pub fn tag_list_dialect(&self) -> DialectFact {
+        DialectFact::from_u8(self.tag_list_dialect.load(Ordering::Relaxed))
+    }
+}
+
+/// One remembered fact about a device's CIP dialect (D-EIP-34) — learned, never probed for.
+///
+/// `Unknown` is a first-class answer and the honest default: until an operation has actually
+/// exercised the service, the adapter does not know, and saying so beats guessing from a product
+/// name (which is asserted by the device and proven by nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialectFact {
+    /// No operation has exercised it yet.
+    Unknown = 0,
+    /// The device answered it.
+    Supported = 1,
+    /// The device refused the service itself.
+    Unsupported = 2,
+}
+
+impl DialectFact {
+    /// The token published on `sb/status`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Supported,
+            2 => Self::Unsupported,
+            _ => Self::Unknown,
+        }
     }
 }
 
