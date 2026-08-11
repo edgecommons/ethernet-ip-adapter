@@ -34,7 +34,7 @@ Grounding artifacts (verified 2026-07-18, do not work from memory):
 ## Table of contents
 
 1. [Goals, non-goals & isolation contract](#1-goals-non-goals--isolation-contract)
-2. [Decisions register (D-ENIP-1…D-ENIP-22)](#2-decisions-register)
+2. [Decisions register (D-ENIP-1…D-ENIP-25)](#2-decisions-register)
 3. [Workspace & crate layout](#3-workspace--crate-layout)
 4. [Memory-safe decoding: the `WireReader` invariant](#4-memory-safe-decoding-the-wirereader-invariant)
 5. [Encapsulation layer](#5-encapsulation-layer)
@@ -151,6 +151,9 @@ throwaway test certs for the handshake-over-duplex unit tests and the `live_tls.
 | **D-ENIP-20** | **ForwardOpen arming is acknowledged, and output staging is confirmable.** `forward_open` completes only after the socket task has registered the connection **and** joined any multicast T→O group; a join failure is a typed `EnipError::Io` with the usual best-effort ForwardClose, and an opener whose future is cancelled before its acknowledgement has the connection unregistered rather than left producing. The handle gains `stage_output`, which carries the manager's verdict back — the same validation as `set_output`, then `Ok` only when the buffer is held for a live connection, `Err(Closed)` when the manager has shut down or the connection is gone. `set_output` keeps its signature and its unconfirmed semantics. **A staging caller may also give the command an absolute deadline** (`stage_output_by`): it bounds the handoff and the verdict, and — because it travels *inside* the command — the socket task drops an expired one instead of mutating the producer buffer, answering `Err(Timeout { op: "output staging" })`. A caller-side timer cannot do that on its own: the command it abandons is still queued, and staging it afterwards puts a value the caller was told had failed on the next O→T frame and every frame after it. Multicast group membership is **not** refcounted: a second connection joining a group its manager socket already holds fails fast and is refused. | The join result was discarded (`let _ = socket.join_multicast_v4(..)`), so a connection whose membership never happened was armed anyway and received nothing: the operator's only symptom was a delayed watchdog timeout naming `Timeout`, with the interface error that caused it thrown away at the point it was known. Making the join load-bearing means the verdict has to travel back, and once `Add` is acknowledged the return-before-registration gap closes with it — a datagram arriving the instant `forward_open` returns can no longer be counted as `unknown_connection`. The same reasoning applies one step further out: `SetOutput` was fire-and-forget, so a write aimed at a connection the task had already removed was reported as success, the crate-side link in the `sb/write` silent-success chain (DESIGN D-EIP-31). The deadline arrived for the same reason one step further still: a confirmed caller that gives up still leaves its command in the queue, so "the write timed out" and "the write was applied" were both true at once — the crate has to be told the deadline if it is to be the one enforcing it at the buffer. Alternatives rejected: refcounting shared groups (the adapter opens one `IoManager` per push session, so sharing never occurs in product use — a refcount would exist only to be tested, where the fail-fast refusal is itself the honest answer), and making `set_output` async (it would break every existing caller to confirm something most of them cannot act on). **Scope limit, stated:** multicast T→O is proven here only by crate tests (join failure, armed post-condition) — no sim in the bench matrix serves a real multicast T→O stream, so true multicast conformance remains real-hardware territory. |
 | **D-ENIP-21** | **Encapsulation validation is complete, not partial — header *and* RegisterSession body.** (a) `options ≠ 0` is enforced, not just documented: inside a session the frame is discarded **before** correlation and counted on its own cause (`ClientStats.discarded_options`, warn-logged); at the RegisterSession handshake it is a refusal (`ProtocolViolation`). (b) The **RegisterSession reply is correlated** — it must echo the request's `sender_context` (`ECREGIST`), checked *first*, ahead of command/options/status/handle/version (§5.5). (c) A **non-zero CIP interface handle** in a `SendRRData`, `SendUnitData`, or Connection-Manager UCMM reply is a `ProtocolViolation` at all three decode sites (§5.2). (d) The **RegisterSession reply's 4-byte command-specific body is validated whole**, not just its leading word: `u16 protocol_version` must be 1, the `u16` session-options word must be **0**, and there must be **exactly** those four bytes — a body that ends before either word, and a body with trailing data after them, are both refusals (§5.5). | The header was matched on context, command and handle but never on `options`, and the one exchange with no correlation at all was the handshake that establishes the session: any RegisterSession-shaped frame already on the stream could be adopted as our session, and a peer stamping `options` could answer a request with a frame the spec says to drop. The interface handle was read and thrown away at three sites while §5.2 declares it 0 — a peer addressing another interface is not speaking the CIP encapsulation we asked for, so its payload is not a Message Router reply we may decode and nothing in it may bind a connection. The asymmetry between the two `options` dispositions is deliberate: mid-session the actor has a deadline and other frames may follow, so discard-and-keep-waiting is right; pre-actor exactly one frame is expected, so looping over discards buys nothing and adopting a session from a peer this broken is worse. The counter is its own field rather than folded into `stale_replies` because the two say different things about the peer (§10.2, never silent). The body was the same defect one field further in: reading the version word and stopping accepted a **two-byte** `01 00` reply — one in which the options word §5.5 requires is simply absent — and accepted any amount of trailing data after a well-formed one, so "the reply is the same four bytes we sent" was a documented claim nothing checked. The options word must be 0 because ODVA Vol 2 reserves it with no defined meaning: a target has nothing it may legitimately say there, so bits in it mean the peer is either negotiating an option we never offered or overlaying a different structure on the same four bytes — the header-level `options` refusal is this same rule one layer out, and clause (a)'s reasoning for refusing rather than discarding applies unchanged. **Variant split:** a body of the right *shape* whose version is not 1 is `Unsupported` — the peer is speaking a generation of the encapsulation layer this crate does not implement, which is exactly what encapsulation status `0x0069` says, so both routes to "wrong generation" read the same to a caller; a wrong-length body or a reserved field carrying bits is `ProtocolViolation`, because it is not a protocol we could support at some other version, it is a frame that does not conform. A reader can therefore tell "understood, cannot speak it" from "malformed" by the variant alone, and each refusal names its own field in `detail`. **Interop arbitration:** the context echo, the interface-handle refusals and the whole-body check are spec-correct but strict, so the live-sims gate (cpppo, OpENer, ab_server, EthernetIPSharp, stunnel-TLS ×2, OpENer-CIPSec, EST) is the false-positive check; the pre-approved concessions, to be taken only on evidence of a real peer failing, are accepting an all-zero context on RegisterSession with a one-time warn and/or demoting the interface-handle refusal to a counted warn. **No concession is taken: no fallback is implemented.** The body check was measured before it shipped: every EtherNet/IP peer in the bench — cpppo, libplctag's ab_server, EthernetIPSharp, OpENer and the OpENer CIPSecurity branch — answers RegisterSession with exactly `01 00 00 00`, and the two stunnel terminators are byte-transparent TLS in front of cpppo, so there is no observed peer whose body the rule would newly refuse. |
 | **D-ENIP-22** | **Encapsulation status `0x0064` (`InvalidSessionHandle`) severs the session at the actor.** The caller that provoked it still gets `Err(Encap(InvalidSessionHandle))`; the actor then exits, so every pending and subsequent request completes `Err(Closed)` without stream I/O. The rule applies to **any** correlated reply, discovery commands included. Recovery is the owner's reconnect — the adapter's classification maps a session-poisoning `Encap` status to transient (DESIGN §10.1) — and the crate never re-registers in place. | The status is a statement about our *registration*, not about the command that provoked it: once the target has forgotten the handle, nothing later on that stream can succeed. Delivering the typed error and then carrying on merely deferred recovery to whatever arbitrary later failure happened next, and left a *live* actor speaking into a session the device had already torn down. It also fed the class-3 inactivity keepalive: `send_connected` touches the activity clock only after the transaction returns `Ok`, so while the poisoned frame was delivered as `Ok` the clock was refreshed by a dead session's reply and the probe cadence went on "keeping alive" a handle that no longer existed (§7.6). Severing at the actor fixes both with one rule, in the one place that owns the stream. In-crate re-registration was rejected as a non-goal: the adapter's reconnect ladder already classifies the status as transient and owns backoff, alarms and instance state — a second, silent recovery path inside the crate would race it. |
+| **D-ENIP-23** | **Fragmented transfers are strict in both directions.** (a) **Write Tag Fragmented (`0x53`) requires General Status `00` on EVERY fragment, the final one included** — any other value, `0x06` (`PartialTransfer`) among them, is `Err(Cip(..))`. (b) **Read Tag Fragmented (`0x52`) requires every fragment to repeat the FIRST fragment's type code**, and for a structure its template handle; a change mid-transfer is `ProtocolViolation { detail: "fragmented read type code changed between fragments" }` / `"… struct handle changed …"`, with both values named in the accompanying warn log rather than in `detail` (§10.1 keeps error details fixed strings). | (a) The write loop accepted success-**or**-`0x06` on every fragment and then returned `Ok(())` regardless, so a target that refused the last chunk of a value reported a *successful* write with part of the value never applied — the crate-side instance of the silent-success class the adapter's confirmed-write contract exists to kill (DESIGN D-EIP-31). Canonical basis, checked directly rather than inferred: **Rockwell 1756-PM020I-EN-P** specifies success on each fragment of a Write Tag Fragmented transfer, and its write-service status table does not list `0x06` at all — `0x06` is a *read*-fragmentation code meaning "more data follows", which has no counterpart on a write the originator is itself pacing. **A retracted remedy is recorded deliberately:** the external review's original proposal was to *require* `0x06` on intermediate fragments and `00` only on the last. That is wrong and was withdrawn in the reviewer's own reconciliation — it would reject every conforming ControlLogix, which answers `00` throughout. The rule shipped is the one PM020 states: `00` everywhere. (b) Only the first fragment's type was ever kept (`get_or_insert`), so a peer could declare DINT on fragment 1 and ship REAL bytes on fragment 2: the reassembled buffer is decoded as the *declared* type, and the caller's type check (D-ENIP-4) only ever sees that declaration — wrong values reach the sample wearing the right type, with nothing in the chain able to notice. The struct template handle is held to the same rule because it identifies the layout the opaque bytes belong to. PM020's fragmented-read examples repeat the identical type in every reply of a transfer, so neither clause costs a conforming device anything. **Interop:** both clauses are strict readings of a Rockwell-documented service, so the live-sims gate (cpppo, ab_server, EthernetIPSharp, OpENer, the two stunnel terminators, OpENer-CIPSec) is the false-positive check; no concession is pre-approved, because a peer that answers `0x06` to a write is making a claim the service has no way to honour. |
+| **D-ENIP-24** | **A CPF item list is trusted only as far as the layer can name the frame.** (a) **Class-1 receive is filtered by source IP**: a connection accepts T→O datagrams only from its target's own address — the address its owning TCP session was opened to, and the address its O→T frames are transmitted to (the same value by D-ENIP-17, so there is one notion of "the target", not two that can drift). A mismatch is dropped between the routing lookup and the consume gauntlet, counted on the manager-wide `source_mismatch_datagrams` (surfaced in `IoStats`), and — the load-bearing part — **does not feed the watchdog**. The source *port* is not checked (a target's producing port is legitimately ephemeral); multicast T→O is covered unchanged, since a multicast frame still carries the producing device's unicast source address. (b) **The explicit path validates the address and data items as a PAIR**, not independently: `[null address, unconnected data]` (UCMM) and `[connected address, connected data]` (class-3) are the only legal shapes, and the two undefined cross-pairings are refused on their own detail. (c) **The class-1/class-3 find-by-connection-id stays as it is** — a recorded decision, not an omission. | (a) Routing was purely by connection id, and an accepted frame both delivers a sample and refreshes the watchdog — so the id, which travels in cleartext in every frame, was effectively a bearer token for keeping a dead link looking alive. The target IP is the one fact the originator already knows independently of the datagram, so it costs one comparison to stop treating the id as identity. **Framed honestly: this is OpENer-style hygiene** (OpENer likewise checks that a frame is "coming from the originator") **and defence in depth, not an integrity control.** Plaintext class-1 has no integrity by design; an on-segment attacker who can also spoof the target's source address still gets through, and CIP Security/DTLS is the real control. What it buys is that anything off-path or merely misdirected — a stray producer, a second scanner, a device still producing into a recycled id — can no longer inject samples or hold the watchdog open. **Interop risk, and how it is bounded:** a multi-homed target that answers TCP on one interface and produces T→O from another would now never come up. No bench peer does this (the OpENer class-1 legs run host-networked in CI precisely so UDP is symmetric), and the failure is diagnosable rather than silent because the counter names it. (b) `addr_ok && data_ok` accepted `[null address, connected data]` and `[connected address, unconnected data]`: each names one addressing model in its address item and the other in its data item, so no conforming peer can emit one and nothing downstream could interpret one correctly — a class-3 sequence count would be read out of an unconnected payload, or a connection id bound to a payload that belongs to no connection. (c) The class-1 and class-3 consumers pick items by id and then route on the connection id inside the address item; the id *is* the addressing there, so an item's position — or an extra item, such as the sockaddr-info pair a ForwardOpen reply carries — must not decide whether a frame belongs to a live connection. That is the §8.6 contract working as intended, and it is written down here so the next review does not re-file it as the same defect as (b). |
+| **D-ENIP-25** | **Opening a session costs ONE `connect_timeout`, not one per phase.** The clock is stamped before the TCP connect and the remainder funds everything `connect_over` then does — the RegisterSession handshake and, when `connected_messaging` is set, the class-3 ForwardOpen — floored at 1 ms so a connect that spent the whole allowance still attempts the handshake and fails on its own deadline. `connect_tls` already worked this way; the plaintext path now mirrors it. The stream-injection entry points (`connect_over`, `connect_tls_over`) keep bounding their own work by the full value: they are handed an already-open stream, so there is no earlier phase to charge. | The plaintext path bounded the TCP connect by `connect_timeout` and then let `connect_over` stamp a **fresh** deadline for the handshake, so a caller asking for a 5 s bound on opening a session could wait ~10 s against a peer that is slow to complete the TCP handshake and then silent. This is a register row rather than a bare note because it **changes the documented meaning of a public option**: `ClientOptions::connect_timeout` was specified as per-phase ("each phase gets the full value") and is now total, so the change has to be findable by someone reading the option rather than only by someone reading §5.5. Product behaviour is unchanged — the adapter already caps the whole open from outside (DESIGN §10.1), which is why the finding is rated low; what it fixes is the crate API telling the truth about its own bound, and the asymmetry with `connect_tls` that made two constructors mean different things by the same field. |
 
 ---
 
@@ -360,8 +363,19 @@ generically by `cpf.rs` with per-item bounds checks; consumers then assert the s
 | T→O sockaddr info | `0x8001` | same layout |
 | Sequenced address | `0x8002` | `u32 connection_id` + `u32 encapsulation_sequence` — class-0/1 UDP |
 
-Explicit replies must contain exactly the expected 2-item shape (address + data); anything else is
-`WireError::Malformed` with the offending item id in context.
+Explicit replies must contain exactly the expected 2-item shape (address + data), **and the two ids
+must be one of the two legal pairings** (D-ENIP-24) — `[null address, unconnected data]` for UCMM, or
+`[connected address, connected data]` for class-3. The cross-pairings the spec never defines
+(`[null address, connected data]`, `[connected address, unconnected data]`) name one addressing model
+in the address item and the other in the data item, and are refused on their own detail
+(`"explicit reply pairs an address and data item of different classes"`); anything else is
+`WireError::Malformed` naming the shape that failed.
+
+**The class-1 and class-3 consumers deliberately do NOT assert a shape** (D-ENIP-24). They pick their
+items out of the list by id (`Cpf::find`) and route on the connection id inside the address item —
+the id *is* the addressing, so item order, and extra items such as the sockaddr-info pair a
+ForwardOpen reply carries, must not decide whether a frame belongs to a live connection. Only the
+explicit path, which has no connection id to route by, needs the exact shape.
 
 ### 5.5 Session lifecycle
 
@@ -372,6 +386,14 @@ TCP connect (endpoint, default port 44818)
   … SendRRData / SendUnitData requests, sender_context-correlated …
   → UnRegisterSession { session_handle } (no reply) → close socket
 ```
+
+**`connect_timeout` is one budget for the whole open, not one per phase** (D-ENIP-25). The clock is
+stamped before the TCP connect; the handshake — and, when `connected_messaging` is set, the class-3
+ForwardOpen that follows it — spends the remainder, floored at 1 ms so a connect that consumed the
+whole allowance still attempts the handshake and fails on its own deadline. `connect_tls` applies
+the same rule across the TCP connect and the TLS handshake. The stream-injection entry points
+(`connect_over`, `connect_tls_over`) are handed an already-open stream, so there is no earlier phase
+to charge and each bounds its own work by the full value.
 
 The reply is validated in this order, and every check is a refusal (D-ENIP-21):
 
@@ -446,6 +468,16 @@ Decode order (invariant-6-safe): ensure 4 bytes → read the four header bytes �
 the extended size → ensure/take the extended words → the remainder is the service data. The reply
 service must equal `request | 0x80` (checked in the client, `ProtocolViolation` otherwise). The
 extended-status list is kept in full (`SmallVec<u16>`); the first word is the primary extended code.
+
+**The reserved byte is read and not enforced — a deliberate tolerant-reader decision, not an
+oversight.** CIP Vol 1 words the field as a producer obligation ("shall be zero"); it assigns
+receivers no rejection duty, and every major stack (cpppo, OpENer, libplctag, EthernetIPSharp)
+likewise ignores it on receive. Refusing a reply over a byte that carries no meaning would turn a
+cosmetic firmware quirk into a dead poll group, and it is not the same case as the encapsulation
+`options` field or the RegisterSession session-options word (D-ENIP-21), where a non-zero value
+means the peer is negotiating or overlaying something on a frame we must decide whether to *adopt*.
+Here the reply is already correlated to our request and its status and service are checked
+independently, so a stray reserved bit changes nothing we would do with it.
 
 ### 6.2 EPATH encoding (padded — the form CIP messaging uses)
 
@@ -547,7 +579,7 @@ distinguishable via `CipStatus::is_routing_error()` + `remaining_path_size`.
 | Read Tag | `0x4C` | `u16 element_count` | `u16 type code` (or `0x02A0,u16 handle`) + value bytes |
 | Write Tag | `0x4D` | `u16 type code` (+handle) `u16 element_count` + value bytes | empty |
 | Read Tag Fragmented | `0x52` | `u16 element_count, u32 byte_offset` | type code + value bytes at offset; status `0x06` ⇒ more |
-| Write Tag Fragmented | `0x53` | `u16 type, u16 element_count, u32 byte_offset` + chunk | empty; status `0x06` ⇒ target expects more |
+| Write Tag Fragmented | `0x53` | `u16 type, u16 element_count, u32 byte_offset` + chunk | empty; **General Status `00` on every fragment** — the write services define no "more expected" status (D-ENIP-23) |
 | Read-Modify-Write | `0x4E` | `u16 mask_size ∈ {1,2,4,8,12}` + OR-masks + AND-masks | empty |
 
 **Auto-fragmentation (D-ENIP-12).** `read_tag` first issues `0x4C`; on `PartialTransfer` (or
@@ -555,6 +587,20 @@ distinguishable via `CipStatus::is_routing_error()` + `remaining_path_size`.
 status 0 — capped by `max_value_bytes`. `write_tag` computes the encoded size; if it exceeds the
 session's usable request size (≈ 480 B unconnected; the connected size negotiated at ForwardOpen),
 it chunks via `0x53` on element boundaries. The caller never sees fragmentation.
+
+**Fragmented transfers are strict on both sides (D-ENIP-23).**
+
+* **Write:** every `0x53` reply must carry General Status **`00`**, the final fragment included.
+  Rockwell 1756-PM020I-EN-P specifies success on each fragment of a write transfer, and `0x06`
+  (`PartialTransfer`) does not appear in the write service's status table at all — it is a *read*
+  fragmentation code meaning "more data follows", which has no counterpart on a write the
+  originator is itself pacing. Any other status is `Err(Cip(..))` for that fragment.
+* **Read:** every `0x52` reply must repeat the **first** fragment's type code, and for a structure
+  its template handle; a change mid-transfer is
+  `ProtocolViolation { detail: "fragmented read type code changed between fragments" }` (or
+  `"… struct handle changed …"`), with both values named in the accompanying warn log. PM020's
+  fragmented-read examples repeat the identical type in every reply of a transfer, so the rule
+  costs a conforming device nothing.
 
 Note: `0x52`/`0x4E` service codes collide with Unconnected_Send/Forward_Close codes — CIP service
 codes are scoped by the target object (Symbol vs Connection Manager); the crate keeps them in
@@ -841,7 +887,9 @@ instead of producing O→T into it for the life of the process.
 
 One `IoManager` task owns the UDP socket. Per datagram: CPF decode (`WireReader`; runt/malformed →
 `malformed_frames` counter, drop) → sequenced-address lookup by `connection_id` against live
-connections (unknown → `unknown_connection` counter, drop) → strip class-1 sequence + optional
+connections (unknown → `unknown_connection` counter, drop) → **source check** against the
+connection's target IP (mismatch → `source_mismatch_datagrams` counter, drop; D-ENIP-24) → strip
+class-1 sequence + optional
 header per the connection's negotiated T→O format → **size check** against the negotiated T→O data
 size (fixed-size mismatch → `size_mismatch` counter, drop) → **sequence acceptance**: accept iff
 `(seq − last_accepted) as i16 > 0` (mod-65536 forward window; duplicates/stale → `stale_frames`
@@ -860,6 +908,23 @@ dropped is discarded without counting an overflow (nothing was evicted — there
 to). `IoConnectionHandle::events()` hands out the consumer half (`IoEventReceiver`, with `recv` /
 `try_recv` mirroring `mpsc::Receiver`'s shapes); the sender half lives with the manager task and
 owns the connection's counters, so an eviction is counted where it happens.
+
+**The source check is between the routing lookup and the gauntlet** (D-ENIP-24). A connection
+accepts T→O datagrams from exactly one IP: the target's own, the address the owning TCP session was
+opened to and the address O→T frames are transmitted to. Anything else is dropped before it can
+touch connection state — no sample delivered, no sequence window advanced, and above all **no
+watchdog refresh**, so a foreign producer cannot hold a link "up" that has actually stopped. The
+source **port** is not checked: a target's producing port is legitimately ephemeral. Multicast T→O
+is covered by the same rule, because a multicast frame still carries the producing device's unicast
+source address.
+
+Scope, stated honestly: this is hygiene of the kind OpENer applies ("coming from the originator") and
+defence in depth — **not** an integrity control. Plaintext class-1 has no integrity by design; an
+on-segment attacker that can also spoof the target's source address still gets through, and
+CIP Security/DTLS is the real control there. What the filter does buy is that the connection id
+stops being a bearer token for anything off-path or merely misdirected: a stray producer, a
+misconfigured second scanner, or a device still producing into a recycled id can no longer inject
+samples or feed the watchdog.
 
 **Socket errors are counted and classified, never swallowed.** Every `recv_from` failure increments
 `recv_errors`. Per-datagram kinds (`ConnectionReset` — the Windows ICMP port-unreachable case —
@@ -971,8 +1036,13 @@ etc.) are *values* to the adapter (BAD samples), not session failures — the cr
   affect any connection; a dead socket loses **all** its connections with a typed `Lost{Io}`, never
   silently.
 - Peer-driven counters (`stale_frames`, `malformed_frames`, `overflowed_events`,
-  `refused_redirects`, `discarded_options`, …) are exposed on the handles (`stats()`), so the adapter can alarm on a
-  noisy/hostile peer without the crate knowing what an alarm is. `refused_redirects` is 0 or 1 per
+  `refused_redirects`, `source_mismatch_datagrams`, `discarded_options`, …) are exposed on the handles (`stats()`), so the adapter can alarm on a
+  noisy/hostile peer without the crate knowing what an alarm is. `source_mismatch_datagrams` is
+  manager-wide and counts T→O datagrams that named a live connection but arrived from an IP that is
+  not that connection's target (§8.6, D-ENIP-24) — nonzero means either something else on the
+  segment is producing into our connection id, or the target genuinely sources its T→O stream from a
+  second interface, which otherwise presents only as a link that never comes up.
+  `refused_redirects` is 0 or 1 per
   connection and records that the ForwardOpen reply's O→T sockaddr named a foreign address, whose
   address half was refused and only its port honoured (D-ENIP-17) — the one disposition a healthy
   link would otherwise hide. `keepalives_sent` on `ClientStats` is the explicit-side equivalent for
@@ -1076,7 +1146,8 @@ let client = EipClient::connect(
     "192.168.1.50:44818",
     ClientOptions {
         route: Some(RoutePath::backplane_slot(0)),   // None for cpppo / CompactLogix-direct
-        connect_timeout: …, request_timeout: …,
+        connect_timeout: …,                          // ONE budget for the whole open (D-ENIP-25)
+        request_timeout: …,
         connected_messaging: false,                  // true ⇒ class-3 ForwardOpen (§7.6)
         class3_rpi: Duration::from_secs(2),          // requested class-3 RPI, both directions
         class3_timeout_multiplier: TimeoutMultiplier::X16,   // ⇒ a 32 s target watchdog, ¾-window keepalive
@@ -1186,6 +1257,29 @@ timing race. The **latest-wins event queue** (§8.6) is proven as a pure policy 
 gone) and through its real sender/receiver pair (the counted overflow, `Lost` surviving a flood,
 terminal-after-drain, wakeup and cancel-safety), with the manager's `select!` glue driven end to end
 over a loopback UDP pair.
+
+**Fragmented-transfer strictness** (§7.2, D-ENIP-23) rides the same fixtures
+(`tests/session_p2.rs`): a scripted `0x53` peer that answers `0x06` on the **final** write fragment,
+and one that answers it on an intermediate fragment, are each `Err(Cip(PartialTransfer))` — against
+a third that answers `00` throughout and still completes the write, so the rule is shown not to be a
+blanket refusal of fragmentation; and a `0x52` peer that changes its declared type code (DINT then
+REAL), or its struct template handle, between two fragments of one transfer is the typed
+`ProtocolViolation`, against a fourth that repeats the type and still reassembles. Each fixture
+reads the chunk boundaries the client chose off the wire rather than assuming them.
+
+**The class-1 source filter** (§8.6, D-ENIP-24) is proven at both layers: as pure routing
+(`Registry::consume_datagram` — a foreign source is a counted `SourceMismatch` drop that leaves
+`frames_accepted`, the sequence window and the **watchdog deadline** all untouched, while the same
+bytes from the target are accepted; and the same address on a different port is accepted, pinning
+the IP-only comparison), and through the manager's real `select!` over loopback UDP — a connection
+whose target is an address the loopback peer cannot have is fed a well-formed, correctly-addressed,
+sequence-advancing stream for longer than its watchdog window, and must still emit `Lost { Timeout }`
+with nothing delivered. **CPF pairing** (§5.4, D-ENIP-24b) is a pure unit test over both legal
+pairings and both cross-pairings. **The shared connect budget** (§5.5, D-ENIP-25) needs a TCP
+connect that is slow *and successful*, which no portable fixture can produce directly; the test
+manufactures one by resolving the target through tokio's blocking pool while a sleeper occupies its
+single thread, then asserts the total open cost stays inside one `connect_timeout` (~0.9 s) rather
+than two (~1.5 s).
 
 **Tag-enumeration paging** (§7.3, D-ENIP-19) rides the same fixtures (`tests/tag_paging.rs`): a
 scripted `0x55` reply whose record sits above `0xFFFF` yields a cursor above `0xFFFF` and the request

@@ -3,7 +3,10 @@
 //! Generic item-list encode/decode: `u16 item_count`, then `item_count × { u16 type_id,
 //! u16 length, length bytes }`, decoded with per-item bounds checks so a lying `length` is
 //! [`crate::error::WireError::Truncated`] rather than an over-read. Consumers assert the shape they
-//! need (explicit replies are exactly `[address, data]`). [`ItemType`] is the total item-type
+//! need: the explicit path takes [`Cpf::expect_explicit_data`], which requires exactly
+//! `[address, data]` in one of the two legal pairings (D-ENIP-24); the class-1 and class-3 consumers
+//! deliberately keep [`Cpf::find`], routing an inbound frame by its connection id (§8.6).
+//! [`ItemType`] is the total item-type
 //! registry. [`SockAddrInfo`] carries the **one endianness exception** in the whole protocol — its
 //! family/port/address are **big-endian** (§5.4) — kept here so no other module has to remember it.
 
@@ -164,6 +167,13 @@ impl Cpf {
     }
 
     /// The first item with the given type id, if present.
+    ///
+    /// **Deliberately position-independent** (D-ENIP-24). The class-1 receive path (§8.6) and the
+    /// class-3 reply path pick their address and data items out of the list by id and then route on
+    /// the connection id inside the address item — the id *is* the addressing, so an item order or
+    /// an extra item (a sockaddr-info pair on a ForwardOpen reply, for instance) must not decide
+    /// whether a frame belongs to a live connection. Only the explicit path, which has no connection
+    /// id to route by, asserts an exact shape — see [`Cpf::expect_explicit_data`].
     #[must_use]
     pub fn find(&self, type_id: ItemType) -> Option<&CpfItem> {
         self.items.iter().find(|i| i.type_id == type_id)
@@ -207,8 +217,15 @@ impl Cpf {
     }
 
     /// Assert the exact two-item explicit-reply shape `[address, data]` and return the data item's
-    /// payload (§5.4). The address item's id must be one of the expected address types; the data
-    /// item must be `0x00B1`/`0x00B2`. Anything else is [`WireError::Malformed`].
+    /// payload (§5.4, D-ENIP-24).
+    ///
+    /// The two ids are validated as a **pair**, not independently: §5.4 defines exactly two legal
+    /// explicit shapes — null address + unconnected data (UCMM) and connected address + connected
+    /// data (class-3). Validating each half on its own additionally admitted the two cross-pairings
+    /// the spec never defines — `[null address, connected data]` and
+    /// `[connected address, unconnected data]` — each of which names one addressing model in its
+    /// address item and the other in its data item, so no conforming peer can emit one and nothing
+    /// downstream could interpret one correctly. Anything else is [`WireError::Malformed`].
     pub fn expect_explicit_data(&self) -> Result<&Bytes, WireError> {
         let [addr, data] = self.items.as_slice() else {
             return Err(WireError::Malformed {
@@ -216,21 +233,23 @@ impl Cpf {
                 detail: "explicit reply must contain exactly 2 items",
             });
         };
-        let addr_ok = matches!(
-            addr.type_id,
-            ItemType::NullAddress | ItemType::ConnectedAddress
-        );
-        let data_ok = matches!(
-            data.type_id,
-            ItemType::UnconnectedData | ItemType::ConnectedData
-        );
-        if addr_ok && data_ok {
-            Ok(&data.data)
-        } else {
-            Err(WireError::Malformed {
+        match (addr.type_id, data.type_id) {
+            (ItemType::NullAddress, ItemType::UnconnectedData)
+            | (ItemType::ConnectedAddress, ItemType::ConnectedData) => Ok(&data.data),
+            // Both halves are individually legal explicit ids, but they belong to different
+            // addressing models — reported on its own detail so the peer defect is diagnosable
+            // rather than lumped in with a wholly unexpected item id.
+            (
+                ItemType::NullAddress | ItemType::ConnectedAddress,
+                ItemType::UnconnectedData | ItemType::ConnectedData,
+            ) => Err(WireError::Malformed {
+                context: CONTEXT,
+                detail: "explicit reply pairs an address and data item of different classes",
+            }),
+            _ => Err(WireError::Malformed {
                 context: CONTEXT,
                 detail: "unexpected item ids in explicit reply",
-            })
+            }),
         }
     }
 }
@@ -397,6 +416,87 @@ mod tests {
         assert!(matches!(
             cpf.expect_explicit_data(),
             Err(WireError::Malformed { .. })
+        ));
+    }
+
+    /// **D-ENIP-24.** The address and data items are validated as a pair. Both legal pairings are
+    /// accepted; the two undefined cross-pairings — each legal in isolation, and both accepted while
+    /// the halves were checked independently — are refused on their own detail.
+    #[test]
+    fn explicit_item_ids_are_validated_as_a_pair() {
+        let payload = Bytes::from_static(&[0xDE, 0xAD]);
+
+        // Legal: UCMM — null address + unconnected data.
+        let ucmm = Cpf::from_items(vec![
+            CpfItem::null_address(),
+            CpfItem::unconnected_data(payload.clone()),
+        ]);
+        assert_eq!(
+            ucmm.expect_explicit_data().unwrap().as_ref(),
+            payload.as_ref()
+        );
+
+        // Legal: class-3 — connected address + connected data.
+        let class3 = Cpf::from_items(vec![
+            CpfItem::connected_address(0x1234_5678),
+            CpfItem::connected_data(payload.clone()),
+        ]);
+        assert_eq!(
+            class3.expect_explicit_data().unwrap().as_ref(),
+            payload.as_ref()
+        );
+
+        // Illegal: null address + CONNECTED data — an unconnected reply carrying a connected
+        // payload, which the class-3 sequence count would then be read out of.
+        let crossed_a = Cpf::from_items(vec![
+            CpfItem::null_address(),
+            CpfItem::connected_data(payload.clone()),
+        ]);
+        assert!(matches!(
+            crossed_a.expect_explicit_data(),
+            Err(WireError::Malformed {
+                detail: "explicit reply pairs an address and data item of different classes",
+                ..
+            })
+        ));
+
+        // Illegal: connected address + UNCONNECTED data — a connection id bound to a payload that
+        // does not belong to a connection.
+        let crossed_b = Cpf::from_items(vec![
+            CpfItem::connected_address(0x1234_5678),
+            CpfItem::unconnected_data(payload.clone()),
+        ]);
+        assert!(matches!(
+            crossed_b.expect_explicit_data(),
+            Err(WireError::Malformed {
+                detail: "explicit reply pairs an address and data item of different classes",
+                ..
+            })
+        ));
+
+        // Still refused on the original detail when an id is not an explicit one at all, and when
+        // the two legal halves arrive in the wrong ORDER (data first).
+        let sockaddr = Cpf::from_items(vec![
+            CpfItem::new(ItemType::SockAddrOtoT, Bytes::new()),
+            CpfItem::unconnected_data(payload.clone()),
+        ]);
+        assert!(matches!(
+            sockaddr.expect_explicit_data(),
+            Err(WireError::Malformed {
+                detail: "unexpected item ids in explicit reply",
+                ..
+            })
+        ));
+        let reversed = Cpf::from_items(vec![
+            CpfItem::unconnected_data(payload),
+            CpfItem::null_address(),
+        ]);
+        assert!(matches!(
+            reversed.expect_explicit_data(),
+            Err(WireError::Malformed {
+                detail: "unexpected item ids in explicit reply",
+                ..
+            })
         ));
     }
 }

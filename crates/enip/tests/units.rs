@@ -12,7 +12,7 @@
     clippy::arithmetic_side_effects
 )]
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -515,6 +515,7 @@ fn io_params(o2t_format: RealTimeFormat, t2o_format: RealTimeFormat) -> IoConnec
         o2t_fixed: true,
         t2o_fixed: true,
         tx_endpoint: SocketAddr::from(([127, 0, 0, 1], 2222)),
+        expected_source_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         multicast_group: None,
     }
 }
@@ -618,6 +619,7 @@ fn io_enum_helpers_and_debug() {
     for d in [
         DropReason::Malformed,
         DropReason::UnknownConnection,
+        DropReason::SourceMismatch,
         DropReason::SizeMismatch,
         DropReason::Stale,
     ] {
