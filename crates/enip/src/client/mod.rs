@@ -295,7 +295,8 @@ impl EipClient {
         .await?;
 
         // §5.5 (D-ENIP-21) — the RegisterSession reply validation list, in order: context echo,
-        // command echo, options 0, status ok, non-zero handle, protocol version 1.
+        // command echo, header options 0, status ok, non-zero handle, then the whole 4-byte
+        // command-specific body (protocol version 1, session options 0, and nothing after it).
         //
         // The **context echo comes first**: a frame that is not even our reply must not be
         // diagnosed by its other fields, and every check below is only meaningful once the frame
@@ -328,12 +329,53 @@ impl EipClient {
                 detail: "register assigned session handle 0",
             });
         }
-        // Reply protocol version must be 1 (§5.5).
+        // The command-specific body is validated WHOLE, not just its first word (§5.5): the reply
+        // carries back the same four bytes the request sent — `u16 protocol_version = 1`,
+        // `u16 options = 0` — and nothing else. Reading only the version accepted a two-byte
+        // `01 00` reply, in which the required options word is simply absent, and accepted any
+        // amount of trailing data after a well-formed one; both are frames the encapsulation layer
+        // is entitled to reject, and a peer that emits either is not the peer §5.5 describes.
+        //
+        // **The options word must be 0**, the same value the request carries. ODVA Vol 2 defines it
+        // as the RegisterSession session-options field with all bits reserved and no defined
+        // meaning, so a target has nothing it may legitimately say there; a non-zero word means the
+        // peer is either negotiating an option we never offered or overlaying a different structure
+        // on the same four bytes. Neither is a session we can reason about, and the header-level
+        // `options` refusal directly above is the same rule one layer out.
+        //
+        // Variant split, deliberately: the **version** is `Unsupported` — the frame is exactly the
+        // shape §5.5 defines and the peer is speaking a protocol generation this crate does not
+        // implement, which is also how the equivalent encapsulation status `0x0069`
+        // (`UnsupportedProtocolVersion`) surfaces, so both routes to "wrong generation" read the
+        // same to a caller. Everything else here is `ProtocolViolation` — a body of the wrong
+        // length, or a reserved field carrying bits, is not a protocol we could support at some
+        // other version, it is a frame that does not conform. A reader can therefore tell
+        // "understood, cannot speak it" from "malformed" by the variant alone; both are
+        // non-transient, so neither is retried behind the adapter's back.
         let mut vr = WireReader::with_context(&reply.data, "register reply");
-        let version = vr.u16().unwrap_or(0);
+        let Ok(version) = vr.u16() else {
+            return Err(EnipError::ProtocolViolation {
+                detail: "register reply body ends before the protocol version",
+            });
+        };
         if version != PROTOCOL_VERSION {
             return Err(EnipError::Unsupported {
                 what: "encapsulation protocol version",
+            });
+        }
+        let Ok(session_options) = vr.u16() else {
+            return Err(EnipError::ProtocolViolation {
+                detail: "register reply body ends before the session options word",
+            });
+        };
+        if session_options != 0 {
+            return Err(EnipError::ProtocolViolation {
+                detail: "register reply body carries non-zero session options",
+            });
+        }
+        if vr.expect_end().is_err() {
+            return Err(EnipError::ProtocolViolation {
+                detail: "register reply body has trailing bytes after the 4-byte payload",
             });
         }
 
