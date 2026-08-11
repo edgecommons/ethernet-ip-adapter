@@ -129,9 +129,11 @@ configured input fields, and publishes them as `SouthboundSignalUpdate` on the s
 `sb/write` to an allow-listed **output** field is staged into the O→T buffer and rides the next cyclic
 frame (`applied: "next-frame"`).
 
-> The class-1 return path uses bidirectional UDP `:2222`. On a Linux Docker host keep the sim and the
-> adapter on the same compose network. On Docker Desktop for Windows the WSL2 UDP NAT breaks the class-1
-> return path — run the class-1 leg on a Linux host or natively.
+> Class-1 I/O is a two-way UDP flow: the adapter sends to the device's port `2222` and the device
+> sends back to an ephemeral port the adapter binds and advertises in the ForwardOpen. The return
+> path therefore needs a route with no NAT in it. On a Linux Docker host keep the sim and the adapter
+> on the same compose network. On Docker Desktop for Windows the WSL2 UDP NAT breaks that return path
+> — run the class-1 leg on a Linux host or natively.
 
 Next: the [how-to guides](how-to-guides.md) for building your own device map, allow-listing writes, and
 deploying; the [reference](reference/) for every option, verb, metric, and type; the

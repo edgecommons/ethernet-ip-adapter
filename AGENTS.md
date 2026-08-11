@@ -87,9 +87,14 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
   regenerated with the
   sibling `[patch]` override disabled, because a lock written while it is active loses the git
   `source` line for `edgecommons` and cannot build a clean clone.
+- **Shipped artifacts resolve `--locked` too** (D-EIP-30): `Dockerfile` and `build.sh`. `build.sh`
+  carries the one escape hatch, `EDGECOMMONS_UNLOCKED=1`, because it also runs in developer
+  checkouts where the sibling `[patch]` override may be active (cargo walks *upward* for
+  `.cargo/config.toml`); it warns loudly that the result is not a release artifact.
 - Docs: Diátaxis `.md`, no frontmatter, synced to the site — current behavior only, present tense.
 
 ## Registry
 
-Add to `../registry/components.json` as `category: "adapter"`, status `experimental`, once published
-under `edgecommons/ethernet-ip-adapter`.
+Published under `edgecommons/ethernet-ip-adapter` and listed in `../registry/components.json` as
+`category: "adapter"` at the org-standard maturity (`beta`, the org-wide promotion of every catalog
+entry). The registry is authoritative for that field — change it there, not here.
