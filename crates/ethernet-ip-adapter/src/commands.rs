@@ -732,7 +732,7 @@ impl Commander {
             let interval = h.cfg.effective_poll_ms(g, &global);
             let mode = h.cfg.effective_publish_mode(g, &global).as_str();
             for s in &g.signals {
-                signals.push(json!({
+                let mut entry = json!({
                     "name": s.name,
                     "id": s.tag_path,
                     "address": s.address_json(&h.cfg.connection),
@@ -741,7 +741,18 @@ impl Commander {
                     "publishMode": mode,
                     "writable": h.cfg.writes.permits(&s.tag_path),
                     "deadband": deadband_json(&s.deadband),
-                }));
+                });
+                // The **observed** wire representation (D-EIP-35): what the device declared on this
+                // signal's last reply, beside the `address.type` the operator configured. It is a
+                // device property, so it is absent until first contact rather than defaulted to the
+                // configured type — an empty field says "not yet read", which is a different fact
+                // from "reads as configured".
+                if let (Some(observed), Some(obj)) =
+                    (h.health.observed_type(&s.tag_path), entry.as_object_mut())
+                {
+                    obj.insert("observedType".to_string(), json!(observed));
+                }
+                signals.push(entry);
             }
         }
         json!({ "id": h.cfg.id, "mode": "poll", "signals": signals })
@@ -1764,6 +1775,7 @@ mod tests {
                                     value: json!(42.0),
                                     quality: Quality::Good,
                                     quality_raw: Some("0x00".into()),
+                                    observed_type: Some("REAL".into()),
                                 })
                                 .collect();
                             let _ = reply.send(Ok(readings));
@@ -2329,6 +2341,7 @@ mod tests {
                 value: json!(7),
                 quality: Quality::Good,
                 quality_raw: Some("0x00".into()),
+                observed_type: None,
             }],
             received_at: Instant::now(),
             run_mode: true,
@@ -2378,6 +2391,57 @@ mod tests {
             .unwrap();
         assert_eq!(speed["writable"], json!(false));
         assert!(speed.get("pollGroup").is_some() && speed.get("pollIntervalMs").is_some());
+    }
+
+    /// D-EIP-35: `sb/signals` reports the **observed** wire representation beside the configured
+    /// one. It is a device property, so it is absent until the signal has actually been read — an
+    /// empty field says "not yet contacted", which is a different fact from "reads as configured"
+    /// and must not be papered over by defaulting to the config's type. Once a reply has declared a
+    /// type, the field carries it verbatim, including the packed `DWORD` a Logix BOOL array serves.
+    #[tokio::test]
+    async fn signals_reports_the_observed_wire_representation_once_it_is_known() {
+        let h = harness(poll_device(), MockOpts::default());
+
+        let before = ok(h.commander.signals(None, &json!({})).await);
+        for s in before["signals"].as_array().unwrap() {
+            assert!(
+                s.get("observedType").is_none(),
+                "no representation is claimed before first contact: {s}"
+            );
+        }
+
+        // What the poll loop records after a reply (see poll_driver's own test for the wiring).
+        h.health.record_observed(&[
+            Reading {
+                observed_type: Some("DWORD".into()),
+                ..crate::testutil::reading("LINE_SPEED", json!(1.0), Quality::Good)
+            },
+            Reading {
+                observed_type: None,
+                ..crate::testutil::reading("FILL_SETPOINT", json!(1.0), Quality::Good)
+            },
+        ]);
+
+        let after = ok(h.commander.signals(None, &json!({})).await);
+        let sigs = after["signals"].as_array().unwrap();
+        let speed = sigs
+            .iter()
+            .find(|s| s["id"] == json!("LINE_SPEED"))
+            .unwrap();
+        assert_eq!(speed["observedType"], json!("DWORD"));
+        assert_eq!(
+            speed["address"]["type"],
+            json!("real"),
+            "the configured type is untouched beside it"
+        );
+        let setpoint = sigs
+            .iter()
+            .find(|s| s["id"] == json!("FILL_SETPOINT"))
+            .unwrap();
+        assert!(
+            setpoint.get("observedType").is_none(),
+            "a signal with no observation is still silent: {setpoint}"
+        );
     }
 
     // --- sb/browse --------------------------------------------------------------------------------

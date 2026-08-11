@@ -63,6 +63,10 @@ pub(crate) fn assembly_to_readings(
             value,
             quality,
             quality_raw: Some(quality_raw),
+            // A class-1 assembly carries no per-field type declaration: the layout is the
+            // adapter's OWN declared byte map (D-EIP-18), so there is no *observed* representation
+            // to report and none is invented (D-EIP-35).
+            observed_type: None,
         });
     }
     out

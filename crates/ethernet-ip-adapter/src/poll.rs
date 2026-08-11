@@ -141,6 +141,7 @@ mod tests {
                 }
                 .to_string(),
             ),
+            observed_type: None,
         }
     }
 

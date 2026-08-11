@@ -30,24 +30,28 @@ use serde_json::Value;
 /// the count the reply must carry (§5.1), never a clamp of a bigger number the operator wrote.
 pub const MAX_ARRAY_COUNT: u32 = u16::MAX as u32;
 
-/// The startup warning a `bool` + `arrayCount` poll signal carries (D-EIP-16).
+/// The startup warning a `bool` + `arrayCount` poll signal carries (D-EIP-16, D-EIP-35).
 ///
 /// The configuration is **accepted and labelled experimental** rather than refused — availability
 /// with honesty. It is not a claim of conditional correctness: the adapter cannot tell one device
 /// family from another (there is no device-family detection, and `slot` is routing, not identity),
-/// so the experimental label is global to the feature. The one canonically known behavior is the
-/// Logix packing — "Logix BOOL arrays are multiples of BOOL[32] and are implemented as a DWORD
-/// array" (Rockwell 1756-PM020, p. 58) — where a `BOOL[n]` read answers `0x00D3` 4-byte words and
-/// the byte-per-element decode is a TypeMismatch ⇒ BAD. That is fail-loud rather than silently
-/// wrong, but it is loud *forever*, and the bench cannot catch it: cpppo is a Logix emulator with a
-/// fidelity gap here (it serves BOOL arrays byte-per-element), so a green sim proves nothing about
-/// this feature. Hence the warning at validation, and the matching hint on the BAD sample itself
-/// (`eip/session.rs`) for an operator who never saw the startup log.
+/// so the experimental label is global to the feature.
+///
+/// What the label now covers is *not* an expected failure. The adapter reads whichever
+/// representation the device declares: byte-per-element `0xC1`, or the Logix packing — "Logix BOOL
+/// arrays are multiples of BOOL[32] and are implemented as a DWORD array" (Rockwell 1756-PM020,
+/// p. 58) — whose `0x00D3` words are translated LSB-first into the configured booleans (D-EIP-35).
+/// What remains experimental is that **no physical controller has confirmed it**: the bit order and
+/// the element-count denomination of a packed Read Tag are read out of PM020, not measured, and
+/// writes to a tag observed packed are refused rather than guessed. The bench cannot settle any of
+/// it — cpppo is a Logix emulator with a fidelity gap at exactly this point (it serves BOOL arrays
+/// byte-per-element), so a green sim proves nothing about the packed path.
 pub const BOOL_ARRAY_EXPERIMENTAL: &str =
-    "BOOL arrays are experimental - best-effort byte-per-element encoding, not validated against \
-     physical hardware; Logix controllers pack BOOL arrays as DWORDs (Rockwell 1756-PM020), so \
-     reads from ControlLogix/CompactLogix are expected to report BAD, and behavior on other \
-     devices depends on their implementation";
+    "BOOL arrays are experimental - the adapter reads whichever representation the device declares \
+     (byte-per-element, or Logix DWORD packing unpacked LSB-first per Rockwell 1756-PM020), but \
+     the packed path is not validated against physical hardware: the bit order and the packed \
+     element-count denomination await confirmation on a real controller, and a write to a tag \
+     observed packed is refused (it needs a masked read-modify-write)";
 
 // ---- built-in defaults (the last rung of the precedence ladder, §4.1) ----
 const BUILTIN_POLL_MS: u64 = 5_000;
@@ -1403,7 +1407,9 @@ mod tests {
     /// feature is available and labelled experimental. The label is global — the adapter has no
     /// device-family detection — and the warning claims nothing beyond the one canonically known
     /// behavior: Logix packs BOOL arrays as DWORDs ("multiples of BOOL[32] … implemented as a DWORD
-    /// array", Rockwell 1756-PM020 p.58), so a controller read is expected BAD, loudly.
+    /// array", Rockwell 1756-PM020 p.58), which the adapter now **translates** (D-EIP-35) rather
+    /// than reports BAD. What the warning states is what is still unsettled — the packed path has
+    /// never met a physical controller, and a write to a packed tag is refused.
     ///
     /// The warning is asserted as a **value**, not scraped from a log: validation returns it (the
     /// same shape `unmatched_allow_entries` already uses) and the supervisor logs it with the
@@ -1441,12 +1447,21 @@ mod tests {
                 && text.contains("byte-per-element")
                 && text.contains("not validated against physical hardware")
                 && text.contains("DWORD")
-                && text.contains("1756-PM020"),
+                && text.contains("1756-PM020")
+                && text.contains("LSB-first")
+                && text.contains("refused"),
             "the operator is told what is experimental and why: {text}"
         );
         assert!(
             !text.contains("generic CIP"),
             "the warning claims no device family works — the adapter cannot tell them apart: {text}"
+        );
+        // The stale claim is GONE (D-EIP-35): a packed reply is translated, not reported BAD, so a
+        // warning that still promised BAD on Logix would send an operator hunting a fault that no
+        // longer exists.
+        assert!(
+            !text.contains("expected to report BAD") && !text.contains("ControlLogix"),
+            "the warning no longer predicts a BAD that translation removed: {text}"
         );
 
         // A device with no bool arrays warns about nothing.

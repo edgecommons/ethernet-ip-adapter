@@ -8,6 +8,12 @@
 //! * **Read** ([`decode_value`]): `published = raw * scale + offset` (f64), with a wire-type check
 //!   (`DECODE type mismatch` ⇒ BAD) and the non-finite rule (`NaN`/`inf` after scaling ⇒ UNCERTAIN,
 //!   §5.4). Integer types with no transform keep native JSON-integer precision.
+//! * **Representation translation** ([`unpack_bools`], D-EIP-35): the config declares the *logical*
+//!   type; how the device stores it on the wire is the **device's** property, observed from the
+//!   reply's declared type code. The one translation is the packed BOOL array — a Logix `BOOL[n]`
+//!   is a `DWORD` array (Rockwell 1756-PM020 p. 58) — unpacked LSB-first into the configured N
+//!   booleans. Translation covers representation variants of one logical type ONLY; it never
+//!   becomes type substitution, so a `real` reply to a configured `dint` stays a mismatch.
 //! * **Write** ([`encode_write`]): the inverse `device = (value − offset) / scale`, then a
 //!   **range-check against the CIP type — out-of-range is a typed error, never a clamp** (§5.1), and
 //!   the value coerced to the elementary type. Arrays are element-wise with an exact-length check.
@@ -20,6 +26,51 @@
 use serde_json::{json, Value};
 
 use crate::config::EipType;
+
+// ===================================================================================
+// Wire-type naming — how a device's declared type is spelled to an operator
+// ===================================================================================
+
+/// The CIP elementary type's spelling, uppercase, as a Logix browse reports it (§7.5). Shared by
+/// the `sb/browse` type mapping and by every "device declares …" detail, so one type is spelled one
+/// way wherever an operator meets it.
+pub(crate) fn cip_type_name(ty: enip::CipType) -> &'static str {
+    match ty {
+        enip::CipType::Bool => "BOOL",
+        enip::CipType::Sint => "SINT",
+        enip::CipType::Int => "INT",
+        enip::CipType::Dint => "DINT",
+        enip::CipType::Lint => "LINT",
+        enip::CipType::Usint => "USINT",
+        enip::CipType::Uint => "UINT",
+        enip::CipType::Udint => "UDINT",
+        enip::CipType::Ulint => "ULINT",
+        enip::CipType::Real => "REAL",
+        enip::CipType::Lreal => "LREAL",
+        enip::CipType::Byte => "BYTE",
+        enip::CipType::Word => "WORD",
+        enip::CipType::Dword => "DWORD",
+        enip::CipType::Lword => "LWORD",
+        enip::CipType::String => "STRING",
+        enip::CipType::Struct => "STRUCT",
+        enip::CipType::Unknown(_) => "UNKNOWN",
+        // `CipType` is `#[non_exhaustive]`: any future elementary code maps to a generic name.
+        _ => "UNKNOWN",
+    }
+}
+
+/// The label a **declared wire type** carries into an operator-facing surface — the `observedType`
+/// of `sb/signals` and the "device declares …" half of a mismatch detail (D-EIP-35).
+///
+/// [`cip_type_name`], except that a code the crate does not recognize names itself in hex: "the
+/// device declares `UNKNOWN`" tells an operator nothing they can look up, and the type code is the
+/// one fact that identifies what the controller actually sent.
+pub(crate) fn wire_type_label(ty: enip::CipType) -> String {
+    match ty {
+        enip::CipType::Unknown(code) => format!("UNKNOWN(0x{code:04X})"),
+        other => cip_type_name(other).to_string(),
+    }
+}
 
 // ===================================================================================
 // Read: CipValue → JSON
@@ -51,14 +102,21 @@ pub enum DecodeError {
 
 impl DecodeError {
     /// The `qualityRaw` string for a BAD sample from this decode failure (§5.4).
+    ///
+    /// The detail names **both sides in their own vocabulary** (D-EIP-35): the configured logical
+    /// type as the config spells it, and the wire type the device declared as a controller spells
+    /// it. That is the whole diagnosis for every mismatch — which is why there is no per-shape hint
+    /// beside it: the BOOL-array-answered-with-`DWORD` case that once needed one is now *translated*
+    /// rather than refused, and a mismatch that survives is a genuine type substitution, which
+    /// "expected bool, device declares REAL" already explains.
     #[must_use]
     pub fn quality_raw(&self) -> String {
         match self {
             Self::TypeMismatch { expected, got } => {
                 format!(
-                    "DECODE type mismatch (expected {}, got {:?})",
+                    "DECODE type mismatch (expected {}, device declares {})",
                     expected.wire(),
-                    got
+                    wire_type_label(*got)
                 )
             }
         }
@@ -237,6 +295,111 @@ fn native_int_json(v: &enip::CipValue) -> Value {
 /// callers exclude before calling this).
 fn float_json(f: f64) -> Value {
     serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number)
+}
+
+// ===================================================================================
+// Representation translation: packed BOOL arrays (D-EIP-35)
+// ===================================================================================
+
+/// How many BOOLs one packed `DWORD` carries. "Logix BOOL arrays are multiples of BOOL[32] and are
+/// implemented as a DWORD array" (Rockwell 1756-PM020, p. 58), and the Read/Write Tag
+/// service-parameter table gives BOOL `0x0nC1`/1 byte against DWORD `0x00D3`/4 bytes — 32 bits per
+/// word.
+pub(crate) const BOOLS_PER_DWORD: u32 = u32::BITS;
+
+/// How many `DWORD`s a packed reply must carry to hold `bools` booleans — `ceil(bools / 32)`.
+///
+/// A controller only ever declares `BOOL[n]` in multiples of 32, but the *configuration* may ask for
+/// any N: `arrayCount: 40` against a `BOOL[64]` tag means "publish the first 40 of them". The bits
+/// past N in the final word are the device's padding and are ignored on read (never published,
+/// never written back).
+pub(crate) fn packed_dword_count(bools: u32) -> u32 {
+    bools.div_ceil(BOOLS_PER_DWORD)
+}
+
+/// The `DWORD`s a reply carries, or `None` when the value is not `DWORD`-typed — the gate that keeps
+/// translation to the one representation variant it is defined for. A single-element reply arrives
+/// as a scalar (the crate collapses it), which is why both shapes are accepted here.
+pub(crate) fn packed_dwords(v: &enip::CipValue) -> Option<Vec<u32>> {
+    match v {
+        enip::CipValue::Dword(w) => Some(vec![*w]),
+        enip::CipValue::Array(enip::CipType::Dword, elems) => elems
+            .iter()
+            .map(|e| match e {
+                enip::CipValue::Dword(w) => Some(*w),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// Why a packed-BOOL reply could not be translated into the configured contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackedBoolError {
+    /// The reply carried a different number of `DWORD`s than `bools` booleans need (D-EIP-33's
+    /// cardinality promise, counted in the unit that was actually compared).
+    Cardinality {
+        /// The configured element count — booleans, the logical contract.
+        bools: u32,
+        /// The `DWORD`s that count needs.
+        expected: usize,
+        /// The `DWORD`s the reply carried.
+        got: usize,
+    },
+}
+
+impl PackedBoolError {
+    /// The `qualityRaw` string for a BAD sample from a failed translation (§5.4).
+    ///
+    /// The counts are stated in **`DWORD`s**, the unit the comparison was made in, and the boolean
+    /// count that produced the expectation is named beside them: a bare "expected 2, got 1" against
+    /// a signal configured `arrayCount: 40` reads as a bug in the adapter rather than a short reply.
+    #[must_use]
+    pub fn quality_raw(&self) -> String {
+        match self {
+            Self::Cardinality {
+                bools,
+                expected,
+                got,
+            } => format!(
+                "DECODE element count mismatch (expected {expected} packed dword(s) for \
+                 {bools} bools, got {got})"
+            ),
+        }
+    }
+}
+
+/// Unpack `bools` booleans out of a packed `DWORD` reply — element *n* is bit *(n mod 32)* of word
+/// *(n / 32)*, **LSB-first** (PM020's layout: `word & 1` is element 0, not element 31).
+///
+/// The result is the configured logical contract — a JSON array of exactly `bools` booleans — for
+/// every `bools ≥ 1`, including `1`. Bits past `bools` in the final word are device padding and are
+/// dropped.
+///
+/// # Errors
+///
+/// [`PackedBoolError::Cardinality`] when the reply's word count is not `ceil(bools / 32)`.
+pub(crate) fn unpack_bools(words: &[u32], bools: u32) -> Result<Value, PackedBoolError> {
+    let expected = usize::try_from(packed_dword_count(bools)).unwrap_or(usize::MAX);
+    if words.len() != expected {
+        return Err(PackedBoolError::Cardinality {
+            bools,
+            expected,
+            got: words.len(),
+        });
+    }
+    let want = usize::try_from(bools).unwrap_or(usize::MAX);
+    let mut out: Vec<Value> = Vec::with_capacity(want.min(words.len().saturating_mul(32)));
+    'words: for word in words {
+        for bit in 0..BOOLS_PER_DWORD {
+            if out.len() >= want {
+                break 'words;
+            }
+            out.push(Value::Bool(word.wrapping_shr(bit) & 1 == 1));
+        }
+    }
+    Ok(Value::Array(out))
 }
 
 // ===================================================================================
@@ -737,6 +900,216 @@ mod tests {
             }
         );
         assert!(e.quality_raw().starts_with("DECODE type mismatch"));
+    }
+
+    // ==============================================================================
+    // The generalized representation report (D-EIP-35, part A)
+    // ==============================================================================
+
+    /// **Every** mismatch names both sides — the configured logical type in the config's spelling,
+    /// the declared wire type in the device's. Pre-change the detail rendered the wire type with
+    /// `{:?}` ("got Dword"), a Rust identifier no controller manual or browse listing uses, and the
+    /// one shape an operator was likely to hit carried a hand-written hint beside it. One rule now,
+    /// for every pairing, including the bit-string aliases a BOOL/INT/DINT tag can come back as.
+    #[test]
+    fn a_mismatch_detail_names_the_configured_type_and_the_declared_wire_type() {
+        let cases: [(EipType, CipValue, &str, &str); 5] = [
+            (EipType::Bool, CipValue::Dword(0), "bool", "DWORD"),
+            (EipType::Dint, CipValue::Real(1.0), "dint", "REAL"),
+            (EipType::Real, CipValue::Lreal(1.0), "real", "LREAL"),
+            (EipType::Int, CipValue::Word(7), "int", "WORD"),
+            (EipType::Usint, CipValue::Byte(7), "usint", "BYTE"),
+        ];
+        for (ty, value, want_expected, want_got) in cases {
+            let detail = decode_value(&value, ty, None, None)
+                .unwrap_err()
+                .quality_raw();
+            assert_eq!(
+                detail,
+                format!(
+                    "DECODE type mismatch (expected {want_expected}, device declares {want_got})"
+                ),
+            );
+        }
+    }
+
+    /// A type code the crate does not recognize names itself in hex. "device declares UNKNOWN" is
+    /// unactionable; the code is the one fact that identifies what arrived.
+    #[test]
+    fn an_unrecognized_wire_type_reports_its_code() {
+        let v = CipValue::Unsupported {
+            type_code: 0x00AB,
+            bytes_len: 4,
+        };
+        let detail = decode_value(&v, EipType::Dint, None, None)
+            .unwrap_err()
+            .quality_raw();
+        assert_eq!(
+            detail,
+            "DECODE type mismatch (expected dint, device declares UNKNOWN(0x00AB))"
+        );
+        assert_eq!(
+            wire_type_label(enip::CipType::Unknown(0x00AB)),
+            "UNKNOWN(0x00AB)"
+        );
+        assert_eq!(wire_type_label(enip::CipType::Dword), "DWORD");
+    }
+
+    // ==============================================================================
+    // Packed BOOL translation (D-EIP-35, part B)
+    // ==============================================================================
+
+    #[test]
+    fn a_packed_dword_count_is_the_ceiling() {
+        assert_eq!(packed_dword_count(1), 1);
+        assert_eq!(packed_dword_count(32), 1);
+        assert_eq!(packed_dword_count(33), 2);
+        assert_eq!(packed_dword_count(40), 2);
+        assert_eq!(packed_dword_count(64), 2);
+        assert_eq!(packed_dword_count(65), 3);
+        assert_eq!(packed_dword_count(65_535), 2_048);
+    }
+
+    /// **LSB-first, pinned with a palindrome-proof value.** `0x00000001` is one bit set at the
+    /// bottom of the word; LSB-first that is element 0, MSB-first it would be element 31. A
+    /// symmetric pattern (`0xFFFF0000`, `0x0000FFFF`) cannot tell the two orders apart the way this
+    /// can, which is why the assertion is on a single low bit and on an asymmetric byte pattern
+    /// beside it.
+    #[test]
+    fn bits_unpack_lsb_first() {
+        let one = unpack_bools(&[0x0000_0001], 32).unwrap();
+        let bits = one.as_array().unwrap();
+        assert!(bits[0].as_bool().unwrap(), "bit 0 is element 0, not 31");
+        assert!(
+            bits[1..].iter().all(|b| b == &json!(false)),
+            "no other element is set: {one}"
+        );
+
+        // 0x80000000 is the mirror image: the TOP bit, which must land at element 31.
+        let top = unpack_bools(&[0x8000_0000], 32).unwrap();
+        let bits = top.as_array().unwrap();
+        assert!(bits[31].as_bool().unwrap());
+        assert!(bits[..31].iter().all(|b| b == &json!(false)));
+
+        // An asymmetric pattern, element by element: 0x0000_000D = 0b1101 ⇒ 0,2,3 set, 1 clear.
+        let pat = unpack_bools(&[0x0000_000D], 8).unwrap();
+        assert_eq!(
+            pat,
+            json!([true, false, true, true, false, false, false, false])
+        );
+    }
+
+    /// A single word covers `N ≤ 32`, and the value is a JSON array of exactly N — including N = 1,
+    /// which is the logical contract the configuration declared (`arrayCount: 1` ⇒ one element).
+    #[test]
+    fn a_single_dword_serves_up_to_thirty_two_bools() {
+        assert_eq!(unpack_bools(&[0x0000_0001], 1).unwrap(), json!([true]));
+        assert_eq!(unpack_bools(&[0x0000_0000], 1).unwrap(), json!([false]));
+        assert_eq!(
+            unpack_bools(&[0x0000_000F], 4).unwrap(),
+            json!([true, true, true, true])
+        );
+        assert_eq!(
+            unpack_bools(&[0xFFFF_FFFF], 32)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+    }
+
+    /// **The N-vs-tag-size rule.** A controller only declares `BOOL[n]` in multiples of 32, but the
+    /// configuration may ask for any N: `arrayCount: 40` against a `BOOL[64]` tag means "publish the
+    /// first 40 of those booleans". Two words arrive, 40 booleans are published, and the 24 padding
+    /// bits — set here, so their absence is provable — are dropped.
+    #[test]
+    fn forty_bools_come_from_two_dwords_with_the_padding_dropped() {
+        // word 0: every bit set. word 1: low 8 set (elements 32..40), high 24 set as padding.
+        let v = unpack_bools(&[0xFFFF_FFFF, 0xFFFF_FFFF], 40).unwrap();
+        let bits = v.as_array().unwrap();
+        assert_eq!(bits.len(), 40, "exactly N, not 64");
+        assert!(bits.iter().all(|b| b == &json!(true)));
+
+        // The padding is genuinely ignored rather than accidentally absent: with only element 32
+        // set in the second word, elements 33..40 read false and nothing beyond 40 appears.
+        let v = unpack_bools(&[0x0000_0000, 0x0000_0001], 40).unwrap();
+        let bits = v.as_array().unwrap();
+        assert_eq!(bits.len(), 40);
+        assert!(bits[32].as_bool().unwrap(), "element 32 is word 1 bit 0");
+        assert!(bits[33..].iter().all(|b| b == &json!(false)));
+        assert!(bits[..32].iter().all(|b| b == &json!(false)));
+    }
+
+    /// The cardinality promise survives translation, and it is stated in the unit that was actually
+    /// compared: 40 booleans need 2 words, so a one-word reply is a mismatch naming **dwords** and
+    /// the boolean count that produced the expectation. "expected 2, got 1" against `arrayCount: 40`
+    /// would read as an adapter bug.
+    #[test]
+    fn a_packed_reply_of_the_wrong_word_count_is_a_cardinality_failure() {
+        let e = unpack_bools(&[0x0000_0001], 40).unwrap_err();
+        assert_eq!(
+            e,
+            PackedBoolError::Cardinality {
+                bools: 40,
+                expected: 2,
+                got: 1
+            }
+        );
+        let raw = e.quality_raw();
+        assert!(
+            raw.starts_with("DECODE element count mismatch")
+                && raw.contains("expected 2 packed dword(s)")
+                && raw.contains("for 40 bools")
+                && raw.contains("got 1"),
+            "the detail is honest about the unit compared: {raw}"
+        );
+
+        // Too many words is the same failure in the other direction.
+        assert_eq!(
+            unpack_bools(&[0, 0, 0], 40).unwrap_err(),
+            PackedBoolError::Cardinality {
+                bools: 40,
+                expected: 2,
+                got: 3
+            }
+        );
+    }
+
+    /// The gate that keeps translation to the one representation it is defined for: only a `DWORD`
+    /// value yields words. A BOOL array, a DINT array, and a struct marker do not — so the caller
+    /// falls through to the ordinary type check for all of them.
+    #[test]
+    fn only_dword_values_are_packed_bools() {
+        assert_eq!(packed_dwords(&CipValue::Dword(0xABCD)), Some(vec![0xABCD]));
+        assert_eq!(
+            packed_dwords(&CipValue::Array(
+                enip::CipType::Dword,
+                vec![CipValue::Dword(1), CipValue::Dword(2)]
+            )),
+            Some(vec![1, 2])
+        );
+        assert_eq!(packed_dwords(&CipValue::Bool(true)), None);
+        assert_eq!(packed_dwords(&CipValue::Dint(1)), None);
+        assert_eq!(
+            packed_dwords(&CipValue::Udint(1)),
+            None,
+            "UDINT is not DWORD"
+        );
+        assert_eq!(
+            packed_dwords(&CipValue::Array(
+                enip::CipType::Bool,
+                vec![CipValue::Bool(true)]
+            )),
+            None
+        );
+        assert_eq!(
+            packed_dwords(&CipValue::Struct {
+                handle: 1,
+                bytes_len: 4
+            }),
+            None
+        );
     }
 
     #[test]
