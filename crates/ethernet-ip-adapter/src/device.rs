@@ -100,9 +100,11 @@ pub struct BrowsePage {
     pub next_cursor: Option<String>,
 }
 
-/// One discovered tag. `array_dim` is `Some(n)` for a 1-D array tag; `type_name` is the CIP type
-/// name as the device reports it (e.g. `"REAL"`, `"DINT"`, `"SSTRING"`), which the command layer
-/// maps to `supported: bool` per §5.1.
+/// One discovered tag. `array_dim` is the array **dimensionality** the symbol type declares —
+/// `Some(1)` for a 1-D array, `Some(2)`/`Some(3)` for a multi-dimensional one, `None` for a scalar
+/// (`enip::SymbolType::dims()`); it is not an element count, which a symbol type word cannot carry.
+/// `type_name` is the CIP type name as the device reports it (e.g. `"REAL"`, `"DINT"`, `"SSTRING"`).
+/// The command layer maps the pair to `supported: bool` per §5.1/§7.5.
 // SLICE S6: consumed by the `sb/browse` command handler (§7.5).
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]

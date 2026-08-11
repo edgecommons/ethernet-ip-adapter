@@ -1127,6 +1127,222 @@ async fn fragmented_write_chunks_large_array() {
     server.await.unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// fragmented-transfer strictness (D-ENIP-23)
+// ---------------------------------------------------------------------------
+
+/// The number of DINTs a fragmented write test sends, and the byte length that implies. 400 × 4 B
+/// is comfortably past the ~480 B usable UCMM request size, so `write_tag` chunks (§7.2).
+const WRITE_ELEMS: usize = 400;
+const WRITE_BYTES: usize = WRITE_ELEMS * 4;
+
+/// Drive a fragmented write whose peer answers `status` on the fragment selected by `on_final`
+/// (`true` = the last chunk only, `false` = the first chunk only) and `0x00` on every other, then
+/// return the client's verdict. The chunk boundaries are read off the wire (`u16 type, u16 count,
+/// u32 offset` + chunk), so the fixture never has to know how the client split the value.
+async fn fragmented_write_answering(status: u8, on_final: bool) -> enip::Result<()> {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        let mut seen = 0usize;
+        while let Some(req) = peer.recv().await {
+            let (svc, data) = parse_ucmm_request(&req);
+            assert_eq!(svc, 0x53, "a 1600-byte write must fragment");
+            let mut dr = WireReader::new(&data);
+            let _ty = dr.u16().unwrap();
+            let _count = dr.u16().unwrap();
+            let offset = dr.u32().unwrap() as usize;
+            let chunk_len = dr.take_rest().len();
+            seen += 1;
+            let final_fragment = offset + chunk_len >= WRITE_BYTES;
+            let selected = if on_final { final_fragment } else { seen == 1 };
+            let reply_status = if selected { status } else { 0x00 };
+            peer.send(&rrdata_reply(
+                req.header.sender_context,
+                &mr_reply(0x53, reply_status, &[], &[]),
+            ))
+            .await;
+        }
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
+    let tag = TagAddress::parse("BIG_OUT").unwrap();
+    let value = CipValue::Array(
+        CipType::Dint,
+        (0..WRITE_ELEMS as i32).map(CipValue::Dint).collect(),
+    );
+    let verdict = client.write_tag(&tag, CipType::Dint, &value).await;
+    drop(client);
+    server.abort();
+    verdict
+}
+
+/// **D-ENIP-23 / §7.2.** Every Write Tag Fragmented reply must carry General Status **00**
+/// (Rockwell 1756-PM020I-EN-P): the write services have no "more expected" status, and `0x06`
+/// (`PartialTransfer`) is a *read*-fragmentation code that PM020's write-service error table does
+/// not list at all.
+///
+/// The **final** fragment is the case that mattered: the loop accepted success-or-`0x06` on every
+/// fragment and then returned `Ok(())` regardless, so a target refusing the last chunk of a value
+/// reported a successful write with part of the value never applied — the silent-success class the
+/// adapter's confirmed-write contract exists to eliminate.
+#[tokio::test]
+async fn write_fragment_refuses_partial_transfer_on_the_final_fragment() {
+    let verdict = fragmented_write_answering(0x06, true).await;
+    match verdict {
+        Err(enip::EnipError::Cip(status)) => {
+            assert_eq!(status.general, enip::GeneralStatus::PartialTransfer);
+        }
+        other => panic!("0x06 on the final write fragment must be Err(Cip(0x06)), got {other:?}"),
+    }
+}
+
+/// **D-ENIP-23 / §7.2.** The same rule on an *intermediate* fragment: `0x06` there is equally
+/// uncanonical, and continuing past it wrote the remaining chunks into a transfer the target had
+/// already refused.
+#[tokio::test]
+async fn write_fragment_refuses_partial_transfer_on_an_intermediate_fragment() {
+    let verdict = fragmented_write_answering(0x06, false).await;
+    match verdict {
+        Err(enip::EnipError::Cip(status)) => {
+            assert_eq!(status.general, enip::GeneralStatus::PartialTransfer);
+        }
+        other => {
+            panic!("0x06 on an intermediate write fragment must be Err(Cip(0x06)), got {other:?}")
+        }
+    }
+}
+
+/// **D-ENIP-23 / §7.2.** The conforming case still succeeds: `00` on every fragment, including the
+/// last, is the whole value written. Guards the rule above against being a blanket refusal.
+#[tokio::test]
+async fn write_fragment_accepts_success_on_every_fragment() {
+    fragmented_write_answering(0x00, true)
+        .await
+        .expect("00 on every fragment is a completed write");
+}
+
+/// Drive a fragmented read of two 8-byte fragments whose leading type code (and, for a structure,
+/// template handle) is `first` on fragment 1 and `second` on fragment 2, returning the verdict.
+async fn fragmented_read_with_type_codes(
+    first: (u16, Option<u16>),
+    second: (u16, Option<u16>),
+) -> enip::Result<enip::TagReadResult> {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut peer = MockPeer::new(server_io);
+        peer.handle_register().await;
+        while let Some(req) = peer.recv().await {
+            let (svc, data) = parse_ucmm_request(&req);
+            match svc {
+                // Force fragmentation with a reply-too-large on the plain 0x4C.
+                0x4C => {
+                    peer.send(&rrdata_reply(
+                        req.header.sender_context,
+                        &mr_reply(0x4C, 0x11, &[], &[]),
+                    ))
+                    .await;
+                }
+                0x52 => {
+                    let mut dr = WireReader::new(&data);
+                    let _elements = dr.u16().unwrap();
+                    let offset = dr.u32().unwrap() as usize;
+                    let full = [0xAAu8; 16];
+                    let end = (offset + 8).min(full.len());
+                    let more = end < full.len();
+                    let (code, handle) = if offset == 0 { first } else { second };
+                    let mut body = WireWriter::new();
+                    body.u16(code);
+                    if let Some(h) = handle {
+                        body.u16(h);
+                    }
+                    body.put_slice(&full[offset..end]);
+                    let status = if more { 0x06 } else { 0x00 };
+                    peer.send(&rrdata_reply(
+                        req.header.sender_context,
+                        &mr_reply(0x52, status, &[], body.as_slice()),
+                    ))
+                    .await;
+                }
+                other => panic!("unexpected service 0x{other:02X}"),
+            }
+        }
+    });
+
+    let client = EipClient::connect_over(client_io, base_opts())
+        .await
+        .unwrap();
+    let tag = TagAddress::parse("SPLIT").unwrap();
+    let verdict = client.read_tag(&tag, 4).await;
+    drop(client);
+    server.abort();
+    verdict
+}
+
+/// **D-ENIP-23 / §7.2.** Every fragment of a read must repeat the **first** fragment's type code.
+///
+/// Only the first was ever kept (`get_or_insert`), so a peer could declare DINT on fragment 1 and
+/// ship REAL bytes on fragment 2: the reassembled buffer is decoded as the *declared* type and the
+/// caller's type check (D-ENIP-4) never sees the substitution, so wrong values reach the sample
+/// wearing the right type. PM020's fragmented-read examples repeat the identical type in every
+/// reply of a transfer, so no conforming device is affected.
+#[tokio::test]
+async fn fragmented_read_refuses_a_type_code_that_changes_between_fragments() {
+    let verdict =
+        fragmented_read_with_type_codes((CipType::Dint.code(), None), (CipType::Real.code(), None))
+            .await;
+    assert!(
+        matches!(
+            verdict,
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "fragmented read type code changed between fragments"
+            })
+        ),
+        "got {verdict:?}"
+    );
+}
+
+/// **D-ENIP-23 / §7.2.** The structure template handle is held to the same rule: it identifies the
+/// layout the opaque bytes belong to, so a handle that changes mid-transfer is a reassembly of two
+/// different structures.
+#[tokio::test]
+async fn fragmented_read_refuses_a_struct_handle_that_changes_between_fragments() {
+    let verdict = fragmented_read_with_type_codes(
+        (CipType::Struct.code(), Some(0x0FCE)),
+        (CipType::Struct.code(), Some(0x0FCF)),
+    )
+    .await;
+    assert!(
+        matches!(
+            verdict,
+            Err(enip::EnipError::ProtocolViolation {
+                detail: "fragmented read struct handle changed between fragments"
+            })
+        ),
+        "got {verdict:?}"
+    );
+}
+
+/// **D-ENIP-23 / §7.2.** The conforming case still reassembles: an identical type code on both
+/// fragments yields the whole value, so the stability rule is not a blanket refusal of
+/// fragmentation.
+#[tokio::test]
+async fn fragmented_read_accepts_an_unchanged_type_code() {
+    let r =
+        fragmented_read_with_type_codes((CipType::Dint.code(), None), (CipType::Dint.code(), None))
+            .await
+            .expect("an unchanged type code reassembles");
+    assert!(r.fragmented);
+    assert_eq!(r.wire_type, CipType::Dint);
+    match r.value {
+        CipValue::Array(CipType::Dint, elems) => assert_eq!(elems.len(), 4),
+        other => panic!("expected a 4-element DINT array, got {other:?}"),
+    }
+}
+
 /// §7.2 — a fragmented read of a STRING tag reassembles into the opaque `Unsupported` marker (the
 /// crate reports STRING but does not interpret it), exercising `build_fragment_value`'s STRING arm.
 #[tokio::test]
