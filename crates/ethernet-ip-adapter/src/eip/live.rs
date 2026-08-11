@@ -2187,7 +2187,8 @@ mod tests {
             recv_errors: 9,
             malformed_frames: 10,
             unknown_connection: 11,
-            refused_redirects: 12,
+            source_mismatch_datagrams: 12,
+            refused_redirects: 13,
         });
         assert_eq!(
             mapped,
@@ -2200,7 +2201,7 @@ mod tests {
                 produce_overruns: 7,
                 send_errors: 8,
                 recv_errors: 9,
-                refused_redirects: 12,
+                refused_redirects: 13,
             }
         );
 

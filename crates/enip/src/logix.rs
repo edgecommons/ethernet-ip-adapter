@@ -214,13 +214,16 @@ impl EipClient {
         Err(EnipError::Cip(reply.status))
     }
 
-    /// The fragmented read loop (§7.2, D-ENIP-12): re-reads from offset 0 with `0x52`, accumulating
-    /// each fragment's value bytes until a final `status 0`, capped by `max_value_bytes`.
+    /// The fragmented read loop (§7.2, D-ENIP-12, D-ENIP-23): re-reads from offset 0 with `0x52`,
+    /// accumulating each fragment's value bytes until a final `status 0`, capped by
+    /// `max_value_bytes`. **Every fragment must repeat the first fragment's type code — and, for a
+    /// structure, its template handle** (D-ENIP-23); a change mid-transfer is a
+    /// [`EnipError::ProtocolViolation`].
     async fn read_tag_fragmented(&self, tag: &TagAddress, elements: u16) -> Result<TagReadResult> {
         let cap = self.max_value_bytes();
         let mut offset: u32 = 0;
         let mut acc: Vec<u8> = Vec::new();
-        let mut wire_type: Option<CipType> = None;
+        let mut wire_code: Option<u16> = None;
         let mut struct_handle: Option<u16> = None;
 
         loop {
@@ -240,13 +243,53 @@ impl EipClient {
                 return Err(EnipError::Cip(reply.status));
             }
 
-            // Each fragment repeats the leading type code (+ handle for a struct).
+            // Each fragment repeats the leading type code (+ handle for a struct), and every
+            // fragment's must be the SAME one (D-ENIP-23). PM020's Read Tag Fragmented examples
+            // repeat the identical type in every reply of a transfer, so nothing conforming is
+            // affected — but reading the code once and discarding it thereafter is what let a peer
+            // declare one type on the first fragment and ship the rest of the bytes under another:
+            // the reassembled buffer is decoded as the FIRST fragment's type, and the caller's
+            // type check (D-ENIP-4) only ever sees that declaration, so the substitution is
+            // invisible all the way to the sample. The same reasoning covers the struct template
+            // handle, which identifies the layout the opaque bytes belong to.
             let mut r = WireReader::with_context(&reply.data, CONTEXT);
             let code = r.u16()?;
-            let ty = *wire_type.get_or_insert(CipType::from_code(code));
+            match wire_code {
+                None => wire_code = Some(code),
+                Some(first) if first != code => {
+                    // The values live in the log line, never in `detail` — `EnipError`'s details
+                    // are fixed strings by construction (§10.1), so the diagnostic that names both
+                    // codes is emitted here.
+                    tracing::warn!(
+                        first_type_code = format_args!("{first:#06X}"),
+                        fragment_type_code = format_args!("{code:#06X}"),
+                        offset,
+                        "fragmented read: the type code changed between fragments"
+                    );
+                    return Err(EnipError::ProtocolViolation {
+                        detail: "fragmented read type code changed between fragments",
+                    });
+                }
+                Some(_same) => {}
+            }
+            let ty = CipType::from_code(code);
             if matches!(ty, CipType::Struct) {
                 let handle = r.u16()?;
-                struct_handle.get_or_insert(handle);
+                match struct_handle {
+                    None => struct_handle = Some(handle),
+                    Some(first) if first != handle => {
+                        tracing::warn!(
+                            first_struct_handle = format_args!("{first:#06X}"),
+                            fragment_struct_handle = format_args!("{handle:#06X}"),
+                            offset,
+                            "fragmented read: the struct template handle changed between fragments"
+                        );
+                        return Err(EnipError::ProtocolViolation {
+                            detail: "fragmented read struct handle changed between fragments",
+                        });
+                    }
+                    Some(_same) => {}
+                }
             }
             let value_bytes = r.take_rest();
 
@@ -275,7 +318,10 @@ impl EipClient {
             }
         }
 
-        let ty = wire_type.unwrap_or(CipType::Unknown(0));
+        let ty = match wire_code {
+            Some(code) => CipType::from_code(code),
+            None => CipType::Unknown(0),
+        };
         let value = build_fragment_value(ty, struct_handle, &acc)?;
         Ok(TagReadResult {
             value,
@@ -287,6 +333,11 @@ impl EipClient {
     /// Write a tag (§7.2). Encodes the value and issues Write Tag (`0x4D`); if the encoded request
     /// would exceed the session's usable request size it chunks via Write Tag Fragmented (`0x53`) on
     /// element boundaries (D-ENIP-12). Structures/strings cannot be written (`Unsupported`).
+    ///
+    /// **Every fragment's reply must carry General Status 00** (D-ENIP-23, Rockwell
+    /// 1756-PM020I-EN-P): the write services have no "more expected" status, so any other value —
+    /// `0x06` included — is the target refusing that chunk and is returned as `Err(Cip(..))` rather
+    /// than counted as progress.
     pub async fn write_tag(&self, tag: &TagAddress, ty: CipType, value: &CipValue) -> Result<()> {
         let element_size = ty.element_size().ok_or(EnipError::Unsupported {
             what: "write of non-elementary type",
@@ -347,7 +398,14 @@ impl EipClient {
             );
             let reply = self.send_cip(mr, "write_tag_fragmented").await?;
             reply.expect_service(SERVICE_WRITE_TAG_FRAGMENTED)?;
-            if !reply.status.is_ok() && !reply.status.has_more() {
+            // **Every** Write Tag Fragmented reply must carry General Status 00 (D-ENIP-23).
+            // Rockwell 1756-PM020I-EN-P specifies success on each fragment of a write transfer and
+            // does not list `0x06` (PartialTransfer) among the write service's statuses at all —
+            // `0x06` belongs to READ fragmentation, where it means "more data follows". Accepting
+            // it here, on the final fragment as much as on an intermediate one, turned a target's
+            // refusal of a chunk into `Ok(())`: the write returned success with part of the value
+            // never applied. Any non-zero status, `0x06` included, is that refusal.
+            if !reply.status.is_ok() {
                 return Err(EnipError::Cip(reply.status));
             }
             let advance = u32::try_from(chunk.len()).map_err(|_| EnipError::TooLarge {
