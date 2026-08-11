@@ -1,9 +1,11 @@
 //! # The poll backend: [`EipSession`] over `enip::EipClient` (§3.4)
 //!
 //! One live explicit-messaging session to one device. `read_signals` issues one Read Tag per signal
-//! (D-EIP-15) and decodes each reply through [`super::types`]; a per-tag CIP error or an isolated
-//! request timeout becomes a **BAD [`Reading`]** (the session lives — one dead tag must not blind the
-//! other ninety-nine, §5.4), while a connection-level failure returns `Err` so the supervisor
+//! (D-EIP-15) and decodes each reply through [`super::types`]; a per-tag CIP error, an isolated
+//! request timeout, or a reply whose element count is not the configured one
+//! ([`cardinality_mismatch`], D-EIP-33) becomes a **BAD [`Reading`]** (the session lives — one dead
+//! tag must not blind the other ninety-nine, and a malformed reply must not bounce the link, §5.4),
+//! while a connection-level failure returns `Err` so the supervisor
 //! reconnects (§10.1). `write_signal` coerces + Write Tag (confirmed). `browse` pages Get Instance
 //! Attribute List, honouring `max` truthfully: an uncursored walk starts at symbol instance 0 so
 //! nothing at the bottom of the instance space is skipped ([`parse_browse_cursor`]), a page cut
@@ -22,13 +24,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::config::SignalSpec;
+use crate::config::{EipType, SignalSpec};
 use crate::device::{
     BrowsePage, BrowsedTag, DeviceError, DeviceSession, Quality, Reading, Result, SecurityStatus,
 };
 
 use super::map_enip_error;
-use super::types::{self, Decoded};
+use super::types;
 
 /// A live poll session over the owned `enip` client.
 pub struct EipSession {
@@ -85,21 +87,36 @@ impl EipSession {
             // A malformed tag path is a per-signal problem, not a link failure.
             Err(e) => return Ok(bad(spec, format!("DECODE bad tag path ({e})"))),
         };
-        let elements = spec.array_count.unwrap_or(1).min(u32::from(u16::MAX)) as u16;
+        // Both paths that mint a `SignalSpec` bound `arrayCount` to `1..=MAX_ARRAY_COUNT` — config
+        // validation (§4.4) and the `sb/read`/`sb/write` explicit ref (`BAD_ARGS`, §7.2) — so this
+        // conversion is exact. It is written as a per-signal refusal rather than the clamp it
+        // replaces because a silently narrowed element count asks the device for a different
+        // contract than the configured one and then publishes the answer GOOD (D-EIP-33).
+        let requested = spec.array_count.unwrap_or(1);
+        let elements = match u16::try_from(requested) {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                return Ok(bad(
+                    spec,
+                    format!("DECODE arrayCount {requested} out of range (expected 1..=65535)"),
+                ))
+            }
+        };
 
         let outcome =
             tokio::time::timeout(self.defensive(), self.client.read_tag(&addr, elements)).await;
         match outcome {
             Ok(Ok(result)) => {
                 match types::decode_value(&result.value, spec.eip_type, spec.scale, spec.offset) {
-                    Ok(Decoded {
-                        value,
-                        non_finite: false,
-                    }) => Ok(good(spec, value)),
-                    Ok(Decoded {
-                        non_finite: true, ..
-                    }) => Ok(uncertain(spec)),
-                    Err(e) => Ok(bad(spec, e.quality_raw())),
+                    Err(e) => Ok(bad(spec, decode_detail(spec, &e))),
+                    // The element *type* matched; the element *count* is a separate promise, and it
+                    // is checked here — on the shape the crate decoded — because only the adapter
+                    // holds the configured cardinality (§5.1's "a JSON array of N elements").
+                    Ok(decoded) => match cardinality_mismatch(&result.value, elements) {
+                        Some(detail) => Ok(bad(spec, detail)),
+                        None if decoded.non_finite => Ok(uncertain(spec)),
+                        None => Ok(good(spec, decoded.value)),
+                    },
                 }
             }
             // A per-tag CIP error status: BAD sample, session lives (§5.4, §10.1).
@@ -115,6 +132,61 @@ impl EipSession {
             ))),
         }
     }
+}
+
+/// The `qualityRaw` detail for a decode failure — [`types::DecodeError::quality_raw`], plus one hint
+/// for the single mismatch shape an operator is most likely to hit and least likely to understand.
+///
+/// A configured BOOL **array** answered with `DWORD` is a Logix controller telling us its `BOOL[n]`
+/// tag is packed (D-EIP-16): the adapter's BOOL-array encoding is byte-per-element, which this
+/// device does not use. Config validation already warns about the signal at startup, but an operator
+/// reading a BAD sample months later never saw that line, so the sample explains itself. Nothing
+/// else is annotated — a hint on every mismatch would be noise, and the base detail already names
+/// expected vs got.
+fn decode_detail(spec: &SignalSpec, e: &types::DecodeError) -> String {
+    let base = e.quality_raw();
+    let bool_array_vs_dword = spec.eip_type == EipType::Bool
+        && spec.array_count.is_some()
+        && matches!(
+            e,
+            types::DecodeError::TypeMismatch {
+                got: enip::CipType::Dword,
+                ..
+            }
+        );
+    if bool_array_vs_dword {
+        return format!(
+            "{base} - Logix packs BOOL arrays as DWORDs; BOOL-array support is experimental"
+        );
+    }
+    base
+}
+
+/// How many elements a decoded reply actually carries. The protocol crate derives the count from the
+/// reply length and **collapses a single element to a scalar** (`cip/types.rs`, PROTOCOL-DESIGN
+/// §7.2), so a scalar is one element — which is also why a configured `arrayCount: 1` is satisfied by
+/// a scalar reply.
+fn returned_elements(v: &enip::CipValue) -> usize {
+    match v {
+        enip::CipValue::Array(_, elems) => elems.len(),
+        _ => 1,
+    }
+}
+
+/// The `qualityRaw` detail when a reply's element count is not the one the request asked for, or
+/// `None` when it matches (D-EIP-33).
+///
+/// The requested count is sent on the wire and then has to be *checked*: a conforming Logix answers
+/// exactly `requested` elements or errors, but nothing in the reply forces that, and the crate
+/// deliberately derives the count from the payload length. Left unchecked, a nonconforming or
+/// hostile peer turns a short reply into a GOOD array shorter than the configured contract, and a
+/// one-element reply into a GOOD **scalar** where an array is configured — both silently wrong,
+/// which is the failure mode D-EIP-1's threat model exists to refuse. It is a per-signal BAD sample,
+/// never a connection-level error: a malformed reply must not bounce the session (§5.4).
+fn cardinality_mismatch(v: &enip::CipValue, requested: u16) -> Option<String> {
+    let got = returned_elements(v);
+    let want = usize::from(requested);
+    (got != want).then(|| format!("DECODE element count mismatch (expected {want}, got {got})"))
 }
 
 /// A GOOD reading of `value`.
@@ -432,6 +504,25 @@ mod tests {
         v
     }
 
+    /// A tagged REAL **array** reply payload: `u16 0xCA` + one f32 LE per element. The crate derives
+    /// the element count from the payload length, so this is how a device serves N of them — and how
+    /// a test serves a number the request did not ask for.
+    fn tagged_real_array(vals: &[f32]) -> Vec<u8> {
+        let mut v = 0xCA_u16.to_le_bytes().to_vec();
+        for f in vals {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        v
+    }
+
+    /// The element count a Read Tag request carried: a Message Request is
+    /// `service, path_size_words, path…, data…`, and the Read Tag data is a single `u16` count.
+    fn requested_elements(mr: &[u8]) -> u16 {
+        let path_len = mr[1] as usize * 2;
+        let off = 2 + path_len;
+        u16::from_le_bytes([mr[off], mr[off + 1]])
+    }
+
     /// One Get-Instance-Attribute-List record.
     fn tag_record(inst: u32, name: &str, sym: u16) -> Vec<u8> {
         let mut v = inst.to_le_bytes().to_vec();
@@ -573,6 +664,254 @@ mod tests {
         );
         assert_eq!(readings[1].value, serde_json::Value::Null);
         assert!(readings[1].quality_raw.as_deref().unwrap().contains("0x04"));
+    }
+
+    /// **The cardinality contract (D-EIP-33).** The requested element count is sent on the wire and
+    /// must then be *checked*: nothing in a Read Tag reply forces the device to have honoured it, and
+    /// the crate deliberately derives the count from the payload length. A reply carrying 3 of the 8
+    /// elements asked for is a BAD sample naming both numbers — not a GOOD 3-element array short of
+    /// the configured contract. The exact-N reply in the same test is the control: the check refuses
+    /// only the mismatch.
+    #[tokio::test]
+    async fn a_short_array_reply_is_bad_naming_expected_and_got_while_exact_n_stays_good() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |idx, service, mr| {
+            assert_eq!(service, 0x4C, "read tag");
+            assert_eq!(requested_elements(mr), 8, "the request asks for all 8");
+            match idx {
+                0 => (0x00, tagged_real_array(&[1.0, 2.0, 3.0])), // three of eight
+                _ => (
+                    0x00,
+                    tagged_real_array(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                ),
+            }
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("zone-temps", "ZONE_TEMPS", "real", Some(8));
+
+        let short = session
+            .read_signals(std::slice::from_ref(&sp))
+            .await
+            .unwrap();
+        assert_eq!(short[0].quality, Quality::Bad, "a short array is not GOOD");
+        assert_eq!(short[0].value, serde_json::Value::Null);
+        let raw = short[0].quality_raw.clone().unwrap_or_default();
+        assert!(
+            raw.contains("expected 8") && raw.contains("got 3"),
+            "the detail names expected vs got: {raw}"
+        );
+
+        let full = session.read_signals(&[sp]).await.unwrap();
+        assert_eq!(full[0].quality, Quality::Good, "exactly N is still GOOD");
+        assert_eq!(
+            full[0].value,
+            json!([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        );
+    }
+
+    /// The collapse case: the crate turns a one-element reply into a **scalar** (`cip/types.rs`), so
+    /// an array-configured signal answered with one element published a GOOD scalar where §5.1
+    /// promises a JSON array of N. That is the same defect wearing a different shape, and it is the
+    /// same refusal.
+    #[tokio::test]
+    async fn a_scalar_reply_where_an_array_is_configured_is_bad_not_a_good_scalar() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |_idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            (0x00, tagged_real(42.0)) // one element ⇒ the crate decodes a scalar
+        });
+        let mut session = connect(client_half).await;
+
+        let r = session
+            .read_signals(&[spec("zone-temps", "ZONE_TEMPS", "real", Some(4))])
+            .await
+            .unwrap();
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(r[0].value, serde_json::Value::Null);
+        let raw = r[0].quality_raw.clone().unwrap_or_default();
+        assert!(
+            raw.contains("expected 4") && raw.contains("got 1"),
+            "the detail names expected vs got: {raw}"
+        );
+    }
+
+    /// The mirror image, and the reason the check is a count rather than a shape test: a *scalar*
+    /// signal answered with several elements is equally out of contract. It is also why a configured
+    /// `arrayCount: 1` is satisfied by the scalar the crate collapses a single element into — one
+    /// element is one element, whichever shape carries it.
+    #[tokio::test]
+    async fn an_array_reply_where_a_scalar_is_configured_is_bad_and_array_count_one_accepts_a_scalar(
+    ) {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            match idx {
+                0 => (0x00, tagged_real_array(&[1.0, 2.0, 3.0])),
+                _ => (0x00, tagged_real(7.5)),
+            }
+        });
+        let mut session = connect(client_half).await;
+
+        let r = session
+            .read_signals(&[spec("line-speed", "LINE_SPEED", "real", None)])
+            .await
+            .unwrap();
+        assert_eq!(r[0].quality, Quality::Bad);
+        let raw = r[0].quality_raw.clone().unwrap_or_default();
+        assert!(
+            raw.contains("expected 1") && raw.contains("got 3"),
+            "a scalar signal answered with three elements: {raw}"
+        );
+
+        let one = session
+            .read_signals(&[spec("one", "ONE", "real", Some(1))])
+            .await
+            .unwrap();
+        assert_eq!(one[0].quality, Quality::Good, "arrayCount 1 is satisfiable");
+        assert_eq!(one[0].value, json!(7.5));
+    }
+
+    /// **The clamp is gone (D-EIP-33).** `read_one` used to narrow the element count with
+    /// `.min(u16::MAX)`, so a signal asking for 70 000 elements quietly requested 65 535 and
+    /// published the device's answer GOOD — a different contract than the configured one, answered
+    /// as if it were the configured one. Configuration now refuses that count outright; the seam
+    /// keeps a non-panicking refusal for any spec that reaches it unvalidated, and issues **no
+    /// request at all**.
+    #[tokio::test]
+    async fn an_unvalidated_out_of_range_array_count_is_refused_not_clamped() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        spawn_device(server_half, move |_idx, _service, _mr| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            (0x00, tagged_real_array(&[1.0, 2.0]))
+        });
+        let mut session = connect(client_half).await;
+
+        // `SignalSpec` deserializes without the §4.4 device validation, which is exactly the shape a
+        // defensive conversion exists for.
+        let r = session
+            .read_signals(&[spec("huge", "HUGE", "real", Some(70_000))])
+            .await
+            .unwrap();
+        assert_eq!(r[0].quality, Quality::Bad);
+        let raw = r[0].quality_raw.clone().unwrap_or_default();
+        assert!(
+            raw.contains("70000") && raw.contains("1..=65535"),
+            "the refusal names the count and the bound: {raw}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no truncated read is issued at all"
+        );
+    }
+
+    /// **The BOOL-array experiment, both outcomes (D-EIP-16).** A byte-per-element peer answers the
+    /// configured `BOOL[4]` and the signal reads GOOD — the feature is available, which is what
+    /// "accepted, experimental" means. A Logix controller answers the same read with a packed
+    /// `DWORD` array (`0x00D3`), which is a type mismatch ⇒ BAD; that BAD carries the hint, because
+    /// an operator reading it months later never saw the startup warning and has no way to know
+    /// from "expected bool, got Dword" that BOOL-array support is the thing at fault.
+    #[tokio::test]
+    async fn a_bool_array_reads_byte_per_element_and_a_dword_reply_is_bad_with_the_hint() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            match idx {
+                // Byte-per-element BOOL[4]: `u16 0xC1` + four bytes.
+                0 => (0x00, vec![0xC1, 0x00, 1, 0, 1, 1]),
+                // The Logix answer: a packed DWORD array (`u16 0xD3` + two 32-bit words).
+                _ => (
+                    0x00,
+                    vec![0xD3, 0x00, 0x0F, 0, 0, 0, 0xF0, 0xFF, 0xFF, 0xFF],
+                ),
+            }
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("alarms", "ALARMS", "bool", Some(4));
+
+        let good = session
+            .read_signals(std::slice::from_ref(&sp))
+            .await
+            .unwrap();
+        assert_eq!(good[0].quality, Quality::Good);
+        assert_eq!(good[0].value, json!([true, false, true, true]));
+
+        let packed = session.read_signals(&[sp]).await.unwrap();
+        assert_eq!(
+            packed[0].quality,
+            Quality::Bad,
+            "a packed reply is loud, not silently reinterpreted"
+        );
+        let raw = packed[0].quality_raw.clone().unwrap_or_default();
+        assert!(
+            raw.contains("type mismatch") && raw.contains("Dword"),
+            "the base detail still names expected vs got: {raw}"
+        );
+        assert!(
+            raw.contains("Logix packs BOOL arrays as DWORDs")
+                && raw.contains("BOOL-array support is experimental"),
+            "the sample explains itself to an operator who never saw the startup log: {raw}"
+        );
+    }
+
+    /// The hint is for that one mismatch shape only — every other decode mismatch keeps the bare
+    /// detail, so the annotation stays a signal rather than noise.
+    #[tokio::test]
+    async fn the_bool_array_hint_is_not_appended_to_unrelated_mismatches() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            match idx {
+                // A REAL signal answered with a DINT: a mismatch, but nothing to do with BOOLs.
+                0 => (0x00, vec![0xC4, 0x00, 1, 0, 0, 0]),
+                // A *scalar* bool answered with a DWORD: still not the BOOL-array shape.
+                _ => (0x00, vec![0xD3, 0x00, 0x0F, 0, 0, 0]),
+            }
+        });
+        let mut session = connect(client_half).await;
+
+        for sp in [
+            spec("line-speed", "LINE_SPEED", "real", None),
+            spec("motor-run", "MOTOR_RUN", "bool", None),
+        ] {
+            let r = session.read_signals(&[sp]).await.unwrap();
+            assert_eq!(r[0].quality, Quality::Bad);
+            let raw = r[0].quality_raw.clone().unwrap_or_default();
+            assert!(
+                !raw.contains("experimental"),
+                "no BOOL-array hint on an unrelated mismatch: {raw}"
+            );
+        }
+    }
+
+    /// The counterpart of the clamp removal on the wire: the count the operator configured is the
+    /// count the request carries, right up to the `u16` ceiling this bound exists to respect. (The
+    /// device answers a CIP status rather than 256 KB of REALs — the assertion is about the
+    /// *request*; a reply that large does not fit one unfragmented CPF item anyway.)
+    #[tokio::test]
+    async fn the_configured_element_count_reaches_the_wire_verbatim() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let asked = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let record = Arc::clone(&asked);
+        spawn_device(server_half, move |_idx, service, mr| {
+            assert_eq!(service, 0x4C);
+            record.lock().unwrap().push(requested_elements(mr));
+            (0x13, Vec::new()) // not enough data — a per-tag CIP status, session lives
+        });
+        let mut session = connect(client_half).await;
+
+        let r = session
+            .read_signals(&[spec("max", "MAX_ARR", "real", Some(65_535))])
+            .await
+            .unwrap();
+        assert_eq!(r[0].quality, Quality::Bad, "the device refused this one");
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [65_535],
+            "the configured count rides the wire unnarrowed"
+        );
     }
 
     #[tokio::test]

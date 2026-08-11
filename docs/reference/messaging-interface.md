@@ -86,7 +86,7 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 
 | Code | When |
 |------|------|
-| `BAD_ARGS` | Malformed body; a request that addresses no instance with ≥ 2 devices running; a body `instance` that disagrees with the topic's instance token; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, an unknown browse `ref`, or a push `sb/browse` `cursor` that is not one a previous page returned. |
+| `BAD_ARGS` | Malformed body; a request that addresses no instance with ≥ 2 devices running; a body `instance` that disagrees with the topic's instance token; `repoll` on a push instance; mixing the paged and hierarchical `sb/browse` argument families, `depth`/`maxRefs` without `ref`, an unknown browse `ref`, a push `sb/browse` `cursor` that is not one a previous page returned, or an explicit poll signal-ref whose `arrayCount` is outside 1–65535 (the whole command is refused; nothing is read or written). |
 | `PAUSED` | `repoll` on a paused instance — resume first. |
 | `NO_SUCH_INSTANCE` | The addressed instance names no running device. |
 | `WRITE_NOT_ALLOWED` | Every `sb/write` entry was refused by the allow-list. |
@@ -102,7 +102,8 @@ Returned as `{"ok": false, "error": {"code", "message"}}`.
 A signal-ref in `sb/read`/`sb/write` is either **friendly** (`{"name": "<configured signal>"}`) or
 **explicit**:
 
-- **poll:** `{"tagPath", "type", "arrayCount"?}` — an arbitrary CIP tag.
+- **poll:** `{"tagPath", "type", "arrayCount"?}` — an arbitrary CIP tag. `arrayCount` is an integer from
+  1 to 65535; any other value refuses the whole command with `BAD_ARGS`.
 - **push read:** `{"assembly", "offset", "type", "bit"?}` matching a declared **input** field.
 - **push write:** an **output** field, by `name` or `{"assembly", "offset", "type", "bit"?}`. An input
   field is reported per-entry as `input field`; an unknown ref as `unresolved ref`.
@@ -221,6 +222,10 @@ Every entry emits a `write-audit` event.
   mode:"push", signals:[{ name, id, address, direction ("input"|"output"), publishMode, writable,
   deadband? }] }`.
 - **`sb/browse`** → poll: `{ id, tags:[{ name, type, configured, supported, arrayDim? }], cursor? }`.
+  `arrayDim` is the tag's array **dimensionality** — `1` for a one-dimensional array, `2` or `3` for a
+  multi-dimensional one, absent for a scalar. `supported` reports whether the tag can be configured as a
+  signal and decoded, which depends on both its type and its shape: multi-dimensional tags, structures,
+  and strings are `false`; scalars and one-dimensional arrays of the elementary types are `true`.
   Push: `{ id, tags:[{ name, id, type, direction, configured:true, supported:true }], cursor? }` (the
   configured layout, no round-trip). Both modes page the same way: a request without a cursor starts at
   the beginning of the inventory, `max` bounds the page, `cursor` appears only while entries remain, and

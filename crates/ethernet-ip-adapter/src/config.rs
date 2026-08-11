@@ -25,6 +25,30 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+/// The largest `arrayCount` a poll signal may declare (D-EIP-33). The CIP Read Tag service carries
+/// its element count in a `u16`, so 65 535 is the wire ceiling — and the count the adapter sends is
+/// the count the reply must carry (§5.1), never a clamp of a bigger number the operator wrote.
+pub const MAX_ARRAY_COUNT: u32 = u16::MAX as u32;
+
+/// The startup warning a `bool` + `arrayCount` poll signal carries (D-EIP-16).
+///
+/// The configuration is **accepted and labelled experimental** rather than refused — availability
+/// with honesty. It is not a claim of conditional correctness: the adapter cannot tell one device
+/// family from another (there is no device-family detection, and `slot` is routing, not identity),
+/// so the experimental label is global to the feature. The one canonically known behavior is the
+/// Logix packing — "Logix BOOL arrays are multiples of BOOL[32] and are implemented as a DWORD
+/// array" (Rockwell 1756-PM020, p. 58) — where a `BOOL[n]` read answers `0x00D3` 4-byte words and
+/// the byte-per-element decode is a TypeMismatch ⇒ BAD. That is fail-loud rather than silently
+/// wrong, but it is loud *forever*, and the bench cannot catch it: cpppo is a Logix emulator with a
+/// fidelity gap here (it serves BOOL arrays byte-per-element), so a green sim proves nothing about
+/// this feature. Hence the warning at validation, and the matching hint on the BAD sample itself
+/// (`eip/session.rs`) for an operator who never saw the startup log.
+pub const BOOL_ARRAY_EXPERIMENTAL: &str =
+    "BOOL arrays are experimental - best-effort byte-per-element encoding, not validated against \
+     physical hardware; Logix controllers pack BOOL arrays as DWORDs (Rockwell 1756-PM020), so \
+     reads from ControlLogix/CompactLogix are expected to report BAD, and behavior on other \
+     devices depends on their implementation";
+
 // ---- built-in defaults (the last rung of the precedence ladder, §4.1) ----
 const BUILTIN_POLL_MS: u64 = 5_000;
 // SLICE S4: the built-in fall-through for publishMode/batchMs, used by the poll engine's resolution.
@@ -256,8 +280,9 @@ pub struct SignalSpec {
     /// (D-EIP-16).
     #[serde(rename = "type")]
     pub eip_type: EipType,
-    /// Present ⇒ a 1-D array read of that many elements; the value is a JSON array. Consumed by the
-    /// codec (S3).
+    /// Present ⇒ a 1-D array read of that many elements; the value is a JSON array. Bounded to
+    /// `1..=`[`MAX_ARRAY_COUNT`] and refused on a `bool` signal by [`DeviceConfig::validate_poll`]
+    /// (D-EIP-33 / D-EIP-16). Consumed by the codec (S3).
     pub array_count: Option<u32>,
     /// Published value = `raw * scale + offset` (numeric only). Consumed by the codec (S3).
     pub scale: Option<f64>,
@@ -994,6 +1019,19 @@ impl DeviceConfig {
                         self.id, sig.tag_path
                     ));
                 }
+                // `bool` + `arrayCount` is ACCEPTED and warned, not rejected — the feature is
+                // available and labelled experimental, with no claim about which devices it works
+                // on (the adapter has no device-family detection). See [`BOOL_ARRAY_EXPERIMENTAL`]
+                // and [`DeviceConfig::experimental_signal_warnings`].
+                if let Some(n) = sig.array_count {
+                    if !(1..=MAX_ARRAY_COUNT).contains(&n) {
+                        return Err(format!(
+                            "device `{}`: signal `{}` has arrayCount {} - it must be in \
+                             1..={MAX_ARRAY_COUNT} (the CIP Read Tag element count is a u16)",
+                            self.id, sig.name, n
+                        ));
+                    }
+                }
                 if !sig.is_numeric() {
                     if sig.scale.is_some() || sig.offset.is_some() {
                         return Err(format!(
@@ -1042,6 +1080,23 @@ impl DeviceConfig {
             .iter()
             .filter(|a| !configured.contains(a.as_str()))
             .cloned()
+            .collect()
+    }
+
+    /// Signals whose configuration is **accepted but experimental** — one entry per offending
+    /// signal, as `(signal name, reason)` (§4.4, D-EIP-16). Today that is exactly the `bool` +
+    /// `arrayCount` case ([`BOOL_ARRAY_EXPERIMENTAL`]).
+    ///
+    /// Returned rather than logged here, mirroring [`DeviceConfig::unmatched_allow_entries`]: the
+    /// caller owns the log line (it holds the instance context and knows whether this is a startup
+    /// or a reload launch), and a warning that is a value rather than a side effect is one a test
+    /// can assert without scraping a subscriber. The reason is a `&'static str` constant, so the
+    /// substance of what an operator is told is pinned by the same assertion.
+    #[must_use]
+    pub fn experimental_signal_warnings(&self) -> Vec<(String, &'static str)> {
+        self.signals()
+            .filter(|s| s.eip_type == EipType::Bool && s.array_count.is_some())
+            .map(|s| (s.name.clone(), BOOL_ARRAY_EXPERIMENTAL))
             .collect()
     }
 
@@ -1342,6 +1397,131 @@ mod tests {
                 { "name": "grid", "tagPath": "GRID", "type": "real", "arrayCount": [2, 2] } ] } ]
         }));
         assert!(bad.is_err());
+    }
+
+    /// A `bool` signal with `arrayCount` is **accepted and warned**, not rejected (D-EIP-16): the
+    /// feature is available and labelled experimental. The label is global — the adapter has no
+    /// device-family detection — and the warning claims nothing beyond the one canonically known
+    /// behavior: Logix packs BOOL arrays as DWORDs ("multiples of BOOL[32] … implemented as a DWORD
+    /// array", Rockwell 1756-PM020 p.58), so a controller read is expected BAD, loudly.
+    ///
+    /// The warning is asserted as a **value**, not scraped from a log: validation returns it (the
+    /// same shape `unmatched_allow_entries` already uses) and the supervisor logs it with the
+    /// instance context, so both the fact and its wording are pinned here.
+    #[test]
+    fn a_bool_array_signal_is_accepted_and_warned_as_experimental() {
+        let d = device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "h" },
+            "pollGroups": [ { "signals": [
+                { "name": "alarms", "tagPath": "ALARMS", "type": "bool", "arrayCount": 32 },
+                { "name": "motor-run", "tagPath": "MOTOR_RUN", "type": "bool" },
+                { "name": "zone-temps", "tagPath": "ZONE_TEMPS", "type": "real",
+                  "arrayCount": 8 } ] } ]
+        }))
+        .expect("a bool array is configurable, not a startup failure");
+
+        // Accepted means present and addressable, not merely parsed.
+        let alarms = d.find_signal("ALARMS").expect("the signal is configured");
+        assert_eq!(alarms.array_count, Some(32));
+        assert_eq!(alarms.eip_type, EipType::Bool);
+
+        // Exactly one warning: the bool ARRAY. A scalar bool and a non-bool array are silent.
+        let warnings = d.experimental_signal_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one line per offending signal: {warnings:?}"
+        );
+        assert_eq!(warnings[0].0, "alarms");
+        assert_eq!(warnings[0].1, BOOL_ARRAY_EXPERIMENTAL);
+        let text = warnings[0].1;
+        assert!(
+            text.contains("experimental")
+                && text.contains("byte-per-element")
+                && text.contains("not validated against physical hardware")
+                && text.contains("DWORD")
+                && text.contains("1756-PM020"),
+            "the operator is told what is experimental and why: {text}"
+        );
+        assert!(
+            !text.contains("generic CIP"),
+            "the warning claims no device family works — the adapter cannot tell them apart: {text}"
+        );
+
+        // A device with no bool arrays warns about nothing.
+        let quiet = device(json!({
+            "id": "plc-2",
+            "connection": { "endpoint": "h" },
+            "pollGroups": [ { "signals": [
+                { "name": "motor-run", "tagPath": "MOTOR_RUN", "type": "bool" } ] } ]
+        }))
+        .unwrap();
+        assert!(quiet.experimental_signal_warnings().is_empty());
+    }
+
+    /// The bounds still apply to a bool array — accepted is not unvalidated.
+    #[test]
+    fn a_bool_array_is_still_subject_to_the_array_count_bounds() {
+        let bad = device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "h" },
+            "pollGroups": [ { "signals": [
+                { "name": "alarms", "tagPath": "ALARMS", "type": "bool", "arrayCount": 70_000 } ] } ]
+        }));
+        assert!(bad.unwrap_err().contains("1..=65535"));
+    }
+
+    /// `arrayCount` is bounded by the wire: the CIP Read Tag element count is a `u16`. Before this,
+    /// `0` and `70000` both validated and the session silently clamped the request to 65 535 — a
+    /// conforming device then answered 65 535 elements, published GOOD, short of the configured
+    /// contract (D-EIP-33).
+    #[test]
+    fn rejects_out_of_range_array_count_and_accepts_the_bounds() {
+        for n in [0u64, 70_000, 4_294_967_295] {
+            let bad = device(json!({
+                "id": "plc-1",
+                "connection": { "endpoint": "h" },
+                "pollGroups": [ { "signals": [
+                    { "name": "zone-temps", "tagPath": "ZONE_TEMPS", "type": "real",
+                      "arrayCount": n } ] } ]
+            }));
+            let msg = bad.unwrap_err();
+            assert!(
+                msg.contains("arrayCount") && msg.contains("1..=65535"),
+                "arrayCount {n} is refused naming the bound: {msg}"
+            );
+        }
+        for n in [1u64, 65_535] {
+            let ok = device(json!({
+                "id": "plc-1",
+                "connection": { "endpoint": "h" },
+                "pollGroups": [ { "signals": [
+                    { "name": "zone-temps", "tagPath": "ZONE_TEMPS", "type": "real",
+                      "arrayCount": n } ] } ]
+            }));
+            assert!(ok.is_ok(), "arrayCount {n} is inside the bound: {ok:?}");
+        }
+    }
+
+    /// The rejection granularity is unchanged: an out-of-contract signal fails its **device**, which
+    /// the supervisor skips with the message (fail-only-if-zero-valid), exactly as a duplicate name
+    /// or a bad `type` already does. It is not a per-signal drop that would leave the instance
+    /// running a silently smaller signal set.
+    #[test]
+    fn a_bad_array_count_fails_the_whole_device_like_every_other_signal_refusal() {
+        let bad = device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "h" },
+            "pollGroups": [ { "signals": [
+                { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" },
+                { "name": "zone-temps", "tagPath": "ZONE_TEMPS", "type": "real",
+                  "arrayCount": 70_000 } ] } ]
+        }));
+        assert!(
+            bad.is_err(),
+            "one bad signal refuses the device — the same granularity as a duplicate name"
+        );
     }
 
     #[test]
