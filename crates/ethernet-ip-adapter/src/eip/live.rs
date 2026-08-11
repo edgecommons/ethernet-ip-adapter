@@ -158,6 +158,11 @@ fn ms(d: Duration) -> u32 {
     u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
 }
 
+/// Depth of the session→translator control queue. Bounded, so a session that outruns its translator
+/// waits rather than growing the queue — which is exactly why a write bounds its handoff as well as
+/// its acknowledgement (D-EIP-31): abandoned commands stay queued, and this many of them fill it.
+const CONTROL_CHANNEL_DEPTH: usize = 8;
+
 /// The grace the aborted translator gets to actually stop (D-EIP-31). After a clean ack the task has
 /// already returned and the join resolves immediately; after an `abort()` the `JoinHandle` resolves at
 /// the translator's next await point, and it is always parked on one. This exists for scheduler slack
@@ -166,10 +171,14 @@ const ABORT_JOIN_GRACE: Duration = Duration::from_millis(250);
 
 /// A control message from the session handle to its translator task.
 enum PushControl {
-    /// Stage a fully-encoded output-assembly buffer; the sender receives the **staging verdict** once
-    /// the I/O manager has accepted (or refused) it (D-EIP-31). `Ok(())` means the buffer is held for
-    /// a live class-1 connection and rides the next O→T frame; an `Err` means it never will.
-    SetOutput(Vec<u8>, oneshot::Sender<Result<()>>),
+    /// Stage a fully-encoded output-assembly buffer **by an absolute deadline**; the sender receives
+    /// the **staging verdict** once the I/O manager has accepted (or refused) it (D-EIP-31).
+    /// `Ok(())` means the buffer is held for a live class-1 connection and rides the next O→T frame;
+    /// an `Err` means it never will. The deadline is the write's whole budget, carried so the
+    /// decision to stage is made against the caller's clock rather than the queue's: a command that
+    /// outlives it is dropped, never staged, because its caller has already been told the write
+    /// failed.
+    SetOutput(Vec<u8>, tokio::time::Instant, oneshot::Sender<Result<()>>),
     /// ForwardClose + teardown, then acknowledge.
     Close(oneshot::Sender<()>),
 }
@@ -191,10 +200,11 @@ pub struct EipPushSession {
     /// The class-1 connection's live drop/produce counters (§8.8), refreshed by the translator task;
     /// read by [`PushSession::io_stats`] for the periodic `EtherNetIpIo` emit.
     stats: SharedStats,
-    /// The bound on a write's staging confirmation (D-EIP-31) — the operator's own
-    /// `timeouts.requestTimeoutMs`, the same per-request bound the CIP calls run under. A translator
-    /// that cannot confirm within it (wedged on a full update channel) makes `sb/write` say so
-    /// instead of hanging or reporting a success that never reached the producer buffer.
+    /// The bound on a whole push write (D-EIP-31) — the operator's own `timeouts.requestTimeoutMs`,
+    /// the same per-request bound the CIP calls run under. It becomes one absolute deadline covering
+    /// the control handoff, the staging confirmation, **and** the staging decision itself, so a
+    /// write neither hangs (whatever the control queue's state) nor lands on the device after
+    /// `sb/write` has already refused it.
     ack_cap: Duration,
 }
 
@@ -231,8 +241,8 @@ impl EipPushSession {
 
         // Connect the TCP session (for CM/UCMM), bind the I/O socket, and ForwardOpen.
         let opts = client_options(conn, timeouts);
-        // The staging confirmation rides the same per-request bound the operator configured for CIP
-        // calls (D-EIP-31) rather than a knob of its own.
+        // A write rides the same per-request bound the operator configured for CIP calls (D-EIP-31)
+        // rather than a knob of its own.
         let ack_cap = opts.request_timeout;
         let client = enip::EipClient::connect(&conn.endpoint, opts)
             .await
@@ -246,7 +256,7 @@ impl EipPushSession {
             .map_err(map_enip_error)?;
 
         let (updates_tx, updates_rx) = mpsc::channel(16);
-        let (control_tx, control_rx) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
         let snapshot: SharedSnapshot = Arc::new(Mutex::new(None));
         let stats: SharedStats = Arc::new(Mutex::new(IoLinkStats::default()));
         let task = tokio::spawn(run_translator(
@@ -404,6 +414,15 @@ fn closed_verdict(lost: Option<enip::LostReason>) -> DeviceError {
     }
 }
 
+/// The seam verdict for a staging request whose write budget ran out before the buffer could be
+/// staged (D-EIP-31). The wording is deliberately about the *value*, not the confirmation: unlike
+/// "not confirmed", this one asserts that nothing was staged and nothing will be.
+fn expired_verdict() -> DeviceError {
+    DeviceError::Transient(anyhow::anyhow!(
+        "the request timeout elapsed before the output was staged"
+    ))
+}
+
 /// What one staging attempt produced (D-EIP-31).
 struct Staged {
     /// The verdict the session handle answers `sb/write` with.
@@ -416,8 +435,16 @@ struct Staged {
     drained: Vec<enip::IoEvent>,
 }
 
-/// Stage one encoded output-assembly buffer and turn the I/O manager's answer into a seam verdict
-/// (D-EIP-31).
+/// Stage one encoded output-assembly buffer **by `deadline`** and turn the I/O manager's answer into
+/// a seam verdict (D-EIP-31).
+///
+/// **An expired command is dropped, never staged.** By the time the deadline has passed the caller
+/// has already been answered `ok:false`, so putting the buffer in front of the producer now would
+/// apply a write the operator was told had failed — the one outcome a control system must never
+/// produce. The decision is not taken here but *carried*: `stage_output_by` hands the deadline to
+/// the I/O manager, which drops the command at the only place that mutates the producer buffer
+/// (D-ENIP-20). One decision, taken where it is authoritative — a check here as well would be a
+/// second opinion that can only ever agree, or drift.
 ///
 /// Everything except [`enip::EnipError::Closed`] goes through [`super::map_enip_error`] unchanged.
 /// `Closed` is resolved to a disposition first, and the translator can do that because the manager
@@ -427,11 +454,25 @@ struct Staged {
 /// one. `Lost` is a control event the queue never evicts and a dropped sender never discards, so
 /// draining the — by then terminal — stream is a **causal** read of why the connection is gone, not
 /// a guess. Finding no loss there means the connection was removed deliberately (`close`/`shutdown`).
-async fn stage_and_interpret(handle: &mut enip::IoConnectionHandle, bytes: Vec<u8>) -> Staged {
+async fn stage_and_interpret(
+    handle: &mut enip::IoConnectionHandle,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> Staged {
     let mut lost = None;
     let mut drained = Vec::new();
-    let verdict = match handle.stage_output(bytes).await {
+    let verdict = match handle.stage_output_by(bytes, deadline).await {
         Ok(()) => Ok(()),
+        // The write's budget ran out — either before this command was ever read, or while it was in
+        // flight. Both mean the same thing, and the I/O manager has already refused to put the
+        // buffer in front of the producer for it.
+        Err(enip::EnipError::Timeout { .. }) => {
+            tracing::warn!(
+                "push: an output staging request outlived its request timeout and was dropped; \
+                 the write was already refused and its value does not reach the device"
+            );
+            Err(expired_verdict())
+        }
         Err(enip::EnipError::Closed) => {
             while let Ok(ev) = handle.events().try_recv() {
                 // Nothing is queued behind the terminal event, so this is the end of the drain.
@@ -549,7 +590,8 @@ async fn run_translator(
         // emit's `EtherNetIpIo` drop/produce measures fresh (frames arrive at the RPI cadence).
         *stats.lock().unwrap() = map_io_stats(handle.stats());
 
-        let mut do_output: Option<(Vec<u8>, oneshot::Sender<Result<()>>)> = None;
+        let mut do_output: Option<(Vec<u8>, tokio::time::Instant, oneshot::Sender<Result<()>>)> =
+            None;
         let mut do_close: Option<oneshot::Sender<()>> = None;
 
         tokio::select! {
@@ -600,19 +642,23 @@ async fn run_translator(
             }
             ctrl = control_rx.recv() => {
                 match ctrl {
-                    Some(PushControl::SetOutput(bytes, ack)) => do_output = Some((bytes, ack)),
+                    Some(PushControl::SetOutput(bytes, deadline, ack)) => {
+                        do_output = Some((bytes, deadline, ack));
+                    }
                     Some(PushControl::Close(ack)) => do_close = Some(ack),
                     None => break 'task,
                 }
             }
         }
 
-        if let Some((bytes, ack)) = do_output {
+        if let Some((bytes, deadline, ack)) = do_output {
             // The confirmed staging path (D-ENIP-20 / D-EIP-31): the I/O manager's own verdict —
             // `Ok` only when it holds the buffer for a live connection — travels back to the caller,
             // so `sb/write` can never report a success the producer buffer never took. A refusal is
-            // resolved to a disposition first, so the caller is told *why* nothing was staged.
-            let staged = stage_and_interpret(&mut handle, bytes).await;
+            // resolved to a disposition first, so the caller is told *why* nothing was staged. The
+            // command's deadline governs whether it is staged at all: one that outlived it belongs
+            // to a caller already told `ok:false`.
+            let staged = stage_and_interpret(&mut handle, bytes, deadline).await;
             if let Err(e) = &staged.verdict {
                 tracing::warn!(error = %e, "push: staging output frame failed");
             }
@@ -681,31 +727,61 @@ impl PushSession for EipPushSession {
             field.array_count,
         )
         .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e.to_string())))?;
+        // Encode into a CANDIDATE image rather than the session's own. `out_buf` mirrors what the
+        // I/O manager holds, and every staging offers the WHOLE assembly, so a field written into
+        // it before the verdict would ride out inside the next *accepted* write — a refused value
+        // reaching the device by the back door. It is adopted only once the manager has taken it.
+        let mut candidate = self.out_buf.clone();
         layout
-            .encode_into(&[(key, cip)], &mut self.out_buf)
+            .encode_into(&[(key, cip)], &mut candidate)
             .map_err(|e| DeviceError::Permanent(anyhow::anyhow!(e.to_string())))?;
+        // ONE absolute deadline over the whole write (D-EIP-31), the same shape `close_with_cap`
+        // uses: the handoff to the translator, the wait for the verdict, and — carried inside the
+        // command — the decision to stage at all. `timeout_at` on a shared `Instant` is what makes
+        // that one budget; `send_timeout` would mint a second, independent one for the handoff (so
+        // the total could be twice `requestTimeoutMs`), and `try_send` would refuse instantly on a
+        // control channel that is merely busy. Bounding the handoff is not theoretical: abandoned
+        // commands stay queued, and eight of them fill the channel.
+        let deadline = tokio::time::Instant::now() + self.ack_cap;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let handoff =
+            self.control
+                .send(PushControl::SetOutput(candidate.clone(), deadline, ack_tx));
+        match tokio::time::timeout_at(deadline, handoff).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_closed)) => {
+                return Err(DeviceError::Transient(anyhow::anyhow!(
+                    "push session is closing; output not staged"
+                )))
+            }
+            // The translator has not read its control channel for a whole request timeout. A
+            // cancelled `send` never took a permit, so nothing was queued: this write is refused
+            // outright rather than left to land later.
+            Err(_elapsed) => {
+                return Err(DeviceError::Transient(anyhow::anyhow!(
+                    "the push translator did not accept the write within the request timeout; \
+                     output not staged"
+                )))
+            }
+        }
         // Result-bearing end to end (D-EIP-31): session ack ⇒ translator ⇒ I/O manager ack. `Ok(())`
         // here means the manager holds this buffer for a live connection, nothing weaker.
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.control
-            .send(PushControl::SetOutput(self.out_buf.clone(), ack_tx))
-            .await
-            .map_err(|_| {
-                DeviceError::Transient(anyhow::anyhow!(
-                    "push session is closing; output not staged"
-                ))
-            })?;
-        match tokio::time::timeout(self.ack_cap, ack_rx).await {
+        let verdict = match tokio::time::timeout_at(deadline, ack_rx).await {
             Ok(Ok(verdict)) => verdict,
             Ok(Err(_gone)) => Err(DeviceError::Transient(anyhow::anyhow!(
                 "push translator ended before the output was staged"
             ))),
             // Causal honesty, not a race: a translator wedged on a full update channel cannot
-            // confirm, and a write must say so rather than hang or lie.
+            // confirm, and a write must say so rather than hang or lie. The command it abandons
+            // carries this same deadline, so it can only be dropped from here on, never staged.
             Err(_elapsed) => Err(DeviceError::Transient(anyhow::anyhow!(
                 "output staging was not confirmed within the request timeout"
             ))),
+        };
+        if verdict.is_ok() {
+            self.out_buf = candidate;
         }
+        verdict
     }
 
     async fn close(&mut self) {
@@ -804,6 +880,35 @@ mod tests {
                 "sizeBytes": 4,
                 "realTimeFormat": "header32",
                 "signals": [ { "name": "setpoint", "offset": 0, "type": "real" } ]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// [`io_of`]'s input with a **two-field** O→T assembly (8 bytes: REAL `setpoint` at 0, REAL
+    /// `trim` at 4). The output image is staged whole, so it takes two fields to prove that a
+    /// refused field cannot ride out inside the next *accepted* write.
+    fn io_two_field_output() -> IoConfig {
+        serde_json::from_value(json!({
+            "rpiMs": 500,
+            "o2tRpiMs": 20,
+            "timeoutMultiplier": 16,
+            "assemblies": { "config": 151, "output": 150, "input": 100 },
+            "input": {
+                "sizeBytes": 8,
+                "realTimeFormat": "modeless",
+                "signals": [
+                    { "name": "din-word", "offset": 0, "type": "udint" },
+                    { "name": "line-speed", "offset": 4, "type": "real" }
+                ]
+            },
+            "output": {
+                "sizeBytes": 8,
+                "realTimeFormat": "header32",
+                "signals": [
+                    { "name": "setpoint", "offset": 0, "type": "real" },
+                    { "name": "trim", "offset": 4, "type": "real" }
+                ]
             }
         }))
         .unwrap()
@@ -1520,6 +1625,63 @@ mod tests {
     /// assembly, so a refusal is always about the connection and never about the buffer.
     fn out_buf() -> Vec<u8> {
         12.5f32.to_le_bytes().to_vec()
+    }
+
+    /// A staging deadline no test can reach: the disposition tests are about *why* the manager
+    /// refused a buffer, not about the write budget, so theirs must never be the thing that expires.
+    fn live_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(30)
+    }
+
+    /// Discard every O→T datagram already queued at the peer, so a later assertion judges only
+    /// frames the producer emitted *after* this point.
+    fn drain_o2t(peer: &UdpSocket) {
+        let mut discard = vec![0u8; 2048];
+        while peer.try_recv_from(&mut discard).is_ok() {}
+    }
+
+    /// The payload of the next O→T frame at `peer` (a 32-bit-header frame, per [`io_of`]'s output).
+    async fn next_o2t_output(peer: &UdpSocket, deadline: tokio::time::Instant) -> Vec<u8> {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let Ok(received) = tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await
+            else {
+                panic!("no O→T datagram reached the peer before the deadline");
+            };
+            let (n, _src) = received.unwrap();
+            let Ok(cpf) = Cpf::decode(&buf[..n]) else {
+                continue;
+            };
+            let Some(item) = cpf.find(ItemType::ConnectedData) else {
+                continue;
+            };
+            let frame =
+                enip::IoFrame::decode(enip::RealTimeFormat::Header32Bit, &item.data).unwrap();
+            return frame.data.to_vec();
+        }
+    }
+
+    /// The REAL at `offset` in an O→T payload, or `None` when the frame is the empty initial one.
+    fn real_at(payload: &[u8], offset: usize) -> Option<f32> {
+        let bytes: [u8; 4] = payload.get(offset..offset + 4)?.try_into().ok()?;
+        Some(f32::from_le_bytes(bytes))
+    }
+
+    /// Block until the translator has **dequeued** everything on its control channel.
+    ///
+    /// The permit comes back when the receiver takes the message, and the translator decides on a
+    /// staging command in that same loop iteration — so this is a causal signal that the decision
+    /// has been made, not a wait for it to probably have happened. Draining `updates()` on the way
+    /// round is what frees a wedged translator to get there.
+    async fn await_control_drained(session: &mut EipPushSession, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while session.control.capacity() < CONTROL_CHANNEL_DEPTH {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: the translator never took its queued control messages"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(5), session.updates().recv()).await;
+        }
     }
 
     /// Wedge the translator on a **full** seam update channel (16 slots) by producing T→O frames the
@@ -2361,6 +2523,128 @@ mod tests {
         );
     }
 
+    /// **The P1 the reviewer reproduced: a refused write must never take effect.** A write the
+    /// wedged translator could not confirm is answered `ok:false` — and the command it left behind
+    /// used to be staged anyway when the translator woke up, so the operator was told the write was
+    /// refused and the PLC got the value regardless, one O→T frame later.
+    ///
+    /// Both routes are pinned here, because the assembly image is staged whole:
+    ///
+    /// 1. the abandoned command itself — after the translator is freed and provably takes it off
+    ///    the control channel, the producer buffer must still be untouched; and
+    /// 2. the session's own output image — the next *accepted* write must not carry the refused
+    ///    field out with it.
+    ///
+    /// The second write doubles as the positive control: the same observation that saw no refused
+    /// value does see an accepted one, so the assertion above is not vacuous.
+    #[tokio::test]
+    async fn a_write_refused_at_its_deadline_is_never_applied_later() {
+        let io = io_two_field_output();
+        // 250 ms is ample for loopback CIP and keeps the unconfirmable write's bound short.
+        let (plc, peer, mut session) = open_concrete_push_session(&io, &timeouts_of(250)).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        wedge_translator(&session, &peer, target, cid).await;
+
+        let signals = &io.output.as_ref().unwrap().signals;
+        let (setpoint, trim) = (&signals[0], &signals[1]);
+        let verdict = session.set_output(setpoint, &json!(12.5)).await;
+        assert!(
+            matches!(verdict, Err(DeviceError::Transient(_))),
+            "an unconfirmable write is refused, not reported staged: {verdict:?}"
+        );
+
+        // Free the translator and wait — causally — until it has taken the abandoned command.
+        await_control_drained(&mut session, "the abandoned staging command").await;
+
+        // (1) Nothing already in flight can mask the failure: judge only frames produced after the
+        // translator dealt with that command.
+        drain_o2t(&peer);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for _ in 0..5 {
+            let payload = next_o2t_output(&peer, deadline).await;
+            assert_ne!(
+                real_at(&payload, 0),
+                Some(12.5),
+                "the refused value reached the producer buffer after all: {payload:?}"
+            );
+        }
+
+        // (2) The session is still usable, and the write that succeeds carries ONLY its own field.
+        session
+            .set_output(trim, &json!(33.0))
+            .await
+            .expect("the session still serves writes once the translator is free");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let payload = next_o2t_output(&peer, deadline).await;
+            assert_ne!(
+                real_at(&payload, 0),
+                Some(12.5),
+                "the refused field rode out inside the accepted write: {payload:?}"
+            );
+            if real_at(&payload, 4) == Some(33.0) {
+                break;
+            }
+        }
+        session.close().await;
+    }
+
+    /// The handoff half of the same budget: eight abandoned commands — what eight refused writes
+    /// leave behind — fill the control channel, and the ninth write used to park in `send` for
+    /// **ever**, with nothing but the translator's recovery to end it. `requestTimeoutMs` now bounds
+    /// the handoff as well as the acknowledgement, so a write against a full channel is refused
+    /// instead of hanging (D-EIP-31).
+    #[tokio::test]
+    async fn a_write_is_bounded_when_the_control_channel_is_already_full() {
+        let io = io_of(500, 20, 16);
+        let (plc, peer, mut session) = open_concrete_push_session(&io, &timeouts_of(250)).await;
+        let cid = plc.t2o_cid();
+        let target = plc.t2o_target();
+        wedge_translator(&session, &peer, target, cid).await;
+
+        let mut abandoned = Vec::new();
+        for _ in 0..CONTROL_CHANNEL_DEPTH {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            session
+                .control
+                .try_send(PushControl::SetOutput(
+                    out_buf(),
+                    tokio::time::Instant::now(),
+                    ack_tx,
+                ))
+                .expect("the control channel takes a command per abandoned write");
+            abandoned.push(ack_rx);
+        }
+        let (spare_tx, _spare_rx) = oneshot::channel();
+        assert!(
+            session
+                .control
+                .try_send(PushControl::Close(spare_tx))
+                .is_err(),
+            "the control channel is full — which is the state under test"
+        );
+
+        let field = &io.output.as_ref().unwrap().signals[0];
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.set_output(field, &json!(12.5)),
+        )
+        .await
+        .expect("a write against a full control channel returns instead of parking forever");
+        assert!(
+            matches!(verdict, Err(DeviceError::Transient(_))),
+            "a write that could not be handed over is refused: {verdict:?}"
+        );
+        assert!(
+            verdict
+                .unwrap_err()
+                .to_string()
+                .contains("did not accept the write within the request timeout"),
+            "the refusal names the handoff, not the confirmation"
+        );
+    }
+
     /// **The third link, and the one the I/O manager cannot answer on its own.** `EnipError::Closed`
     /// is one word for three situations — the manager task is gone, the connection was removed
     /// because it was *lost*, or it was removed because it was *closed* — and its `Display` is the
@@ -2391,7 +2675,7 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "the watchdog never expired the connection, so no refusal was ever produced"
             );
-            let staged = stage_and_interpret(&mut handle, out_buf()).await;
+            let staged = stage_and_interpret(&mut handle, out_buf(), live_deadline()).await;
             if staged.verdict.is_err() {
                 break staged;
             }
@@ -2436,7 +2720,7 @@ mod tests {
         let (_plc, _peer, client, manager, mut handle) = open_bare_connection(&io).await;
 
         handle.close(&client).await.unwrap();
-        let staged = stage_and_interpret(&mut handle, out_buf()).await;
+        let staged = stage_and_interpret(&mut handle, out_buf(), live_deadline()).await;
 
         assert_eq!(staged.lost, None, "nothing was lost — it was closed");
         let error = staged.verdict.unwrap_err();
@@ -2465,7 +2749,7 @@ mod tests {
         let (_plc, _peer, _client, manager, mut handle) = open_bare_connection(&io).await;
 
         manager.shutdown().await;
-        let staged = stage_and_interpret(&mut handle, out_buf()).await;
+        let staged = stage_and_interpret(&mut handle, out_buf(), live_deadline()).await;
 
         assert_eq!(staged.lost, None);
         let error = staged.verdict.unwrap_err();
@@ -2485,7 +2769,7 @@ mod tests {
         let io = io_of(500, 20, 16);
         let (_plc, _peer, _client, manager, mut handle) = open_bare_connection(&io).await;
 
-        let staged = stage_and_interpret(&mut handle, vec![1, 2]).await;
+        let staged = stage_and_interpret(&mut handle, vec![1, 2], live_deadline()).await;
 
         assert_eq!(staged.lost, None);
         let error = staged.verdict.unwrap_err();
