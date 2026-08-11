@@ -2,8 +2,10 @@
 //!
 //! The adapter is the **scanner/originator**: it ForwardOpens an I/O connection pair against a
 //! target's assembly instances and then produces O→T frames at the negotiated O→T API while
-//! consuming the T→O frames the target produces. Everything runs over bare CPF datagrams on UDP
-//! :2222 — no encapsulation header (§8.1). This module owns:
+//! consuming the T→O frames the target produces. Everything runs over bare CPF datagrams on UDP —
+//! no encapsulation header (§8.1). O→T goes to the **target's** registered [`IO_UDP_PORT`] (2222);
+//! T→O comes back to whatever port the originator bound and advertised in the ForwardOpen's
+//! Sockaddr Info items, which for this adapter is an ephemeral one. This module owns:
 //!
 //! * [`IoFrame`] — the class-1 connected-data frame codec. **Frame order is sequence-then-header**
 //!   (D-ENIP-10): `[u16 class-1 sequence][u32 run/idle header if present][data]`, on **both** encode
@@ -1359,8 +1361,13 @@ pub struct IoManager {
 }
 
 impl IoManager {
-    /// Bind the implicit-I/O UDP socket at `addr` (e.g. `"0.0.0.0:2222"`) and spawn the socket task
-    /// (§8.6). The task owns the socket; this handle owns only the command channel.
+    /// Bind the implicit-I/O UDP socket at `addr` and spawn the socket task (§8.6). The task owns
+    /// the socket; this handle owns only the command channel.
+    ///
+    /// An **originator** binds an ephemeral port (`"0.0.0.0:0"`) and lets [`Self::forward_open`]
+    /// advertise it to the target in the Sockaddr Info items, so it never contends for the
+    /// registered port with a target on the same host; only a **target**-role consumer binds
+    /// [`IO_UDP_PORT`] (`"0.0.0.0:2222"`) to be reachable there.
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
