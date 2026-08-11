@@ -146,6 +146,7 @@ Class-1 implicit-I/O health (push mode only). Dimensions: `instance`.
 | `produceOverruns` | Count | counter | O→T produce overruns. |
 | `sendErrors` | Count | counter | O→T datagrams that failed to send. |
 | `recvErrors` | Count | counter | Receive failures on the class-1 socket. |
+| `sourceMismatchDatagrams` | Count | counter | Inbound class-1 datagrams that carried a live connection's id but came from an address other than that connection's device. They are dropped without delivering a sample and without refreshing the connection's watchdog. Nonzero means either something else on the network segment is producing into the connection, or the device sends its data from a second interface — in which case the connection never comes up. |
 | `refusedRedirects` | Count | counter | O→T redirect refusals: the device asked the adapter to send its outputs to a foreign address, and the adapter refuses the address and keeps the device's own (only the port the device named is honoured). When this is nonzero and the device requires the redirect, outputs do not reach it — check the device's socket configuration. |
 | `interFrameMs` | Milliseconds | gauge | Most recent T→O inter-arrival time within one class-1 connection. The gap across a reconnect is not one of them. |
 | `runMode` | Count | gauge | The peer's run/idle bit (`1` run, `0` idle). |
