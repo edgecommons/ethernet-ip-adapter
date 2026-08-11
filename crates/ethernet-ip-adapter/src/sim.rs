@@ -25,16 +25,19 @@ use crate::device::{
 };
 use crate::eip::push::assembly_to_readings;
 
-/// The cpppo tag layout (§11.1): `(name, type_name, array_dim)`. `RECIPE=SSTRING` is present
-/// precisely to prove the browse/validation story for an unsupported type — its `type_name` maps to
-/// `supported: false` at the command layer.
+/// The cpppo tag layout (§11.1): `(name, type_name, array_dim)`. `array_dim` is the **array
+/// dimensionality** the symbol type declares — the same thing the real backend derives from
+/// `SymbolType::dims()` (0–3, `None` for a scalar), not an element count, which a CIP symbol type
+/// word cannot carry. `ZONE_TEMPS : REAL[8]` is therefore one-dimensional. `RECIPE=SSTRING` is
+/// present precisely to prove the browse/validation story for an unsupported type — its `type_name`
+/// maps to `supported: false` at the command layer.
 const SIM_TAGS: &[(&str, &str, Option<u32>)] = &[
     ("LINE_SPEED", "REAL", None),
     ("FILL_TEMP", "REAL", None),
     ("TANK_LEVEL", "REAL", None),
     ("PRODUCT_COUNT", "DINT", None),
     ("FILL_SETPOINT", "REAL", None),
-    ("ZONE_TEMPS", "REAL", Some(8)),
+    ("ZONE_TEMPS", "REAL", Some(1)),
     ("MOTOR_RUN", "DINT", None),
     ("RECIPE", "SSTRING", None),
 ];
@@ -378,6 +381,32 @@ mod tests {
         assert_eq!(arr.len(), 8);
     }
 
+    /// A `bool` array signal is **accepted and functional**, not merely parsed (D-EIP-16): it is
+    /// configurable, it polls, and against a byte-per-element peer it reads back a JSON array of
+    /// booleans. The label on it is experimental because that outcome is what a *simulator* gives —
+    /// cpppo, which this backend models, has a fidelity gap here (a Logix controller packs BOOL
+    /// arrays into DWORDs and the same signal reads BAD), so this test proves availability, never
+    /// hardware correctness.
+    #[tokio::test]
+    async fn a_bool_array_signal_is_configurable_and_polls() {
+        let cfg = crate::config::DeviceConfig::from_value(&json!({
+            "id": "plc-1", "adapter": "sim",
+            "connection": { "endpoint": "h" },
+            "pollGroups": [ { "signals": [
+                { "name": "alarms", "tagPath": "MOTOR_RUN", "type": "bool", "arrayCount": 4 } ] } ]
+        }))
+        .expect("a bool array is configurable");
+        assert_eq!(cfg.experimental_signal_warnings().len(), 1, "and warned");
+
+        let mut s = SimBackend.connect(&conn("h")).await.unwrap();
+        let specs: Vec<SignalSpec> = cfg.signals().cloned().collect();
+        let r = s.read_signals(&specs).await.unwrap();
+        assert_eq!(r[0].quality, Quality::Good);
+        let arr = r[0].value.as_array().expect("a JSON array of booleans");
+        assert_eq!(arr.len(), 4);
+        assert!(arr.iter().all(serde_json::Value::is_boolean));
+    }
+
     #[tokio::test]
     async fn a_written_setpoint_reads_back_the_written_value() {
         let mut s = SimBackend.connect(&conn("h")).await.unwrap();
@@ -403,7 +432,14 @@ mod tests {
             "the unsupported type is surfaced by name"
         );
         let zones = page.tags.iter().find(|t| t.name == "ZONE_TEMPS").unwrap();
-        assert_eq!(zones.array_dim, Some(8));
+        assert_eq!(
+            zones.array_dim,
+            Some(1),
+            "`REAL[8]` is ONE-dimensional: `array_dim` is the dimensionality the symbol type \
+             declares (what the real backend reads from `SymbolType::dims()`), not the element \
+             count — a sim that reported 8 here would make a 1-D array look multi-dimensional to \
+             the `supported` rule the command layer applies (§7.5)"
+        );
     }
 
     /// The sim pages exactly like the real backend (§4.3): a `max`-limited walk enumerates every tag

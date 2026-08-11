@@ -40,7 +40,9 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::app::{BrowseError, DeviceControl, EventSink, Health, LinkState, WriteRequest};
-use crate::config::{DeviceConfig, DeviceMode, EipType, IoConfig, IoFieldSpec, SignalSpec};
+use crate::config::{
+    DeviceConfig, DeviceMode, EipType, IoConfig, IoFieldSpec, SignalSpec, MAX_ARRAY_COUNT,
+};
 use crate::device::{BrowsePage, Quality, Reading};
 use crate::lifecycle::{DeviceRegistry, SoleHandle};
 use crate::metrics::{CommandTally, DeviceMetrics};
@@ -351,7 +353,8 @@ impl Commander {
         refs: &[Value],
     ) -> std::result::Result<(Value, u64), CommandError> {
         // Resolve each ref: a friendly name → the configured spec; an explicit {tagPath,type} → a
-        // synthesized spec; anything else → a BAD "UNRESOLVED_REF" entry.
+        // synthesized spec; anything else → a BAD "UNRESOLVED_REF" entry. A malformed argument
+        // (`arrayCount` outside the wire bound) refuses the whole command instead (D-EIP-33).
         let mut plan: Vec<std::result::Result<SignalSpec, String>> = Vec::with_capacity(refs.len());
         let mut specs: Vec<SignalSpec> = Vec::new();
         for r in refs {
@@ -360,7 +363,8 @@ impl Commander {
                     specs.push(spec.clone());
                     plan.push(Ok(spec));
                 }
-                Err(label) => plan.push(Err(label)),
+                Err(PollRefError::Unresolved(label)) => plan.push(Err(label)),
+                Err(PollRefError::BadArgs(m)) => return Err(CommandError::new("BAD_ARGS", m)),
             }
         }
 
@@ -554,13 +558,16 @@ impl Commander {
                         Err(_) => return Err(device_unavailable()),
                     }
                 }
-                Err(label) => {
+                Err(PollRefError::Unresolved(label)) => {
                     failures += 1;
                     self.audit(h, &label, false, value.as_ref(), Some("unresolved ref"))
                         .await;
                     results
                         .push(json!({ "signal": label, "ok": false, "error": "unresolved ref" }));
                 }
+                // A malformed argument is refused whole — an out-of-bound `arrayCount` never
+                // reaches the device, and no partial batch is written under it (D-EIP-33).
+                Err(PollRefError::BadArgs(m)) => return Err(CommandError::new("BAD_ARGS", m)),
             }
         }
 
@@ -976,7 +983,10 @@ impl Commander {
                     for t in &page.tags {
                         let mut extra = serde_json::Map::new();
                         extra.insert("configured".into(), json!(configured.contains(&t.name)));
-                        extra.insert("supported".into(), json!(type_supported(&t.type_name)));
+                        extra.insert(
+                            "supported".into(),
+                            json!(tag_supported(&t.type_name, t.array_dim)),
+                        );
                         if let Some(dim) = t.array_dim {
                             extra.insert("arrayDim".into(), json!(dim));
                         }
@@ -1204,39 +1214,75 @@ fn parse_eip_type(s: &str) -> Option<EipType> {
     serde_json::from_value(Value::String(s.to_string())).ok()
 }
 
+/// Why a poll signal-ref did not resolve to a [`SignalSpec`].
+///
+/// The two outcomes are different facts and get different answers. A ref that simply names nothing
+/// this device can address is a **per-entry** result — a BAD `UNRESOLVED_REF` read, a failed write —
+/// because the rest of the batch is still serviceable. A ref whose `arrayCount` is outside the wire
+/// bound is a **malformed argument**, and the whole command is refused with `BAD_ARGS` rather than
+/// answered: the truncating `as u32` this replaces turned `2^32 + 1` into a one-element read
+/// answered GOOD, and `2^32` into a zero-element read whose reply the device may not frame at all —
+/// a bad command argument poisoning the session (D-EIP-33).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PollRefError {
+    /// The ref names nothing addressable — a per-entry BAD/unresolved outcome, carrying the label.
+    Unresolved(String),
+    /// The ref is malformed — the whole command is `BAD_ARGS`, carrying the message.
+    BadArgs(String),
+}
+
 /// Resolve a poll `sb/read`/`sb/write` signal-ref (§7.2): a friendly `{"name"}` → the configured
-/// signal; an explicit `{"tagPath","type","arrayCount"?}` → a synthesized [`SignalSpec`]. `Err` carries
-/// the ref label for the BAD/unresolved entry.
-fn resolve_poll_ref(cfg: &DeviceConfig, r: &Value) -> std::result::Result<SignalSpec, String> {
+/// signal; an explicit `{"tagPath","type","arrayCount"?}` → a synthesized [`SignalSpec`]. See
+/// [`PollRefError`] for the two failure shapes.
+fn resolve_poll_ref(
+    cfg: &DeviceConfig,
+    r: &Value,
+) -> std::result::Result<SignalSpec, PollRefError> {
     if let Some(name) = r.get("name").and_then(|v| v.as_str()) {
         return cfg
             .signals()
             .find(|s| s.name == name)
             .cloned()
-            .ok_or_else(|| name.to_string());
+            .ok_or_else(|| PollRefError::Unresolved(name.to_string()));
     }
     if let Some(tag) = r.get("tagPath").and_then(|v| v.as_str()) {
         let ty = r
             .get("type")
             .and_then(|v| v.as_str())
             .and_then(parse_eip_type);
+        let array_count = match r.get("arrayCount").filter(|v| !v.is_null()) {
+            None => None,
+            // An explicit ref never reaches config validation, so the SAME bound is applied here —
+            // an unreadable or out-of-range count is refused, never narrowed and never quietly
+            // dropped into a scalar read (D-EIP-33). 65 535 is the wire limit: the CIP Read Tag
+            // element count is a `u16`.
+            Some(v) => match v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| (1..=MAX_ARRAY_COUNT).contains(n))
+            {
+                Some(n) => Some(n),
+                None => {
+                    return Err(PollRefError::BadArgs(format!(
+                        "`arrayCount` must be an integer in 1..={MAX_ARRAY_COUNT} (got {v})"
+                    )))
+                }
+            },
+        };
         return match ty {
             Some(eip_type) => Ok(SignalSpec {
                 name: tag.to_string(),
                 tag_path: tag.to_string(),
                 eip_type,
-                array_count: r
-                    .get("arrayCount")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32),
+                array_count,
                 scale: None,
                 offset: None,
                 deadband: crate::config::DeadbandSpec::default(),
             }),
-            None => Err(tag.to_string()),
+            None => Err(PollRefError::Unresolved(tag.to_string())),
         };
     }
-    Err(ref_label(r))
+    Err(PollRefError::Unresolved(ref_label(r)))
 }
 
 /// Resolve a push `sb/read` ref against the **configured input layout only** (§7.2): a friendly
@@ -1369,7 +1415,7 @@ fn browse_page_json(h: &DeviceHandle, page: BrowsePage) -> Value {
                 "name": t.name,
                 "type": t.type_name,
                 "configured": configured.contains(t.name.as_str()),
-                "supported": type_supported(&t.type_name),
+                "supported": tag_supported(&t.type_name, t.array_dim),
             });
             if let Some(dim) = t.array_dim {
                 v["arrayDim"] = json!(dim);
@@ -1469,8 +1515,25 @@ fn layout_tag(f: &IoFieldSpec, assembly: u16, direction: &str) -> Value {
     })
 }
 
-/// Whether a browsed CIP type name is decodable per §5.1 (an elementary scalar). Structures / STRING /
-/// SSTRING / unknown codes are `false`.
+/// Whether a browsed tag can be configured as a signal and decoded per §5.1 — the `supported` flag
+/// both `sb/browse` arms publish (§7.5). It is the **type name AND the shape**, because a name alone
+/// answers only half the question: `array_dim` is the dimensionality the symbol type declares
+/// (`SymbolType::dims()`, 0–3, carried through as [`BrowsedTag::array_dim`]) — **not** an element
+/// count — and `> 1` is a multi-dimensional tag, which has no configuration representation
+/// (`arrayCount` is a single integer). That is what §7.5's "multi-dim report `false`" means; without
+/// the shape half, such a tag advertised itself `supported: true` alongside its own `arrayDim: 2`.
+///
+/// A one-dimensional `BOOL` stays **supported**: `bool` + `arrayCount` is a configurable signal,
+/// accepted and labelled experimental — see [`crate::config::BOOL_ARRAY_EXPERIMENTAL`].
+///
+/// Deliberately NOT the crate's `SymbolType::is_value_supported`, which requires `dims() == 0` and
+/// would mark every supported 1-D array unsupported.
+fn tag_supported(type_name: &str, array_dim: Option<u32>) -> bool {
+    array_dim.unwrap_or(0) <= 1 && type_supported(type_name)
+}
+
+/// Whether a browsed CIP type name is decodable per §5.1 (an elementary type). Structures / STRING /
+/// SSTRING / unknown codes are `false`. The shape half of the question is [`tag_supported`]'s.
 fn type_supported(type_name: &str) -> bool {
     matches!(
         type_name,
@@ -1589,6 +1652,10 @@ mod tests {
     #[derive(Clone)]
     enum BrowseKind {
         Tags(Vec<(&'static str, &'static str)>),
+        /// One page of `(name, type_name, array_dim)` — the dimensionality a real symbol type
+        /// declares (`SymbolType::dims()`), so the `supported` rule can be pinned on shape as well
+        /// as name (§7.5).
+        DimTags(Vec<(&'static str, &'static str, Option<u32>)>),
         /// A page carrying an array-dim tag and a next-cursor (§7.5 paging). The cursor is the
         /// constant `"42"`, so a walk that follows it revisits the same page — a device that pages
         /// in a circle.
@@ -1808,16 +1875,36 @@ mod tests {
                             }));
                         }
                         BrowseKind::Paged => {
-                            // An array tag + a next-cursor exercise the arrayDim + cursor reply keys.
+                            // An array tag + a next-cursor exercise the arrayDim + cursor reply
+                            // keys. `REAL[8]` is ONE-dimensional: `array_dim` is the symbol type's
+                            // dimensionality, not its element count.
                             let tags = vec![BrowsedTag {
                                 name: "ZONE_TEMPS".to_string(),
                                 type_name: "REAL".to_string(),
-                                array_dim: Some(8),
+                                array_dim: Some(1),
                                 instance_id: 1,
                             }];
                             let _ = reply.send(Ok(BrowsePage {
                                 tags,
                                 next_cursor: Some("42".into()),
+                            }));
+                        }
+                        BrowseKind::DimTags(t) => {
+                            // One page of `(name, type, dims)` — the shape both browse arms read the
+                            // `supported` flag out of (§7.5).
+                            let tags = t
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (n, ty, dims))| BrowsedTag {
+                                    name: (*n).to_string(),
+                                    type_name: (*ty).to_string(),
+                                    array_dim: *dims,
+                                    instance_id: i as u32 + 1,
+                                })
+                                .collect();
+                            let _ = reply.send(Ok(BrowsePage {
+                                tags,
+                                next_cursor: None,
                             }));
                         }
                         BrowseKind::Tags(t) => {
@@ -2451,6 +2538,70 @@ mod tests {
         );
     }
 
+    /// **`supported` is the type name AND the shape (D-EIP-33), on BOTH arms.** §7.5 promises that
+    /// multi-dimensional tags report `supported: false`; a pure name match reported a multi-dim
+    /// atomic `supported: true` right next to its own `arrayDim: 2`, telling a console it could
+    /// configure a tag the config parser rejects. A 1-D array is the control — it stays supported,
+    /// which is why the crate's `SymbolType::is_value_supported` (`dims() == 0`) is deliberately not
+    /// used, and that includes a 1-D `BOOL`: `bool` + `arrayCount` is configurable (experimental,
+    /// D-EIP-16). The flat and hierarchical arms must agree, so both are pinned here.
+    #[tokio::test]
+    async fn browse_supported_accounts_for_dimensionality_on_both_arms() {
+        // (name, CIP type name, dims) → expected `supported`.
+        let rows: Vec<(&'static str, &'static str, Option<u32>, bool)> = vec![
+            ("LINE_SPEED", "REAL", None, true),
+            ("ZONE_TEMPS", "REAL", Some(1), true),
+            ("TEMP_GRID", "REAL", Some(2), false),
+            ("CUBE", "DINT", Some(3), false),
+            ("MOTOR_RUN", "BOOL", None, true),
+            ("ALARMS", "BOOL", Some(1), true),
+            ("RECIPE", "SSTRING", None, false),
+        ];
+        let opts = MockOpts {
+            browse: BrowseKind::DimTags(rows.iter().map(|(n, t, d, _)| (*n, *t, *d)).collect()),
+            ..MockOpts::default()
+        };
+        let h = harness(poll_device(), opts);
+
+        // Flat (paged) arm.
+        let out = ok(h.commander.browse(None, &json!({})).await);
+        let tags = out["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), rows.len());
+        for (tag, (name, _, dims, want)) in tags.iter().zip(rows.iter()) {
+            assert_eq!(
+                tag["supported"],
+                json!(want),
+                "flat: `{name}` with dims {dims:?}"
+            );
+        }
+        assert_eq!(
+            tags[2]["arrayDim"],
+            json!(2),
+            "the multi-dim tag still reports its dimensionality — it just is not supported"
+        );
+
+        // Hierarchical arm, over the same inventory: the two must not disagree.
+        let out = ok(h.commander.browse(None, &json!({ "ref": "root" })).await);
+        let refs = out["root"]["refs"].as_array().unwrap();
+        assert_eq!(refs.len(), rows.len());
+        for (r, (name, _, dims, want)) in refs.iter().zip(rows.iter()) {
+            assert_eq!(
+                r["target"]["supported"],
+                json!(want),
+                "hierarchical: `{name}` with dims {dims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_supported_is_the_name_and_the_shape() {
+        assert!(tag_supported("DINT", None) && tag_supported("DINT", Some(1)));
+        assert!(!tag_supported("DINT", Some(2)) && !tag_supported("DINT", Some(3)));
+        // A 1-D BOOL is configurable (experimental), so browse does not mark it unsupported.
+        assert!(tag_supported("BOOL", None) && tag_supported("BOOL", Some(1)));
+        assert!(!tag_supported("SSTRING", None) && !tag_supported("STRUCT", Some(1)));
+    }
+
     // --- sb/browse hierarchical (the treeBrowser panel mode) --------------------------------------
 
     #[tokio::test]
@@ -2810,7 +2961,7 @@ mod tests {
         // A name that matches nothing is Err (the label rides the BAD entry).
         assert_eq!(
             resolve_poll_ref(&cfg, &json!({ "name": "ghost" })).unwrap_err(),
-            "ghost"
+            PollRefError::Unresolved("ghost".to_string())
         );
         // An explicit {tagPath,type,arrayCount} synthesizes a spec.
         let s = resolve_poll_ref(
@@ -2823,12 +2974,12 @@ mod tests {
         // An explicit tagPath with no/invalid type is unresolved.
         assert_eq!(
             resolve_poll_ref(&cfg, &json!({ "tagPath": "NOPE" })).unwrap_err(),
-            "NOPE"
+            PollRefError::Unresolved("NOPE".to_string())
         );
         // Neither a name nor a tagPath ⇒ the ref label.
         assert_eq!(
             resolve_poll_ref(&cfg, &json!({ "junk": 1 })).unwrap_err(),
-            "<invalid ref>"
+            PollRefError::Unresolved("<invalid ref>".to_string())
         );
     }
 
@@ -2997,6 +3148,79 @@ mod tests {
         );
     }
 
+    /// **An explicit ref's `arrayCount` is bounded, and out of bounds is `BAD_ARGS` (D-EIP-33).**
+    /// The truncating `n as u32` this replaces made `2^32 + 1` a one-element read answered GOOD —
+    /// wrong data, confidently labelled — and `2^32` a zero-element read whose reply a device may
+    /// not frame, which is a bad *command argument* able to poison the session. Both are refused
+    /// before any device I/O, and the session survives: the very next read succeeds.
+    #[tokio::test]
+    async fn read_poll_refuses_an_out_of_bound_array_count_without_bouncing_the_session() {
+        let h = harness(poll_device(), MockOpts::default());
+        for n in [4_294_967_297u64, 4_294_967_296, 70_000, 0] {
+            let reply = h
+                .commander
+                .read(
+                    None,
+                    &json!({ "signals": [
+                        { "tagPath": "ZONE_TEMPS", "type": "real", "arrayCount": n } ] }),
+                )
+                .await;
+            let e = reply.expect_err("an out-of-bound arrayCount is refused");
+            assert_eq!(e.code, "BAD_ARGS", "arrayCount {n}");
+            assert!(
+                e.message.contains("1..=65535"),
+                "the refusal names the bound: {}",
+                e.message
+            );
+        }
+
+        // The refusals were arguments, not link failures: the instance still serves reads.
+        let out = ok(h
+            .commander
+            .read(
+                None,
+                &json!({ "signals": [ { "tagPath": "LINE_SPEED", "type": "real" } ] }),
+            )
+            .await);
+        assert_eq!(out["reads"][0]["value"], json!(42.0));
+
+        // In bounds, the count survives to the spec; an absent/null one is simply a scalar read.
+        let out = ok(h
+            .commander
+            .read(
+                None,
+                &json!({ "signals": [
+                    { "tagPath": "ZONE_TEMPS", "type": "real", "arrayCount": 65_535 },
+                    { "tagPath": "LINE_SPEED", "type": "real", "arrayCount": null } ] }),
+            )
+            .await);
+        assert_eq!(
+            out["reads"][0]["signal"]["address"]["arrayCount"],
+            json!(65_535)
+        );
+        assert!(out["reads"][1]["signal"]["address"]
+            .get("arrayCount")
+            .is_none());
+    }
+
+    /// The same bound guards `sb/write`, which resolves refs through the same function — a malformed
+    /// argument refuses the whole batch instead of writing part of it (§7.3).
+    #[tokio::test]
+    async fn write_poll_refuses_an_out_of_bound_array_count_as_bad_args() {
+        let h = harness(poll_device(), MockOpts::default());
+        let e = h
+            .commander
+            .write(
+                None,
+                &json!({ "writes": [ { "tagPath": "FILL_SETPOINT", "type": "real",
+                                       "arrayCount": 0, "value": [1.0] } ] }),
+            )
+            .await
+            .expect_err("an out-of-bound arrayCount is refused");
+        assert_eq!(e.code, "BAD_ARGS");
+        assert!(h.writes.lock().unwrap().is_empty(), "nothing was written");
+    }
+
     #[tokio::test]
     async fn write_poll_reports_missing_value_failed_and_unresolved_entries() {
         // A missing value + an unresolved ref: both fail, and (since not ALL are allow-list refusals)
@@ -3110,7 +3334,7 @@ mod tests {
             .commander
             .browse(None, &json!({ "cursor": "1", "max": 50 }))
             .await);
-        assert_eq!(out["tags"][0]["arrayDim"], json!(8));
+        assert_eq!(out["tags"][0]["arrayDim"], json!(1));
         assert_eq!(out["cursor"], json!("42"));
     }
 
