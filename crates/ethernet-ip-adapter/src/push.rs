@@ -71,13 +71,7 @@ pub(crate) fn process_frame(
             }
         }
 
-        if !publish::should_publish(
-            st.baseline.as_ref(),
-            &reading.value,
-            reading.quality,
-            mode,
-            deadband,
-        ) {
+        if !publish::gate_passes(st, &reading.value, reading.quality, mode, deadband) {
             health.samples_suppressed.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -87,7 +81,9 @@ pub(crate) fn process_frame(
             if mode == PublishMode::OnChange {
                 health.samples_changed.fetch_add(1, Ordering::Relaxed);
             }
-            st.baseline = Some(reading.value.clone());
+            // Pending until the publish is confirmed — `Engine::settle` promotes it to the
+            // committed baseline, or drops it so a failed publish is retried (D-EIP-32).
+            st.pending = Some(reading.value.clone());
         }
 
         // Every sample carries the explicit capture-time serverTs (frame receipt, §6.2) — never the

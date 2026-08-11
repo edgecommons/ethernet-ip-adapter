@@ -45,7 +45,9 @@ Explicit messaging is request/response: the adapter opens a CIP session and **re
 tag on a schedule. This is the model for ControlLogix/CompactLogix tags. You group signals into
 `pollGroups[]`, each with its own cadence (`pollIntervalMs`), and the adapter reads each group's tags,
 decides what changed, and publishes. "Change" is decided client-side: with `publishMode: onChange` (the
-default) a signal publishes only when its value moves past its `deadband`; with `always` it publishes
+default) a signal publishes only when its value moves past its `deadband` relative to the last value
+that actually reached the bus — a reading whose publish fails is sent again on its next occurrence
+rather than suppressed against something the bus never received; with `always` it publishes
 every poll. One CIP request is issued per signal per cycle — the `EtherNetIpInventory.requestsPerCycle`
 metric makes that cost visible, and the answer to a large tag count is fewer, larger poll groups at
 longer intervals (or push mode, which has no per-signal request cost). The connection can be
@@ -133,6 +135,14 @@ with a slow real CIP round-trip every `keepaliveProbeIntervalMs`. A paused insta
 (error code `PAUSED`) until you resume. Pause is in-memory and does not survive a restart of the
 instance. `sb/resume` reverses it. Both are
 idempotent — the reply's `changed` tells you whether the call actually changed state.
+
+A pause is a hard stop on telemetry in both directions in time: nothing is published on the way in, and
+nothing that was buffered before it escapes on the way out. If `batchMs` is set, the samples sitting in
+an open coalescing window when the pause arrives are dropped rather than flushed at pause time or held
+until you resume — so a resume never releases a burst of values that are already minutes old. Pausing
+therefore costs you at most one `batchMs` window of telemetry. Resuming a push instance also re-bases
+change detection against the device's current input, so the drift accumulated while paused is not
+republished as one large "everything changed" update.
 
 ## How configuration changes apply
 
