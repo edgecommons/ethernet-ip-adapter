@@ -20,10 +20,37 @@ use tokio::task::JoinHandle;
 
 use crate::config::{EipType, IoConfig, IoFieldSpec, SignalSpec};
 use crate::device::{
-    BrowsePage, BrowsedTag, ConnectionConfig, DeviceBackend, DeviceError, DeviceSession,
-    InputSnapshot, IoUpdate, PushSession, Quality, Reading, Result,
+    BrowsePage, BrowsedTag, ConnectionConfig, DeviceBackend, DeviceError, DeviceIdentity,
+    DeviceSession, InputSnapshot, IoUpdate, PushSession, Quality, Reading, Result,
 };
 use crate::eip::push::assembly_to_readings;
+
+/// The simulator's identity (D-EIP-34) — **an honest fake, and it says so on the nameplate**.
+///
+/// The one thing a simulated identity must not do is pass for a real device. cpppo, the container
+/// this backend models, identifies itself as a Rockwell `1756-L61/B LOGIX5561` under vendor `0x0001`,
+/// which is exactly the impersonation that makes identity untrustworthy as a decision input — and
+/// exactly the reason the in-process sim declines to join in. So:
+///
+/// * **vendor `0x0000`** — the reserved id, assigned to nobody. Never `0x0001`: claiming to be
+///   Rockwell would put a lie in an operator's status page and a fleet's inventory.
+/// * **device type `0x00`** (Generic Device) — the profile for "nothing in particular".
+/// * **product code `0`, revision `0.0`, serial `0`** — placeholders that read as placeholders.
+/// * **a product name that names itself a simulator**, so a screenshot of `sb/status` is
+///   self-explanatory.
+fn sim_identity() -> DeviceIdentity {
+    DeviceIdentity {
+        vendor_id: 0x0000,
+        vendor_name: None,
+        device_type: 0x0000,
+        device_type_name: Some("Generic Device".to_string()),
+        product_code: 0,
+        revision_major: 0,
+        revision_minor: 0,
+        serial_number: 0,
+        product_name: "EdgeCommons in-process simulator (not a device)".to_string(),
+    }
+}
 
 /// The cpppo tag layout (§11.1): `(name, type_name, array_dim)`. `array_dim` is the **array
 /// dimensionality** the symbol type declares — the same thing the real backend derives from
@@ -177,6 +204,10 @@ impl PushSession for SimPushSession {
 
     fn last_input(&self) -> Option<InputSnapshot> {
         self.snapshot.lock().unwrap().clone()
+    }
+
+    fn identity(&self) -> Option<DeviceIdentity> {
+        Some(sim_identity())
     }
 
     async fn set_output(&mut self, field: &IoFieldSpec, value: &Value) -> Result<()> {
@@ -336,6 +367,10 @@ impl DeviceSession for SimSession {
     async fn probe(&mut self) -> Result<()> {
         // The cheapest round-trip: for the sim, always alive.
         Ok(())
+    }
+
+    fn identity(&self) -> Option<DeviceIdentity> {
+        Some(sim_identity())
     }
 }
 
@@ -505,6 +540,47 @@ mod tests {
     async fn probe_answers() {
         let mut s = SimBackend.connect(&conn("h")).await.unwrap();
         assert!(s.probe().await.is_ok());
+    }
+
+    /// **The simulator's identity is an honest fake** (D-EIP-34). It must be legible as a nameplate
+    /// — poll and push alike carry one, so the identity surfaces are exercised by `cargo run` with no
+    /// hardware — while never being mistakable for a real device.
+    ///
+    /// The impersonation this guards against is not hypothetical: cpppo, the container this backend
+    /// models, answers the Identity Object as a Rockwell `1756-L61/B LOGIX5561` under vendor
+    /// `0x0001`. A simulator that copied it would put a fabricated Rockwell controller into an
+    /// operator's status page and a fleet's inventory.
+    #[tokio::test]
+    async fn the_simulator_identifies_itself_as_a_simulator_and_impersonates_nobody() {
+        let poll = SimBackend.connect(&conn("h")).await.unwrap();
+        let id = poll.identity().expect("the sim names itself");
+
+        assert_ne!(
+            id.vendor_id, 0x0001,
+            "the simulator must never claim Rockwell's vendor id (what cpppo does)"
+        );
+        assert_eq!(id.vendor_id, 0x0000, "the reserved id, assigned to nobody");
+        assert!(
+            id.vendor_name.is_none(),
+            "a reserved vendor id has no registered name to render"
+        );
+        let name = id.product_name.to_lowercase();
+        assert!(
+            name.contains("simulator") && name.contains("not a device"),
+            "the product name says what it is on its face: {}",
+            id.product_name
+        );
+        assert_eq!(id.serial_number, 0, "a placeholder that reads as one");
+        assert_eq!(id.product_code, 0);
+        assert_eq!(id.revision(), "0.0");
+
+        // The push simulator reports the SAME nameplate: one simulator, one identity, whichever mode
+        // a runnable config selects.
+        let push = SimBackend
+            .open_push(&conn("opener"), &push_io())
+            .await
+            .unwrap();
+        assert_eq!(push.identity(), Some(id));
     }
 
     #[tokio::test]

@@ -73,6 +73,66 @@ pub(crate) const REPLY_BACKSTOP_GRACE: Duration = Duration::from_millis(50);
 /// peer that simply speaks first) could be adopted as *our* session.
 pub(crate) const REGISTER_CONTEXT: [u8; 8] = *b"ECREGIST";
 
+/// The correlation context stamped on a **pre-registration** ListIdentity request, and required back
+/// on its reply ([`list_identity_over`], D-ENIP-26).
+///
+/// Distinct from [`REGISTER_CONTEXT`] for the same reason that one exists at all: the probe runs
+/// before any session actor owns the stream, so there is no session-scoped monotonic context yet,
+/// and requiring the echo is what makes the exchange correlated rather than "whatever the peer said
+/// next". A separate tag also keeps a stray RegisterSession reply from being read as an identity.
+pub const LIST_IDENTITY_CONTEXT: [u8; 8] = *b"ECLISTID";
+
+/// Send one `ListIdentity` (encapsulation command `0x0063`) over an **already-connected, not yet
+/// registered** byte stream and decode the reply (§5.3, D-ENIP-26).
+///
+/// `ListIdentity` is defined over an unregistered connection, which is exactly what makes it usable
+/// as a *registration-failure diagnostic*: when a target accepts TCP but refuses to open a session,
+/// this is the one question it may still answer. The whole exchange — write and read alike — is
+/// bounded by the single absolute `deadline` the caller passes, so a peer that accepts the request
+/// and then goes quiet cannot extend it.
+///
+/// One request, one reply, no retry, no discard loop. Pre-registration there is exactly one frame
+/// expected on the stream, so a reply that does not echo [`LIST_IDENTITY_CONTEXT`] and the
+/// `ListIdentity` command is a peer defect, not staleness.
+///
+/// # Errors
+///
+/// [`EnipError::Timeout`] / [`EnipError::ConnectionLost`] when the peer does not answer inside the
+/// deadline, [`EnipError::Encap`] when it answers with an encapsulation error status,
+/// [`EnipError::ProtocolViolation`] when the reply is not the one that was asked for, and
+/// [`EnipError::Malformed`] for a runt or shapeless Identity item.
+pub async fn list_identity_over<S>(
+    stream: &mut S,
+    deadline: tokio::time::Instant,
+) -> Result<DeviceIdentity>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = EncapFrame::new(
+        EncapHeader::request(Command::ListIdentity, 0, 0, LIST_IDENTITY_CONTEXT),
+        Bytes::new(),
+    );
+    send_frame_by(stream, &frame, deadline).await?;
+
+    let mut codec = EncapCodec::new();
+    let mut buf = BytesMut::new();
+    let reply = recv_frame(stream, &mut buf, &mut codec, deadline, "list_identity").await?;
+    if reply.header.sender_context != LIST_IDENTITY_CONTEXT {
+        return Err(EnipError::ProtocolViolation {
+            detail: "list identity reply context mismatch",
+        });
+    }
+    if !matches!(reply.header.command, Command::ListIdentity) {
+        return Err(EnipError::ProtocolViolation {
+            detail: "list identity reply command mismatch",
+        });
+    }
+    if !reply.header.status.is_ok() {
+        return Err(EnipError::Encap(reply.header.status));
+    }
+    DeviceIdentity::parse_reply(&reply.data).map_err(EnipError::Malformed)
+}
+
 /// The Connection Manager object path `[0x20 0x06 0x24 0x01]` as an [`EPath`] (§7.1).
 pub(crate) fn connection_manager_path() -> EPath {
     EPath::new().class(0x06).instance(0x01)

@@ -109,13 +109,16 @@ pub use cip::security::{
 };
 
 pub use discovery::{
-    parse_list_interfaces, parse_list_services, DeviceIdentity, DeviceType, InterfaceItem,
-    ServiceItem, VendorId,
+    parse_list_interfaces, parse_list_services, DeviceIdentity, DeviceType, IdentityObject,
+    InterfaceItem, ServiceItem, VendorId, IDENTITY_ATTR_REVISION, IDENTITY_CLASS,
+    IDENTITY_INSTANCE,
 };
 
 // ---- P2 public re-exports (the async client surface `DESIGN.md` §3.3 consumes) ----
 
-pub use client::{ClientOptions, ClientStats, EipClient, RoutePath};
+pub use client::{
+    list_identity_over, ClientOptions, ClientStats, EipClient, RoutePath, LIST_IDENTITY_CONTEXT,
+};
 
 // TLS transport (CIP Security Phase 1, feature `tls`, DESIGN-cip-security.md §3.1): the `connect_tls`
 // entry points live on `EipClient`; these are the supporting types + a re-export of the `rustls`

@@ -217,6 +217,54 @@ pub struct TargetCertificateSummary {
     pub encoding: Option<String>,
 }
 
+/// What a device says it is (D-EIP-34) — the protocol-agnostic view of the CIP Identity Object the
+/// backend reads once per connect, surfaced on `sb/status`, the `device-connected` event, and the
+/// connect log line. The seam stays protocol-agnostic: the EtherNet/IP backend fills this from
+/// `enip::IdentityObject` (and renders the vendor / device-type names through the crate's
+/// known-values table); nothing above the seam sees the `enip` types.
+///
+/// **Identity informs; wire facts decide.** Every field here is *asserted by the device and proven by
+/// nothing*. An emulator answers whatever its author typed — the cpppo bench peer identifies as a
+/// Rockwell `1756-L61/B LOGIX5561`, vendor `0x0001` — so this struct feeds operator-facing surfaces
+/// only. Branching adapter behaviour on it (a decode path, a service choice, a quirk table) would
+/// build the adapter's correctness on an unverified claim; what a device *supports* is settled by
+/// asking it and reading the answer, never by reading its nameplate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// The CIP vendor id (Identity attribute 1).
+    pub vendor_id: u16,
+    /// The registered vendor name, when the protocol stack's table knows it; `None` ⇒ render the id.
+    pub vendor_name: Option<String>,
+    /// The CIP device type / profile (attribute 2).
+    pub device_type: u16,
+    /// The device-type name, when known; `None` ⇒ render the code.
+    pub device_type_name: Option<String>,
+    /// The vendor-specific product code (attribute 3).
+    pub product_code: u16,
+    /// Major revision (attribute 4, high byte).
+    pub revision_major: u8,
+    /// Minor revision (attribute 4, low byte).
+    pub revision_minor: u8,
+    /// Serial number (attribute 6).
+    pub serial_number: u32,
+    /// Product name (attribute 7) — the string an operator recognizes.
+    pub product_name: String,
+}
+
+impl DeviceIdentity {
+    /// The `major.minor` revision, as it is printed on a nameplate.
+    #[must_use]
+    pub fn revision(&self) -> String {
+        format!("{}.{}", self.revision_major, self.revision_minor)
+    }
+
+    /// The one-line render for a log message: `<product name> rev <major.minor>`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!("{} rev {}", self.product_name, self.revision())
+    }
+}
+
 /// A live connection to one device. **This is the trait a backend implements.**
 #[async_trait]
 pub trait DeviceSession: Send + Sync {
@@ -265,6 +313,15 @@ pub trait DeviceSession: Send + Sync {
     /// no security surface — e.g. the simulator). The EtherNet/IP backend returns the negotiated TLS
     /// facts for a `mode: tls` connection, or a plaintext marker otherwise.
     fn security(&self) -> Option<SecurityStatus> {
+        None
+    }
+
+    /// What the device said it is, read once when this session opened (D-EIP-34). `None` when the
+    /// device refused the read or the backend does not do one — **never an error and never a
+    /// reconnect**: identity is a diagnostic surface, and a device that will not name itself is a
+    /// device that still polls. Cheap: it returns a value captured at connect, it does not touch the
+    /// wire.
+    fn identity(&self) -> Option<DeviceIdentity> {
         None
     }
 
@@ -436,6 +493,14 @@ pub trait PushSession: Send + Sync {
     /// `staleFramesDropped` / `sizeMismatchDropped` / `malformedFrames` / `produceOverruns` reflect
     /// the real stack counters (the S5-flagged gap).
     fn io_stats(&self) -> Option<IoLinkStats> {
+        None
+    }
+
+    /// What the device said it is, read once when this class-1 session opened (D-EIP-34) — the push
+    /// counterpart of [`DeviceSession::identity`], read over the same explicit session the
+    /// ForwardOpen rides. `None` when the device refused it or the backend does not do one; never an
+    /// error, never a reason to drop the connection.
+    fn identity(&self) -> Option<DeviceIdentity> {
         None
     }
 

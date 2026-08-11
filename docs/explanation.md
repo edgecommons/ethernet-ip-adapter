@@ -206,6 +206,34 @@ I/O behavior. Their dimensions are bounded values like `instance`, `pollGroup`, 
 `result`, and `connectionMode`; signal names, tag paths, endpoints, and raw error text belong in
 data/events/logs/command replies, not in metric dimensions.
 
+## What the device says it is
+
+When a session opens, the adapter reads the device's CIP Identity Object once — vendor, device type,
+product code, revision, serial number, product name — and reports it on `sb/status.identity`, in the
+`device-connected` event, and in the connect log line (`connected to 10.0.0.5:44818 (1756-L71/B rev
+20.11)`). It is read once and answered from memory, so asking for status costs no traffic on the wire,
+and it is cleared when the session ends: a nameplate belongs to a session, not to an address.
+
+**Identity informs; wire facts decide.** Everything in that nameplate is asserted by the device and
+verified by nothing — an emulator reports whatever its author configured, and a simulator on a bench
+can present itself as a Rockwell controller. So it feeds status, events, and logs, and nothing else:
+no decode path, no service choice, and no quirk table keys on it. What a device supports is settled by
+asking it and reading the answer.
+
+A device is allowed to refuse the read, and some do. Refusal costs one warning and leaves
+`identity: null`; the instance connects, polls, and writes exactly as it would otherwise.
+
+Where a device accepts the TCP connection and then refuses to open a session, the adapter makes one
+short, bounded `ListIdentity` attempt — the one question a device answers without a session — and adds
+whatever it learns to the failure it reports. That turns "the handshake failed" into "the 1756-L71/B at
+10.0.0.5 refused to open a session", which is a different problem from a wrong address. This is the
+only thing `ListIdentity` is used for.
+
+Alongside the nameplate, `sb/status.dialect` reports what the adapter has learned about the device from
+operations that have already run — today, whether the Logix tag-list service answered a browse. It is
+`unknown` until something has settled it. The adapter does not probe a device for capabilities when it
+connects; it records what real operations teach.
+
 ## A note on security
 
 An instance speaks **plaintext by default** — CIP over TCP `44818`, and class-1 implicit I/O over UDP

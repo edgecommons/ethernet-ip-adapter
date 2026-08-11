@@ -522,5 +522,11 @@ state is in-memory, an instance that was paused starts running again when the ad
   `evt/warning/tls-peer-unverified`.
 - **Security posture** — `sb/status` returns a `security` object per instance, and the `state`
   keepalive carries `attributes.security` (`"tls"`|`"plaintext"`).
+- **Device identity** — `sb/status` returns an `identity` object per instance (vendor, device type,
+  product code, revision, serial number, product name), read from the device's CIP Identity Object when
+  the session opened; it is `null` while the instance is down and for a device that refuses the read.
+  The `device-connected` event carries the same object, and the connect log line names the product. Use
+  it to confirm which controller an instance is actually talking to — it is what the device claims, and
+  nothing verifies it, so treat it as a label rather than a guarantee.
 - **Status verb** `sb/status` → connection state, paused, a counter snapshot (and an `io` block on push).
   **Signals verb** `sb/signals` → the resolved signal list with addresses and writable flags.

@@ -391,6 +391,9 @@ pub struct ScriptedSession {
     browses: Mutex<VecDeque<DevResult<BrowsePage>>>,
     reads_done: AtomicUsize,
     closed: AtomicUsize,
+    /// What this session reports the device said it is (D-EIP-34). `None` by default — the same
+    /// "the device refused, or the backend does not read one" case the ladder must handle.
+    identity: Mutex<Option<crate::device::DeviceIdentity>>,
 }
 
 impl ScriptedSession {
@@ -446,6 +449,94 @@ impl ScriptedSession {
     pub fn closed(&self) -> usize {
         self.closed.load(Ordering::Relaxed)
     }
+
+    /// Give this session an identity to report (D-EIP-34) — what a backend that read the device's
+    /// Identity Object at connect hands the ladder.
+    pub fn with_identity(self: &Arc<Self>, identity: crate::device::DeviceIdentity) -> Arc<Self> {
+        *self.identity.lock().unwrap() = Some(identity);
+        Arc::clone(self)
+    }
+}
+
+// =====================================================================================
+// WARN capture.
+// =====================================================================================
+
+/// A `tracing` subscriber that records WARN-level (and ERROR-level) event messages on the current
+/// thread, so a log line a design promises — the §4.1 unprovisioned-device warning, the D-EIP-34
+/// identity-refusal and experimental-signal notes — is asserted as a fact rather than assumed.
+///
+/// Install it with `tracing::subscriber::set_default(log.clone())` for the span of the code under
+/// test; the guard restores whatever was there before.
+#[derive(Clone, Default)]
+pub struct WarnLog(pub Arc<Mutex<Vec<String>>>);
+
+impl WarnLog {
+    /// Whether any captured message contains `needle`.
+    #[must_use]
+    pub fn contains(&self, needle: &str) -> bool {
+        self.0.lock().unwrap().iter().any(|m| m.contains(needle))
+    }
+
+    /// Whether nothing at WARN or above was logged.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
+    /// Every captured message, in order.
+    #[must_use]
+    pub fn messages(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for WarnLog {
+    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        *meta.level() <= tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() > tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A nameplate for the scripted doubles (D-EIP-34) — a fictional vendor (`0x1337`, registered to
+/// nobody) so no fixture ever claims to be a real manufacturer's product.
+#[must_use]
+pub fn scripted_identity(product_name: &str) -> crate::device::DeviceIdentity {
+    crate::device::DeviceIdentity {
+        vendor_id: 0x1337,
+        vendor_name: None,
+        device_type: 0x000E,
+        device_type_name: Some("Programmable Logic Controller".to_string()),
+        product_code: 0x0042,
+        revision_major: 7,
+        revision_minor: 3,
+        serial_number: 0x00C0_FFEE,
+        product_name: product_name.to_string(),
+    }
 }
 
 #[async_trait]
@@ -489,6 +580,10 @@ impl DeviceSession for Arc<ScriptedSession> {
         }
     }
 
+    fn identity(&self) -> Option<crate::device::DeviceIdentity> {
+        self.identity.lock().unwrap().clone()
+    }
+
     async fn close(&mut self) {
         self.closed.fetch_add(1, Ordering::Relaxed);
     }
@@ -508,6 +603,8 @@ pub struct ScriptedPush {
     outputs: Mutex<Vec<(String, Value)>>,
     output_err: Mutex<Option<(usize, String)>>,
     closed: AtomicUsize,
+    /// What this class-1 session reports the device said it is (D-EIP-34); `None` by default.
+    identity: Mutex<Option<crate::device::DeviceIdentity>>,
 }
 
 impl ScriptedPush {
@@ -523,8 +620,14 @@ impl ScriptedPush {
                 outputs: Mutex::new(Vec::new()),
                 output_err: Mutex::new(None),
                 closed: AtomicUsize::new(0),
+                identity: Mutex::new(None),
             },
         )
+    }
+
+    /// Give this class-1 session an identity to report (D-EIP-34).
+    pub fn set_identity(&self, identity: Option<crate::device::DeviceIdentity>) {
+        *self.identity.lock().unwrap() = identity;
     }
 
     /// Set what a push `sb/read` (and the resume rebase) answers from.
@@ -583,6 +686,10 @@ impl PushSession for ScriptedPush {
 
     fn io_stats(&self) -> Option<IoLinkStats> {
         *self.stats.lock().unwrap()
+    }
+
+    fn identity(&self) -> Option<crate::device::DeviceIdentity> {
+        self.identity.lock().unwrap().clone()
     }
 
     async fn close(&mut self) {
@@ -747,6 +854,9 @@ impl DeviceSession for SecureSession {
     fn security(&self) -> Option<SecurityStatus> {
         self.security.clone()
     }
+    fn identity(&self) -> Option<crate::device::DeviceIdentity> {
+        self.inner.identity()
+    }
     async fn close(&mut self) {
         self.inner.close().await;
     }
@@ -780,6 +890,9 @@ impl PushSession for SharedPush {
     }
     fn io_stats(&self) -> Option<IoLinkStats> {
         self.inner.io_stats()
+    }
+    fn identity(&self) -> Option<crate::device::DeviceIdentity> {
+        self.inner.identity()
     }
     async fn close(&mut self) {
         self.closed.fetch_add(1, Ordering::Relaxed);

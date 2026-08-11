@@ -7,6 +7,9 @@
 //! (`CipValue`, `EnipError`, `IoEvent`, `AssemblyLayout`) never cross it.
 //!
 //! * [`types`] — the pure JSON ⇄ `CipValue` codec (§5.1, fully unit-tested).
+//! * [`identity`] — the connect-time CIP Identity Object read and the ListIdentity
+//!   registration-failure diagnostic (D-EIP-34). Both are diagnostics: identity informs, wire facts
+//!   decide, and nothing in this backend branches on what a device calls itself.
 //! * [`session`] — [`session::EipSession`]: the poll [`DeviceSession`] over `EipClient`.
 //! * [`push`] — the pure class-1 translators ([`push::assembly_to_readings`] / [`push::map_lost_reason`]).
 //! * [`live`] — the live-socket drivers: `EipBackend`'s connect/ForwardOpen + the `EipPushSession`,
@@ -28,6 +31,7 @@ use crate::config::Timeouts;
 use crate::device::{ConnectionConfig, DeviceError};
 
 pub mod est;
+pub mod identity;
 pub mod live;
 pub mod push;
 pub mod rotation;

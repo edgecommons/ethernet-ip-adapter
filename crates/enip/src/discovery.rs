@@ -1,10 +1,19 @@
-//! Device discovery (PROTOCOL-DESIGN §5.3).
+//! Device discovery (PROTOCOL-DESIGN §5.3) and the CIP **Identity Object** read (D-ENIP-26).
 //!
-//! Parses the `ListIdentity`, `ListServices`, and `ListInterfaces` reply data (each a CPF item
-//! list, §5.4) into typed values. [`DeviceIdentity`] renders vendor and device type through a small
-//! known-values table with an `Unknown(raw)` fallback (§4 invariant 5), and its embedded socket
-//! address goes through the big-endian [`crate::cpf::SockAddrInfo`] decoder. Every field is read
-//! through the checked cursor — a runt reply is [`WireError::Truncated`], never a panic.
+//! Two different answers to "what is this device", from two different layers, and the distinction
+//! matters:
+//!
+//! * [`DeviceIdentity`] decodes an **encapsulation** `ListIdentity` reply (§5.3) — a CPF Identity
+//!   item, answerable by a target that has not registered a session (and, by
+//!   [`crate::list_identity_over`], before one exists at all).
+//! * [`IdentityObject`] decodes the **CIP** Identity Object (class `0x01`, instance 1) attribute
+//!   block returned by `Get_Attributes_All` over an established session
+//!   ([`crate::EipClient::read_identity`]).
+//!
+//! Both render vendor and device type through a small known-values table with a raw fallback (§4
+//! invariant 5); [`DeviceIdentity`]'s embedded socket address goes through the big-endian
+//! [`crate::cpf::SockAddrInfo`] decoder. Every field is read through the checked cursor — a runt
+//! reply is [`WireError::Truncated`], never a panic.
 
 use bytes::Bytes;
 
@@ -13,6 +22,15 @@ use crate::error::WireError;
 use crate::wire::WireReader;
 
 const CONTEXT: &str = "identity";
+
+/// The CIP Identity Object class code (`0x01`). Every CIP device implements exactly one instance of
+/// it, and its attributes are the only device self-description CIP mandates.
+pub const IDENTITY_CLASS: u16 = 0x01;
+/// The Identity Object instance every CIP device carries (`1`).
+pub const IDENTITY_INSTANCE: u16 = 0x01;
+/// Identity attribute 4 (Revision) — a 2-byte mandatory attribute; the cheapest legal read, and the
+/// one the class-3 inactivity keepalive uses as its NOP (§7.6).
+pub const IDENTITY_ATTR_REVISION: u16 = 0x04;
 
 /// A CIP vendor id with an optional known name (§5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +154,110 @@ impl DeviceIdentity {
             product_name,
             state,
         })
+    }
+}
+
+/// The decoded CIP **Identity Object** (class `0x01`, instance 1) attribute block (D-ENIP-26).
+///
+/// This is the device's own answer to "what are you", read over an established session rather than
+/// broadcast: vendor, device type, product code, revision, status word, serial number, and product
+/// name — attributes 1–7, the set CIP Vol 1 makes mandatory on the Identity Object.
+///
+/// **Asserted, never proven.** Nothing on the wire authenticates any of it; an emulator answers
+/// whatever its author typed. It is a diagnostic and a label, and a caller that *dispatches* on it
+/// has built a protocol on an unverified claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityObject {
+    /// Attribute 1 — manufacturer vendor id.
+    pub vendor: VendorId,
+    /// Attribute 2 — device type (the CIP device profile).
+    pub device_type: DeviceType,
+    /// Attribute 3 — product code, vendor-specific.
+    pub product_code: u16,
+    /// Attribute 4, high byte — major revision.
+    pub revision_major: u8,
+    /// Attribute 4, low byte — minor revision.
+    pub revision_minor: u8,
+    /// Attribute 5 — the device status word.
+    pub status: u16,
+    /// Attribute 6 — serial number.
+    pub serial_number: u32,
+    /// Attribute 7 — product name (SHORT_STRING; checked UTF-8).
+    pub product_name: String,
+}
+
+impl IdentityObject {
+    /// Parse a `Get_Attributes_All` reply for the Identity Object (D-ENIP-26).
+    ///
+    /// The reply is the mandatory attributes **concatenated in attribute order** — `UINT` vendor,
+    /// `UINT` device type, `UINT` product code, `USINT`/`USINT` revision, `WORD` status, `UDINT`
+    /// serial, `SHORT_STRING` product name. Anything after the product name is an optional attribute
+    /// (state, config consistency, heartbeat…) whose presence is device-specific, so **trailing bytes
+    /// are ignored rather than refused**: a device that serves more than the mandatory set is not
+    /// malformed. A reply that ends early is [`WireError::Truncated`].
+    pub fn parse_get_attributes_all(data: &[u8]) -> Result<Self, WireError> {
+        let mut r = WireReader::with_context(data, CONTEXT);
+        let vendor = VendorId(r.u16()?);
+        let device_type = DeviceType(r.u16()?);
+        let product_code = r.u16()?;
+        let revision_major = r.u8()?;
+        let revision_minor = r.u8()?;
+        let status = r.u16()?;
+        let serial_number = r.u32()?;
+        let product_name = r.short_string()?;
+        Ok(Self {
+            vendor,
+            device_type,
+            product_code,
+            revision_major,
+            revision_minor,
+            status,
+            serial_number,
+            product_name,
+        })
+    }
+
+    /// The `major.minor` revision, as an operator reads it off a nameplate.
+    #[must_use]
+    pub fn revision(&self) -> String {
+        format!("{}.{}", self.revision_major, self.revision_minor)
+    }
+}
+
+impl core::fmt::Display for IdentityObject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} rev {} ({}, serial 0x{:08X})",
+            self.product_name,
+            self.revision(),
+            self.vendor,
+            self.serial_number
+        )
+    }
+}
+
+impl crate::client::EipClient {
+    /// Read the CIP Identity Object (class `0x01`, instance 1) over the established session
+    /// (D-ENIP-26) — **one** `Get_Attributes_All` round trip, bounded by the client's
+    /// `request_timeout` like any other request.
+    ///
+    /// One `Get_Attributes_All` rather than six `Get_Attribute_Single`s: the mandatory attribute
+    /// block is defined as an ordered concatenation, so a single reply carries everything
+    /// [`IdentityObject`] needs, and connect-time identity has to fit inside one request budget on
+    /// every reconnect — six round trips would multiply that cost by six and give six ways to
+    /// half-fail.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::EnipError::Cip`] when the device refuses the service (Identity is mandatory, but a
+    /// refusal is a device's prerogative and the caller is expected to tolerate it),
+    /// [`crate::EnipError::Malformed`] for a runt attribute block, or any connection-level error.
+    pub async fn read_identity(&self) -> crate::error::Result<IdentityObject> {
+        let data = self
+            .get_attribute_all(IDENTITY_CLASS, IDENTITY_INSTANCE)
+            .await?;
+        IdentityObject::parse_get_attributes_all(&data).map_err(crate::error::EnipError::Malformed)
     }
 }
 

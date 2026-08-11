@@ -1003,6 +1003,28 @@ impl DeviceMetrics {
         serde_json::Value::Object(out)
     }
 
+    /// The `sb/status` `identity` object (D-EIP-34): what the device said it is on the current
+    /// session, or `null` when the session is down or the device refused the read.
+    ///
+    /// `null` is not an error state and must not be rendered as one — a device is entitled to refuse
+    /// the Identity Object, and a perfectly healthy poll target (the libplctag `ab_server` bench
+    /// peer) does. It means "not known", which is exactly what a console should show.
+    #[must_use]
+    pub fn identity_view(&self) -> serde_json::Value {
+        self.health
+            .identity()
+            .as_ref()
+            .map_or(serde_json::Value::Null, identity_json)
+    }
+
+    /// The `sb/status` `dialect` object (D-EIP-34): what ordinary operations have taught this
+    /// instance about the device's CIP dialect. Always present, `"unknown"` until something has
+    /// actually exercised the service — nothing here is probed for.
+    #[must_use]
+    pub fn dialect_view(&self) -> serde_json::Value {
+        serde_json::json!({ "tagListService": self.health.tag_list_dialect().as_str() })
+    }
+
     /// The push `sb/status` `io` object (§7.1): negotiated APIs, run/peerRun, and the §8.8 counters.
     #[must_use]
     pub fn io_view(&self) -> serde_json::Value {
@@ -1411,6 +1433,28 @@ fn trust_store_view(anchors: &[crate::device::TrustAnchorSummary]) -> serde_json
         .map(|a| serde_json::json!({ "subject": a.subject, "notAfter": a.not_after }))
         .collect();
     serde_json::json!({ "count": anchors.len(), "anchors": list })
+}
+
+/// Render a [`crate::device::DeviceIdentity`] into the JSON shape every identity surface uses
+/// (D-EIP-34): the `sb/status.identity` object and the `device-connected` event's `identity`
+/// context. ONE renderer, so a fleet consumer parses one shape wherever identity appears.
+///
+/// `vendorName` / `deviceTypeName` are `null` when the protocol stack's known-values table does not
+/// recognize the code — the numeric field beside it is always the authority. `serialNumber` is the
+/// zero-padded hex an operator reads off a nameplate, not a decimal, and it is a **string**: it is a
+/// label, and the JSON type is chosen so nobody is tempted to do arithmetic on it.
+#[must_use]
+pub fn identity_json(id: &crate::device::DeviceIdentity) -> serde_json::Value {
+    serde_json::json!({
+        "vendorId": id.vendor_id,
+        "vendorName": id.vendor_name,
+        "deviceType": id.device_type,
+        "deviceTypeName": id.device_type_name,
+        "productCode": id.product_code,
+        "revision": id.revision(),
+        "serialNumber": format!("0x{:08X}", id.serial_number),
+        "productName": id.product_name,
+    })
 }
 
 /// Render a target CIP Security posture (Phase 2a, DESIGN-cip-security.md §4.1) into the

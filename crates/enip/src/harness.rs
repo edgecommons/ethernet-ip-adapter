@@ -33,7 +33,9 @@ use crate::cm::{
     NetworkConnectionParams, Priority, TimeoutMultiplier, VariableLength,
 };
 use crate::cpf::{Cpf, SequencedAddress, SockAddrInfo};
-use crate::discovery::{parse_list_interfaces, parse_list_services, DeviceIdentity};
+use crate::discovery::{
+    parse_list_interfaces, parse_list_services, DeviceIdentity, IdentityObject,
+};
 use crate::encap::codec::EncapCodec;
 use crate::encap::{EncapFrame, EncapHeader};
 use crate::io::{IoConnection, IoConnectionParams, IoFrame, RealTimeFormat};
@@ -242,11 +244,13 @@ pub fn tag_path(data: &[u8]) {
     let _ = TagAddress::parse(&lossy);
 }
 
-/// Exercise the discovery decoders (`fuzz_discovery`): the ListIdentity reply and item parsers plus
-/// the ListServices / ListInterfaces CPF walkers.
+/// Exercise the discovery decoders (`fuzz_discovery`): the ListIdentity reply and item parsers, the
+/// CIP Identity Object attribute-block parser (D-ENIP-26 — a connect-time decode of device-controlled
+/// bytes, so it belongs on the same gate), plus the ListServices / ListInterfaces CPF walkers.
 pub fn discovery(data: &[u8]) {
     let _ = DeviceIdentity::parse_reply(data);
     let _ = DeviceIdentity::parse_item(data);
+    let _ = IdentityObject::parse_get_attributes_all(data);
     let _ = parse_list_services(data);
     let _ = parse_list_interfaces(data);
 }
