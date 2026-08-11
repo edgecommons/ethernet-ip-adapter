@@ -33,7 +33,8 @@ value outside that range is a configuration error, and in an `sb/read`/`sb/write
 is a `BAD_ARGS` refusal. A write must supply exactly `N` elements — a wrong length is rejected. A read
 must come back with exactly `N` elements: a reply carrying a different number is a `BAD` sample whose
 `qualityRaw` names the expected and received counts, never a shorter array published as `GOOD`.
-Multi-dimensional arrays are not supported.
+`arrayCount: 1` publishes the bare value rather than a one-element array — the same shape whichever
+representation the device serves the tag in. Multi-dimensional arrays are not supported.
 
 **BOOL array signals are experimental.** Two wire representations exist for them, and the adapter reads
 whichever one the device declares. A device that serves one byte per element is read directly. A Logix
@@ -41,7 +42,8 @@ controller stores a `BOOL[n]` tag as a packed `DWORD` array, and the adapter unp
 bit *(n mod 32)* of word *(n / 32)*, so `arrayCount: N` needs `ceil(N/32)` words and the bits past N in
 the final word are the controller's padding and are dropped. `arrayCount: 40` against a `BOOL[64]` tag
 therefore publishes the first 40 booleans. A packed reply carrying any other number of words is a `BAD`
-sample whose `qualityRaw` names the counts in words.
+sample whose `qualityRaw` names the counts in words. The published value has the same JSON shape in
+either representation, including the bare value for `arrayCount: 1`.
 
 The representation is a property of the device, not something you configure: the adapter observes it from
 the reply and shapes the following reads to match. `sb/signals` reports it per signal as `observedType`.

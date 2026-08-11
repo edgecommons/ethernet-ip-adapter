@@ -194,6 +194,8 @@ impl EipSession {
 /// have returned `ceil(N/32)` BOOLs against a `ceil(N/32)`-element request and published a GOOD
 /// array of the wrong length. Checked this way the reply is BAD and the fresh observation re-shapes
 /// the following request, so the mismatch costs one sample rather than becoming permanent.
+///
+/// **The published shape is the same in both representations** ([`collapse_one_element`]).
 fn decode_reading(
     spec: &SignalSpec,
     value: &enip::CipValue,
@@ -204,7 +206,7 @@ fn decode_reading(
     if EipSession::is_bool_array(spec) {
         if let Some(words) = types::packed_dwords(value) {
             return match types::unpack_bools(&words, logical) {
-                Ok(v) => good(spec, v, Some(observed)),
+                Ok(v) => good(spec, collapse_one_element(v, logical), Some(observed)),
                 Err(e) => bad(spec, e.quality_raw(), Some(observed)),
             };
         }
@@ -219,6 +221,39 @@ fn decode_reading(
             None if decoded.non_finite => uncertain(spec, Some(observed)),
             None => good(spec, decoded.value, Some(observed)),
         },
+    }
+}
+
+/// **Shape parity across representations** (D-EIP-33, D-EIP-35): a one-element read publishes the
+/// bare value, never a one-element array — on *every* path.
+///
+/// The byte-per-element path gets this for free, from the protocol crate's one-element collapse
+/// (`cip/types.rs`: a single element decodes as a scalar, which is what makes `arrayCount: 1`
+/// satisfiable in the first place). A packed reply has no such collapse to inherit — its words are
+/// unpacked into booleans by count — so the same rule is applied here explicitly.
+///
+/// **Why here and not inside [`types::unpack_bools`]:** unpacking is a *bit-layout* rule whose
+/// contract is "the words in, N booleans out", and it stays exactly that — testable in isolation,
+/// with no opinion about publication. This is a *publication-shape* rule about what a one-element
+/// reading looks like on the UNS, so it belongs beside the other decisions about the published
+/// value, at the point the [`Reading`] is minted, in one place, for both representations.
+///
+/// **Why parity beats purity.** Stating the pure "a JSON array of N elements" contract on the
+/// translated path alone would make the published JSON **shape depend on which device serves the
+/// tag**: the identical `{"type": "bool", "arrayCount": 1}` config would publish a scalar against a
+/// byte-per-element device and `[false]` against a Logix controller. The representation is a device
+/// property the operator never declared (D-EIP-35), so keying an observable value shape on it means
+/// a consumer's parsing can break because the plant swapped PLC brands. One quirk applied uniformly
+/// is worth more than two behaviors that are each locally defensible.
+fn collapse_one_element(value: serde_json::Value, logical: u32) -> serde_json::Value {
+    if logical != 1 {
+        return value;
+    }
+    match value {
+        serde_json::Value::Array(mut elems) if elems.len() == 1 => {
+            elems.pop().unwrap_or(serde_json::Value::Null)
+        }
+        other => other,
     }
 }
 
@@ -970,6 +1005,69 @@ mod tests {
             "elements 33..40 come from word 1 bits 1..8: {bits:?}"
         );
         assert!(bits[..31].iter().all(|b| b == &json!(false)));
+    }
+
+    /// **Shape parity across representations (D-EIP-35).** The published JSON shape must not depend
+    /// on which device serves the tag: the identical `{"type": "bool", "arrayCount": 1}` config
+    /// publishes the **bare boolean** whether the reply came back byte-per-element or packed. The
+    /// byte path inherits that collapse from the crate (a single element decodes as a scalar,
+    /// D-EIP-33); the translated path applies the same rule deliberately.
+    ///
+    /// The N = 2 pair is the control: parity is a shape rule for the one-element case, not a
+    /// flattening — both representations still publish a two-element array, same values, same order.
+    ///
+    /// Four distinct tags, so each carries its own observation and no read reshapes another's.
+    #[tokio::test]
+    async fn a_one_element_bool_array_publishes_the_same_shape_in_both_representations() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            match idx {
+                0 => (0x00, tagged_bools(&[true])), // N=1, byte-per-element
+                1 => (0x00, tagged_dwords(&[0x0000_0001])), // N=1, packed
+                2 => (0x00, tagged_bools(&[true, false])), // N=2, byte-per-element
+                _ => (0x00, tagged_dwords(&[0x0000_0001])), // N=2, packed: bit 0 set, bit 1 clear
+            }
+        });
+        let mut session = connect(client_half).await;
+
+        let byte_one = session
+            .read_signals(&[spec("one-byte", "ONE_BYTE", "bool", Some(1))])
+            .await
+            .unwrap();
+        let packed_one = session
+            .read_signals(&[spec("one-packed", "ONE_PACKED", "bool", Some(1))])
+            .await
+            .unwrap();
+        assert_eq!(byte_one[0].quality, Quality::Good);
+        assert_eq!(packed_one[0].quality, Quality::Good);
+        assert_eq!(
+            byte_one[0].value,
+            json!(true),
+            "the byte path publishes a bare boolean for arrayCount 1"
+        );
+        assert_eq!(
+            packed_one[0].value, byte_one[0].value,
+            "…and so does the packed path — the shape cannot depend on the device"
+        );
+        // The representations genuinely differ; only the published shape is forced to agree.
+        assert_eq!(byte_one[0].observed_type.as_deref(), Some("BOOL"));
+        assert_eq!(packed_one[0].observed_type.as_deref(), Some("DWORD"));
+
+        let byte_two = session
+            .read_signals(&[spec("two-byte", "TWO_BYTE", "bool", Some(2))])
+            .await
+            .unwrap();
+        let packed_two = session
+            .read_signals(&[spec("two-packed", "TWO_PACKED", "bool", Some(2))])
+            .await
+            .unwrap();
+        assert_eq!(
+            byte_two[0].value,
+            json!([true, false]),
+            "N > 1 is still an array — parity is not flattening"
+        );
+        assert_eq!(packed_two[0].value, byte_two[0].value);
     }
 
     /// **The adaptive read (D-EIP-35).** Whether a packed tag's Read Tag element count is
