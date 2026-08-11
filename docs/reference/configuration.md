@@ -204,7 +204,7 @@ One CIP tag mapped to a data point.
 | `name` | string (lower-kebab) | **required** | Human label AND the `data` topic channel. Unique per device. |
 | `tagPath` | string | **required** | The CIP tag path, verbatim/case-sensitive (`LINE_SPEED`, `Program:Main.FillPV`). It IS the stable `signal.id`. Unique per device. |
 | `type` | enum | **required** | The CIP elementary type used to decode the tag (see [data-types](data-types.md)). |
-| `arrayCount` | integer 1–65535 | — | Present ⇒ a 1-D array read of that many elements; the value is a JSON array. The upper bound is the CIP Read Tag 16-bit element count; a value outside the range is a configuration error. With `type: bool` the signal is experimental and logs a warning at startup (see [data-types](data-types.md)). |
+| `arrayCount` | integer 1–65535 | — | Present ⇒ a 1-D array read of that many elements; the value is a JSON array. The upper bound is the CIP Read Tag 16-bit element count; a value outside the range is a configuration error. With `type: bool` the signal is experimental and logs a warning at startup; a packed (`DWORD`) reply is unpacked into the same N booleans, so the count is always the boolean count, never a word count (see [data-types](data-types.md)). |
 | `scale` | number | — | Published value = `raw × scale + offset` (element-wise for arrays; numeric types only, not `bool`). |
 | `offset` | number | — | See `scale`. |
 | `deadband` | object | `{type:"none"}` | The change/deadband gate for `onChange` publishing (numeric types only; below). |
@@ -339,9 +339,10 @@ and skipped instance ids (see the [messaging interface](messaging-interface.md#e
 
 - **Value types** — CIP elementary scalars and 1-D arrays thereof (see [data-types](data-types.md)).
   Structures/UDTs, Logix `STRING`, and multi-dimensional arrays are rejected at config-parse time.
-- **BOOL arrays** — BOOL array signals are experimental. The adapter encodes them byte-per-element;
-  Logix controllers implement BOOL arrays as packed `DWORD`s, so BOOL-array reads from
-  ControlLogix/CompactLogix report `BAD`. Each such signal logs a warning at startup.
+- **BOOL arrays** — BOOL array signals are experimental. The adapter reads whichever representation the
+  device declares — one byte per element, or the packed `DWORD`s Logix controllers store BOOL arrays as,
+  unpacked into the configured booleans (see [data-types](data-types.md)). Writes to a tag observed
+  packed are refused. Each such signal logs a warning at startup.
 - **Array length** — `arrayCount` is an integer from 1 to 65535, and the count is a contract in both
   directions: a read whose reply carries a different number of elements is published `BAD` rather than
   trimmed to fit.

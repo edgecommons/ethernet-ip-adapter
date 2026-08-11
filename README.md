@@ -77,8 +77,9 @@ Full docs live under [`docs/`](docs/) (synced to
 - **Value types:** CIP elementary scalars (`bool`, `sint`/`usint`/`int`/`uint`/`dint`/`udint`/`lint`/
   `ulint`, `real`, `lreal`) and 1-D arrays of 1–65535 elements thereof. Structures/UDTs, Logix
   `STRING`, and multi-dimensional arrays are not supported. BOOL array signals are experimental: the
-  adapter encodes them byte-per-element, and Logix controllers implement BOOL arrays as packed
-  `DWORD`s, so BOOL-array reads from ControlLogix/CompactLogix report `BAD`.
+  adapter reads whichever representation the device declares — byte-per-element, or the packed
+  `DWORD`s Logix controllers store BOOL arrays as, unpacked into the configured booleans — and
+  refuses writes to a tag it has observed packed.
 - **Poll** uses CIP explicit messaging (one request per signal per cycle); **push** uses class-1
   implicit I/O.
 - **Security:** poll (explicit-messaging) instances can run over **EtherNet/IP over TLS** (CIP Security,
