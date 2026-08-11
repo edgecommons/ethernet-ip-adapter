@@ -137,8 +137,14 @@ pub struct ClientOptions {
     pub port: u16,
     /// Optional route path (`None` for cpppo / CompactLogix-direct).
     pub route: Option<RoutePath>,
-    /// Deadline for **each phase** of opening a session: the TCP connect, then the RegisterSession
-    /// handshake (its request write and its reply read together). Each phase gets the full value.
+    /// Deadline for opening a session **in total** (default 5 s): the TCP connect and everything
+    /// [`EipClient::connect_over`] then does — the RegisterSession handshake (request write and
+    /// reply read alike) plus, when `connected_messaging` is set, the class-3 ForwardOpen — share
+    /// this one budget, stamped before the connect. [`EipClient::connect_tls`] applies it the same
+    /// way across the TCP connect and the TLS handshake.
+    ///
+    /// Reached directly, [`EipClient::connect_over`] bounds its own work by the full value: it is a
+    /// public entry point handed an already-open stream, so there is no earlier phase to charge.
     pub connect_timeout: Duration,
     /// Per-request deadline (§10.4).
     pub request_timeout: Duration,
@@ -241,14 +247,21 @@ pub struct EipClient {
 }
 
 impl EipClient {
-    /// Connect to `addr` (host or `host:port`) and open a session (§5.5). Bounds the TCP connect +
-    /// RegisterSession by `connect_timeout`.
+    /// Connect to `addr` (host or `host:port`) and open a session (§5.5). **`connect_timeout` is
+    /// one budget for the whole open**, not one per phase: the clock starts before the TCP connect
+    /// and the RegisterSession handshake spends whatever the connect left of it.
+    ///
+    /// Stamping a fresh deadline for the handshake made the crate-level worst case ~2 ×
+    /// `connect_timeout` — a caller that asked for a 5 s bound on opening a session could wait 10 s
+    /// against a peer that is slow to complete the TCP handshake and then silent. This mirrors
+    /// [`EipClient::connect_tls`], which has always run on one budget.
     pub async fn connect(addr: &str, opts: ClientOptions) -> Result<Self> {
         let target = if addr.contains(':') {
             addr.to_owned()
         } else {
             format!("{addr}:{}", opts.port)
         };
+        let started = std::time::Instant::now();
         let connect = TcpStream::connect(target);
         let stream = match tokio::time::timeout(opts.connect_timeout, connect).await {
             Ok(Ok(s)) => s,
@@ -257,7 +270,16 @@ impl EipClient {
         };
         stream.set_nodelay(true).ok();
         let peer_addr = stream.peer_addr().ok();
-        let mut client = Self::connect_over(stream, opts).await?;
+        // The handshake spends the remainder of the same budget. Floored at 1 ms rather than 0 so a
+        // connect that consumed the whole allowance still *attempts* the handshake and fails on its
+        // own deadline, instead of returning a timeout for work never started.
+        let remaining = opts
+            .connect_timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(1));
+        let mut client = tokio::time::timeout(remaining, Self::connect_over(stream, opts))
+            .await
+            .map_err(|_elapsed| EnipError::Timeout { op: "register" })??;
         client.peer_addr = peer_addr;
         Ok(client)
     }
@@ -715,6 +737,102 @@ mod tests {
             "the backstop must fire strictly after the deadline, not on it"
         );
         assert_eq!(client.stats().timeouts, 1, "the backstop is never silent");
+    }
+
+    /// **D-ENIP-25 / §5.5.** `connect_timeout` is one budget for the whole open, so a TCP connect
+    /// that is slow but *successful* leaves the RegisterSession handshake only the remainder —
+    /// never a fresh full allowance on top.
+    ///
+    /// Making the connect phase slow deterministically is the whole difficulty: a loopback TCP
+    /// handshake is instant, and nothing portable delays it. The lever used here is the resolver.
+    /// A target that is **not** a literal socket address (`localhost:<port>`, not `127.0.0.1:<port>`)
+    /// sends `TcpStream::connect` through `getaddrinfo` on tokio's blocking pool, so a runtime
+    /// built with exactly one blocking thread — already occupied by a sleeper — queues the lookup
+    /// behind it. The connect then genuinely takes `STALL` before succeeding against a listener
+    /// that accepts and never speaks EtherNet/IP, and the handshake is left to run out whatever is
+    /// left of `BUDGET`.
+    ///
+    /// Two budgets: `STALL + BUDGET` = 3000 ms. One budget: `BUDGET` = 2000 ms. `CEILING` sits
+    /// between them with 500 ms of slack either way. The margins are deliberately wide, because the
+    /// test shares a machine with the rest of the suite (the TLS tests mint certificates): `BUDGET`
+    /// must leave the resolver-plus-connect far more time than it needs once the stall releases, or
+    /// a loaded runner turns a scheduling delay into a *connect-phase* timeout that proves nothing —
+    /// which is why the accept is asserted before the elapsed time is.
+    #[test]
+    fn plaintext_connect_spends_one_budget_across_the_tcp_connect_and_the_handshake() {
+        const STALL: Duration = Duration::from_millis(1_000);
+        const BUDGET: Duration = Duration::from_millis(2_000);
+        const CEILING: Duration = Duration::from_millis(2_500);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            // Exactly one blocking thread, so the sleeper below owns the pool and the resolver
+            // queues behind it.
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // A plain TCP listener — it accepts and then says nothing. Not an EtherNet/IP peer
+            // (D-ENIP-14): the client is the only implementation on the socket.
+            //
+            // Bound by NAME, not by literal address, so it lands on whichever address `localhost`
+            // resolves to *first* — the same one `TcpStream::connect` will try first. Binding
+            // `127.0.0.1` on a host whose `localhost` leads with `::1` would leave the first
+            // attempt to fail, and how long that failure takes is a per-OS variable this test must
+            // not depend on.
+            let listener = tokio::net::TcpListener::bind("localhost:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = accepted.clone();
+            let server = tokio::spawn(async move {
+                // Hold the accepted stream for the rest of the test — dropping it would give the
+                // client an EOF (a framing error) instead of the silence under test.
+                if let Ok((stream, _)) = listener.accept().await {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                }
+            });
+
+            // Occupy the single blocking thread. The DNS lookup `TcpStream::connect` needs cannot
+            // start until this returns.
+            let sleeper = tokio::task::spawn_blocking(|| std::thread::sleep(STALL));
+
+            let opts = ClientOptions {
+                connect_timeout: BUDGET,
+                ..ClientOptions::default()
+            };
+            let started = std::time::Instant::now();
+            let result = EipClient::connect(&format!("localhost:{port}"), opts).await;
+            let elapsed = started.elapsed();
+
+            match result {
+                Err(EnipError::Timeout { .. }) => {}
+                Err(other) => {
+                    panic!("a peer that accepts and never answers must time out, got {other:?} after {elapsed:?}")
+                }
+                Ok(_client) => panic!("a peer that never answers must not yield a session"),
+            }
+            assert!(
+                accepted.load(std::sync::atomic::Ordering::SeqCst),
+                "the TCP connect must have SUCCEEDED — otherwise the timeout came from the connect \
+                 phase and says nothing about how the two phases share the budget \
+                 (elapsed {elapsed:?})"
+            );
+            assert!(
+                elapsed >= STALL,
+                "the connect phase really was delayed (elapsed {elapsed:?}, stall {STALL:?})"
+            );
+            assert!(
+                elapsed < CEILING,
+                "opening a session must cost ONE connect_timeout, not one per phase: \
+                 elapsed {elapsed:?} against a {BUDGET:?} budget after a {STALL:?} connect"
+            );
+
+            server.abort();
+            sleeper.await.unwrap();
+        });
     }
 
     #[test]

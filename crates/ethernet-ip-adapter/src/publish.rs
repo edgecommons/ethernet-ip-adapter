@@ -20,10 +20,15 @@
 //!   `always` publishes every sample; `onChange` compares against the last published value with the
 //!   configured deadband — none / absolute / percent, arrays "any element exceeds", non-numeric "any
 //!   change"). §4.4 / §6.2.
+//! * [`gate_passes`] — the same gate against the **committed ∪ pending** baseline pair (D-EIP-32):
+//!   `committed` is the last value whose publish was confirmed, `pending` the latest value gated in
+//!   but not yet confirmed. A value that matches either is suppressed; a confirmed publish promotes
+//!   `pending` to `committed` ([`Engine::settle`]), a failed one drops it so the same value gates in
+//!   again and is retried.
 //! * [`Batcher`] — the per-signal `batchMs` coalescing window (0 ⇒ publish per cycle; > 0 ⇒ buffer
 //!   and flush on window close, one `samples[]` per flush). §6.2.
-//! * [`SignalState`] — the per-signal running state (onChange baseline, staleness `last_good`, the
-//!   `sampleMs` floor `last_eligible`, and the batcher).
+//! * [`SignalState`] — the per-signal running state (the committed/pending onChange baselines,
+//!   staleness `last_good`, the `sampleMs` floor `last_eligible`, and the batcher).
 //! * [`is_stale`] / [`cycle_overran`] — the staleness and overrun predicates the engines account
 //!   against `staleSignalSecs` (§8.1) and the poll interval (§3.2).
 
@@ -163,6 +168,27 @@ pub(crate) fn should_publish(
     }
 }
 
+/// The gate a live signal is actually held to (D-EIP-32): [`should_publish`] against **both** halves
+/// of the baseline pair — the last *confirmed-published* value (`committed`) and the latest value
+/// gated in but not yet confirmed (`pending`).
+///
+/// A value that matches either half is suppressed. The `pending` half is what keeps intra-batch
+/// dedup correct when the poll interval is shorter than `batchMs` (an unchanged reading must not
+/// enqueue a second sample into the open window); the `committed` half is what makes a *failed*
+/// publish retryable — [`Engine::settle`] drops `pending` on failure, so the next occurrence of the
+/// same value is measured against the older committed value again and publishes.
+#[must_use]
+pub(crate) fn gate_passes(
+    st: &SignalState,
+    value: &Value,
+    quality: Quality,
+    mode: PublishMode,
+    deadband: &DeadbandSpec,
+) -> bool {
+    should_publish(st.committed.as_ref(), value, quality, mode, deadband)
+        && should_publish(st.pending.as_ref(), value, quality, mode, deadband)
+}
+
 /// Whether `new` differs from `prev` past the deadband. Arrays: differing length ⇒ changed; else "any
 /// element exceeds". Non-numeric (bool / string / type change) ⇒ any inequality.
 #[must_use]
@@ -262,15 +288,31 @@ impl Batcher {
         self.window_open
             .map(|t| t + Duration::from_millis(batch_ms))
     }
+
+    /// Throw the open window away, returning how many buffered samples were dropped. Used on
+    /// **pause** (§7.4, D-EIP-32): flushing at pause time would publish through an instance that is
+    /// deliberately quiet, and holding the window releases a stale burst on resume — so the window
+    /// is discarded.
+    pub(crate) fn discard(&mut self) -> usize {
+        self.window_open = None;
+        let dropped = self.buffer.len();
+        self.buffer.clear();
+        dropped
+    }
 }
 
-/// One signal's running publish state: the onChange baseline (last published value), the last GOOD
-/// read time (staleness), the last publish-eligible time (the push `sampleMs` floor), and the batch
+/// One signal's running publish state: the onChange baseline pair (D-EIP-32), the last GOOD read
+/// time (staleness), the last publish-eligible time (the push `sampleMs` floor), and the batch
 /// window.
 #[derive(Default)]
 pub(crate) struct SignalState {
-    /// Last published value — the onChange comparison baseline.
-    pub baseline: Option<Value>,
+    /// Last **confirmed-published** value — the durable half of the onChange baseline. It only ever
+    /// moves when a publish came back `Ok`.
+    pub committed: Option<Value>,
+    /// Latest value gated in but **not yet confirmed published** — in flight, or sitting in an open
+    /// `batchMs` window. It suppresses an equal follow-up (intra-batch dedup) while it lives, and is
+    /// either promoted into `committed` or dropped by [`Engine::settle`].
+    pub pending: Option<Value>,
     /// Last GOOD read (for staleness accounting, §8.1).
     pub last_good: Option<Instant>,
     /// Last publish-eligible time (the `sampleMs` floor gate; push only, §4.6).
@@ -320,6 +362,42 @@ impl Engine {
         out
     }
 
+    /// Settle one signal's in-flight baseline against the outcome of its publish (D-EIP-32).
+    ///
+    /// `published = true` (the facade confirmed the `SouthboundSignalUpdate`) **promotes** the
+    /// pending value into `committed` — that value is now the last published one, and an equal
+    /// follow-up is suppressed. `published = false` (the publish failed, or the id resolved to no
+    /// configured signal so nothing was sent) **drops** the pending value and leaves `committed`
+    /// untouched, so the next occurrence of the same value gates in again and is retried instead of
+    /// being suppressed against a value that never reached the bus.
+    ///
+    /// A signal with nothing pending (a flush of BAD samples only, or `publishMode: always`, which
+    /// never consults a baseline) is unaffected either way.
+    pub(crate) fn settle(&mut self, signal_id: &str, published: bool) {
+        if let Some(st) = self.state.get_mut(signal_id) {
+            if let Some(value) = st.pending.take() {
+                if published {
+                    st.committed = Some(value);
+                }
+            }
+        }
+    }
+
+    /// Discard every open batch window and the pending baselines those buffered samples carry,
+    /// returning how many samples were dropped. Used on **pause** (§7.4, D-EIP-32): the samples were
+    /// never published, so they must neither escape after the resume nor suppress anything later.
+    pub(crate) fn discard_open_batches(&mut self) -> u64 {
+        let mut dropped = 0u64;
+        for st in self.state.values_mut() {
+            let n = st.batcher.discard();
+            if n > 0 {
+                st.pending = None;
+                dropped = dropped.saturating_add(n as u64);
+            }
+        }
+        dropped
+    }
+
     /// Re-base the staleness clock for every tracked signal to `now`. Used on **resume** (§7.4.5,
     /// §9.3) so the paused span does not count a signal as stale — a paused signal is paused, not
     /// stale.
@@ -332,11 +410,13 @@ impl Engine {
     /// Re-base change-detection **and** staleness from a set of `(signal_id, value)` current readings.
     /// Used on **push resume** (§7.4.8) so the paused span's accumulated drift is not published as one
     /// giant "change" burst: each field's onChange baseline is set to its current value and its
-    /// staleness clock re-based to `now`.
+    /// staleness clock re-based to `now`. The pending half goes with it — pause discarded the open
+    /// windows, so nothing is in flight to promote (D-EIP-32).
     pub(crate) fn rebase_from(&mut self, readings: &[(String, Value)], now: Instant) {
         for (id, value) in readings {
             let st = self.state.entry(id.clone()).or_default();
-            st.baseline = Some(value.clone());
+            st.committed = Some(value.clone());
+            st.pending = None;
             st.last_good = Some(now);
         }
     }
@@ -771,18 +851,194 @@ mod tests {
         e.rebase_from(&[("a100/0/udint".into(), json!(7))], now);
         let st = e.state.get("a100/0/udint").expect("state seeded");
         assert_eq!(
-            st.baseline.as_ref(),
+            st.committed.as_ref(),
             Some(&json!(7)),
             "baseline set to the current value"
         );
+        assert!(
+            st.pending.is_none(),
+            "nothing is in flight across a pause — the windows were discarded"
+        );
         assert_eq!(st.last_good, Some(now), "staleness clock re-based to now");
         // The re-based baseline means the same value now suppresses under onChange.
-        assert!(!should_publish(
-            st.baseline.as_ref(),
+        assert!(!gate_passes(
+            st,
             &json!(7),
             Quality::Good,
             PublishMode::OnChange,
             &db(DeadbandKind::None, 0.0)
         ));
+    }
+
+    // ---- the committed ∪ pending baseline pair (D-EIP-32) ----
+
+    /// The gate holds a value against **both** halves: a value equal to the confirmed `committed`
+    /// value is suppressed, and so is one equal to the in-flight `pending` value — the latter is
+    /// what stops a second, unchanged reading from enqueuing a duplicate sample into an open
+    /// `batchMs` window.
+    #[test]
+    fn the_gate_suppresses_a_value_matching_either_half_of_the_baseline_pair() {
+        let none = db(DeadbandKind::None, 0.0);
+        let mut st = SignalState {
+            committed: Some(json!(10.0)),
+            ..SignalState::default()
+        };
+        assert!(
+            !gate_passes(
+                &st,
+                &json!(10.0),
+                Quality::Good,
+                PublishMode::OnChange,
+                &none
+            ),
+            "equal to the committed value ⇒ suppressed"
+        );
+        assert!(gate_passes(
+            &st,
+            &json!(11.0),
+            Quality::Good,
+            PublishMode::OnChange,
+            &none
+        ));
+
+        // 11.0 is now in flight (buffered, unconfirmed): an identical follow-up is suppressed…
+        st.pending = Some(json!(11.0));
+        assert!(
+            !gate_passes(
+                &st,
+                &json!(11.0),
+                Quality::Good,
+                PublishMode::OnChange,
+                &none
+            ),
+            "equal to the pending value ⇒ suppressed (intra-batch dedup)"
+        );
+        // …a value equal to the older committed one is suppressed too…
+        assert!(!gate_passes(
+            &st,
+            &json!(10.0),
+            Quality::Good,
+            PublishMode::OnChange,
+            &none
+        ));
+        // …and a newer, different value simply replaces the pending one.
+        assert!(gate_passes(
+            &st,
+            &json!(12.0),
+            Quality::Good,
+            PublishMode::OnChange,
+            &none
+        ));
+
+        // `always` never consults either half.
+        assert!(gate_passes(
+            &st,
+            &json!(11.0),
+            Quality::Good,
+            PublishMode::Always,
+            &none
+        ));
+        // A non-GOOD sample bypasses both halves as well (a failure is information).
+        assert!(gate_passes(
+            &st,
+            &json!(11.0),
+            Quality::Bad,
+            PublishMode::OnChange,
+            &none
+        ));
+    }
+
+    /// `settle` is the promote/retry rule: a confirmed publish moves `pending` into `committed`; a
+    /// failed one drops `pending` and leaves `committed` where it was, so the identical next value
+    /// gates in again instead of being suppressed against a value that never reached the bus.
+    #[test]
+    fn settle_promotes_on_success_and_drops_the_pending_value_on_failure() {
+        let none = db(DeadbandKind::None, 0.0);
+        let mut e = Engine::new(Instant::now());
+        e.state.entry("A".into()).or_default().pending = Some(json!(1.0));
+
+        e.settle("A", true);
+        let st = e.state.get("A").expect("state seeded");
+        assert_eq!(st.committed.as_ref(), Some(&json!(1.0)), "promoted");
+        assert!(st.pending.is_none());
+        assert!(!gate_passes(
+            st,
+            &json!(1.0),
+            Quality::Good,
+            PublishMode::OnChange,
+            &none
+        ));
+
+        // A second value is gated in and its publish fails.
+        e.state.entry("A".into()).or_default().pending = Some(json!(2.0));
+        e.settle("A", false);
+        let st = e.state.get("A").expect("state seeded");
+        assert_eq!(
+            st.committed.as_ref(),
+            Some(&json!(1.0)),
+            "a failed publish never advances the committed baseline"
+        );
+        assert!(st.pending.is_none(), "the in-flight value is dropped");
+        assert!(
+            gate_passes(st, &json!(2.0), Quality::Good, PublishMode::OnChange, &none),
+            "so the identical next reading gates in again and is retried"
+        );
+
+        // Settling a signal with nothing pending (a BAD-only flush) is a no-op, and an unknown id
+        // is ignored rather than seeding phantom state.
+        e.settle("A", true);
+        assert_eq!(
+            e.state.get("A").and_then(|s| s.committed.clone()),
+            Some(json!(1.0))
+        );
+        e.settle("nope", true);
+        assert!(!e.state.contains_key("nope"));
+    }
+
+    /// `discard_open_batches` (pause, §7.4) throws the buffered samples away AND clears the pending
+    /// baselines they carried — they were never published, so they must neither escape after the
+    /// resume nor suppress anything later. A signal with no open window keeps its committed value.
+    #[test]
+    fn discard_open_batches_drops_buffered_samples_and_their_pending_baselines() {
+        let t0 = Instant::now();
+        let mut e = Engine::new(t0);
+        {
+            let st = e.state.entry("A".into()).or_default();
+            st.committed = Some(json!(1.0));
+            st.pending = Some(json!(2.0));
+            st.batcher.add(
+                sample_of(json!(2.0), Quality::Good, None, Some("t".into())),
+                t0,
+                100,
+            );
+            st.batcher.add(
+                sample_of(json!(2.0), Quality::Good, None, Some("t".into())),
+                t0,
+                100,
+            );
+        }
+        // B published cleanly before the pause — nothing buffered, nothing pending.
+        e.state.entry("B".into()).or_default().committed = Some(json!(9.0));
+
+        assert_eq!(e.discard_open_batches(), 2, "both buffered samples dropped");
+        assert!(
+            e.next_batch_deadline(100).is_none(),
+            "no window survives the pause"
+        );
+        assert!(
+            e.take_due(100, t0 + Duration::from_secs(60)).is_empty(),
+            "and nothing flushes once the window's old deadline passes"
+        );
+        let a = e.state.get("A").expect("A tracked");
+        assert!(a.pending.is_none(), "the unpublished pending value is gone");
+        assert_eq!(
+            a.committed.as_ref(),
+            Some(&json!(1.0)),
+            "the last genuinely published value is untouched"
+        );
+        assert_eq!(
+            e.state.get("B").and_then(|s| s.committed.clone()),
+            Some(json!(9.0))
+        );
     }
 }

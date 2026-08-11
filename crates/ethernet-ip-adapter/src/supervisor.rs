@@ -268,6 +268,12 @@ impl DeviceLauncher for RuntimeLauncher {
             );
         }
 
+        // Accepted-but-experimental signals are warned on every launch too, so a reload says it
+        // exactly as startup does (§4.4, D-EIP-16). One line per offending signal.
+        for (signal, reason) in cfg.experimental_signal_warnings() {
+            tracing::warn!(instance = %cfg.id, signal = %signal, "{reason}");
+        }
+
         let cancel = self.root.child_token();
 
         // One control channel per device. The command inbox cannot touch the session directly —

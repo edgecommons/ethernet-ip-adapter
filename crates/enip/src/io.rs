@@ -16,7 +16,10 @@
 //!   originator watchdog (`timeout_multiplier × T2O_API`, D-ENIP-8). It takes an explicit `now`, so
 //!   the whole gauntlet, produce cadence, and watchdog are testable with crafted bytes and a paused
 //!   clock — **no socket, no peer** (§12.2).
-//! * [`IoManager`] — the thin UDP socket task: recv → route by connection id → drive
+//! * [`IoManager`] — the thin UDP socket task: recv → route by connection id → **check the
+//!   datagram's source IP against the connection's target** (D-ENIP-24: a mismatch is a counted
+//!   `source_mismatch_datagrams` drop that never reaches the gauntlet and never feeds the watchdog)
+//!   → drive
 //!   [`IoConnection::consume`]; and a scheduler tick that drives [`IoConnection::poll_produce`] /
 //!   [`IoConnection::poll_watchdog`]. It exposes [`IoConnectionHandle`] (`events`, `set_output`,
 //!   `stage_output`, `stage_output_by`, `set_run`, `stats`, `close`). Commands that can fail inside
@@ -365,6 +368,9 @@ pub enum DropReason {
     Malformed,
     /// The sequenced-address connection id matched no live connection.
     UnknownConnection,
+    /// The datagram's source IP was not the connection's target (D-ENIP-24). Dropped before the
+    /// consume gauntlet, so it neither delivers a sample nor feeds the connection's watchdog.
+    SourceMismatch,
     /// The stripped data length did not match the negotiated T→O size (or the frame was a runt).
     SizeMismatch,
     /// The class-1 sequence was a duplicate, stale, or reordered frame (signed-window rule).
@@ -392,6 +398,7 @@ struct ManagerCounters {
     malformed_frames: AtomicU64,
     unknown_connection: AtomicU64,
     recv_errors: AtomicU64,
+    source_mismatch_datagrams: AtomicU64,
 }
 
 /// A snapshot of a connection's peer-driven counters (§10.2). The adapter alarms on these without
@@ -421,6 +428,12 @@ pub struct IoStats {
     pub malformed_frames: u64,
     /// Datagrams whose connection id matched no live connection (manager-wide).
     pub unknown_connection: u64,
+    /// Datagrams addressed to a live connection but sourced from an IP that is not that
+    /// connection's target (manager-wide, D-ENIP-24). They are dropped before the consume gauntlet,
+    /// so they deliver nothing and do not feed the watchdog. Nonzero means either something else on
+    /// the segment is producing into our connection id, or the target is genuinely sourcing its
+    /// T→O stream from a second interface — the latter shows up as a link that never comes up.
+    pub source_mismatch_datagrams: u64,
     /// O→T sockaddr redirects whose foreign address was refused at ForwardOpen (D-ENIP-17); 0 or 1
     /// per connection. Nonzero means the target asked for its outputs on an address we will not
     /// transmit to: only the sockaddr's **port** was honoured, and a device that genuinely requires
@@ -442,6 +455,7 @@ impl ConnCounters {
             recv_errors: 0,
             malformed_frames: 0,
             unknown_connection: 0,
+            source_mismatch_datagrams: 0,
             refused_redirects: self.refused_redirects.load(Ordering::Relaxed),
         }
     }
@@ -796,6 +810,14 @@ pub struct IoConnectionParams {
     pub t2o_fixed: bool,
     /// Where O→T datagrams are sent (target :2222, or the O→T sockaddr redirect).
     pub tx_endpoint: SocketAddr,
+    /// The **only** source IP whose datagrams this connection accepts (D-ENIP-24) — the target's
+    /// own address, the one the TCP session was opened to. A T→O datagram from anywhere else is
+    /// dropped and counted before the consume gauntlet, whether the stream is unicast or multicast
+    /// (a multicast T→O frame still carries the producing device's unicast source IP).
+    ///
+    /// The source **port** is deliberately not part of this: a target's producing port is
+    /// legitimately ephemeral.
+    pub expected_source_ip: IpAddr,
     /// The T→O multicast group to join, when the reply carried a multicast T→O sockaddr.
     pub multicast_group: Option<Ipv4Addr>,
 }
@@ -859,6 +881,12 @@ impl IoConnection {
     #[must_use]
     pub fn tx_endpoint(&self) -> SocketAddr {
         self.params.tx_endpoint
+    }
+
+    /// The only source IP whose T→O datagrams this connection accepts (D-ENIP-24).
+    #[must_use]
+    pub fn expected_source_ip(&self) -> IpAddr {
+        self.params.expected_source_ip
     }
 
     /// The T→O multicast group to join, if any.
@@ -1145,9 +1173,10 @@ pub enum ConsumeOutcome {
 // ---------------------------------------------------------------------------
 
 /// The routing table the manager task drives: CPF-decode a datagram, look the connection up by its
-/// sequenced-address connection id, and hand the connected-data payload to that connection's
-/// [`IoConnection::consume`]. CPF-level drops (malformed shape, unknown id) are counted here; the
-/// per-connection drops are counted inside `consume`.
+/// sequenced-address connection id, check the datagram's source against that connection's target,
+/// and hand the connected-data payload to that connection's [`IoConnection::consume`]. Datagram-level
+/// drops (malformed shape, unknown id, source mismatch) are counted here; the per-connection drops
+/// are counted inside `consume`.
 struct Registry {
     conns: HashMap<u32, IoConnection>,
     stats: Arc<ManagerCounters>,
@@ -1174,9 +1203,9 @@ impl Registry {
         }
     }
 
-    /// Decode `buf` as a class-1 datagram and route it to its connection (§8.6). Every failure is a
-    /// counted, typed drop — never a panic, whatever bytes arrive.
-    fn consume_datagram(&mut self, buf: &[u8], now: Instant) -> Routed {
+    /// Decode `buf` as a class-1 datagram, received from `src_ip`, and route it to its connection
+    /// (§8.6). Every failure is a counted, typed drop — never a panic, whatever bytes arrive.
+    fn consume_datagram(&mut self, buf: &[u8], src_ip: IpAddr, now: Instant) -> Routed {
         let cpf = match Cpf::decode(buf) {
             Ok(cpf) => cpf,
             Err(_) => {
@@ -1216,6 +1245,29 @@ impl Registry {
                 reason: DropReason::UnknownConnection,
             };
         };
+        // Source filter (D-ENIP-24), between the routing lookup and the consume gauntlet. The
+        // connection id is a routing key, not an authenticator: it travels in cleartext in every
+        // frame, so anything on the segment can address a live connection with it — and an accepted
+        // frame both delivers a sample and refreshes the watchdog, which is what makes a spoofed
+        // stream able to hold a dead link "up". The target's IP is the one fact we already know
+        // independently of the datagram (it is where the TCP session was opened), so it gates the
+        // frame *before* it can touch any connection state. The port is not checked: a target's
+        // producing port is legitimately ephemeral.
+        //
+        // Honestly scoped: this is OpENer-style hygiene ("coming from the originator") and defence
+        // in depth, not an integrity control. Plaintext class-1 has no integrity by design, so an
+        // on-segment attacker that can also spoof the target's source address still gets through —
+        // CIP Security/DTLS is the real control. What it does buy is that a stray or misdirected
+        // producer, and any off-path sender, can no longer inject samples or keep the watchdog fed.
+        if src_ip != conn.expected_source_ip() {
+            self.stats
+                .source_mismatch_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+            return Routed::Dropped {
+                connection_id: Some(addr.connection_id),
+                reason: DropReason::SourceMismatch,
+            };
+        }
         match conn.consume(&data_item.data, addr.encap_sequence, now) {
             ConsumeOutcome::Accepted { first, update } => Routed::Accepted {
                 connection_id: addr.connection_id,
@@ -1467,6 +1519,12 @@ impl IoManager {
             o2t_fixed: matches!(spec.o2t.variable, VariableLength::Fixed),
             t2o_fixed: matches!(spec.t2o.variable, VariableLength::Fixed),
             tx_endpoint,
+            // The transmit endpoint's ADDRESS is the target's by construction — `resolve_tx_endpoint`
+            // fails when the session has no known target address and refuses any redirect that names
+            // a different one (D-ENIP-17), so its address half is exactly `session.target_ip()`. That
+            // makes it the receive-side filter (D-ENIP-24) without a second, separately-derivable
+            // notion of "the target" that could drift from the one we transmit to.
+            expected_source_ip: tx_endpoint.ip(),
             multicast_group,
         };
         let conn = IoConnection::new(params, Instant::now());
@@ -1695,6 +1753,10 @@ impl IoConnectionHandle {
             .unknown_connection
             .load(Ordering::Relaxed);
         s.recv_errors = self.manager_stats.recv_errors.load(Ordering::Relaxed);
+        s.source_mismatch_datagrams = self
+            .manager_stats
+            .source_mismatch_datagrams
+            .load(Ordering::Relaxed);
         s
     }
 
@@ -1953,11 +2015,11 @@ async fn manager_task(
             }
             recv = socket.recv_from(&mut buf) => {
                 match recv {
-                    Ok((n, _src)) => {
+                    Ok((n, src)) => {
                         recv_policy.on_recv_ok();
                         let now = Instant::now();
                         if let Some(slice) = buf.get(..n) {
-                            match registry.consume_datagram(slice, now) {
+                            match registry.consume_datagram(slice, src.ip(), now) {
                                 Routed::Accepted { connection_id, first, update } => {
                                     deliver(&registry, &events, connection_id, first, update);
                                 }
@@ -2112,10 +2174,18 @@ mod tests {
             t2o_data_size: 8,
             o2t_fixed: true,
             t2o_fixed: true,
-            tx_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), IO_UDP_PORT),
+            tx_endpoint: SocketAddr::new(TARGET_IP, IO_UDP_PORT),
+            expected_source_ip: TARGET_IP,
             multicast_group: None,
         }
     }
+
+    /// The target address every in-module fixture connection is opened against — its transmit
+    /// destination and, by D-ENIP-24, the only source its T→O datagrams may carry.
+    const TARGET_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+
+    /// A source IP that is **not** the fixture target: the spoofer / stray producer.
+    const FOREIGN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
 
     /// A T→O connected-data payload with the given class-1 sequence and `data`, modeless (no header).
     fn modeless_payload(seq: u16, data: &[u8]) -> Vec<u8> {
@@ -2310,7 +2380,7 @@ mod tests {
         // Unknown connection id 0xDEADBEEF.
         let unknown = datagram(0xDEAD_BEEF, 1, &modeless_payload(1, &[0u8; 8]));
         assert!(matches!(
-            registry.consume_datagram(&unknown, now),
+            registry.consume_datagram(&unknown, TARGET_IP, now),
             Routed::Dropped {
                 reason: DropReason::UnknownConnection,
                 ..
@@ -2320,7 +2390,7 @@ mod tests {
 
         // Malformed CPF (garbage bytes that are not a valid item list).
         assert!(matches!(
-            registry.consume_datagram(&[0xFF, 0xFF, 0xFF], now),
+            registry.consume_datagram(&[0xFF, 0xFF, 0xFF], TARGET_IP, now),
             Routed::Dropped {
                 reason: DropReason::Malformed,
                 ..
@@ -2331,9 +2401,92 @@ mod tests {
         // The known connection still accepts a valid datagram after the drops.
         let good = datagram(cid, 1, &modeless_payload(1, &[0u8; 8]));
         assert!(matches!(
-            registry.consume_datagram(&good, now),
+            registry.consume_datagram(&good, TARGET_IP, now),
             Routed::Accepted { first: true, .. }
         ));
+    }
+
+    /// **D-ENIP-24, at the routing layer.** A datagram that is perfect in every other respect —
+    /// well-formed CPF, the live connection's id, the next sequence — is dropped and counted when
+    /// its source IP is not the connection's target, and it reaches the consume gauntlet not at
+    /// all: no sample, no sequence acceptance, and (the load-bearing half) **no watchdog refresh**,
+    /// so a spoofed stream cannot hold a dead link up.
+    #[tokio::test]
+    async fn a_datagram_from_a_foreign_source_is_dropped_counted_and_never_consumed() {
+        let now = Instant::now();
+        let stats = Arc::new(ManagerCounters::default());
+        let mut registry = Registry::new(stats.clone());
+        let conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
+        let cid = conn.connection_id();
+        let armed_deadline = conn.watchdog_deadline;
+        registry.conns.insert(cid, conn);
+
+        let frame = datagram(cid, 1, &modeless_payload(1, &[0u8; 8]));
+        // Later than `now`, so a refresh would be observable as a moved deadline.
+        let later = now
+            .checked_add(Duration::from_millis(50))
+            .expect("instant in range");
+        assert!(matches!(
+            registry.consume_datagram(&frame, FOREIGN_IP, later),
+            Routed::Dropped {
+                reason: DropReason::SourceMismatch,
+                connection_id: Some(id),
+            } if id == cid
+        ));
+        assert_eq!(stats.source_mismatch_datagrams.load(Ordering::Relaxed), 1);
+        // Not counted as anything else, and nothing reached `consume`.
+        assert_eq!(stats.malformed_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unknown_connection.load(Ordering::Relaxed), 0);
+        let conn = registry.conns.get(&cid).expect("connection still live");
+        assert_eq!(conn.stats().frames_accepted, 0);
+        assert_eq!(conn.stats().stale_frames, 0);
+        assert_eq!(conn.stats().size_mismatch, 0);
+        assert_eq!(
+            conn.watchdog_deadline, armed_deadline,
+            "a refused datagram must not feed the watchdog"
+        );
+
+        // The very same bytes from the target are accepted — the filter is on the source alone.
+        assert!(matches!(
+            registry.consume_datagram(&frame, TARGET_IP, later),
+            Routed::Accepted { first: true, .. }
+        ));
+        assert_eq!(stats.source_mismatch_datagrams.load(Ordering::Relaxed), 1);
+        let conn = registry.conns.get(&cid).expect("connection still live");
+        assert!(
+            conn.watchdog_deadline > armed_deadline,
+            "an accepted datagram does feed the watchdog"
+        );
+    }
+
+    /// **D-ENIP-24, port independence.** A target's producing port is legitimately ephemeral, so
+    /// only the IP is compared: the same source address on a different port is still accepted.
+    #[tokio::test]
+    async fn the_source_filter_compares_the_ip_and_not_the_port() {
+        let now = Instant::now();
+        let stats = Arc::new(ManagerCounters::default());
+        let mut registry = Registry::new(stats.clone());
+        let conn = IoConnection::new(
+            params(RealTimeFormat::Heartbeat, RealTimeFormat::Modeless),
+            now,
+        );
+        let cid = conn.connection_id();
+        // The connection transmits to the target on IO_UDP_PORT; the datagram below arrives from
+        // the same address on an ephemeral one.
+        assert_eq!(conn.tx_endpoint().port(), IO_UDP_PORT);
+        assert_eq!(conn.expected_source_ip(), TARGET_IP);
+        registry.conns.insert(cid, conn);
+
+        let ephemeral = SocketAddr::new(TARGET_IP, 51_234);
+        let frame = datagram(cid, 1, &modeless_payload(1, &[0u8; 8]));
+        assert!(matches!(
+            registry.consume_datagram(&frame, ephemeral.ip(), now),
+            Routed::Accepted { first: true, .. }
+        ));
+        assert_eq!(stats.source_mismatch_datagrams.load(Ordering::Relaxed), 0);
     }
 
     // -- watchdog (D-ENIP-8), paused clock ---------------------------------
@@ -3381,6 +3534,13 @@ mod tests {
             self
         }
 
+        /// The same fixture, reporting `ip` as the target address — which is both the O→T transmit
+        /// destination and, by D-ENIP-24, the only source its T→O datagrams may carry.
+        fn with_target_ip(mut self, ip: IpAddr) -> Self {
+            self.target_ip = Some(ip);
+            self
+        }
+
         /// The same fixture, answering with the given O→T sockaddr redirect.
         fn with_o2t_sock(mut self, sock: SockAddrInfo) -> Self {
             self.o2t_sock = Some(sock);
@@ -3794,6 +3954,77 @@ mod tests {
         let stats = handle.stats();
         assert!(stats.frames_accepted >= 1, "consume path: {stats:?}");
         assert!(stats.frames_produced >= 1, "produce path: {stats:?}");
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-24, through the real select loop over loopback UDP.** The manager routes by
+    /// connection id, and an accepted frame both delivers a sample and refreshes the watchdog — so
+    /// a sender that merely knows the id could keep a link that has actually stopped producing
+    /// looking healthy forever. With the source filter, a datagram whose source IP is not the
+    /// connection's target is dropped at the routing layer: nothing is delivered, the drop is
+    /// counted on `source_mismatch_datagrams`, and the watchdog runs out **while the spoofed stream
+    /// is still arriving**.
+    ///
+    /// The mismatch is arranged by giving the fixture a target address the loopback peer cannot
+    /// have (TEST-NET-1, RFC 5737) rather than by sourcing from a second loopback alias, which is
+    /// not portable. The reply's O→T API is 5 s so the produce scheduler never ticks inside the
+    /// test and never tries to reach that unroutable address; the T→O API is 30 ms, so the ×16
+    /// watchdog is 480 ms.
+    #[tokio::test]
+    async fn a_spoofed_source_is_dropped_counted_and_never_feeds_the_watchdog() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let elsewhere = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let fixture = FoFixture::new(None, 5_000_000, 30_000).with_target_ip(elsewhere);
+        let mut handle = mgr.forward_open(&fixture, sample_spec()).await.unwrap();
+        let cid = handle.connection_id();
+
+        // Keep a well-formed, correctly-addressed, sequence-advancing stream arriving from the
+        // WRONG source for longer than the watchdog window. If any of it were accepted the
+        // watchdog would be refreshed on every frame and `Lost` could never fire.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut seq: u16 = 0;
+        let mut lost = None;
+        while lost.is_none() && Instant::now() < deadline {
+            seq = seq.wrapping_add(1);
+            peer.send_to(
+                &datagram(cid, u32::from(seq), &modeless_payload(seq, &[0u8; 8])),
+                mgr.local_addr(),
+            )
+            .await
+            .unwrap();
+            match tokio::time::timeout(Duration::from_millis(20), handle.events().recv()).await {
+                Ok(Some(IoEvent::Lost { reason })) => lost = Some(reason),
+                Ok(other) => panic!(
+                    "a datagram from {} must never be delivered on a connection whose target is \
+                     {elsewhere}; got {other:?}",
+                    peer.local_addr().unwrap()
+                ),
+                // Nothing delivered in this slice — the expected steady state. Send another.
+                Err(_elapsed) => {}
+            }
+        }
+
+        assert_eq!(
+            lost,
+            Some(LostReason::Timeout),
+            "the watchdog must expire even though frames kept arriving ({seq} sent)"
+        );
+        let stats = handle.stats();
+        assert!(
+            // All but (at most) the last: the datagram sent in the same slice as the `Lost` may
+            // still be in flight when the counters are read.
+            stats.source_mismatch_datagrams >= u64::from(seq).saturating_sub(1),
+            "every refused datagram is counted: {stats:?} after {seq} sent"
+        );
+        assert!(stats.source_mismatch_datagrams > 0, "{stats:?}");
+        assert_eq!(stats.frames_accepted, 0, "nothing was consumed: {stats:?}");
+        assert_eq!(stats.stale_frames, 0, "nothing reached the sequence window");
+        assert_eq!(stats.size_mismatch, 0, "nothing reached the size check");
+        assert_eq!(
+            stats.unknown_connection, 0,
+            "the id DID match a live connection — the source is what refused it"
+        );
         mgr.shutdown().await;
     }
 

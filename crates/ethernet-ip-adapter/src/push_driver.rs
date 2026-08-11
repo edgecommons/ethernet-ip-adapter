@@ -123,7 +123,8 @@ pub(crate) async fn consume_push(
 
     loop {
         // Frames arrive on the channel; we also wake for the next batch close and the health tick.
-        // While paused, batches don't accrue (nothing is published), so only the health tick matters.
+        // While paused, batches don't accrue (nothing is published) and the windows open at the
+        // moment of the pause were discarded (D-EIP-32), so only the health tick matters.
         let mut wake = since_health + metrics_interval;
         if !paused {
             if let Some(bd) = engine.next_batch_deadline(batch_ms) {
@@ -182,6 +183,14 @@ pub(crate) async fn consume_push(
                     DeviceControl::Pause { by, reply } => {
                         let changed =
                             apply_pause(cfg, health, dm, events, true, by.as_deref()).await;
+                        // Open `batchMs` windows are DISCARDED, not held (§7.4, D-EIP-32). Holding
+                        // them would land a pre-pause burst AFTER the §7.4.8 resume rebase, making
+                        // a stale value the last published one while the rebased current value is
+                        // suppressed — a wrong last-known value downstream.
+                        let dropped = engine.discard_open_batches();
+                        if dropped > 0 {
+                            tracing::info!(instance = %cfg.id, dropped, "paused with open batch windows; buffered samples discarded");
+                        }
                         paused = true;
                         let _ = reply.send(changed);
                     }
@@ -288,7 +297,7 @@ pub(crate) async fn consume_push(
                             &server_ts,
                             health,
                         ) {
-                            publish_field(
+                            let published = publish_field(
                                 sink,
                                 cfg,
                                 adapter,
@@ -302,6 +311,9 @@ pub(crate) async fn consume_push(
                                 false,
                             )
                             .await;
+                            // Promote the field's pending baseline only once the publish resolved;
+                            // a failure drops it so the value is retried (D-EIP-32).
+                            engine.settle(&p.signal_id, published);
                         }
                     }
                 }
@@ -331,7 +343,7 @@ pub(crate) async fn consume_push(
         if !paused {
             for p in engine.take_due(batch_ms, now.into_std()) {
                 // A coalescing-window flush (§8.5 batchFlushes/batchSize).
-                publish_field(
+                let published = publish_field(
                     sink,
                     cfg,
                     adapter,
@@ -345,6 +357,7 @@ pub(crate) async fn consume_push(
                     true,
                 )
                 .await;
+                engine.settle(&p.signal_id, published);
             }
         }
         if now.saturating_duration_since(since_health) >= metrics_interval {
@@ -388,6 +401,11 @@ pub(crate) async fn consume_push(
 
 /// Resolve a stable id to its input field and publish its samples (§6.1) — the push analog of the
 /// poll `publish_by_id`, using the field's `a<inst>/<off>/<type>` id + assembly address (§5.2).
+///
+/// Returns whether the samples reached the bus, which is what
+/// [`crate::publish::Engine::settle`] needs to promote or drop the field's pending baseline
+/// (D-EIP-32). A frame field with no configured layout entry publishes nothing, so it reports
+/// `false`: nothing was published, so nothing may become a suppression baseline.
 #[allow(clippy::too_many_arguments)]
 async fn publish_field(
     sink: &dyn Publisher,
@@ -401,9 +419,9 @@ async fn publish_field(
     dm: &DeviceMetrics,
     publish_mode: &'static str,
     from_batch: bool,
-) {
+) -> bool {
     let Some(field) = fields.get(signal_id) else {
-        return;
+        return false;
     };
     let n = samples.len() as u64;
     let (res, latency) = publish::publish_via(
@@ -427,10 +445,12 @@ async fn publish_field(
                 .publish_latency_ms
                 .store(latency_ms, Ordering::Relaxed);
             dm.record_publish(publish_mode, n, from_batch, latency_ms, true);
+            true
         }
         Err(e) => {
             tracing::warn!(instance = %cfg.id, signal_id = %field.signal_id(assembly), error = %e, "publish failed");
             dm.record_publish(publish_mode, n, from_batch, latency_ms, false);
+            false
         }
     }
 }
@@ -754,6 +774,96 @@ mod tests {
              the real change publishes"
         );
         assert_eq!(published[0].samples[0].value, Some(json!(9)));
+    }
+
+    /// §7.4 / D-EIP-32, the sharp edge of the pause rule on push: an open `batchMs` window held
+    /// across a pause would flush **after** the §7.4.8 resume rebase, making a stale pre-pause value
+    /// the last published one while the rebased current value is suppressed — a wrong last-known
+    /// value downstream. Pause discards the window, so the rebase cannot be masked.
+    #[tokio::test(start_paused = true)]
+    async fn pause_discards_the_open_window_so_no_stale_value_lands_after_the_resume_rebase() {
+        let mut rig = PushRig::new(
+            io_device(json!({ "defaults": { "batchMs": 200 } })),
+            global(json!({})),
+        );
+        // The device sits at 9 by the time the operator resumes; 7 is what was buffered when the
+        // pause arrived.
+        rig.push.set_snapshot(Some(InputSnapshot {
+            readings: vec![reading(FIELD_ID, json!(9), Quality::Good)],
+            received_at: std::time::Instant::now(),
+            run_mode: true,
+        }));
+        rig.frame_after(Duration::from_millis(10), frame(7, 1));
+        let (p_tx, p_rx) = oneshot::channel();
+        rig.send_after(
+            Duration::from_millis(20),
+            DeviceControl::Pause {
+                by: None,
+                reply: p_tx,
+            },
+        );
+        let (r_tx, r_rx) = oneshot::channel();
+        rig.send_after(
+            Duration::from_millis(30),
+            DeviceControl::Resume { reply: r_tx },
+        );
+        // The current value right after the resume, then a real change.
+        rig.frame_after(Duration::from_millis(40), frame(9, 2));
+        rig.frame_after(Duration::from_millis(250), frame(11, 3));
+        // Past both the discarded window's old deadline (210) and the new one's (450).
+        rig.cancel_after(Duration::from_millis(500));
+
+        rig.run().await;
+
+        assert!(p_rx.await.unwrap() && r_rx.await.unwrap());
+        let updates = rig.sink.updates();
+        assert!(
+            updates
+                .iter()
+                .all(|u| u.samples.iter().all(|s| s.value != Some(json!(7)))),
+            "the pre-pause value never escapes — it would otherwise land after the rebase and \
+             become the last published value while the device reads 9"
+        );
+        assert_eq!(
+            updates.len(),
+            1,
+            "the post-resume frame equal to the rebased baseline is suppressed; only the real \
+             change publishes"
+        );
+        assert_eq!(updates[0].samples[0].value, Some(json!(11)));
+    }
+
+    /// D-EIP-32 on the push path: a failed publish leaves the onChange baseline where it was, so
+    /// the identical next frame is republished instead of being suppressed for the rest of the
+    /// session. On Greengrass the awaited IPC error is the ordinary failure mode, which is what
+    /// makes this the P1 half of the defect.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publish_is_retried_on_the_next_identical_frame() {
+        let mut rig = PushRig::simple();
+        rig.sink.push_result(true);
+        rig.sink.push_result(false);
+        rig.sink.push_result(true);
+        rig.frame_after(Duration::from_millis(10), frame(1, 1));
+        rig.frame_after(Duration::from_millis(20), frame(2, 2));
+        rig.frame_after(Duration::from_millis(30), frame(2, 3));
+        rig.frame_after(Duration::from_millis(40), frame(2, 4));
+        rig.cancel_after(Duration::from_millis(100));
+
+        rig.run().await;
+
+        let values: Vec<_> = rig
+            .sink
+            .updates()
+            .iter()
+            .map(|u| u.samples[0].value.clone())
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some(json!(1)), Some(json!(2)), Some(json!(2))],
+            "the frame whose publish failed is republished on its next occurrence; the fourth \
+             frame, unchanged against a value that DID reach the bus, is suppressed"
+        );
+        assert_eq!(rig.health.signals_published.load(Ordering::Relaxed), 2);
     }
 
     /// D-ENIP-17: a refused O→T redirect warns **once per ForwardOpen** (the latch), not on every

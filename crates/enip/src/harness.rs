@@ -184,6 +184,7 @@ fn sample_io_params() -> IoConnectionParams {
         o2t_fixed: false,
         t2o_fixed: false,
         tx_endpoint: endpoint,
+        expected_source_ip: endpoint.ip(),
         multicast_group: None,
     }
 }

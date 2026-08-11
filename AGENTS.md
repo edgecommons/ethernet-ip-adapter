@@ -43,8 +43,13 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
 - **Signals are declared explicitly** in poll groups (Modbus-style, not OPC UA regex matching);
   `sb/browse` is on-demand CIP tag discovery. `signal.id` = the configured `tagPath` verbatim;
   the `data` topic channel = the config `name` (lower-kebab).
-- **Supported value types**: CIP elementary scalars + 1-D arrays thereof. `string`/UDT/multi-dim are
-  rejected at config validation (D-EIP-16).
+- **Supported value types**: CIP elementary scalars + 1-D arrays thereof, `arrayCount` bounded to
+  `1..=65535`. `string`/UDT/multi-dim are rejected at config validation; `bool` + `arrayCount` is
+  **accepted and warned as EXPERIMENTAL** — byte-per-element encoding, unvalidated on hardware, and
+  expected BAD on Logix (DWORD packing, 1756-PM020, deferred to hardware). The adapter has no
+  device-family detection, so the label is global to the feature (D-EIP-16). Cardinality is enforced,
+  never clamped: a reply whose element count is not the configured one is a BAD sample, and an
+  out-of-bound `arrayCount` in an `sb/read`/`sb/write` ref is `BAD_ARGS` (D-EIP-33).
 - **Writes are allow-listed, secure-by-default**: empty `writes.allow[]` ⇒ all writes refused,
   matched on the stable `signal.id` (D-EIP-5).
 - **`sb/pause`/`sb/resume` are a deliberate southbound-contract extension** (D-EIP-3), a candidate

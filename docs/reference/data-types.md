@@ -28,8 +28,18 @@ at config-parse time, and `sb/browse` marks such tags `supported: false`.
 ## Arrays
 
 `arrayCount: N` reads (or writes) a **1-D array** of `N` elements of the signal's `type`; the value is a
-JSON array. A write must supply exactly `N` elements — a wrong length is rejected. Multi-dimensional
-arrays are not supported.
+JSON array. `N` is an integer from **1 to 65535** (the CIP Read Tag element count is a 16-bit field); a
+value outside that range is a configuration error, and in an `sb/read`/`sb/write` explicit signal ref it
+is a `BAD_ARGS` refusal. A write must supply exactly `N` elements — a wrong length is rejected. A read
+must come back with exactly `N` elements: a reply carrying a different number is a `BAD` sample whose
+`qualityRaw` names the expected and received counts, never a shorter array published as `GOOD`.
+Multi-dimensional arrays are not supported.
+
+**BOOL array signals are experimental.** The adapter encodes them byte-per-element; Logix controllers
+implement BOOL arrays as packed `DWORD`s, so BOOL-array reads from ControlLogix/CompactLogix report
+`BAD`, with the reason in `qualityRaw`. Each such signal logs a warning at startup. Scalar `bool` signals
+and `bool` array **fields of a push assembly** are not affected — a push layout is a byte map you
+declare, not Logix tag storage.
 
 ## Scale & offset
 
@@ -57,7 +67,7 @@ Every sample carries a normalized `quality` plus `qualityRaw` (the native detail
 | `quality` | When |
 |-----------|------|
 | `GOOD` | A successful read/decode. |
-| `BAD` | A read failure, or a wire type that does not match the configured `type` (`qualityRaw` = `DECODE type mismatch …`). Poll: also `NO_DATA`/`UNRESOLVED_REF` on `sb/read`; push: `NO_FRAME` when no frame has arrived. |
+| `BAD` | A read failure, a wire type that does not match the configured `type` (`qualityRaw` = `DECODE type mismatch …`), or a reply carrying a different number of elements than the read asked for (`qualityRaw` = `DECODE element count mismatch (expected N, got M)`). Poll: also `NO_DATA`/`UNRESOLVED_REF` on `sb/read`; push: `NO_FRAME` when no frame has arrived. |
 | `UNCERTAIN` | A value that goes non-finite (`NaN`/`inf`) after `scale`/`offset` — `qualityRaw` = `NON_FINITE_AFTER_SCALE`, value `null`. For an array, any non-finite element makes the whole reading UNCERTAIN. |
 
 A non-GOOD sample always publishes (a failure is information); it is never suppressed by the deadband.

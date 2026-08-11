@@ -33,7 +33,8 @@ allow-list only if it needs to be writable.
 - `tagPath` is the CIP tag path **verbatim and case-sensitive** (`LINE_SPEED`, `Program:Main.FillPV`) —
   it is the stable `signal.id`.
 - `type` is the CIP elementary type used to decode the tag (see
-  [data-types](reference/data-types.md)); `arrayCount` reads a 1-D array of that many elements.
+  [data-types](reference/data-types.md)); `arrayCount` reads a 1-D array of that many elements (1 to
+  65535). BOOL array signals are experimental — see [data-types](reference/data-types.md).
 - `scale`/`offset` apply engineering units (`value = raw × scale + offset`); `deadband` gates
   `onChange` publishing.
 - For a ControlLogix chassis, set `connection.slot` to the CPU slot so the adapter routes across the
