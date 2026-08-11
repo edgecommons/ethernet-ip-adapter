@@ -34,6 +34,14 @@ jobs:
       # No `rust-features`: the adapter's default feature is `standalone` (dual-broker MQTT, no C
       # toolchain), which is exactly what CI should build/test on Linux. `greengrass` is Linux-only via
       # the C-FFI SDK and is validated on the lab device (DESIGN §12.4), not in this hosted job.
+      #
+      # `locked: true` makes the reusable job's `cargo build`/`test`/`clippy` pass `--locked`, which is
+      # what lets D-EIP-30 say "every CI job that resolves dependencies" and mean it — the in-repo
+      # `coverage` and `live-sims` jobs already do. Without it this job re-resolves silently, which is
+      # exactly how the committed lock came to carry no `source = "git+…"` for `edgecommons` at all
+      # while CI stayed green. The input is an org-workflow opt-in defaulting to `false`, so turning it
+      # on here changes nothing for any other component.
+      locked: true
     secrets: inherit
 
   fmt:
