@@ -70,13 +70,7 @@ pub(crate) fn process_group(
             }
         }
 
-        if !publish::should_publish(
-            st.baseline.as_ref(),
-            &reading.value,
-            reading.quality,
-            mode,
-            &spec.deadband,
-        ) {
+        if !publish::gate_passes(st, &reading.value, reading.quality, mode, &spec.deadband) {
             health.samples_suppressed.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -84,8 +78,10 @@ pub(crate) fn process_group(
             if mode == PublishMode::OnChange {
                 health.samples_changed.fetch_add(1, Ordering::Relaxed);
             }
-            // The onChange baseline is the last *published* value.
-            st.baseline = Some(reading.value.clone());
+            // The onChange baseline is the last *published* value, so this one is only PENDING
+            // until its publish is confirmed — `Engine::settle` promotes it then, and drops it if
+            // the publish failed so the same reading gates in again (D-EIP-32).
+            st.pending = Some(reading.value.clone());
         }
 
         // Every sample carries the explicit capture-time serverTs (read completion, §6.2) — never
@@ -592,6 +588,125 @@ mod tests {
         assert!(
             flush[0].samples[0].source_ts.is_none(),
             "sourceTs is never emitted"
+        );
+    }
+
+    /// D-EIP-32 intra-batch dedup: with a poll interval shorter than `batchMs`, an unchanged
+    /// reading must NOT enqueue a second sample into the open window. The value is already the
+    /// *pending* half of the baseline pair, so the gate suppresses it even though nothing has been
+    /// published yet — a "commit only on publish" model without the pending half would double it.
+    #[test]
+    fn an_unchanged_reading_inside_an_open_batch_window_enqueues_one_sample_only() {
+        let d = one_signal_device(json!({ "type": "none" }), "onChange");
+        let g = &d.poll_groups[0];
+        let h = Health::default();
+        let t0 = Instant::now();
+        let mut e = Engine::new(t0);
+        let poll = |e: &mut Engine, at: Instant, v: f64, h: &Health| {
+            process_group(
+                e,
+                g,
+                PublishMode::OnChange,
+                200,
+                &[reading("LINE_SPEED", json!(v), Quality::Good)],
+                at,
+                TS,
+                h,
+            )
+            .len()
+        };
+
+        // Three 50 ms polls of the SAME value inside one 200 ms window.
+        assert_eq!(poll(&mut e, t0, 10.0, &h), 0, "buffered, not published yet");
+        assert_eq!(poll(&mut e, t0 + Duration::from_millis(50), 10.0, &h), 0);
+        assert_eq!(poll(&mut e, t0 + Duration::from_millis(100), 10.0, &h), 0);
+        assert_eq!(
+            h.samples_suppressed.load(Ordering::Relaxed),
+            2,
+            "the two unchanged repeats are suppressed against the pending value"
+        );
+
+        let flush = e.take_due(200, t0 + Duration::from_millis(200));
+        assert_eq!(flush.len(), 1);
+        assert_eq!(
+            flush[0].samples.len(),
+            1,
+            "one sample rode the window, not three copies of the same value"
+        );
+
+        // A genuinely changed value inside a window still enqueues, and BOTH samples ride the flush.
+        assert_eq!(poll(&mut e, t0 + Duration::from_millis(250), 11.0, &h), 0);
+        assert_eq!(poll(&mut e, t0 + Duration::from_millis(300), 12.0, &h), 0);
+        let flush = e.take_due(200, t0 + Duration::from_millis(450));
+        assert_eq!(
+            flush[0].samples.len(),
+            2,
+            "a newer, different value replaces the pending one — both samples stay in the batch"
+        );
+    }
+
+    /// D-EIP-32 leaves the quality semantics alone: BAD/UNCERTAIN readings pass the gate exactly as
+    /// before — against a committed baseline, against an in-flight pending one, and repeatedly —
+    /// and they never become a baseline themselves, so the GOOD value they interrupt is unaffected.
+    #[test]
+    fn quality_transitions_still_bypass_the_gate_with_a_value_in_flight() {
+        let d = one_signal_device(json!({ "type": "none" }), "onChange");
+        let g = &d.poll_groups[0];
+        let h = Health::default();
+        let t0 = Instant::now();
+        let mut e = Engine::new(t0);
+        let gate = |e: &mut Engine, at: Instant, v: Value, q: Quality| {
+            process_group(
+                e,
+                g,
+                PublishMode::OnChange,
+                200,
+                &[reading("LINE_SPEED", v, q)],
+                at,
+                TS,
+                &h,
+            )
+            .len()
+        };
+
+        // GOOD 10 is buffered (pending). BAD and UNCERTAIN both still pass, twice over.
+        assert_eq!(gate(&mut e, t0, json!(10.0), Quality::Good), 0);
+        assert_eq!(gate(&mut e, t0, Value::Null, Quality::Bad), 0);
+        assert_eq!(gate(&mut e, t0, Value::Null, Quality::Bad), 0);
+        assert_eq!(gate(&mut e, t0, json!(10.0), Quality::Uncertain), 0);
+        // The unchanged GOOD repeat is still suppressed against the pending value.
+        assert_eq!(gate(&mut e, t0, json!(10.0), Quality::Good), 0);
+
+        let flush = e.take_due(200, t0 + Duration::from_millis(200));
+        assert_eq!(
+            flush[0].samples.len(),
+            4,
+            "one GOOD + two BAD + one UNCERTAIN rode the window; only the GOOD repeat was gated"
+        );
+        assert_eq!(h.samples_bad.load(Ordering::Relaxed), 2);
+        assert_eq!(h.samples_uncertain.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            h.samples_suppressed.load(Ordering::Relaxed),
+            1,
+            "exactly the unchanged GOOD repeat — no non-GOOD sample was ever suppressed"
+        );
+
+        // The non-GOOD samples left the baseline alone: after the flush is confirmed, 10.0 is the
+        // committed value and repeats of it suppress.
+        e.settle("LINE_SPEED", true);
+        assert_eq!(
+            gate(
+                &mut e,
+                t0 + Duration::from_secs(1),
+                json!(10.0),
+                Quality::Good
+            ),
+            0
+        );
+        assert_eq!(h.samples_suppressed.load(Ordering::Relaxed), 2);
+        assert!(
+            e.take_due(200, t0 + Duration::from_secs(5)).is_empty(),
+            "nothing was enqueued, so no window reopened"
         );
     }
 

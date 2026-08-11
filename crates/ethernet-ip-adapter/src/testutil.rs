@@ -296,6 +296,7 @@ pub fn reading(signal_id: &str, value: Value, quality: Quality) -> Reading {
 pub struct RecordingPublisher {
     pub published: Mutex<Vec<SignalUpdate>>,
     pub fail: AtomicBool,
+    outcomes: Mutex<VecDeque<bool>>,
     delay: Mutex<Option<std::time::Duration>>,
 }
 
@@ -303,6 +304,14 @@ impl RecordingPublisher {
     /// Make every subsequent publish fail (or succeed again).
     pub fn set_fail(&self, fail: bool) {
         self.fail.store(fail, Ordering::Relaxed);
+    }
+
+    /// Queue one scripted outcome, consumed in order ahead of the standing [`Self::set_fail`] flag
+    /// (`true` = the facade confirms it, `false` = it fails). Count-based rather than time-based, so
+    /// "the *second* publish fails" is a property of the sequence rather than of a timer racing the
+    /// driver's own schedule.
+    pub fn push_result(&self, ok: bool) {
+        self.outcomes.lock().unwrap().push_back(ok);
     }
 
     /// Make every publish take `d` — so a test can assert the measured publish latency is the wall
@@ -350,10 +359,12 @@ impl Publisher for RecordingPublisher {
             tokio::time::sleep(d).await;
         }
         self.published.lock().unwrap().push(update);
-        if self.fail.load(Ordering::Relaxed) {
-            Err("recording publisher: scripted failure".to_string())
-        } else {
+        let scripted = self.outcomes.lock().unwrap().pop_front();
+        let ok = scripted.unwrap_or_else(|| !self.fail.load(Ordering::Relaxed));
+        if ok {
             Ok(())
+        } else {
+            Err("recording publisher: scripted failure".to_string())
         }
     }
 }

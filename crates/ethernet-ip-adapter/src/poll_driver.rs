@@ -148,7 +148,8 @@ pub(crate) async fn poll_until_disconnected(
 
     loop {
         // Earliest wake: while running, the nearest group deadline / batch close / health emit; while
-        // paused, only the health emit and the keepalive probe (no ticks flow, D-EIP-14/§7.4).
+        // paused, only the health emit and the keepalive probe (no ticks flow, D-EIP-14/§7.4). A
+        // paused instance has no open batch window to wake for — pause discarded them (D-EIP-32).
         let mut wake = since_health + metrics_interval;
         if paused {
             wake = wake.min(since_keepalive + keepalive);
@@ -211,6 +212,14 @@ pub(crate) async fn poll_until_disconnected(
                     }
                     DeviceControl::Pause { by, reply } => {
                         let changed = apply_pause(cfg, health, dm, events, true, by.as_deref()).await;
+                        // Open `batchMs` windows are DISCARDED, not held (§7.4, D-EIP-32): flushing
+                        // now would publish through an instance that must go quiet, and holding
+                        // them releases a stale burst the moment it resumes. A pause forfeits at
+                        // most one batch window of buffered telemetry.
+                        let dropped = engine.discard_open_batches();
+                        if dropped > 0 {
+                            tracing::info!(instance = %cfg.id, dropped, "paused with open batch windows; buffered samples discarded");
+                        }
                         paused = true;
                         let _ = reply.send(changed);
                     }
@@ -302,7 +311,7 @@ pub(crate) async fn poll_until_disconnected(
                     .get(&p.signal_id)
                     .copied()
                     .unwrap_or_else(|| PublishMode::OnChange.as_str());
-                publish_by_id(
+                let published = publish_by_id(
                     sink,
                     cfg,
                     adapter,
@@ -314,6 +323,10 @@ pub(crate) async fn poll_until_disconnected(
                     true,
                 )
                 .await;
+                // The flushed window's value becomes the onChange baseline only now that the
+                // publish resolved — a failure leaves the old baseline so the value is retried
+                // rather than silently suppressed for the rest of the session (D-EIP-32).
+                engine.settle(&p.signal_id, published);
             }
 
             // 2. Poll the earliest due group (there may be none — we woke for a flush/health tick).
@@ -376,7 +389,7 @@ pub(crate) async fn poll_until_disconnected(
                         .get(&p.signal_id)
                         .copied()
                         .unwrap_or_else(|| modes[idx].as_str());
-                    publish_by_id(
+                    let published = publish_by_id(
                         sink,
                         cfg,
                         adapter,
@@ -388,6 +401,7 @@ pub(crate) async fn poll_until_disconnected(
                         false,
                     )
                     .await;
+                    engine.settle(&p.signal_id, published);
                 }
 
                 // Attribute this cycle's samples to its (pollGroup, success) combo (§8.4).
@@ -459,7 +473,7 @@ async fn repoll_all_groups(
                 .get(&p.signal_id)
                 .copied()
                 .unwrap_or_else(|| modes[idx].as_str());
-            publish_by_id(
+            let published = publish_by_id(
                 sink,
                 cfg,
                 adapter,
@@ -471,6 +485,7 @@ async fn repoll_all_groups(
                 false,
             )
             .await;
+            engine.settle(&p.signal_id, published);
         }
     }
     Ok(polled)
@@ -479,6 +494,11 @@ async fn repoll_all_groups(
 /// Resolve a stable id to its configured signal and publish its samples (§6.1). Records the publish
 /// latency + published-sample count on `health` and the per-`publishMode` [`crate::metrics::PUBLISH`]
 /// counters on `dm` (§8.5). `from_batch` marks a coalescing-window flush.
+///
+/// Returns whether the samples reached the bus — the caller feeds that to
+/// [`Engine::settle`], which promotes the signal's pending baseline on success and drops it on
+/// failure (D-EIP-32). An id with no configured signal publishes nothing, so it reports `false`
+/// too: nothing was published, so nothing may become a suppression baseline.
 #[allow(clippy::too_many_arguments)]
 async fn publish_by_id(
     sink: &dyn Publisher,
@@ -490,9 +510,9 @@ async fn publish_by_id(
     dm: &DeviceMetrics,
     publish_mode: &'static str,
     from_batch: bool,
-) {
+) -> bool {
     let Some(spec) = cfg.find_signal(signal_id) else {
-        return;
+        return false;
     };
     publish_samples(
         sink,
@@ -505,10 +525,11 @@ async fn publish_by_id(
         publish_mode,
         from_batch,
     )
-    .await;
+    .await
 }
 
 /// Publish one signal's samples through the mode-agnostic [`crate::publish::publish_via`] path.
+/// Returns whether the facade confirmed the publish.
 #[allow(clippy::too_many_arguments)]
 async fn publish_samples(
     sink: &dyn Publisher,
@@ -520,7 +541,7 @@ async fn publish_samples(
     dm: &DeviceMetrics,
     publish_mode: &'static str,
     from_batch: bool,
-) {
+) -> bool {
     let n = samples.len() as u64;
     let (res, latency) = publish::publish_via(
         sink,
@@ -543,10 +564,12 @@ async fn publish_samples(
                 .publish_latency_ms
                 .store(latency_ms, Ordering::Relaxed);
             dm.record_publish(publish_mode, n, from_batch, latency_ms, true);
+            true
         }
         Err(e) => {
             tracing::warn!(instance = %cfg.id, tag_path = %spec.tag_path, error = %e, "publish failed");
             dm.record_publish(publish_mode, n, from_batch, latency_ms, false);
+            false
         }
     }
 }
@@ -1213,37 +1236,163 @@ mod tests {
     // ---- publish accounting (§8.5) ----
 
     /// A publish failure is accounted as a failure (and does NOT count as published signals); a
-    /// success records the sample count and the measured publish latency.
+    /// success records the sample count and the measured publish latency — **and** the failure does
+    /// not advance the onChange baseline, so the identical next reading is republished rather than
+    /// suppressed for the rest of the session (D-EIP-32).
+    ///
+    /// The onChange baseline is the last *published* value: a value whose publish failed never
+    /// reached the bus, so it may not suppress anything. Scripted per-publish outcomes (not a timer)
+    /// decide which attempt fails, so the sequence is a property of the run, not of a race.
     #[tokio::test(start_paused = true)]
-    async fn publish_failure_records_result_error_and_success_records_latency() {
-        let mut rig = Rig::simple(100, "always", json!(1.0));
-        let sink = Arc::clone(&rig.sink);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            sink.set_fail(true);
-        });
-        rig.cancel_after(Duration::from_millis(250));
+    async fn publish_failure_is_accounted_and_the_identical_value_is_republished() {
+        let mut rig = Rig::simple(100, "onChange", json!(2.0));
+        // Reads: 1.0 → 2.0 → 2.0, then 2.0 forever. Publishes: ok, FAIL, ok.
+        rig.session
+            .push_read(vec![reading("LINE_SPEED", json!(1.0), Quality::Good)]);
+        rig.session
+            .push_read(vec![reading("LINE_SPEED", json!(2.0), Quality::Good)]);
+        rig.sink.push_result(true);
+        rig.sink.push_result(false);
+        rig.sink.push_result(true);
+        rig.cancel_after(Duration::from_millis(450));
 
         rig.run().await;
 
-        assert_eq!(rig.sink.count(), 2, "both publishes were attempted");
+        let values: Vec<_> = rig
+            .sink
+            .updates()
+            .iter()
+            .map(|u| u.samples[0].value.clone())
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some(json!(1.0)), Some(json!(2.0)), Some(json!(2.0))],
+            "the reading whose publish failed is republished on its next occurrence; once THAT \
+             publish is confirmed, the fourth poll's unchanged 2.0 is suppressed again"
+        );
         assert_eq!(
             rig.health.signals_published.load(Ordering::Relaxed),
-            1,
-            "only the successful publish counts as published"
+            2,
+            "only the successful publishes count as published"
         );
 
         rig.dm.emit_periodic().await;
         let row = rig.metrics.all(PUBLISH).remove(0);
-        assert_eq!(row["dataMessagesPublishedTotal"], 2.0);
+        assert_eq!(row["dataMessagesPublishedTotal"], 3.0);
         assert_eq!(
-            row["samplesPublishedTotal"], 1.0,
+            row["samplesPublishedTotal"], 2.0,
             "a failed publish contributes no samples"
         );
         assert_eq!(row["publishFailuresTotal"], 1.0);
         assert!(
             row.contains_key("publishLatencyMs"),
             "the success recorded a latency"
+        );
+    }
+
+    /// The other half of D-EIP-32's retry rule: a failed publish must not over-suppress *later,
+    /// different* values either. The deadband is measured from the last **published** value, so a
+    /// reading that moved past the band relative to it publishes — even though it sits inside the
+    /// band around the value whose publish failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publish_does_not_shrink_the_deadband_window_for_later_values() {
+        let cfg = poll_device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "127.0.0.1:44818" },
+            "pollGroups": [ {
+                "id": "fast", "pollIntervalMs": 100, "publishMode": "onChange",
+                "signals": [ { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real",
+                               "deadband": { "type": "absolute", "value": 1.0 } } ]
+            } ]
+        }));
+        let mut rig = Rig::new(
+            cfg,
+            global(json!({})),
+            vec![reading("LINE_SPEED", json!(11.5), Quality::Good)],
+        );
+        // Reads: 10.0 (ok) → 11.0 (FAILS) → 11.5. 11.5 is only 0.5 from the failed 11.0 but 1.5
+        // from the last published 10.0, so it must publish.
+        rig.session
+            .push_read(vec![reading("LINE_SPEED", json!(10.0), Quality::Good)]);
+        rig.session
+            .push_read(vec![reading("LINE_SPEED", json!(11.0), Quality::Good)]);
+        rig.sink.push_result(true);
+        rig.sink.push_result(false);
+        rig.cancel_after(Duration::from_millis(350));
+
+        rig.run().await;
+
+        let values: Vec<_> = rig
+            .sink
+            .updates()
+            .iter()
+            .map(|u| u.samples[0].value.clone())
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some(json!(10.0)), Some(json!(11.0)), Some(json!(11.5))],
+            "the deadband is measured from 10.0 — the last value that actually reached the bus — \
+             not from the 11.0 whose publish failed"
+        );
+    }
+
+    /// §7.4 / D-EIP-32: pausing DISCARDS the open `batchMs` windows. Nothing is published at pause
+    /// time (the instance must go quiet) and nothing pre-pause escapes on resume, so an operator
+    /// never sees a burst of stale telemetry the moment they resume.
+    #[tokio::test(start_paused = true)]
+    async fn pause_discards_open_batch_windows_so_nothing_stale_flushes_on_resume() {
+        let cfg = poll_device(json!({
+            "id": "plc-1",
+            "connection": { "endpoint": "127.0.0.1:44818" },
+            "defaults": { "batchMs": 200 },
+            "pollGroups": [ {
+                "id": "fast", "pollIntervalMs": 100, "publishMode": "always",
+                "signals": [ { "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" } ]
+            } ]
+        }));
+        let mut rig = Rig::new(
+            cfg,
+            global(json!({ "healthThresholds": { "keepaliveProbeIntervalMs": 60000 } })),
+            vec![reading("LINE_SPEED", json!(1.0), Quality::Good)],
+        );
+        // The one pre-pause poll reads a distinctive value, so a stale flush is unmistakable.
+        rig.session
+            .push_read(vec![reading("LINE_SPEED", json!(42.0), Quality::Good)]);
+        let (p_tx, p_rx) = oneshot::channel();
+        rig.send_after(
+            Duration::from_millis(150),
+            DeviceControl::Pause {
+                by: None,
+                reply: p_tx,
+            },
+        );
+        let (r_tx, r_rx) = oneshot::channel();
+        rig.send_after(
+            Duration::from_millis(1_000),
+            DeviceControl::Resume { reply: r_tx },
+        );
+        // Long enough for the post-resume polls (1_100, 1_200) to fill and flush a fresh window.
+        rig.cancel_after(Duration::from_millis(1_400));
+
+        rig.run().await;
+
+        assert!(p_rx.await.unwrap() && r_rx.await.unwrap());
+        let updates = rig.sink.updates();
+        assert!(
+            updates
+                .iter()
+                .all(|u| u.samples.iter().all(|s| s.value != Some(json!(42.0)))),
+            "the sample buffered when the pause arrived was discarded, not released on resume"
+        );
+        assert_eq!(
+            updates.len(),
+            1,
+            "exactly the one window that opened AFTER the resume flushed"
+        );
+        assert_eq!(
+            updates[0].samples.len(),
+            2,
+            "…carrying only its own post-resume samples"
         );
     }
 
