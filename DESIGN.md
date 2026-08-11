@@ -670,6 +670,16 @@ Worked PUSH config — the OpENer validation target (§11.5); compose/E2E use ex
   detection, so the label is global to the feature. A BOOL-array read answered with `DWORD` is a BAD
   sample whose detail carries that explanation. Scalar `bool` and push assembly `bool` array fields
   are unaffected.
+- **Exact integers on write.** "Integral number in range" means the integer the caller sent, not its
+  nearest `f64`. With no value transform (`scale`/`valueOffset` absent, or spelled as the identity
+  `1.0`/`0.0`) a JSON **integer literal** written to an integer type is range-checked against that
+  type's exact bounds and carried to the device through `i64`/`u64`, never through an `f64` — so a
+  `ulint` of `9007199254740993` or an epoch-nanosecond `lint` lands bit-for-bit, mirroring the read
+  path's native-integer precision. A JSON **float** is accepted for an integer type when it is finite
+  and integral (`5.0` for a `dint`); a fractional one is refused. Because the bounds are exact, a
+  value one past `lint`/`ulint`'s maximum is refused rather than saturated. Where a **real** transform
+  applies the arithmetic is unavoidably `f64`, so an integer input beyond ±2⁵³ is a per-entry failure
+  naming the value, never a silent rounding.
 - **scale/offset** (numeric only): read: `published = raw * scale + offset` (f64 arithmetic;
   the published JSON number is f64). Write: `device = (value - offset) / scale`, then
   range-checked and coerced to the CIP type; out-of-range ⇒ per-entry failure, never a clamp.
