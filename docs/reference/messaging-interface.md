@@ -70,7 +70,7 @@ applies to poll instances); a `repoll` request is still answered with its per-in
 
 | Verb | Scope | Modes | Body | Result (on `ok:true`) |
 |------|-------|-------|------|-----------------------|
-| `sb/status` | `instance` | poll, push | `{instance?}` | `{id, mode, connected, state, paused, endpoint, adapter, metrics, security, io?}` |
+| `sb/status` | `instance` | poll, push | `{instance?}` | `{id, mode, connected, state, paused, endpoint, adapter, metrics, security, identity, dialect, io?}` |
 | `sb/read` | `instance` | poll, push | `{instance?, signals:[ref…]}` | `{id, reads:[…]}` |
 | `sb/write` | `instance` | poll, push | `{instance?, writes:[{ref…, value}]}` (or a single `{ref…, value}`) | `{id, written, results:[…]}` |
 | `sb/signals` | `instance` | poll, push | `{instance?}` | `{id, mode, signals:[…]}` |
@@ -187,7 +187,7 @@ Every entry emits a `write-audit` event.
 
 - **`sb/status`** → `{ id, mode, connected, state ("ONLINE"|"BACKOFF"|"PAUSED"|…), paused, endpoint,
   adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} },
-  security: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
+  security: {…}, identity: {…}|null, dialect: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
   framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors, refusedRedirects }` —
   `sendErrors` counts O→T datagrams that failed to send, `recvErrors` counts receive failures on the
   class-1 socket, and `refusedRedirects` counts connections whose device asked for its outputs at a
@@ -217,6 +217,24 @@ Every entry emits a `write-audit` event.
   EtherNet/IP Security (0x5E), and Certificate Management (0x5F) objects on connect (both plaintext and
   TLS instances). A device that does not implement these objects reports
   `targetSupportsCipSecurity: false` and no `target`.
+- **`identity`** — what the device says it is. The adapter reads the CIP Identity Object (class `0x01`,
+  instance 1) once when a session is established, and answers from that reading:
+  `{ vendorId, vendorName, deviceType, deviceTypeName, productCode, revision, serialNumber,
+  productName }`. `revision` is `"<major>.<minor>"`; `serialNumber` is a hex string such as
+  `"0x1234ABCD"`; `vendorName` and `deviceTypeName` are `null` for codes the adapter has no registered
+  name for, and the numeric field beside each is the authority. `identity` is `null` while the session
+  is down and for a device that refuses the read — refusing is allowed and costs nothing else, the
+  instance connects and polls exactly as it would otherwise.
+
+  The identity is informational. It is what the device asserts about itself, nothing verifies it, and
+  the adapter's behavior never depends on it: what a device supports is settled by the answers it gives
+  to real requests, not by its nameplate.
+- **`dialect`** — what the adapter has learned about this device's CIP dialect from operations that
+  have already run: `{ tagListService: "supported"|"unsupported"|"unknown" }`. It reads `supported`
+  once the device has answered a tag-list browse, `unsupported` once the device has refused that
+  service (`BROWSE_UNSUPPORTED`), and `unknown` until a browse has settled it. A browse that fails at
+  the link (`BROWSE_FAILED`) teaches nothing and leaves the value unchanged. The adapter does not probe
+  for capabilities when it connects.
 - **`sb/signals`** → the resolved config view, no device I/O. Poll: `{ id, mode:"poll", signals:[{ name,
   id, address, pollGroup, pollIntervalMs, publishMode, writable, deadband }] }`. Push: `{ id,
   mode:"push", signals:[{ name, id, address, direction ("input"|"output"), publishMode, writable,
@@ -261,7 +279,7 @@ Published through the library's `events()` facade: severity **derives** the chan
 
 | Channel | Severity | When |
 |---------|----------|------|
-| `evt/info/device-connected` | Info | The link came up. Clears the `device-unreachable` alarm. |
+| `evt/info/device-connected` | Info | The link came up. Clears the `device-unreachable` alarm. When the device answered the Identity Object read, `context.identity` carries the same nameplate object `sb/status` reports; when it did not, the key is absent. |
 | `evt/critical/device-unreachable` | Critical | The link was lost — a stateful alarm (`alarm:true, active:true` on loss; cleared on reconnect via the same channel). A configuration change that removes the instance also clears it, so a device the configuration no longer runs leaves no latched alarm. |
 | `evt/warning/adapter-paused` | Warning | `sb/pause` moved the instance to paused. `context.by` carries the requester identity path. |
 | `evt/info/adapter-resumed` | Info | `sb/resume` moved the instance back to running. |

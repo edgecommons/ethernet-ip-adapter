@@ -61,32 +61,49 @@ impl DeviceBackend for EipBackend {
             let mut status = super::tls::security_status(client.tls_session_info(), &meta, conn);
             // Phase 2a: read the target's CIP Security posture over the established (TLS) session.
             status.target = read_target_posture(&client).await;
-            return Ok(Box::new(super::session::EipSession::new_secure(
-                client,
-                request_timeout,
-                status,
-            )));
+            // D-EIP-34: and what the device says it is. Best-effort, one round trip, never fatal.
+            let identity = super::identity::read_identity(&client, &conn.endpoint).await;
+            return Ok(Box::new(
+                super::session::EipSession::new_secure(client, request_timeout, status)
+                    .with_identity(identity),
+            ));
         }
         let opts = client_options(conn, self.timeouts());
         let request_timeout = opts.request_timeout;
-        let client = enip::EipClient::connect(&conn.endpoint, opts)
-            .await
-            .map_err(map_enip_error)?;
+        let port = opts.port;
+        let connect_timeout = opts.connect_timeout;
+        let started = std::time::Instant::now();
+        let client = match enip::EipClient::connect(&conn.endpoint, opts).await {
+            Ok(c) => c,
+            Err(e) => {
+                // D-EIP-34: a target that accepted TCP and then refused to open a session gets ONE
+                // bounded ListIdentity, so the failure names the device instead of only the address.
+                // The identity rides the error's context, which is what the connect ladder renders
+                // into its `connect failed` log and the `sb/reconnect` refusal text.
+                return Err(enrich_registration_failure(
+                    conn,
+                    port,
+                    e,
+                    connect_timeout.saturating_sub(started.elapsed()),
+                )
+                .await);
+            }
+        };
         // Phase 2a: a plaintext session still reads the target's posture (best-effort). A generic CIP
         // device reports none (targetSupportsCipSecurity: false); a CIP Security device polled
         // plaintext surfaces its objects. When no posture is read, the session stays a bare plaintext
         // session (`security()` = None ⇒ `{"mode":"plaintext"}`).
-        match read_target_posture(&client).await {
-            Some(target) => Ok(Box::new(super::session::EipSession::new_secure(
+        let target = read_target_posture(&client).await;
+        let identity = super::identity::read_identity(&client, &conn.endpoint).await;
+        let session = match target {
+            Some(target) => super::session::EipSession::new_secure(
                 client,
                 request_timeout,
                 super::tls::plaintext_status(Some(target)),
-            ))),
-            None => Ok(Box::new(super::session::EipSession::new(
-                client,
-                request_timeout,
-            ))),
-        }
+            ),
+            None => super::session::EipSession::new(client, request_timeout),
+        };
+        Ok(Box::new(session.with_identity(identity)))
     }
 
     async fn open_push(
@@ -96,6 +113,52 @@ impl DeviceBackend for EipBackend {
     ) -> Result<Box<dyn PushSession>> {
         let session = EipPushSession::open(conn, io, self.timeouts(), VENDOR_ID).await?;
         Ok(Box::new(session))
+    }
+}
+
+/// Turn a failed connect into the seam error, enriched with the peer's identity when the failure was
+/// a **registration** failure and the peer will still answer a ListIdentity (D-EIP-34).
+///
+/// The enrichment is an `anyhow` context on the mapped error, so it reaches every surface that
+/// already renders the connect failure — the ladder's `connect failed` WARN, the `sb/reconnect`
+/// `RECONNECT_FAILED` text — without a new channel for it to travel down or a new field for the
+/// ladder to learn about. A separate WARN names it too, because the context line is easy to lose in a
+/// long error chain and this is the one moment the information is actionable.
+///
+/// A TCP-level failure is passed through untouched: nothing answered, so there is nothing to ask.
+async fn enrich_registration_failure(
+    conn: &ConnectionConfig,
+    port: u16,
+    e: enip::EnipError,
+    remaining: Duration,
+) -> DeviceError {
+    if !super::identity::is_registration_failure(&e) {
+        return map_enip_error(e);
+    }
+    let Some(id) = super::identity::identity_of_unregisterable_peer(conn, port, remaining).await
+    else {
+        return map_enip_error(e);
+    };
+    tracing::warn!(
+        endpoint = %conn.endpoint,
+        error = %e,
+        product_name = %id.product_name,
+        revision = %id.revision(),
+        vendor = %id.vendor_name.clone().unwrap_or_else(|| format!("0x{:04X}", id.vendor_id)),
+        serial = %format!("0x{:08X}", id.serial_number),
+        "the device answered ListIdentity but refused to open a session"
+    );
+    let summary = id.summary();
+    match map_enip_error(e) {
+        DeviceError::Transient(inner) => {
+            DeviceError::Transient(inner.context(format!("device identifies as {summary}")))
+        }
+        DeviceError::Permanent(inner) => {
+            DeviceError::Permanent(inner.context(format!("device identifies as {summary}")))
+        }
+        // `Unsupported` carries a static reason and no source chain to attach a context to; the WARN
+        // above has already said what answered.
+        other => other,
     }
 }
 
@@ -206,6 +269,9 @@ pub struct EipPushSession {
     /// write neither hangs (whatever the control queue's state) nor lands on the device after
     /// `sb/write` has already refused it.
     ack_cap: Duration,
+    /// What the device said it is (D-EIP-34), read over the explicit session that carries the
+    /// ForwardOpen — before that session moves into the translator task. `None` when it refused.
+    identity: Option<crate::device::DeviceIdentity>,
 }
 
 impl EipPushSession {
@@ -247,6 +313,10 @@ impl EipPushSession {
         let client = enip::EipClient::connect(&conn.endpoint, opts)
             .await
             .map_err(map_enip_error)?;
+        // D-EIP-34: identity comes from the explicit session, so it must be read here — once the
+        // ForwardOpen succeeds the client moves into the translator task and is out of reach. Same
+        // rule as poll: best-effort, one round trip, a refusal costs a WARN and nothing else.
+        let identity = super::identity::read_identity(&client, &conn.endpoint).await;
         let io_manager = enip::IoManager::bind("0.0.0.0:0")
             .await
             .map_err(map_enip_error)?;
@@ -282,6 +352,7 @@ impl EipPushSession {
             snapshot,
             stats,
             ack_cap,
+            identity,
         })
     }
 
@@ -706,6 +777,10 @@ impl PushSession for EipPushSession {
         Some(*self.stats.lock().unwrap())
     }
 
+    fn identity(&self) -> Option<crate::device::DeviceIdentity> {
+        self.identity.clone()
+    }
+
     async fn set_output(&mut self, field: &IoFieldSpec, value: &serde_json::Value) -> Result<()> {
         let layout = self
             .out_layout
@@ -834,9 +909,16 @@ mod tests {
 
     use crate::config::GlobalConfig;
     use crate::device::Quality;
+    use crate::testutil::WarnLog;
 
     /// `Get_Attribute_Single` (§7.5) — the service the posture reads ride.
     const GET_ATTRIBUTE_SINGLE: u8 = enip::cip::services::SERVICE_GET_ATTRIBUTE_SINGLE;
+
+    /// `Get_Attributes_All` (§7.5) — the service the D-EIP-34 Identity Object read rides.
+    const GET_ATTRIBUTE_ALL: u8 = enip::cip::services::SERVICE_GET_ATTRIBUTE_ALL;
+
+    /// The product name the scripted peer answers the Identity Object read with.
+    const MOCK_PRODUCT_NAME: &str = "MockPLC-1000";
 
     // ---- config fixtures -------------------------------------------------------------------------
 
@@ -968,12 +1050,34 @@ mod tests {
         drop_after_register: bool,
         /// Speak TLS on the accepted socket (the CIP Security explicit path).
         tls: Option<Arc<rustls::ServerConfig>>,
+        /// Refuse the Identity Object read with `0x08 service not supported` — what the libplctag
+        /// `ab_server` bench peer really does, and the tolerated case D-EIP-34 turns on. Default
+        /// `false`: the scripted peer serves its Identity Object like the majority of real devices.
+        refuse_identity: bool,
+        /// Answer the RegisterSession with an encapsulation error status instead of a session — the
+        /// registration-failure path the ListIdentity diagnostic exists for (D-EIP-34).
+        refuse_register: bool,
+        /// Answer a pre-registration ListIdentity. `false` ⇒ the peer ignores it (the diagnostic
+        /// finds nothing and the failure is reported bare).
+        serves_list_identity: bool,
     }
 
     impl PlcScript {
         /// A device implementing the CIP Security objects, reporting `state`.
         fn with_posture(mut self, state: u8) -> Self {
             self.posture_state = Some(state);
+            self
+        }
+        /// A device that refuses the Identity Object read (D-EIP-34).
+        fn refusing_identity(mut self) -> Self {
+            self.refuse_identity = true;
+            self
+        }
+        /// A device that accepts TCP and then refuses to open a session, optionally still answering
+        /// the pre-registration ListIdentity (D-EIP-34).
+        fn refusing_register(mut self, serves_list_identity: bool) -> Self {
+            self.refuse_register = true;
+            self.serves_list_identity = serves_list_identity;
             self
         }
         /// A class-1 target that points its O→T stream at `port` (the test's UDP socket).
@@ -1060,6 +1164,10 @@ mod tests {
         /// This is how a test observes that the adapter really let go of the transport, rather than
         /// inferring it from a `close()` that returned.
         disconnected: bool,
+        /// How many pre-registration `ListIdentity` probes reached the peer (D-EIP-34). The counter,
+        /// not a boolean: "the diagnostic fired exactly once, on the failure path" and "it never
+        /// fires on a healthy connect" are both claims about a count.
+        list_identities: usize,
     }
 
     /// A scripted EtherNet/IP peer on `127.0.0.1:0`.
@@ -1342,10 +1450,64 @@ mod tests {
                     None => (0x05u8, Vec::new(), Vec::new()),
                 }
             }
+            // D-EIP-34: the Identity Object read. The peer serves the mandatory attribute block
+            // (1..7, in order) unless the script says it refuses — and refuses anything that is not
+            // the Identity Object, so a wrong path is caught rather than answered.
+            GET_ATTRIBUTE_ALL => {
+                let (class, instance, _attr) = parse_attr_path(&path);
+                if script.refuse_identity
+                    || class != enip::IDENTITY_CLASS
+                    || instance != enip::IDENTITY_INSTANCE
+                {
+                    (0x08u8, Vec::new(), Vec::new())
+                } else {
+                    (0u8, mock_identity_block(), Vec::new())
+                }
+            }
             // 0x08 service not supported.
             _ => (0x08u8, Vec::new(), Vec::new()),
         };
         Some(rr_frame(frame, mr_reply(service, status, &body), extra))
+    }
+
+    /// The mandatory Identity Object attribute block the scripted peer answers with — a fictional
+    /// vendor (`0x1337`, the crate's own originator id, registered to nobody) so no test fixture ever
+    /// claims to be a real manufacturer's product.
+    fn mock_identity_block() -> Vec<u8> {
+        let mut w = Vec::new();
+        w.extend_from_slice(&0x1337u16.to_le_bytes()); // 1 vendor
+        w.extend_from_slice(&0x000Eu16.to_le_bytes()); // 2 device type: PLC
+        w.extend_from_slice(&0x0042u16.to_le_bytes()); // 3 product code
+        w.push(7); // 4 revision major
+        w.push(3); // 4 revision minor
+        w.extend_from_slice(&0x0030u16.to_le_bytes()); // 5 status
+        w.extend_from_slice(&0x00C0_FFEEu32.to_le_bytes()); // 6 serial
+        w.push(u8::try_from(MOCK_PRODUCT_NAME.len()).unwrap()); // 7 SHORT_STRING
+        w.extend_from_slice(MOCK_PRODUCT_NAME.as_bytes());
+        w
+    }
+
+    /// A ListIdentity reply carrying the same nameplate as [`mock_identity_block`] — the
+    /// encapsulation-layer shape, which additionally wraps a socket address and a state byte (§5.3).
+    fn list_identity_reply(ctx: [u8; 8]) -> EncapFrame {
+        let mut item = Vec::new();
+        item.extend_from_slice(&1u16.to_le_bytes()); // protocol version
+        item.extend_from_slice(&SockAddrInfo::ipv4(0x7F00_0001, 44818).encode()); // 16 B big-endian
+        item.extend_from_slice(&0x1337u16.to_le_bytes()); // vendor
+        item.extend_from_slice(&0x000Eu16.to_le_bytes()); // device type
+        item.extend_from_slice(&0x0042u16.to_le_bytes()); // product code
+        item.push(7); // rev major
+        item.push(3); // rev minor
+        item.extend_from_slice(&0x0030u16.to_le_bytes()); // status
+        item.extend_from_slice(&0x00C0_FFEEu32.to_le_bytes()); // serial
+        item.push(u8::try_from(MOCK_PRODUCT_NAME.len()).unwrap());
+        item.extend_from_slice(MOCK_PRODUCT_NAME.as_bytes());
+        item.push(0x03); // state
+        let cpf = Cpf::from_items(vec![CpfItem::new(ItemType::Identity, Bytes::from(item))]);
+        EncapFrame::new(
+            EncapHeader::request(Command::ListIdentity, 0, 0, ctx),
+            cpf.encode().unwrap(),
+        )
     }
 
     /// Serve one encapsulation session (plaintext or inside TLS — the byte stream is all that differs).
@@ -1357,7 +1519,26 @@ mod tests {
         let Some(reg) = read_frame(&mut s).await else {
             return;
         };
+        // D-EIP-34: the pre-registration ListIdentity diagnostic arrives on its OWN connection, so
+        // it is the first (and only) frame this peer sees. A script that does not serve it stays
+        // silent and lets the caller's deadline end the probe.
+        if matches!(reg.header.command, Command::ListIdentity) {
+            log.lock().unwrap().list_identities += 1;
+            if script.serves_list_identity {
+                let _ = write_frame(&mut s, &list_identity_reply(reg.header.sender_context)).await;
+            }
+            return;
+        }
         if !matches!(reg.header.command, Command::RegisterSession) {
+            return;
+        }
+        // A target that answers the handshake with an encapsulation error status: TCP is up, the
+        // session is refused. This is the only failure shape the ListIdentity diagnostic fires on.
+        if script.refuse_register {
+            let mut header =
+                EncapHeader::request(Command::RegisterSession, 0, 0, reg.header.sender_context);
+            header.status = enip::EncapStatus::InsufficientMemory;
+            let _ = write_frame(&mut s, &EncapFrame::new(header, Bytes::new())).await;
             return;
         }
         let handle = if script.bad_register { 0 } else { 0x1234_5678 };
@@ -1469,53 +1650,6 @@ mod tests {
                     .unwrap(),
             )
         }
-    }
-
-    // ---- WARN capture ----------------------------------------------------------------------------
-
-    /// A `tracing` subscriber that records WARN-level event messages on the current thread, so the
-    /// §4.1 unprovisioned-device warning is asserted as a fact rather than assumed.
-    #[derive(Clone, Default)]
-    struct WarnLog(Arc<Mutex<Vec<String>>>);
-
-    impl WarnLog {
-        fn contains(&self, needle: &str) -> bool {
-            self.0.lock().unwrap().iter().any(|m| m.contains(needle))
-        }
-        fn is_empty(&self) -> bool {
-            self.0.lock().unwrap().is_empty()
-        }
-    }
-
-    struct MessageVisitor(String);
-
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0 = format!("{value:?}");
-            }
-        }
-    }
-
-    impl tracing::Subscriber for WarnLog {
-        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-            *meta.level() <= tracing::Level::WARN
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            if *event.metadata().level() > tracing::Level::WARN {
-                return;
-            }
-            let mut visitor = MessageVisitor(String::new());
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push(visitor.0);
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     // ---- shared drivers --------------------------------------------------------------------------
@@ -1847,6 +1981,204 @@ mod tests {
         let target = session.security().unwrap().target.unwrap();
         assert_eq!(target.state.as_deref(), Some("Configured"));
         assert!(quiet.is_empty(), "a provisioned device is not warned about");
+    }
+
+    // ---- identity at connect (D-EIP-34) ----------------------------------------------------------
+
+    /// **The connect reads the device's Identity Object, once, and carries it on the session.** The
+    /// request is asserted as well as the answer: exactly one `Get_Attributes_All` on the whole
+    /// connect, against the Identity Object — not six `Get_Attribute_Single`s, and not a second read
+    /// per status query.
+    #[tokio::test]
+    async fn connect_reads_the_identity_object_once_and_the_session_carries_it() {
+        let backend = EipBackend::new(timeouts());
+        let plc = MockPlc::start(PlcScript::default()).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+
+        let session = backend.connect(&conn).await.expect("a healthy connect");
+        let id = session.identity().expect("the device named itself");
+        assert_eq!(id.product_name, MOCK_PRODUCT_NAME);
+        assert_eq!(id.vendor_id, 0x1337);
+        assert!(
+            id.vendor_name.is_none(),
+            "an unregistered vendor id gets no invented name"
+        );
+        assert_eq!(id.device_type, 0x000E);
+        assert_eq!(
+            id.device_type_name.as_deref(),
+            Some("Programmable Logic Controller")
+        );
+        assert_eq!(id.product_code, 0x0042);
+        assert_eq!(id.revision(), "7.3");
+        assert_eq!(id.serial_number, 0x00C0_FFEE);
+        assert_eq!(id.summary(), "MockPLC-1000 rev 7.3");
+
+        let services = plc.log().services;
+        assert_eq!(
+            services.iter().filter(|s| **s == GET_ATTRIBUTE_ALL).count(),
+            1,
+            "one identity round trip per connect, no more: {services:?}"
+        );
+
+        // Answered from the captured value: a second read of `identity()` costs no wire traffic.
+        let _again = session.identity();
+        assert_eq!(
+            plc.log()
+                .services
+                .iter()
+                .filter(|s| **s == GET_ATTRIBUTE_ALL)
+                .count(),
+            1,
+            "reading the seam's identity must not touch the device"
+        );
+    }
+
+    /// **A device that refuses to name itself still polls.** Identity is CIP-mandatory and the
+    /// libplctag `ab_server` bench peer refuses it anyway — so a refusal costs one WARN, leaves the
+    /// identity absent, and changes nothing else. Making it fatal would take a working poll target
+    /// off the network over a diagnostic.
+    #[tokio::test]
+    async fn a_refused_identity_read_is_tolerated_and_the_connect_proceeds() {
+        let backend = EipBackend::new(timeouts());
+        let plc = MockPlc::start(PlcScript::default().refusing_identity()).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+
+        let warns = WarnLog::default();
+        let mut session = {
+            let _guard = tracing::subscriber::set_default(warns.clone());
+            backend
+                .connect(&conn)
+                .await
+                .expect("a refused identity read must not fail the connect")
+        };
+        assert!(
+            session.identity().is_none(),
+            "no identity is reported, rather than an invented one"
+        );
+        assert!(
+            warns.contains("did not answer the CIP Identity Object read"),
+            "the refusal is said out loud, once: {:?}",
+            warns.0.lock().unwrap()
+        );
+        // And the session is a working session, not a husk: a read reaches the device and comes back
+        // with a per-signal verdict (this scripted peer serves no tags, so it is a BAD sample) rather
+        // than the connection-level `Err` that would send the ladder into backoff.
+        let signal: crate::config::SignalSpec = serde_json::from_value(
+            json!({ "name": "line-speed", "tagPath": "LINE_SPEED", "type": "real" }),
+        )
+        .unwrap();
+        let readings = session
+            .read_signals(&[signal])
+            .await
+            .expect("the session polls");
+        assert_eq!(readings.len(), 1);
+    }
+
+    /// **ListIdentity fires on the registration-failure path, and enriches the failure.** A target
+    /// that accepts TCP and then refuses the session is the one case where the diagnostic runs: the
+    /// connect still fails (identity never rescues a failure), and the error now names what refused.
+    #[tokio::test]
+    async fn a_registration_failure_is_enriched_by_one_list_identity_probe() {
+        let backend = EipBackend::new(timeouts());
+        let plc = MockPlc::start(PlcScript::default().refusing_register(true)).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+
+        let warns = WarnLog::default();
+        let err = {
+            let _guard = tracing::subscriber::set_default(warns.clone());
+            backend
+                .connect(&conn)
+                .await
+                .err()
+                .expect("a refused RegisterSession is still a failed connect")
+        };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("device identifies as MockPLC-1000 rev 7.3"),
+            "the failure names the device that refused: {text}"
+        );
+        assert!(
+            warns.contains("answered ListIdentity but refused to open a session"),
+            "and says so once, out loud: {:?}",
+            warns.0.lock().unwrap()
+        );
+        assert_eq!(
+            plc.log().list_identities,
+            1,
+            "exactly ONE probe — the diagnostic is not a retry loop"
+        );
+    }
+
+    /// **The diagnostic is optional, and its absence changes nothing.** A peer that refuses the
+    /// session and ignores ListIdentity too produces the same typed failure it always did — the
+    /// probe is a nicety layered on the failure path, never a step the failure path depends on.
+    #[tokio::test]
+    async fn a_silent_diagnostic_leaves_the_registration_failure_intact() {
+        let backend = EipBackend::new(timeouts());
+        let plc = MockPlc::start(PlcScript::default().refusing_register(false)).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+
+        let err = backend
+            .connect(&conn)
+            .await
+            .err()
+            .expect("a refused RegisterSession is a failed connect");
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("device identifies as"),
+            "nothing is claimed about a device that said nothing: {text}"
+        );
+        assert!(
+            text.contains("insufficient memory"),
+            "the original refusal still reaches the ladder verbatim: {text}"
+        );
+        assert_eq!(
+            plc.log().list_identities,
+            1,
+            "the probe was attempted once and found nothing"
+        );
+    }
+
+    /// **A healthy connect never sends a ListIdentity.** The diagnostic has exactly one role; it is
+    /// not a discovery verb and not a fallback for the Identity Object read, and a device that opens
+    /// a session must never see one.
+    #[tokio::test]
+    async fn a_successful_connect_sends_no_list_identity_probe() {
+        let backend = EipBackend::new(timeouts());
+        let plc = MockPlc::start(PlcScript::default()).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+
+        let _session = backend.connect(&conn).await.expect("a healthy connect");
+        assert_eq!(
+            plc.log().list_identities,
+            0,
+            "the registration-failure diagnostic must not run on a connect that succeeded"
+        );
+
+        // …and not on the identity-refusal path either: that connect SUCCEEDED, so there is no
+        // registration failure to diagnose.
+        let plc = MockPlc::start(PlcScript::default().refusing_identity()).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        let _session = backend.connect(&conn).await.expect("a healthy connect");
+        assert_eq!(plc.log().list_identities, 0);
+    }
+
+    /// A **push** instance reads the identity too — over the explicit session that carries the
+    /// ForwardOpen, before that session disappears into the translator task.
+    #[tokio::test]
+    async fn open_push_reads_the_identity_over_the_explicit_session() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let plc = MockPlc::start(PlcScript::default().with_io_target(port)).await;
+        let conn = conn_of(json!({ "endpoint": plc.endpoint() }));
+        let io = io_of(100, 100, 4);
+
+        let mut session = EipPushSession::open(&conn, &io, &timeouts(), VENDOR_ID)
+            .await
+            .expect("the class-1 open");
+        let id = session.identity().expect("the device named itself");
+        assert_eq!(id.summary(), "MockPLC-1000 rev 7.3");
+        session.close().await;
     }
 
     /// The §10.1 classification on the open edge, both polarities and both entry points: a link that

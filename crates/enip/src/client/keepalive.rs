@@ -32,12 +32,10 @@ use crate::error::EnipError;
 use super::session::SessionCommand;
 use super::{EipClient, Inner};
 
-/// Identity object class (`0x01`) — the §7.6 keepalive target.
-pub(crate) const IDENTITY_CLASS: u16 = 0x01;
-/// Identity object instance 1 (every CIP device has exactly one).
-pub(crate) const IDENTITY_INSTANCE: u16 = 0x01;
-/// Identity attribute 4 (Revision) — a 2-byte mandatory attribute; the cheapest legal read.
-pub(crate) const IDENTITY_ATTR_REVISION: u16 = 0x04;
+/// The §7.6 keepalive target: Identity object class `0x01`, instance 1, attribute 4 (Revision) — a
+/// 2-byte mandatory attribute, the cheapest legal read. One definition, shared with the Identity
+/// Object read (D-ENIP-26), so the two can never drift.
+pub(crate) use crate::discovery::{IDENTITY_ATTR_REVISION, IDENTITY_CLASS, IDENTITY_INSTANCE};
 
 /// The keepalive fires when idle time reaches ¾ of the inactivity window (§7.6): late enough that an
 /// ordinarily-polled connection never pays for it, early enough that one lost probe still leaves a

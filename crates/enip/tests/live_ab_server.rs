@@ -264,3 +264,49 @@ async fn ab_server_live_browse_is_gracefully_refused() {
     }
     client.close().await;
 }
+
+/// **The connect-time identity read (D-ENIP-26 / D-EIP-34), through the routed path.**
+///
+/// The same Identity Object read the adapter performs on every connect, here wrapped in the real
+/// Unconnected_Send (`0x52`) backplane route — so the leg proves the read survives routing, not only
+/// the direct-UCMM case. What ab_server answers is recorded rather than demanded: an identity, or a
+/// tolerated refusal. Either way the session must still poll afterwards.
+#[tokio::test]
+async fn ab_server_live_identity_is_read_or_tolerably_refused() {
+    let addr = ab_addr();
+    if !sim_up(&addr).await {
+        assert!(
+            !live_required(),
+            "ENIP_LIVE_REQUIRED=1 but no ab_server on {addr} — \
+             docker compose up -d --build enip-ab-server"
+        );
+        eprintln!("live_ab_server: skipped (no ab_server on {addr})");
+        return;
+    }
+    let client = EipClient::connect(&addr, opts())
+        .await
+        .expect("session against live ab_server");
+
+    match client.read_identity().await {
+        Ok(id) => {
+            println!("live_ab_server identity: {id}");
+            assert!(
+                !id.product_name.is_empty(),
+                "an identity that decoded must name a product"
+            );
+        }
+        Err(EnipError::Cip(status)) => {
+            println!(
+                "live_ab_server identity: REFUSED by the peer ({status}) — tolerated by design"
+            );
+        }
+        Err(e) => panic!("the identity read failed at the connection level: {e:?}"),
+    }
+
+    let after = client.read_tag(&tag("LINE_SPEED"), 1).await;
+    assert!(
+        after.is_ok(),
+        "the session must survive the identity read: {after:?}"
+    );
+    client.close().await;
+}
