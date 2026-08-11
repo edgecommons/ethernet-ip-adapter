@@ -187,12 +187,16 @@ Every entry emits a `write-audit` event.
 
 - **`sb/status`** → `{ id, mode, connected, state ("ONLINE"|"BACKOFF"|"PAUSED"|…), paused, endpoint,
   adapter, metrics: { read:{interval,total}, write:{interval,total}, readErrors:{interval,total} },
-  security: {…}, identity: {…}|null, dialect: {…} }`. A push instance also carries `io: { o2tApiMs, t2oApiMs, run, peerRun,
-  framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors, refusedRedirects }` —
-  `sendErrors` counts O→T datagrams that failed to send, `recvErrors` counts receive failures on the
-  class-1 socket, and `refusedRedirects` counts connections whose device asked for its outputs at a
-  foreign address (the adapter refuses the address and keeps the device's own), each as an
-  `{interval, total}` pair like the other `io` counters.
+  security: {…}, identity: {…}|null, dialect: {…} }`. A push instance also carries
+  `io: { o2tApiMs, t2oApiMs, run, peerRun,
+  framesConsumed, staleDropped, sequenceGaps, sendErrors, recvErrors, sourceMismatchDatagrams,
+  refusedRedirects }` — `sendErrors` counts O→T datagrams that failed to send, `recvErrors` counts
+  receive failures on the class-1 socket, `sourceMismatchDatagrams` counts inbound datagrams that
+  carried a live connection's id but came from an address other than that connection's device (they
+  are dropped without delivering a sample and without refreshing the watchdog), and
+  `refusedRedirects` counts connections whose device asked for its outputs at a foreign address (the
+  adapter refuses the address and keeps the device's own), each as an `{interval, total}` pair like
+  the other `io` counters.
 - **`security`** — the connection's security posture. A plaintext instance reports
   `{ mode: "plaintext" }`; a TLS instance reports `{ mode: "tls", tlsVersion, cipherSuite, peerVerified,
   peer, clientCertNotAfter, clientCertSerial, clientCertExpiryDays,

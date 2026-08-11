@@ -433,6 +433,13 @@ pub struct IoLinkStats {
     pub send_errors: u64,
     /// Socket-wide receive errors — `recvErrors` (§8.8).
     pub recv_errors: u64,
+    /// `sourceMismatchDatagrams` (§8.8, PROTOCOL-DESIGN D-ENIP-24) — T→O datagrams that named a
+    /// live connection but arrived from an IP that is not that connection's target. Socket-wide,
+    /// like [`Self::malformed_frames`]. They are dropped before the consume gauntlet, so they
+    /// deliver no sample and do **not** feed the watchdog; nonzero means either something else on
+    /// the segment is producing into our connection id, or the target genuinely sources its T→O
+    /// stream from a second interface — which otherwise presents only as a link that never comes up.
+    pub source_mismatch_datagrams: u64,
     /// `refusedRedirects` (§8.8) — the ForwardOpen reply named a foreign O→T address; the address
     /// was refused and only its port honoured. Outputs may not reach a device that required it.
     pub refused_redirects: u64,

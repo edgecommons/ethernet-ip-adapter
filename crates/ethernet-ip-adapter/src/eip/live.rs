@@ -206,6 +206,7 @@ fn map_io_stats(s: enip::IoStats) -> IoLinkStats {
         produce_overruns: s.produce_overruns,
         send_errors: s.send_errors,
         recv_errors: s.recv_errors,
+        source_mismatch_datagrams: s.source_mismatch_datagrams,
         refused_redirects: s.refused_redirects,
     }
 }
@@ -2533,6 +2534,7 @@ mod tests {
                 produce_overruns: 7,
                 send_errors: 8,
                 recv_errors: 9,
+                source_mismatch_datagrams: 12,
                 refused_redirects: 13,
             }
         );
