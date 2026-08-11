@@ -45,11 +45,18 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
   the `data` topic channel = the config `name` (lower-kebab).
 - **Supported value types**: CIP elementary scalars + 1-D arrays thereof, `arrayCount` bounded to
   `1..=65535`. `string`/UDT/multi-dim are rejected at config validation; `bool` + `arrayCount` is
-  **accepted and warned as EXPERIMENTAL** — byte-per-element encoding, unvalidated on hardware, and
-  expected BAD on Logix (DWORD packing, 1756-PM020, deferred to hardware). The adapter has no
-  device-family detection, so the label is global to the feature (D-EIP-16). Cardinality is enforced,
-  never clamped: a reply whose element count is not the configured one is a BAD sample, and an
-  out-of-bound `arrayCount` in an `sb/read`/`sb/write` ref is `BAD_ARGS` (D-EIP-33).
+  **accepted and warned as EXPERIMENTAL** — still unvalidated on hardware, but no longer expected to
+  fail: a packed `DWORD` reply (Logix, 1756-PM020) is **translated** LSB-first into the configured
+  booleans (D-EIP-35). The adapter has no device-family detection, so the label is global to the
+  feature (D-EIP-16). Cardinality is enforced, never clamped: a reply whose element count is not the
+  configured one is a BAD sample, and an out-of-bound `arrayCount` in an `sb/read`/`sb/write` ref is
+  `BAD_ARGS` (D-EIP-33).
+- **The config declares the LOGICAL type; the wire representation is a DEVICE property** (D-EIP-35),
+  observed from the reply's declared type code — never a config knob. The adapter translates
+  representation variants of one logical type (today: packed BOOL arrays, adaptively re-shaping the
+  read once it has seen a `DWORD`) and refuses everything else loudly: a `real` reply to a
+  configured `dint` stays BAD, and a write to a tag observed packed is refused. Every mismatch names
+  both sides ("expected bool, device declares DWORD"); `sb/signals` reports `observedType`.
 - **Writes are allow-listed, secure-by-default**: empty `writes.allow[]` ⇒ all writes refused,
   matched on the stable `signal.id` (D-EIP-5).
 - **`sb/pause`/`sb/resume` are a deliberate southbound-contract extension** (D-EIP-3), a candidate

@@ -44,6 +44,16 @@ pub struct Reading {
     /// The protocol-native status code, kept verbatim for diagnosis (e.g. `"0x00"`, `"0x04 path
     /// segment error"`, `"TIMEOUT"`).
     pub quality_raw: Option<String>,
+    /// **The observed representation** (D-EIP-35): the wire type the device *declared* for this
+    /// reading — `"REAL"`, `"DWORD"`, `"UNKNOWN(0x00AB)"`. It is a fact about the device, never a
+    /// configured claim, which is why it is carried out of the read rather than read from config;
+    /// the surfaces above record it and `sb/signals` publishes it as `observedType`.
+    ///
+    /// `None` when the reading carries no reply to read a type code from (a link/CIP/timeout
+    /// failure), or when the backend has no wire declaration to report at all: a push assembly
+    /// decodes the adapter's **own** declared byte map (D-EIP-18), so there is nothing the device
+    /// said about it, and the simulator answers from a tag table rather than a wire.
+    pub observed_type: Option<String>,
 }
 
 /// Normalized quality. The protocol's own status code goes in `quality_raw`.

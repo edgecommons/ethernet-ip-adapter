@@ -240,7 +240,10 @@ Every entry emits a `write-audit` event.
   the link (`BROWSE_FAILED`) teaches nothing and leaves the value unchanged. The adapter does not probe
   for capabilities when it connects.
 - **`sb/signals`** → the resolved config view, no device I/O. Poll: `{ id, mode:"poll", signals:[{ name,
-  id, address, pollGroup, pollIntervalMs, publishMode, writable, deadband }] }`. Push: `{ id,
+  id, address, pollGroup, pollIntervalMs, publishMode, writable, deadband, observedType? }] }`.
+  `observedType` is the CIP type the device declared on that signal's last reply (`"REAL"`,
+  `"DWORD"`, …) — the representation it is actually served in, beside the `address.type` the
+  configuration asked for. It is absent for a signal that has not been read yet. Push: `{ id,
   mode:"push", signals:[{ name, id, address, direction ("input"|"output"), publishMode, writable,
   deadband? }] }`.
 - **`sb/browse`** → poll: `{ id, tags:[{ name, type, configured, supported, arrayDim? }], cursor? }`.

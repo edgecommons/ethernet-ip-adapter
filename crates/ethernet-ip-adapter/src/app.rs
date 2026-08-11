@@ -154,6 +154,22 @@ pub struct Health {
     /// It outlives a reconnect on purpose. It is memory about the *device*, not about the session;
     /// a link that dropped teaches us nothing that would unlearn it.
     tag_list_dialect: AtomicU8,
+    /// **The observed wire representation of each signal** (D-EIP-35), `signal id → declared CIP
+    /// type name`, as of that signal's last reply. Written by the poll loop from
+    /// [`Reading::observed_type`]; read by `sb/signals` as `observedType`.
+    ///
+    /// It lives here because this is the per-instance state the command surface already shares with
+    /// the device task, and `sb/signals` answers **without device I/O** (§7.5) — routing it through
+    /// the control channel would turn a config view into a verb that can report
+    /// `DEVICE_UNAVAILABLE`. A signal with no entry has not been read yet, which is exactly the
+    /// "absent until first contact" the field promises. Entries are keyed by the stable signal id
+    /// and last written wins, so a re-programmed device corrects the surface on its next reply.
+    ///
+    /// Sibling to `tag_list_dialect` above but deliberately **not** the same lifetime rule: a
+    /// dialect fact is about the device and survives a reconnect, while the *authoritative* copy of
+    /// a representation lives on the session and is re-observed there (D-EIP-35). This map is the
+    /// reporting surface's cache of the last thing the device said, which the next reply corrects.
+    pub observed_types: std::sync::Mutex<std::collections::HashMap<String, String>>,
 
     // ---- engine counters (consumed by the S5 metric families; §8) ----
     /// Publish latency of the last `data.publish().await`, ms (§6.2).
@@ -232,6 +248,30 @@ impl Health {
     #[must_use]
     pub fn est(&self) -> Option<crate::eip::est::EstStatus> {
         self.est.lock().unwrap().clone()
+    }
+
+    /// Record the wire representation each of these readings was served in (D-EIP-35). Readings
+    /// that carry no declaration (a failed read, a push field) leave the previous observation
+    /// standing — the surface reports the last thing the device actually said, not a gap punched in
+    /// it by one timeout.
+    pub fn record_observed(&self, readings: &[Reading]) {
+        if readings.iter().all(|r| r.observed_type.is_none()) {
+            return;
+        }
+        let Ok(mut map) = self.observed_types.lock() else {
+            return;
+        };
+        for r in readings {
+            if let Some(ty) = &r.observed_type {
+                map.insert(r.signal_id.clone(), ty.clone());
+            }
+        }
+    }
+
+    /// The wire type `signal_id` was last observed to declare, or `None` before first contact.
+    #[must_use]
+    pub fn observed_type(&self, signal_id: &str) -> Option<String> {
+        self.observed_types.lock().ok()?.get(signal_id).cloned()
     }
 
     /// Store what the device said it is on a freshly-established session (D-EIP-34).
@@ -752,6 +792,45 @@ mod tests {
             connectivity_of(&cfg, &health).attributes["targetCipSecurity"],
             json!(false)
         );
+    }
+
+    /// D-EIP-35: the observed representation is remembered per signal and, crucially, **not
+    /// forgotten** by a reading that carries no declaration. A timeout or a CIP refusal produces no
+    /// reply to read a type code from; punching a hole in the surface for it would make
+    /// `observedType` flicker on every dropped poll, when the last thing the device actually said is
+    /// still the best answer available.
+    #[test]
+    fn the_observed_representation_is_remembered_and_survives_a_reply_less_reading() {
+        let health = Health::default();
+        assert_eq!(
+            health.observed_type("ALARMS"),
+            None,
+            "absent until first contact"
+        );
+
+        let observed = |id: &str, ty: Option<&str>| Reading {
+            signal_id: id.to_string(),
+            name: None,
+            value: json!(null),
+            quality: crate::device::Quality::Good,
+            quality_raw: None,
+            observed_type: ty.map(str::to_string),
+        };
+
+        health.record_observed(&[observed("ALARMS", Some("DWORD")), observed("SPEED", None)]);
+        assert_eq!(health.observed_type("ALARMS").as_deref(), Some("DWORD"));
+        assert_eq!(
+            health.observed_type("SPEED"),
+            None,
+            "a reading with no declaration records nothing"
+        );
+
+        // A failed read leaves the prior observation standing…
+        health.record_observed(&[observed("ALARMS", None)]);
+        assert_eq!(health.observed_type("ALARMS").as_deref(), Some("DWORD"));
+        // …and a device that starts answering differently corrects it on its next reply.
+        health.record_observed(&[observed("ALARMS", Some("BOOL"))]);
+        assert_eq!(health.observed_type("ALARMS").as_deref(), Some("BOOL"));
     }
 
     #[test]

@@ -130,6 +130,7 @@ mod tests {
             value,
             quality,
             quality_raw: Some(raw.to_string()),
+            observed_type: None,
         }
     }
 

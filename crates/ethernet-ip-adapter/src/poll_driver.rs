@@ -200,6 +200,7 @@ pub(crate) async fn poll_until_disconnected(
                         // An on-demand read serializes with the loop and works while paused (§7.2).
                         match session.read_signals(&specs).await {
                             Ok(readings) => {
+                                health.record_observed(&readings);
                                 let _ = reply.send(Ok(readings));
                             }
                             Err(e) => {
@@ -366,6 +367,10 @@ pub(crate) async fn poll_until_disconnected(
                         return PollExit::LinkLost;
                     }
                 };
+                // What the device declared for each of these tags (D-EIP-35) — the `observedType`
+                // `sb/signals` reports, recorded on every cycle so a re-programmed controller
+                // corrects the surface on its next reply.
+                health.record_observed(&readings);
                 // Capture time (four-slot timestamp model): serverTs is stamped the moment the
                 // group's read completed, so a batchMs flush carries the read-time stamp.
                 let server_ts = publish::now_iso();
@@ -462,6 +467,7 @@ async fn repoll_all_groups(
             .read_signals(&group.signals)
             .await
             .map_err(|e| e.to_string())?;
+        health.record_observed(&readings);
         // Capture time (four-slot timestamp model): stamped at read completion, as on the timer.
         let server_ts = publish::now_iso();
         polled += group.signals.len() as u64;
@@ -741,6 +747,36 @@ mod tests {
         assert!(
             !rig.events.has("device-unreachable"),
             "a stop raises no alarm"
+        );
+    }
+
+    /// D-EIP-35: the wire representation each reply declared reaches the shared per-instance state
+    /// the command surface reads, so `sb/signals` can report `observedType` without a device
+    /// round-trip. The loop is the only place that sees every reading, which is why the recording
+    /// lives here rather than in the session.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_records_the_observed_representation_of_every_reading() {
+        let mut rig = Rig::new(
+            poll_device(one_group(100, "always")),
+            global(json!({})),
+            vec![Reading {
+                observed_type: Some("DWORD".to_string()),
+                ..reading("LINE_SPEED", json!(1.0), Quality::Good)
+            }],
+        );
+        assert_eq!(
+            rig.health.observed_type("LINE_SPEED"),
+            None,
+            "nothing is claimed before the first reply"
+        );
+        rig.cancel_after(Duration::from_millis(250));
+
+        rig.run().await;
+
+        assert_eq!(
+            rig.health.observed_type("LINE_SPEED").as_deref(),
+            Some("DWORD"),
+            "what the device declared reaches the surface sb/signals reads"
         );
     }
 

@@ -1,7 +1,9 @@
 //! # The poll backend: [`EipSession`] over `enip::EipClient` (§3.4)
 //!
 //! One live explicit-messaging session to one device. `read_signals` issues one Read Tag per signal
-//! (D-EIP-15) and decodes each reply through [`super::types`]; a per-tag CIP error, an isolated
+//! (D-EIP-15) and decodes each reply through [`super::types`], **translating the representation the
+//! device declares into the configured logical type** where the two are variants of one type
+//! (D-EIP-35 — today that is the Logix packed BOOL array); a per-tag CIP error, an isolated
 //! request timeout, or a reply whose element count is not the configured one
 //! ([`cardinality_mismatch`], D-EIP-33) becomes a **BAD [`Reading`]** (the session lives — one dead
 //! tag must not blind the other ninety-nine, and a malformed reply must not bounce the link, §5.4),
@@ -20,6 +22,7 @@
 //! [`tokio::time::timeout`] backstop; if that backstop ever fires the session is treated as poisoned
 //! and the caller reconnects. All `enip` errors are classified by [`super::map_enip_error`] (§10.1).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -45,6 +48,23 @@ pub struct EipSession {
     /// What the device said it is, read once at connect (D-EIP-34). `None` when it refused the read.
     /// Captured, never re-read: a status query must not cost a device round-trip.
     identity: Option<DeviceIdentity>,
+    /// **The representation memory** (D-EIP-35): the wire type each tag was last observed to
+    /// declare, keyed by `tagPath`. It shapes the *next* request — a tag observed to answer `DWORD`
+    /// for a configured BOOL array is asked for `ceil(N/32)` elements thereafter — and gates the
+    /// write refusal.
+    ///
+    /// It lives **on the session**, not above the seam, and therefore dies with the session: a
+    /// device does not change how it stores a tag mid-session, but a reconnect may land on a
+    /// re-programmed controller, so every fresh session re-observes from the byte-per-element first
+    /// read rather than inheriting a belief it cannot re-check. It is also the only layer that both
+    /// issues the request and sees the declared type, so no other layer could hold it without the
+    /// `enip` types crossing the seam. What the surfaces above need is carried out instead, per
+    /// reading, as [`Reading::observed_type`].
+    ///
+    /// Unlike [`Self::identity`] this is read *continuously* rather than once at connect — identity
+    /// is what the device **is**, which cannot change under a session; a representation is what it
+    /// answered **last**, and the point of observing it is that the next request follows.
+    observed: HashMap<String, enip::CipType>,
 }
 
 impl EipSession {
@@ -58,6 +78,7 @@ impl EipSession {
             request_timeout,
             security: None,
             identity: None,
+            observed: HashMap::new(),
         }
     }
 
@@ -83,7 +104,24 @@ impl EipSession {
             request_timeout,
             security: Some(security),
             identity: None,
+            observed: HashMap::new(),
         }
+    }
+
+    /// Whether this signal is a configured BOOL **array** — the one logical type that has two
+    /// representations on the wire (D-EIP-35). A scalar `bool` is not: it is one byte-addressed
+    /// element, and no controller packs it.
+    fn is_bool_array(spec: &SignalSpec) -> bool {
+        spec.eip_type == EipType::Bool && spec.array_count.is_some()
+    }
+
+    /// Whether this session has *observed* the device serve this signal in the packed
+    /// representation — a configured BOOL array the device declared `DWORD` (D-EIP-35). Never a
+    /// configured claim: until a reply has been seen the answer is `false` and the adapter reads
+    /// byte-per-element.
+    fn reads_packed(&self, spec: &SignalSpec) -> bool {
+        Self::is_bool_array(spec)
+            && self.observed.get(&spec.tag_path) == Some(&enip::CipType::Dword)
     }
 
     /// The defensive backstop deadline: comfortably longer than the crate's own per-request deadline
@@ -96,49 +134,60 @@ impl EipSession {
 
     /// Read one signal into a [`Reading`]. `Err` means the **connection** is broken (poison the
     /// session); a per-tag failure comes back as `Ok(BAD Reading)`.
-    async fn read_one(&self, spec: &SignalSpec) -> Result<Reading> {
+    async fn read_one(&mut self, spec: &SignalSpec) -> Result<Reading> {
         let addr = match enip::TagAddress::parse(&spec.tag_path) {
             Ok(a) => a,
             // A malformed tag path is a per-signal problem, not a link failure.
-            Err(e) => return Ok(bad(spec, format!("DECODE bad tag path ({e})"))),
+            Err(e) => return Ok(bad(spec, format!("DECODE bad tag path ({e})"), None)),
         };
+        // The **logical** element count: the contract the configuration declared and the reply is
+        // held to, whatever representation the device serves it in.
+        //
         // Both paths that mint a `SignalSpec` bound `arrayCount` to `1..=MAX_ARRAY_COUNT` — config
         // validation (§4.4) and the `sb/read`/`sb/write` explicit ref (`BAD_ARGS`, §7.2) — so this
         // conversion is exact. It is written as a per-signal refusal rather than the clamp it
         // replaces because a silently narrowed element count asks the device for a different
         // contract than the configured one and then publishes the answer GOOD (D-EIP-33).
-        let requested = spec.array_count.unwrap_or(1);
-        let elements = match u16::try_from(requested) {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                return Ok(bad(
-                    spec,
-                    format!("DECODE arrayCount {requested} out of range (expected 1..=65535)"),
-                ))
-            }
+        let logical = spec.array_count.unwrap_or(1);
+        if !matches!(u16::try_from(logical), Ok(n) if n >= 1) {
+            return Ok(bad(
+                spec,
+                format!("DECODE arrayCount {logical} out of range (expected 1..=65535)"),
+                None,
+            ));
+        }
+        // **Request shaping** (D-EIP-35): first contact asks for the logical count, which is what a
+        // byte-per-element device wants; once this session has seen the tag answered `DWORD`, N
+        // booleans live in `ceil(N/32)` words and that is what is asked for. `logical` is at most
+        // 65535 and the packed count at most 2048, so the conversion cannot narrow.
+        let wire_elements = if self.reads_packed(spec) {
+            types::packed_dword_count(logical)
+        } else {
+            logical
         };
+        let elements = u16::try_from(wire_elements).unwrap_or(u16::MAX);
 
         let outcome =
             tokio::time::timeout(self.defensive(), self.client.read_tag(&addr, elements)).await;
         match outcome {
             Ok(Ok(result)) => {
-                match types::decode_value(&result.value, spec.eip_type, spec.scale, spec.offset) {
-                    Err(e) => Ok(bad(spec, decode_detail(spec, &e))),
-                    // The element *type* matched; the element *count* is a separate promise, and it
-                    // is checked here — on the shape the crate decoded — because only the adapter
-                    // holds the configured cardinality (§5.1's "a JSON array of N elements").
-                    Ok(decoded) => match cardinality_mismatch(&result.value, elements) {
-                        Some(detail) => Ok(bad(spec, detail)),
-                        None if decoded.non_finite => Ok(uncertain(spec)),
-                        None => Ok(good(spec, decoded.value)),
-                    },
-                }
+                // The observation, recorded before anything is decided about it: the type code the
+                // reply declared is a fact about the device, and it shapes the next request whether
+                // this reading ends up GOOD or BAD (D-EIP-35).
+                self.observed
+                    .insert(spec.tag_path.clone(), result.wire_type);
+                Ok(decode_reading(
+                    spec,
+                    &result.value,
+                    result.wire_type,
+                    logical,
+                ))
             }
             // A per-tag CIP error status: BAD sample, session lives (§5.4, §10.1).
-            Ok(Err(enip::EnipError::Cip(status))) => Ok(bad(spec, status.to_string())),
+            Ok(Err(enip::EnipError::Cip(status))) => Ok(bad(spec, status.to_string(), None)),
             // An isolated request timeout: BAD sample. The crate declares the session lost after
             // three consecutive timeouts (returning ConnectionLost, handled below).
-            Ok(Err(enip::EnipError::Timeout { .. })) => Ok(bad(spec, "TIMEOUT".to_string())),
+            Ok(Err(enip::EnipError::Timeout { .. })) => Ok(bad(spec, "TIMEOUT".to_string(), None)),
             // Any other error is connection-level: poison the session.
             Ok(Err(e)) => Err(map_enip_error(e)),
             // The defensive backstop fired: treat the session as poisoned.
@@ -149,32 +198,82 @@ impl EipSession {
     }
 }
 
-/// The `qualityRaw` detail for a decode failure — [`types::DecodeError::quality_raw`], plus one hint
-/// for the single mismatch shape an operator is most likely to hit and least likely to understand.
+/// Turn one Read Tag reply into a [`Reading`] — the decode, the representation translation, and the
+/// cardinality check, in that order (§5.1, §5.4, D-EIP-33, D-EIP-35).
 ///
-/// A configured BOOL **array** answered with `DWORD` is a Logix controller telling us its `BOOL[n]`
-/// tag is packed (D-EIP-16): the adapter's BOOL-array encoding is byte-per-element, which this
-/// device does not use. Config validation already warns about the signal at startup, but an operator
-/// reading a BAD sample months later never saw that line, so the sample explains itself. Nothing
-/// else is annotated — a hint on every mismatch would be noise, and the base detail already names
-/// expected vs got.
-fn decode_detail(spec: &SignalSpec, e: &types::DecodeError) -> String {
-    let base = e.quality_raw();
-    let bool_array_vs_dword = spec.eip_type == EipType::Bool
-        && spec.array_count.is_some()
-        && matches!(
-            e,
-            types::DecodeError::TypeMismatch {
-                got: enip::CipType::Dword,
-                ..
-            }
-        );
-    if bool_array_vs_dword {
-        return format!(
-            "{base} - Logix packs BOOL arrays as DWORDs; BOOL-array support is experimental"
-        );
+/// **The translation boundary.** Exactly one shape is translated: a configured BOOL *array* answered
+/// with `DWORD`s, which is the same logical type in the device's own storage representation
+/// (1756-PM020). Everything else falls through to [`types::decode_value`]'s wire-type check, so a
+/// `real` reply to a configured `dint` is a mismatch ⇒ BAD, forever — translation is never type
+/// substitution.
+///
+/// **The cardinality check is against the LOGICAL count, not the requested one.** The two differ
+/// exactly when the request was reshaped for the packed representation, and that is the case it has
+/// to catch: a device that answered `DWORD` once and byte-per-element the next time would otherwise
+/// have returned `ceil(N/32)` BOOLs against a `ceil(N/32)`-element request and published a GOOD
+/// array of the wrong length. Checked this way the reply is BAD and the fresh observation re-shapes
+/// the following request, so the mismatch costs one sample rather than becoming permanent.
+///
+/// **The published shape is the same in both representations** ([`collapse_one_element`]).
+fn decode_reading(
+    spec: &SignalSpec,
+    value: &enip::CipValue,
+    wire_type: enip::CipType,
+    logical: u32,
+) -> Reading {
+    let observed = types::wire_type_label(wire_type);
+    if EipSession::is_bool_array(spec) {
+        if let Some(words) = types::packed_dwords(value) {
+            return match types::unpack_bools(&words, logical) {
+                Ok(v) => good(spec, collapse_one_element(v, logical), Some(observed)),
+                Err(e) => bad(spec, e.quality_raw(), Some(observed)),
+            };
+        }
     }
-    base
+    match types::decode_value(value, spec.eip_type, spec.scale, spec.offset) {
+        Err(e) => bad(spec, e.quality_raw(), Some(observed)),
+        // The element *type* matched; the element *count* is a separate promise, and it
+        // is checked here — on the shape the crate decoded — because only the adapter
+        // holds the configured cardinality (§5.1's "a JSON array of N elements").
+        Ok(decoded) => match cardinality_mismatch(value, logical) {
+            Some(detail) => bad(spec, detail, Some(observed)),
+            None if decoded.non_finite => uncertain(spec, Some(observed)),
+            None => good(spec, decoded.value, Some(observed)),
+        },
+    }
+}
+
+/// **Shape parity across representations** (D-EIP-33, D-EIP-35): a one-element read publishes the
+/// bare value, never a one-element array — on *every* path.
+///
+/// The byte-per-element path gets this for free, from the protocol crate's one-element collapse
+/// (`cip/types.rs`: a single element decodes as a scalar, which is what makes `arrayCount: 1`
+/// satisfiable in the first place). A packed reply has no such collapse to inherit — its words are
+/// unpacked into booleans by count — so the same rule is applied here explicitly.
+///
+/// **Why here and not inside [`types::unpack_bools`]:** unpacking is a *bit-layout* rule whose
+/// contract is "the words in, N booleans out", and it stays exactly that — testable in isolation,
+/// with no opinion about publication. This is a *publication-shape* rule about what a one-element
+/// reading looks like on the UNS, so it belongs beside the other decisions about the published
+/// value, at the point the [`Reading`] is minted, in one place, for both representations.
+///
+/// **Why parity beats purity.** Stating the pure "a JSON array of N elements" contract on the
+/// translated path alone would make the published JSON **shape depend on which device serves the
+/// tag**: the identical `{"type": "bool", "arrayCount": 1}` config would publish a scalar against a
+/// byte-per-element device and `[false]` against a Logix controller. The representation is a device
+/// property the operator never declared (D-EIP-35), so keying an observable value shape on it means
+/// a consumer's parsing can break because the plant swapped PLC brands. One quirk applied uniformly
+/// is worth more than two behaviors that are each locally defensible.
+fn collapse_one_element(value: serde_json::Value, logical: u32) -> serde_json::Value {
+    if logical != 1 {
+        return value;
+    }
+    match value {
+        serde_json::Value::Array(mut elems) if elems.len() == 1 => {
+            elems.pop().unwrap_or(serde_json::Value::Null)
+        }
+        other => other,
+    }
 }
 
 /// How many elements a decoded reply actually carries. The protocol crate derives the count from the
@@ -188,52 +287,59 @@ fn returned_elements(v: &enip::CipValue) -> usize {
     }
 }
 
-/// The `qualityRaw` detail when a reply's element count is not the one the request asked for, or
-/// `None` when it matches (D-EIP-33).
+/// The `qualityRaw` detail when a reply's element count is not the **configured** one, or `None`
+/// when it matches (D-EIP-33).
 ///
-/// The requested count is sent on the wire and then has to be *checked*: a conforming Logix answers
-/// exactly `requested` elements or errors, but nothing in the reply forces that, and the crate
-/// deliberately derives the count from the payload length. Left unchecked, a nonconforming or
-/// hostile peer turns a short reply into a GOOD array shorter than the configured contract, and a
-/// one-element reply into a GOOD **scalar** where an array is configured — both silently wrong,
-/// which is the failure mode D-EIP-1's threat model exists to refuse. It is a per-signal BAD sample,
-/// never a connection-level error: a malformed reply must not bounce the session (§5.4).
-fn cardinality_mismatch(v: &enip::CipValue, requested: u16) -> Option<String> {
+/// The count is sent on the wire and then has to be *checked*: a conforming Logix answers exactly
+/// what was asked for or errors, but nothing in the reply forces that, and the crate deliberately
+/// derives the count from the payload length. Left unchecked, a nonconforming or hostile peer turns
+/// a short reply into a GOOD array shorter than the configured contract, and a one-element reply
+/// into a GOOD **scalar** where an array is configured — both silently wrong, which is the failure
+/// mode D-EIP-1's threat model exists to refuse. It is a per-signal BAD sample, never a
+/// connection-level error: a malformed reply must not bounce the session (§5.4).
+///
+/// `configured` is the logical element count, which is also the requested one on every path except
+/// a reshaped packed-BOOL read (see [`decode_reading`]).
+fn cardinality_mismatch(v: &enip::CipValue, configured: u32) -> Option<String> {
     let got = returned_elements(v);
-    let want = usize::from(requested);
+    let want = usize::try_from(configured).unwrap_or(usize::MAX);
     (got != want).then(|| format!("DECODE element count mismatch (expected {want}, got {got})"))
 }
 
-/// A GOOD reading of `value`.
-fn good(spec: &SignalSpec, value: serde_json::Value) -> Reading {
+/// A GOOD reading of `value`. `observed` is the wire type the reply declared (§7.5 `observedType`).
+fn good(spec: &SignalSpec, value: serde_json::Value, observed: Option<String>) -> Reading {
     Reading {
         signal_id: spec.tag_path.clone(),
         name: Some(spec.name.clone()),
         value,
         quality: Quality::Good,
         quality_raw: Some("0x00".to_string()),
+        observed_type: observed,
     }
 }
 
 /// An UNCERTAIN reading (scale/offset produced a non-finite number, §5.4).
-fn uncertain(spec: &SignalSpec) -> Reading {
+fn uncertain(spec: &SignalSpec, observed: Option<String>) -> Reading {
     Reading {
         signal_id: spec.tag_path.clone(),
         name: Some(spec.name.clone()),
         value: serde_json::Value::Null,
         quality: Quality::Uncertain,
         quality_raw: Some("NON_FINITE_AFTER_SCALE".to_string()),
+        observed_type: observed,
     }
 }
 
 /// A BAD reading carrying the native status in `qualityRaw` (§5.4). Value is JSON `null`.
-fn bad(spec: &SignalSpec, quality_raw: String) -> Reading {
+/// `observed` is `None` when the failure produced no reply to read a type code from.
+fn bad(spec: &SignalSpec, quality_raw: String, observed: Option<String>) -> Reading {
     Reading {
         signal_id: spec.tag_path.clone(),
         name: Some(spec.name.clone()),
         value: serde_json::Value::Null,
         quality: Quality::Bad,
         quality_raw: Some(quality_raw),
+        observed_type: observed,
     }
 }
 
@@ -244,7 +350,7 @@ fn symbol_type_name(st: enip::SymbolType) -> String {
         return "STRUCT".to_string();
     }
     match st.cip_type() {
-        Some(ty) => cip_type_name(ty).to_string(),
+        Some(ty) => types::cip_type_name(ty).to_string(),
         None => format!("0x{:04X}", st.0),
     }
 }
@@ -306,32 +412,6 @@ fn paginate_browse(
     }
 }
 
-/// The CIP elementary type's spelling (uppercase, as a Logix browse reports it).
-fn cip_type_name(ty: enip::CipType) -> &'static str {
-    match ty {
-        enip::CipType::Bool => "BOOL",
-        enip::CipType::Sint => "SINT",
-        enip::CipType::Int => "INT",
-        enip::CipType::Dint => "DINT",
-        enip::CipType::Lint => "LINT",
-        enip::CipType::Usint => "USINT",
-        enip::CipType::Uint => "UINT",
-        enip::CipType::Udint => "UDINT",
-        enip::CipType::Ulint => "ULINT",
-        enip::CipType::Real => "REAL",
-        enip::CipType::Lreal => "LREAL",
-        enip::CipType::Byte => "BYTE",
-        enip::CipType::Word => "WORD",
-        enip::CipType::Dword => "DWORD",
-        enip::CipType::Lword => "LWORD",
-        enip::CipType::String => "STRING",
-        enip::CipType::Struct => "STRUCT",
-        enip::CipType::Unknown(_) => "UNKNOWN",
-        // `CipType` is `#[non_exhaustive]`: any future elementary code maps to a generic name.
-        _ => "UNKNOWN",
-    }
-}
-
 #[async_trait]
 impl DeviceSession for EipSession {
     async fn read_signals(&mut self, signals: &[SignalSpec]) -> Result<Vec<Reading>> {
@@ -343,6 +423,23 @@ impl DeviceSession for EipSession {
     }
 
     async fn write_signal(&mut self, signal: &SignalSpec, value: &serde_json::Value) -> Result<()> {
+        // **Writes are not adapted** (D-EIP-35). Reads translate the packed representation because
+        // the whole word arrives and every bit in it is the device's current truth. A write does
+        // not have that: setting N booleans inside `ceil(N/32)` words means writing back the bits
+        // that were NOT configured too, so the only correct form is a masked read-modify-write
+        // (or the CIP masked-write service) — and the mask semantics are exactly what has never been
+        // exercised against a physical controller. Writing the word as read would silently republish
+        // a stale value for every padding bit, which on a BOOL array is a coil the operator did not
+        // ask to move. Refused by name instead, before any device I/O.
+        if self.reads_packed(signal) {
+            return Err(DeviceError::Permanent(anyhow::anyhow!(
+                "write refused: the device declares `{}` a packed BOOL array (DWORD, Rockwell \
+                 1756-PM020); writing it needs a masked read-modify-write, which this adapter does \
+                 not implement",
+                signal.tag_path
+            )));
+        }
+
         let cip = types::encode_write(
             value,
             signal.eip_type,
@@ -540,6 +637,23 @@ mod tests {
         let path_len = mr[1] as usize * 2;
         let off = 2 + path_len;
         u16::from_le_bytes([mr[off], mr[off + 1]])
+    }
+
+    /// A tagged **BOOL array** reply payload, byte-per-element: `u16 0xC1` + one byte per element.
+    fn tagged_bools(vals: &[bool]) -> Vec<u8> {
+        let mut v = 0x00C1_u16.to_le_bytes().to_vec();
+        v.extend(vals.iter().map(|b| u8::from(*b)));
+        v
+    }
+
+    /// A tagged **DWORD** reply payload: `u16 0xD3` + one `u32` LE per word — the Logix packed
+    /// representation of a `BOOL[n]` tag (1756-PM020 p.58).
+    fn tagged_dwords(words: &[u32]) -> Vec<u8> {
+        let mut v = 0x00D3_u16.to_le_bytes().to_vec();
+        for w in words {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        v
     }
 
     /// One Get-Instance-Attribute-List record.
@@ -826,83 +940,390 @@ mod tests {
         );
     }
 
-    /// **The BOOL-array experiment, both outcomes (D-EIP-16).** A byte-per-element peer answers the
-    /// configured `BOOL[4]` and the signal reads GOOD — the feature is available, which is what
-    /// "accepted, experimental" means. A Logix controller answers the same read with a packed
-    /// `DWORD` array (`0x00D3`), which is a type mismatch ⇒ BAD; that BAD carries the hint, because
-    /// an operator reading it months later never saw the startup warning and has no way to know
-    /// from "expected bool, got Dword" that BOOL-array support is the thing at fault.
+    /// **The BOOL-array control path is unchanged (D-EIP-16).** A byte-per-element peer answers the
+    /// configured `BOOL[4]` and the signal reads GOOD, exactly as before the translation existed —
+    /// and reports `BOOL` as the representation it was served in.
     #[tokio::test]
-    async fn a_bool_array_reads_byte_per_element_and_a_dword_reply_is_bad_with_the_hint() {
+    async fn a_byte_per_element_bool_array_still_reads_good() {
         let (client_half, server_half) = tokio::io::duplex(4096);
-        spawn_device(server_half, |idx, service, _mr| {
+        spawn_device(server_half, |_idx, service, mr| {
             assert_eq!(service, 0x4C);
-            match idx {
-                // Byte-per-element BOOL[4]: `u16 0xC1` + four bytes.
-                0 => (0x00, vec![0xC1, 0x00, 1, 0, 1, 1]),
-                // The Logix answer: a packed DWORD array (`u16 0xD3` + two 32-bit words).
-                _ => (
-                    0x00,
-                    vec![0xD3, 0x00, 0x0F, 0, 0, 0, 0xF0, 0xFF, 0xFF, 0xFF],
-                ),
-            }
+            assert_eq!(
+                requested_elements(mr),
+                4,
+                "first contact asks for the logical count"
+            );
+            (0x00, tagged_bools(&[true, false, true, true]))
         });
         let mut session = connect(client_half).await;
         let sp = spec("alarms", "ALARMS", "bool", Some(4));
 
-        let good = session
-            .read_signals(std::slice::from_ref(&sp))
-            .await
-            .unwrap();
-        assert_eq!(good[0].quality, Quality::Good);
-        assert_eq!(good[0].value, json!([true, false, true, true]));
+        let r = session.read_signals(&[sp]).await.unwrap();
+        assert_eq!(r[0].quality, Quality::Good);
+        assert_eq!(r[0].value, json!([true, false, true, true]));
+        assert_eq!(r[0].observed_type.as_deref(), Some("BOOL"));
+    }
 
-        let packed = session.read_signals(&[sp]).await.unwrap();
+    /// **Packed BOOL translation, single word (D-EIP-35).** A Logix controller answers a `BOOL[n]`
+    /// read with the `DWORD` array its storage really is (1756-PM020 p.58). That is the *same
+    /// logical type* in the device's representation, so it is translated into the configured 8
+    /// booleans and published GOOD — where before it was a type mismatch, BAD forever.
+    ///
+    /// The bit order is pinned with an asymmetric pattern rather than a palindrome: `0x0000000D` is
+    /// `0b1101`, so LSB-first gives elements 0, 2, 3 set and element 1 clear. MSB-first, or any
+    /// reversal, fails this assertion; `0x0F`-style patterns would not.
+    #[tokio::test]
+    async fn a_packed_dword_reply_translates_to_the_configured_bools_lsb_first() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |_idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            // High bits set as padding beyond the configured 8 — they must not reach the sample.
+            (0x00, tagged_dwords(&[0xFFFF_FF0D]))
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("alarms", "ALARMS", "bool", Some(8));
+
+        let r = session.read_signals(&[sp]).await.unwrap();
         assert_eq!(
-            packed[0].quality,
-            Quality::Bad,
-            "a packed reply is loud, not silently reinterpreted"
+            r[0].quality,
+            Quality::Good,
+            "the packed representation of a BOOL array is a BOOL array: {:?}",
+            r[0].quality_raw
         );
-        let raw = packed[0].quality_raw.clone().unwrap_or_default();
-        assert!(
-            raw.contains("type mismatch") && raw.contains("Dword"),
-            "the base detail still names expected vs got: {raw}"
+        assert_eq!(
+            r[0].value,
+            json!([true, false, true, true, false, false, false, false]),
+            "LSB-first: bit 0 is element 0"
         );
-        assert!(
-            raw.contains("Logix packs BOOL arrays as DWORDs")
-                && raw.contains("BOOL-array support is experimental"),
-            "the sample explains itself to an operator who never saw the startup log: {raw}"
+        assert_eq!(
+            r[0].observed_type.as_deref(),
+            Some("DWORD"),
+            "the representation is reported, not hidden by the translation"
         );
     }
 
-    /// The hint is for that one mismatch shape only — every other decode mismatch keeps the bare
-    /// detail, so the annotation stays a signal rather than noise.
+    /// **Packed BOOL translation across words, and the N-vs-tag-size rule.** A `BOOL[64]` Logix tag
+    /// configured `arrayCount: 40` means "publish the first 40": two words arrive, 40 booleans are
+    /// published, and the 24 padding bits of the second word are dropped (they are all set here, so
+    /// their absence is provable rather than incidental).
     #[tokio::test]
-    async fn the_bool_array_hint_is_not_appended_to_unrelated_mismatches() {
+    async fn a_multi_word_packed_reply_publishes_exactly_n_bools() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |_idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            // word 0: only bit 31 set (element 31). word 1: bit 0 set (element 32), rest padding-set.
+            (0x00, tagged_dwords(&[0x8000_0000, 0xFFFF_FF01]))
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("alarms", "ALARMS", "bool", Some(40));
+
+        let r = session.read_signals(&[sp]).await.unwrap();
+        assert_eq!(r[0].quality, Quality::Good);
+        let bits = r[0].value.as_array().cloned().unwrap_or_default();
+        assert_eq!(bits.len(), 40, "exactly the configured N, not 64");
+        assert_eq!(bits[31], json!(true), "word 0 bit 31 is element 31");
+        assert_eq!(bits[32], json!(true), "word 1 bit 0 is element 32");
+        assert!(
+            bits[33..].iter().all(|b| b == &json!(false)),
+            "elements 33..40 come from word 1 bits 1..8: {bits:?}"
+        );
+        assert!(bits[..31].iter().all(|b| b == &json!(false)));
+    }
+
+    /// **Shape parity across representations (D-EIP-35).** The published JSON shape must not depend
+    /// on which device serves the tag: the identical `{"type": "bool", "arrayCount": 1}` config
+    /// publishes the **bare boolean** whether the reply came back byte-per-element or packed. The
+    /// byte path inherits that collapse from the crate (a single element decodes as a scalar,
+    /// D-EIP-33); the translated path applies the same rule deliberately.
+    ///
+    /// The N = 2 pair is the control: parity is a shape rule for the one-element case, not a
+    /// flattening — both representations still publish a two-element array, same values, same order.
+    ///
+    /// Four distinct tags, so each carries its own observation and no read reshapes another's.
+    #[tokio::test]
+    async fn a_one_element_bool_array_publishes_the_same_shape_in_both_representations() {
         let (client_half, server_half) = tokio::io::duplex(4096);
         spawn_device(server_half, |idx, service, _mr| {
             assert_eq!(service, 0x4C);
             match idx {
-                // A REAL signal answered with a DINT: a mismatch, but nothing to do with BOOLs.
-                0 => (0x00, vec![0xC4, 0x00, 1, 0, 0, 0]),
-                // A *scalar* bool answered with a DWORD: still not the BOOL-array shape.
-                _ => (0x00, vec![0xD3, 0x00, 0x0F, 0, 0, 0]),
+                0 => (0x00, tagged_bools(&[true])), // N=1, byte-per-element
+                1 => (0x00, tagged_dwords(&[0x0000_0001])), // N=1, packed
+                2 => (0x00, tagged_bools(&[true, false])), // N=2, byte-per-element
+                _ => (0x00, tagged_dwords(&[0x0000_0001])), // N=2, packed: bit 0 set, bit 1 clear
             }
         });
         let mut session = connect(client_half).await;
 
-        for sp in [
-            spec("line-speed", "LINE_SPEED", "real", None),
-            spec("motor-run", "MOTOR_RUN", "bool", None),
-        ] {
+        let byte_one = session
+            .read_signals(&[spec("one-byte", "ONE_BYTE", "bool", Some(1))])
+            .await
+            .unwrap();
+        let packed_one = session
+            .read_signals(&[spec("one-packed", "ONE_PACKED", "bool", Some(1))])
+            .await
+            .unwrap();
+        assert_eq!(byte_one[0].quality, Quality::Good);
+        assert_eq!(packed_one[0].quality, Quality::Good);
+        assert_eq!(
+            byte_one[0].value,
+            json!(true),
+            "the byte path publishes a bare boolean for arrayCount 1"
+        );
+        assert_eq!(
+            packed_one[0].value, byte_one[0].value,
+            "…and so does the packed path — the shape cannot depend on the device"
+        );
+        // The representations genuinely differ; only the published shape is forced to agree.
+        assert_eq!(byte_one[0].observed_type.as_deref(), Some("BOOL"));
+        assert_eq!(packed_one[0].observed_type.as_deref(), Some("DWORD"));
+
+        let byte_two = session
+            .read_signals(&[spec("two-byte", "TWO_BYTE", "bool", Some(2))])
+            .await
+            .unwrap();
+        let packed_two = session
+            .read_signals(&[spec("two-packed", "TWO_PACKED", "bool", Some(2))])
+            .await
+            .unwrap();
+        assert_eq!(
+            byte_two[0].value,
+            json!([true, false]),
+            "N > 1 is still an array — parity is not flattening"
+        );
+        assert_eq!(packed_two[0].value, byte_two[0].value);
+    }
+
+    /// **The adaptive read (D-EIP-35).** Whether a packed tag's Read Tag element count is
+    /// denominated in BOOLs or in DWORDs is a hardware-answerable question, and the adapter does not
+    /// guess it: first contact asks for the logical count (what a byte-per-element device wants),
+    /// and once the reply has declared `DWORD` the session remembers the representation and asks for
+    /// `ceil(N/32)` words thereafter. Both denominations therefore converge — this device is
+    /// BOOL-denominated, so even the first read translates.
+    #[tokio::test]
+    async fn a_packed_tag_is_asked_for_words_after_the_first_reply_declares_dword() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let asked = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let record = Arc::clone(&asked);
+        spawn_device(server_half, move |_idx, service, mr| {
+            assert_eq!(service, 0x4C);
+            record.lock().unwrap().push(requested_elements(mr));
+            (0x00, tagged_dwords(&[0x0000_0003, 0x0000_0000]))
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("alarms", "ALARMS", "bool", Some(40));
+
+        for _ in 0..3 {
+            let r = session
+                .read_signals(std::slice::from_ref(&sp))
+                .await
+                .unwrap();
+            assert_eq!(r[0].quality, Quality::Good);
+            assert_eq!(r[0].value.as_array().map(Vec::len), Some(40));
+        }
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [40, 2, 2],
+            "first contact asks the logical count; the observed packing reshapes the rest"
+        );
+    }
+
+    /// The cardinality promise survives translation (D-EIP-33), counted in the unit that was
+    /// compared: 8 booleans need one word, so a two-word reply is BAD naming **dwords** and the
+    /// boolean count behind the expectation.
+    #[tokio::test]
+    async fn a_packed_reply_of_the_wrong_word_count_is_bad_in_translated_units() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |_idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            (0x00, tagged_dwords(&[0x0000_0001, 0x0000_0002]))
+        });
+        let mut session = connect(client_half).await;
+
+        let r = session
+            .read_signals(&[spec("alarms", "ALARMS", "bool", Some(8))])
+            .await
+            .unwrap();
+        assert_eq!(r[0].quality, Quality::Bad);
+        assert_eq!(r[0].value, serde_json::Value::Null);
+        let raw = r[0].quality_raw.clone().unwrap_or_default();
+        assert!(
+            raw.contains("expected 1 packed dword(s)")
+                && raw.contains("for 8 bools")
+                && raw.contains("got 2"),
+            "the detail is honest about what was compared: {raw}"
+        );
+        assert_eq!(
+            r[0].observed_type.as_deref(),
+            Some("DWORD"),
+            "a failed translation still reports what the device declared"
+        );
+    }
+
+    /// The reshaped request is checked against the **logical** contract, not against itself. A
+    /// device that declares `DWORD` once and byte-per-element the next time would otherwise answer
+    /// the 2-element (word) request with 2 BOOLs and have them published GOOD as a 40-element
+    /// signal. It is BAD instead — and because the fresh observation replaces the stale one, the
+    /// following read asks for 40 again and recovers.
+    #[tokio::test]
+    async fn a_representation_that_changes_under_the_session_is_bad_then_recovers() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let asked = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let record = Arc::clone(&asked);
+        spawn_device(server_half, move |idx, service, mr| {
+            assert_eq!(service, 0x4C);
+            record.lock().unwrap().push(requested_elements(mr));
+            match idx {
+                // 1st: packed, translated GOOD (and remembered).
+                0 => (0x00, tagged_dwords(&[0x0000_0001, 0x0000_0000])),
+                // 2nd: the device has gone byte-per-element; it answers the 2-word request with 2
+                // bytes. Two booleans are not forty.
+                1 => (0x00, tagged_bools(&[true, false])),
+                // 3rd: asked for 40 again, answered with 40.
+                _ => (0x00, tagged_bools(&[true; 40])),
+            }
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("alarms", "ALARMS", "bool", Some(40));
+
+        let first = session
+            .read_signals(std::slice::from_ref(&sp))
+            .await
+            .unwrap();
+        assert_eq!(first[0].quality, Quality::Good);
+
+        let second = session
+            .read_signals(std::slice::from_ref(&sp))
+            .await
+            .unwrap();
+        assert_eq!(
+            second[0].quality,
+            Quality::Bad,
+            "two booleans are never a forty-element contract"
+        );
+        let raw = second[0].quality_raw.clone().unwrap_or_default();
+        assert!(
+            raw.contains("expected 40") && raw.contains("got 2"),
+            "the check is against the configured count, not the reshaped request: {raw}"
+        );
+
+        let third = session.read_signals(&[sp]).await.unwrap();
+        assert_eq!(third[0].quality, Quality::Good, "the session re-observed");
+        assert_eq!(third[0].value.as_array().map(Vec::len), Some(40));
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [40, 2, 40],
+            "the request follows the last observation, in both directions"
+        );
+    }
+
+    /// **The translation boundary: representation variants only, never type substitution.** A
+    /// `DINT`-configured signal answered with a `REAL`, and a `REAL` answered with a `DINT`, stay
+    /// BAD — there is no "close enough" adaptation, and no numeric widening. A *scalar* `bool`
+    /// answered with a `DWORD` is likewise BAD: scalar BOOLs are not packed, so a whole word where
+    /// one bit was configured is a substitution, not a representation.
+    ///
+    /// Every detail names both sides in their own vocabulary, with no hand-written per-shape hint —
+    /// the hint the BOOL-array case once carried is gone with the mismatch it explained.
+    #[tokio::test]
+    async fn a_wrong_type_is_never_adapted_only_a_representation_variant_is() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        spawn_device(server_half, |idx, service, _mr| {
+            assert_eq!(service, 0x4C);
+            match idx {
+                // A DINT signal answered with a REAL.
+                0 => (0x00, tagged_real(1.5)),
+                // A REAL signal answered with a DINT.
+                1 => (0x00, vec![0xC4, 0x00, 1, 0, 0, 0]),
+                // A SCALAR bool answered with a DWORD — not the array shape, so not translated.
+                _ => (0x00, tagged_dwords(&[0x0000_000F])),
+            }
+        });
+        let mut session = connect(client_half).await;
+
+        let cases = [
+            (
+                spec("count", "COUNT", "dint", None),
+                "DECODE type mismatch (expected dint, device declares REAL)",
+                "REAL",
+            ),
+            (
+                spec("line-speed", "LINE_SPEED", "real", None),
+                "DECODE type mismatch (expected real, device declares DINT)",
+                "DINT",
+            ),
+            (
+                spec("motor-run", "MOTOR_RUN", "bool", None),
+                "DECODE type mismatch (expected bool, device declares DWORD)",
+                "DWORD",
+            ),
+        ];
+        for (sp, want_detail, want_observed) in cases {
             let r = session.read_signals(&[sp]).await.unwrap();
             assert_eq!(r[0].quality, Quality::Bad);
-            let raw = r[0].quality_raw.clone().unwrap_or_default();
-            assert!(
-                !raw.contains("experimental"),
-                "no BOOL-array hint on an unrelated mismatch: {raw}"
-            );
+            assert_eq!(r[0].quality_raw.as_deref(), Some(want_detail));
+            assert_eq!(r[0].observed_type.as_deref(), Some(want_observed));
         }
+    }
+
+    /// **Writes are not adapted (D-EIP-35).** A write to a tag this session has observed packed is
+    /// refused before any device I/O, naming the reason: setting N bits inside `ceil(N/32)` words
+    /// needs a masked read-modify-write, and the mask semantics are exactly what no physical
+    /// controller has confirmed. The refusal is deliberate, not the incidental CIP rejection a
+    /// byte-per-element write would have earned — the write is never sent at all.
+    #[tokio::test]
+    async fn a_write_to_a_tag_observed_packed_is_refused_before_any_io() {
+        let (client_half, server_half) = tokio::io::duplex(4096);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&writes);
+        spawn_device(server_half, move |_idx, service, _mr| {
+            if service == 0x4D {
+                seen.fetch_add(1, Ordering::SeqCst);
+                return (0x00, Vec::new()); // the device WOULD accept it
+            }
+            (0x00, tagged_dwords(&[0x0000_0000]))
+        });
+        let mut session = connect(client_half).await;
+        let sp = spec("alarms", "ALARMS", "bool", Some(8));
+
+        // Before any read the representation is unknown, so the byte-per-element write goes out —
+        // the refusal is driven by an observation, never by the configuration alone.
+        session
+            .write_signal(
+                &sp,
+                &json!([true, false, true, false, true, false, true, false]),
+            )
+            .await
+            .expect("an unobserved bool array writes byte-per-element as before");
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+
+        // One read declares the tag packed…
+        let r = session
+            .read_signals(std::slice::from_ref(&sp))
+            .await
+            .unwrap();
+        assert_eq!(r[0].observed_type.as_deref(), Some("DWORD"));
+
+        // …and every write to it is refused from then on.
+        let err = session
+            .write_signal(&sp, &json!(vec![true; 8]))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.is_transient(),
+            "a packed tag does not become writable by reconnecting: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("packed BOOL array")
+                && msg.contains("masked read-modify-write")
+                && msg.contains("ALARMS"),
+            "the refusal names the tag and the reason: {msg}"
+        );
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "no second write reaches the device"
+        );
     }
 
     /// The counterpart of the clamp removal on the wire: the count the operator configured is the

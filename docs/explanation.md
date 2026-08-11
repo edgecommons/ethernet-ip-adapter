@@ -94,7 +94,9 @@ identity regardless of how the topic was minted.
 Every sample carries a normalized `quality` (`GOOD`/`BAD`/`UNCERTAIN`) plus `qualityRaw` (the native
 detail). This is structural, not adapter discipline: the library's `data()` facade **requires** a
 quality on every sample it constructs. A read whose wire type does not match the configured type is
-`BAD` with a `DECODE type mismatch` `qualityRaw`. A value that goes non-finite after `scale`/`offset` is
+`BAD` with a `DECODE type mismatch` `qualityRaw` that names both sides — the type the configuration
+declared and the type the device declared on the wire, so the disagreement is diagnosable from the
+sample alone. A value that goes non-finite after `scale`/`offset` is
 `UNCERTAIN` with `NON_FINITE_AFTER_SCALE`. A failed poll read publishes `BAD` rather than silently
 persisting a stale value — a failure is information, and silence is indistinguishable from "not
 changing", so non-GOOD samples always publish regardless of deadband.

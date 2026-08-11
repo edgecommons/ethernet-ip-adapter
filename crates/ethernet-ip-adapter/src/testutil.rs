@@ -281,6 +281,7 @@ pub fn reading(signal_id: &str, value: Value, quality: Quality) -> Reading {
         value,
         quality,
         quality_raw: Some(raw.to_string()),
+        observed_type: None,
     }
 }
 

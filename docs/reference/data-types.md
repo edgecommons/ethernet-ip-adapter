@@ -33,13 +33,24 @@ value outside that range is a configuration error, and in an `sb/read`/`sb/write
 is a `BAD_ARGS` refusal. A write must supply exactly `N` elements — a wrong length is rejected. A read
 must come back with exactly `N` elements: a reply carrying a different number is a `BAD` sample whose
 `qualityRaw` names the expected and received counts, never a shorter array published as `GOOD`.
-Multi-dimensional arrays are not supported.
+`arrayCount: 1` publishes the bare value rather than a one-element array — the same shape whichever
+representation the device serves the tag in. Multi-dimensional arrays are not supported.
 
-**BOOL array signals are experimental.** The adapter encodes them byte-per-element; Logix controllers
-implement BOOL arrays as packed `DWORD`s, so BOOL-array reads from ControlLogix/CompactLogix report
-`BAD`, with the reason in `qualityRaw`. Each such signal logs a warning at startup. Scalar `bool` signals
-and `bool` array **fields of a push assembly** are not affected — a push layout is a byte map you
-declare, not Logix tag storage.
+**BOOL array signals are experimental.** Two wire representations exist for them, and the adapter reads
+whichever one the device declares. A device that serves one byte per element is read directly. A Logix
+controller stores a `BOOL[n]` tag as a packed `DWORD` array, and the adapter unpacks it: element *n* is
+bit *(n mod 32)* of word *(n / 32)*, so `arrayCount: N` needs `ceil(N/32)` words and the bits past N in
+the final word are the controller's padding and are dropped. `arrayCount: 40` against a `BOOL[64]` tag
+therefore publishes the first 40 booleans. A packed reply carrying any other number of words is a `BAD`
+sample whose `qualityRaw` names the counts in words. The published value has the same JSON shape in
+either representation, including the bare value for `arrayCount: 1`.
+
+The representation is a property of the device, not something you configure: the adapter observes it from
+the reply and shapes the following reads to match. `sb/signals` reports it per signal as `observedType`.
+A **write** to a tag observed packed is refused, with the reason in the entry's `error` — setting some
+bits of a shared word requires a masked read-modify-write. Each BOOL array signal logs a warning at
+startup. Scalar `bool` signals and `bool` array **fields of a push assembly** are not affected — a push
+layout is a byte map you declare, not Logix tag storage.
 
 ## Scale & offset
 
@@ -67,7 +78,7 @@ Every sample carries a normalized `quality` plus `qualityRaw` (the native detail
 | `quality` | When |
 |-----------|------|
 | `GOOD` | A successful read/decode. |
-| `BAD` | A read failure, a wire type that does not match the configured `type` (`qualityRaw` = `DECODE type mismatch …`), or a reply carrying a different number of elements than the read asked for (`qualityRaw` = `DECODE element count mismatch (expected N, got M)`). Poll: also `NO_DATA`/`UNRESOLVED_REF` on `sb/read`; push: `NO_FRAME` when no frame has arrived. |
+| `BAD` | A read failure, a wire type that does not match the configured `type` (`qualityRaw` = `DECODE type mismatch (expected <configured>, device declares <wire type>)`), or a reply carrying a different number of elements than the configuration declared (`qualityRaw` = `DECODE element count mismatch (expected N, got M)`; for a packed BOOL array the counts are words, `expected N packed dword(s) for M bools, got K`). Poll: also `NO_DATA`/`UNRESOLVED_REF` on `sb/read`; push: `NO_FRAME` when no frame has arrived. |
 | `UNCERTAIN` | A value that goes non-finite (`NaN`/`inf`) after `scale`/`offset` — `qualityRaw` = `NON_FINITE_AFTER_SCALE`, value `null`. For an array, any non-finite element makes the whole reading UNCERTAIN. |
 
 A non-GOOD sample always publishes (a failure is information); it is never suppressed by the deadband.

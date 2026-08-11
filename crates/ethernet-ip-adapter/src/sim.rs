@@ -267,6 +267,11 @@ impl SimSession {
             value: Value::Null,
             quality: Quality::Good,
             quality_raw: Some("0x00".into()),
+            // The simulator answers from a tag table, not a wire: there is no declared type code to
+            // observe, so it reports none (D-EIP-35). This is also the honest shape of the sim's
+            // fidelity gap on the packed BOOL path — it serves byte-per-element and cannot exercise
+            // the translation at all.
+            observed_type: None,
         };
         if let Some(v) = self.written.get(&spec.tag_path) {
             return Reading {
