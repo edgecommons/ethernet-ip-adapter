@@ -479,6 +479,17 @@ Greengrass build uses the `greengrass` feature (Linux only).
 identity resolves from the Downward API, and the broker/device are reached by in-cluster Service DNS.
 With `--platform auto` the library detects the platform and needs no CLI args.
 
+**Class-1 (push) networking** — a push instance binds an **ephemeral** UDP source port and tells the
+device where to send in the ForwardOpen's Sockaddr Info items. `2222` is the *device's* port, not the
+adapter's, so there is no fixed inbound port to open on the adapter side. What the device needs is a
+route back to the address the adapter advertised — the adapter's own IP, on an unpredictable high
+port — which means the return path must not cross a NAT or a filter that only passes specific ports.
+Compose puts the adapter and the device on one network; Greengrass runs on flat host networking. On
+Kubernetes the Deployment declares no `containerPort` for class-1: a device inside the cluster
+reaches the pod IP directly, and a PLC outside the cluster needs the pod's IP routable from the
+device network — `hostNetwork: true`, or a pod CIDR the device network routes. Poll-only deployments
+open no UDP port at all.
+
 **Stopping the adapter** — on SIGTERM or Ctrl-C every device connection is closed cleanly: poll
 instances send UnRegisterSession (and the class-3 ForwardClose when they hold a connected session),
 push instances send the class-1 ForwardClose and release their I/O sockets, and the final metrics are

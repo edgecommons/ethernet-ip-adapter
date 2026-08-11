@@ -32,7 +32,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p ethernet-ip-adapter
+# `--locked` (D-EIP-30): the image is a shipped artifact, so it resolves against the committed
+# Cargo.lock and fails loudly rather than silently re-resolving. Safe unconditionally here — the
+# build context carries the lock and no `.cargo/config.toml`, so the sibling `[patch]` override
+# that developer checkouts may hold can never reach this resolve.
+RUN cargo build --locked --release -p ethernet-ip-adapter
 
 # ---- stage 2: runtime -----------------------------------------------------------------------
 # debian:bookworm-slim has glibc (the binary is glibc-linked) and is small.
