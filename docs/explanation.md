@@ -111,7 +111,10 @@ event.
 Write confirmation is honest about what each mode can promise. A **poll** write is a CIP
 write-with-acknowledgement: `ok:true` means the device accepted it. A **push** write has no per-write CIP
 confirmation — implicit I/O has no acknowledgement channel — so `ok:true` means the value was staged into
-the O→T buffer and rides the next cyclic frame, reported as `applied: "next-frame"`.
+the O→T buffer and rides the next cyclic frame, reported as `applied: "next-frame"`. The refusal is just
+as definite: a push write that is not staged inside `timeouts.requestTimeoutMs` is reported `ok:false`,
+and that value does not reach the device later — the deadline is enforced at the O→T buffer itself, not
+only at the caller.
 
 ## The connection lifecycle and per-instance pause
 

@@ -19,11 +19,13 @@
 //! * [`IoManager`] — the thin UDP socket task: recv → route by connection id → drive
 //!   [`IoConnection::consume`]; and a scheduler tick that drives [`IoConnection::poll_produce`] /
 //!   [`IoConnection::poll_watchdog`]. It exposes [`IoConnectionHandle`] (`events`, `set_output`,
-//!   `stage_output`, `set_run`, `stats`, `close`). Commands that can fail inside the task —
-//!   registering a connection (the multicast join), and the confirmed form of output staging —
-//!   carry a `oneshot` acknowledgement, so `forward_open` returns only once the connection is
-//!   **armed** and `stage_output` reports whether the buffer will actually ride a frame
-//!   (D-ENIP-20).
+//!   `stage_output`, `stage_output_by`, `set_run`, `stats`, `close`). Commands that can fail inside
+//!   the task — registering a connection (the multicast join), and the confirmed form of output
+//!   staging — carry a `oneshot` acknowledgement, so `forward_open` returns only once the
+//!   connection is **armed** and `stage_output` reports whether the buffer will actually ride a
+//!   frame. A staging command also carries its caller's **absolute deadline**, and the task drops
+//!   an expired one instead of mutating the producer buffer, so a staging call that reports a
+//!   timeout cannot be applied afterwards (D-ENIP-20).
 //!
 //! **Socket errors are classified, never swallowed** (§8.6–§8.7, D-ENIP-7). Every `recv_from` /
 //! `send_to` failure increments a counter (`recv_errors` manager-wide, `send_errors` per
@@ -86,6 +88,11 @@ const EVENT_CHANNEL_DEPTH: usize = 256;
 /// by [`IoConnection::poll_produce`] / [`IoConnection::poll_watchdog`]; the tick only needs to be
 /// finer than the smallest RPI in play.
 const SCHEDULER_TICK: Duration = Duration::from_millis(1);
+
+/// Depth of the manager task's command queue. Bounded, so a caller that outruns the task waits
+/// rather than growing it — which is why a staging caller under a deadline bounds its handoff too
+/// (D-ENIP-20).
+const MANAGER_COMMAND_DEPTH: usize = 64;
 
 /// The smallest actual packet interval a ForwardOpen reply may name (§8.2). Below this the value is
 /// not a timer input but a protocol violation: a 0 µs API used to livelock the produce scheduler.
@@ -1270,6 +1277,11 @@ enum ManagerCommand {
     SetOutput {
         connection_id: u32,
         bytes: Bytes,
+        /// The caller's absolute deadline, carried to the **only** place that mutates the producer
+        /// buffer (D-ENIP-20). A command whose deadline has passed is dropped there rather than
+        /// staged: its caller has already been told the write failed. `None` is a caller with no
+        /// deadline ([`IoConnectionHandle::set_output`] / [`IoConnectionHandle::stage_output`]).
+        deadline: Option<Instant>,
         /// `None` preserves the fire-and-forget [`IoConnectionHandle::set_output`]; `Some` is the
         /// confirmed path ([`IoConnectionHandle::stage_output`]).
         ack: Option<oneshot::Sender<Result<()>>>,
@@ -1301,7 +1313,7 @@ impl IoManager {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
         let stats = Arc::new(ManagerCounters::default());
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(MANAGER_COMMAND_DEPTH);
         tokio::spawn(manager_task(socket, rx, stats.clone()));
         Ok(Self {
             tx,
@@ -1532,6 +1544,21 @@ pub struct IoConnectionHandle {
     open_request: ForwardOpenRequest,
 }
 
+/// The operation name [`EnipError::Timeout`] carries when an output-staging deadline runs out —
+/// on the handoff, on the verdict, or at the producer buffer itself (D-ENIP-20).
+const OUTPUT_STAGING: &str = "output staging";
+
+/// Await `f`, bounded by `deadline` when the caller set one. `None` = the deadline passed first.
+///
+/// `tokio::time::timeout_at` polls `f` before the timer, so a future that is already complete wins
+/// even at an expired deadline — the answer is never thrown away in favour of the clock.
+async fn by<F: core::future::Future>(deadline: Option<Instant>, f: F) -> Option<F::Output> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, f).await.ok(),
+        None => Some(f.await),
+    }
+}
+
 impl IoConnectionHandle {
     /// The T→O connection id (the routing key).
     #[must_use]
@@ -1585,6 +1612,7 @@ impl IoConnectionHandle {
             .try_send(ManagerCommand::SetOutput {
                 connection_id: self.connection_id,
                 bytes,
+                deadline: None,
                 ack: None,
             })
             .map_err(|_| EnipError::Closed)
@@ -1594,6 +1622,10 @@ impl IoConnectionHandle {
     /// (D-ENIP-20). Same validation as [`set_output`](Self::set_output); the difference is the
     /// verdict — this awaits the manager task's answer instead of assuming one.
     ///
+    /// Unbounded: it waits as long as the manager takes. A caller that must not wait past a
+    /// deadline uses [`stage_output_by`](Self::stage_output_by), which also guarantees the buffer
+    /// is not staged after that deadline.
+    ///
     /// # Errors
     ///
     /// [`EnipError::ProtocolViolation`] / [`EnipError::TooLarge`] when the buffer does not fit the
@@ -1601,18 +1633,45 @@ impl IoConnectionHandle {
     /// longer holds this connection (lost or closed) — in that case the buffer will never ride a
     /// frame. The wait is causal: the manager either answers or is gone.
     pub async fn stage_output(&self, bytes: impl Into<Bytes>) -> Result<()> {
-        let bytes = bytes.into();
+        self.stage(bytes.into(), None).await
+    }
+
+    /// Stage the O→T output buffer under an **absolute deadline** (D-ENIP-20): the handoff to the
+    /// manager, the wait for its verdict, and the staging decision itself all live inside
+    /// `deadline`.
+    ///
+    /// The deadline travels *with* the command, so the manager drops an expired one instead of
+    /// mutating the producer buffer with it. That is what makes the refusal safe to act on: a
+    /// caller told `Err(Timeout)` knows the value cannot appear in a later O→T frame, which a
+    /// caller-side timer alone can never promise — the command it abandoned is still queued.
+    ///
+    /// # Errors
+    ///
+    /// As [`stage_output`](Self::stage_output), plus [`EnipError::Timeout`] when the deadline
+    /// passes before the manager accepts the buffer.
+    pub async fn stage_output_by(&self, bytes: impl Into<Bytes>, deadline: Instant) -> Result<()> {
+        self.stage(bytes.into(), Some(deadline)).await
+    }
+
+    /// The shared body of the two confirmed staging paths: validate, hand the command to the
+    /// manager, and return its verdict — each await bounded by `deadline` when there is one.
+    async fn stage(&self, bytes: Bytes, deadline: Option<Instant>) -> Result<()> {
         self.validate_output(&bytes)?;
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd
-            .send(ManagerCommand::SetOutput {
-                connection_id: self.connection_id,
-                bytes,
-                ack: Some(ack_tx),
-            })
+        let queued = self.cmd.send(ManagerCommand::SetOutput {
+            connection_id: self.connection_id,
+            bytes,
+            deadline,
+            ack: Some(ack_tx),
+        });
+        by(deadline, queued)
             .await
+            .ok_or(EnipError::Timeout { op: OUTPUT_STAGING })?
             .map_err(|_| EnipError::Closed)?;
-        ack_rx.await.map_err(|_manager_gone| EnipError::Closed)?
+        by(deadline, ack_rx)
+            .await
+            .ok_or(EnipError::Timeout { op: OUTPUT_STAGING })?
+            .map_err(|_manager_gone| EnipError::Closed)?
     }
 
     /// Set the O→T run/idle bit (§8.7 / D-ENIP-9).
@@ -1812,6 +1871,12 @@ fn resolve_multicast_group(
     Err(EnipError::ProtocolViolation { detail })
 }
 
+/// Has a carried staging deadline already passed (D-ENIP-20)? A command with no deadline never
+/// expires.
+fn expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
 /// The socket task (§8.6, §11.1): receive datagrams and route them; drive produce + watchdog on a
 /// scheduler tick. Thin — all tested logic lives in [`IoConnection`] / [`Registry`].
 async fn manager_task(
@@ -1856,8 +1921,17 @@ async fn manager_task(
                             remove_connection(&socket, &mut registry, &mut events, id);
                         }
                     }
-                    Some(ManagerCommand::SetOutput { connection_id, bytes, ack }) => {
+                    Some(ManagerCommand::SetOutput { connection_id, bytes, deadline, ack }) => {
                         let verdict = match registry.conns.get_mut(&connection_id) {
+                            // This is the ONLY place a producer buffer is mutated, so it is where
+                            // an expired command has to die (D-ENIP-20). A caller whose deadline
+                            // ran out has already been told its write failed; staging the buffer
+                            // now would put a refused value on the next O→T frame. The command is
+                            // still in the queue precisely because something was slow, so the
+                            // check belongs here rather than only at the send side.
+                            Some(_) if expired(deadline) => {
+                                Err(EnipError::Timeout { op: OUTPUT_STAGING })
+                            }
                             Some(conn) => { conn.set_output(bytes); Ok(()) }
                             // The connection was removed (lost or closed): the buffer will never
                             // ride a frame, and a confirmed caller must be told so.
@@ -3985,6 +4059,80 @@ mod tests {
                 "output size does not match the negotiated fixed O→T size"
             ),
             other => panic!("expected the size violation, got {other:?}"),
+        }
+        mgr.shutdown().await;
+    }
+
+    /// **D-ENIP-20, the expired command.** A staging call whose deadline passes is refused — and,
+    /// decisively, the buffer it carried never reaches the producer.
+    ///
+    /// A caller-side timer alone can never promise that: the command it abandons is still in the
+    /// manager's queue, and staging it afterwards puts a value the caller was told had failed on
+    /// the very next O→T frame, and on every frame after it. The deadline therefore travels with
+    /// the command to the one place that mutates the producer buffer.
+    ///
+    /// Deterministic, not timed: the command channel releases its permit when the manager task
+    /// **dequeues** the command, and that task handles it to completion in the same loop iteration
+    /// — before its produce tick can run again. So the restored capacity is a causal signal that
+    /// the decision is made, and every frame after it reflects the decision.
+    #[tokio::test]
+    async fn an_expired_stage_output_is_refused_and_never_reaches_the_producer_buffer() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let mgr = IoManager::bind("127.0.0.1:0").await.unwrap();
+        let (_fixture, handle) = open_against_peer(&mgr, peer_port).await;
+        let refused: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+
+        let verdict = handle
+            .stage_output_by(Bytes::from_static(refused), Instant::now())
+            .await;
+
+        let gate = Instant::now() + Duration::from_secs(10);
+        while mgr.tx.capacity() < MANAGER_COMMAND_DEPTH {
+            assert!(
+                Instant::now() < gate,
+                "the manager never took the expired command off its queue"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Nothing already on the wire can mask the failure: drain what the producer emitted before
+        // the decision, then judge only frames produced after it.
+        let mut discard = vec![0u8; 2048];
+        while peer.try_recv_from(&mut discard).is_ok() {}
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for _ in 0..5 {
+            let frame = next_o2t_frame(&peer, deadline).await;
+            assert!(
+                frame.data.is_empty(),
+                "a buffer whose deadline had passed was staged anyway and is on the wire: {frame:?}"
+            );
+        }
+        match verdict {
+            Err(EnipError::Timeout { op }) => assert_eq!(op, OUTPUT_STAGING),
+            other => panic!("expected an expired staging request to be refused, got {other:?}"),
+        }
+
+        // The same observation, positive: a staging request inside its deadline IS applied — so the
+        // assertion above is about the refusal, not about a test that cannot see a staged value.
+        let accepted: &[u8] = &[1, 2, 3, 4];
+        handle
+            .stage_output_by(
+                Bytes::from_static(accepted),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("a staging request inside its deadline is accepted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let frame = next_o2t_frame(&peer, deadline).await;
+            if frame.data.as_ref() == accepted {
+                break;
+            }
+            assert!(
+                frame.data.is_empty(),
+                "the refused buffer resurfaced behind the accepted one: {frame:?}"
+            );
         }
         mgr.shutdown().await;
     }

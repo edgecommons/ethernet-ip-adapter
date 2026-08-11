@@ -403,8 +403,10 @@ pub trait PushSession: Send + Sync {
     ///
     /// [`DeviceError::Unsupported`] when the device has no output assembly; [`DeviceError::Permanent`]
     /// when the value does not fit the field (a coercion/range error); [`DeviceError::Transient`]
-    /// when the session is closing, the backend's translator has ended, or the I/O manager no longer
-    /// holds the class-1 connection — **the value was NOT staged** and will never ride a frame.
+    /// when the session is closing, the backend's translator has ended, the write outlived the
+    /// configured request timeout, or the I/O manager no longer holds the class-1 connection — in
+    /// every case **the value was NOT staged** and will never ride a frame, including a later frame
+    /// carrying some other field's accepted write.
     // SLICE S6: dispatched by the `sb/write` command handler for push instances.
     #[allow(dead_code)]
     async fn set_output(&mut self, field: &IoFieldSpec, value: &serde_json::Value) -> Result<()>;
