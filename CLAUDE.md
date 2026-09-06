@@ -15,7 +15,7 @@ agent tool. It is imported here in full:
 ## Claude-Code-specific setup (additive to AGENTS.md)
 
 - **Build against the sibling library.** `.cargo/config.toml` (gitignored) patches the `edgecommons`
-  git dep to the local `../edgecommons/core/libs/rust` checkout, so a plain `cargo build` /
+  git dep to the local `../core/libs/rust` checkout, so a plain `cargo build` /
   `cargo test` uses your working copy. CI keeps the pinned `rev` in `Cargo.toml`. Do NOT edit
   `.cargo/config.toml` or the `edgecommons` pin as part of feature work.
 - **Never commit the `Cargo.lock` a local build produces.** Any cargo command run with that override

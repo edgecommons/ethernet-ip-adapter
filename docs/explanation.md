@@ -15,7 +15,7 @@ and class-1 implicit-I/O **push**.
 
 ## The Unified Namespace (UNS)
 
-Addressing follows the UNS: every topic is `ecv1/{device}/{component}/{instance}/{class}[/channel]`,
+Addressing follows the UNS: every topic is `ecv1/{device}/{component}[/{instance}]/{class}[/channel]`,
 built and validated by the library — never a hand-assembled string. Telemetry rides the `data` class
 (`ecv1/{device}/ethernet-ip-adapter/{instance}/data/{signal}`); discrete events ride `evt`; the
 on-demand command surface rides the library's `cmd` inbox; and the library owns `state` (a keepalive

@@ -1,13 +1,13 @@
 # Reference — Data Types
 
-EtherNet/IP carries typed CIP values. This adapter decodes the **CIP elementary types** into JSON, both
+EtherNet/IP carries typed CIP values. This adapter decodes **CIP elementary types** into structured sample values, both
 for scheduled poll reads (explicit messaging) and for class-1 implicit-I/O (push) assembly fields. Every
 signal declares its `type`; for push fields it also declares a byte `offset` (and, for a boolean, a
 `bit`). The conversion is the same pure codec in both directions and both modes.
 
 ## Supported CIP types
 
-| `type` | CIP type | On-wire JSON (read) | Write input |
+| `type` | CIP type | Decoded sample value (JSON projection) | Write input |
 |--------|----------|---------------------|-------------|
 | `bool` | BOOL | boolean | boolean |
 | `sint` | SINT (int8) | number | number (int) |

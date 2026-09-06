@@ -25,6 +25,15 @@ allow-listed write, tag browse, and per-instance pause/resume. Writes are **allo
 default** — every device is read-only until you list the signal ids it may write, and the allow-list is
 checked before any device I/O.
 
+## Current status
+
+Current-main review (2026-09-06): poll and push acquisition, scoped commands, and the owned Rust
+protocol stack are implemented. The [CIP Security delivery record](DESIGN-cip-security.md) records
+explicit-path TLS, posture/trust/certificate lifecycle and EST enrollment with independent live-peer
+evidence. Implicit-path DTLS is not built; certified Vol. 8 hardware qualification and packed BOOL-array
+hardware validation remain gaps. Registry `beta` is a maturity label. This documentation review did
+not rerun protocol, hardware or deployment gates.
+
 ## Quick start
 
 Run against the built-in hardware-free simulator (no PLC needed), publishing to a local MQTT broker:
@@ -37,7 +46,8 @@ cargo run -p ethernet-ip-adapter -- \
   -t my-thing
 ```
 
-Watch the values flow (one wildcard covers the fleet):
+Watch instance-scope data (fleet-wide data also needs `ecv1/+/+/data/#`). This displays protobuf bytes;
+use the [tutorial decoder](docs/tutorial.md) to inspect values:
 
 ```bash
 mosquitto_sub -t 'ecv1/+/+/+/data/#' -v

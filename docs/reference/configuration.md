@@ -14,7 +14,7 @@ sibling sections (`tags`, `hierarchy`, `identity`, `topic`, `messaging`, `loggin
 The adapter's own configuration is the object at **`component.global`** plus each entry of
 **`component.instances[]`**. `component.token` sets the `{component}` UNS token (`ethernet-ip-adapter`).
 
-UNS topics are `ecv1/{device}/{component}/{instance}/{class}[/channel]` — built and validated by the
+UNS topics are `ecv1/{device}/{component}[/{instance}]/{class}[/channel]` — built and validated by the
 library from the identity; there are no per-instance/per-signal topic templates.
 
 ## Top-level sections
@@ -140,7 +140,9 @@ PEM content is resolved from the credentials vault at connect time and never lan
 config. Add `"field": "<key>"` to read one JSON field of the secret (for example, a
 `{certPem, keyPem}` bundle referenced field-by-field). Example:
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "security": {
   "mode": "tls",
   "client": {
