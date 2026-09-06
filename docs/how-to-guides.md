@@ -5,6 +5,8 @@ For concepts see [explanation.md](explanation.md); for exhaustive options see [r
 
 ---
 
+Command examples use [ec-uns-cmd](https://github.com/edgecommons/ec-uns-cmd). Set the broker, device and instance to your deployment. `--body` is a native JSON argument object; the tool encodes protobuf, subscribes before publishing, and prints the reply `result` or `error` within a deadline.
+
 ## Configure a poll device (CIP tags + poll groups + deadband)
 
 A poll device reads CIP tags on a schedule. EtherNet/IP tags are not wire-discoverable in general, so
@@ -126,11 +128,8 @@ is **empty by default** (read-only). Add the ids you want writable:
 
 Then write through the command inbox (`ecv1/{device}/ethernet-ip-adapter/cmd/sb/write`):
 
-```
-publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/write
-          { "header": { "name": "sb/write", "reply_to": "app/r", "correlation_id": "7" },
-            "body": { "instance": "filler-plc", "writes": [ { "name": "fill-setpoint", "value": 42.5 } ] } }
-subscribe app/r   → { "ok": true, "result": { "id": "filler-plc", "written": 1, "results": [ … ] } }
+```bash
+ec-uns-cmd --broker localhost:1883 --device gw-01 --component ethernet-ip-adapter --instance filler-plc sb/write --body '{"writes":[{"name":"fill-setpoint","value":42.5}]}'
 ```
 
 - Address a signal by `name` (a configured signal) or explicitly by ref — poll:
@@ -147,17 +146,13 @@ subscribe app/r   → { "ok": true, "result": { "id": "filler-plc", "written": 1
 
 Take a device out of active polling/publishing during maintenance without dropping its connection:
 
-```
-publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/pause
-          { "header": { "name": "sb/pause", ... }, "body": { "instance": "filler-plc" } }
-   → { "ok": true, "result": { "id": "filler-plc", "paused": true, "changed": true } }
-
-publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/resume
-          { "header": { "name": "sb/resume", ... }, "body": { "instance": "filler-plc" } }
-   → { "ok": true, "result": { "id": "filler-plc", "paused": false, "changed": false } }   // was already resumed
+```bash
+ec-uns-cmd --broker localhost:1883 --device gw-01 --component ethernet-ip-adapter --instance filler-plc sb/pause
+ec-uns-cmd --broker localhost:1883 --device gw-01 --component ethernet-ip-adapter --instance filler-plc sb/resume
 ```
 
-While paused, the instance reports `state: "PAUSED"` (with `connected` still truthful), stale-signal
+While paused with a live link, the instance reports `state: "PAUSED"`; a lost link reports `BACKOFF`
+while preserving `paused: true`. The `connected` field remains truthful, stale-signal
 health is suspended, a slow liveness probe keeps `connected` honest, and `repoll` is refused with the
 `PAUSED` error code. Both verbs
 are idempotent — `changed` tells you whether the call moved the state. Pause is in-memory and resets to
@@ -172,13 +167,8 @@ running on restart — including a restart of that instance caused by a
 returns a page of tags, each flagged `configured` (is it in your config) and `supported` (is its CIP
 type decodable):
 
-```
-publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/browse
-          { "header": { "name": "sb/browse", ... }, "body": { "instance": "filler-plc", "max": 200 } }
-   → { "ok": true, "result": { "id": "filler-plc", "tags": [
-         { "name": "LINE_SPEED", "type": "REAL", "configured": true,  "supported": true },
-         { "name": "RECIPE",     "type": "SSTRING", "configured": false, "supported": false } ],
-       "cursor": "…" } }
+```bash
+ec-uns-cmd --broker localhost:1883 --device gw-01 --component ethernet-ip-adapter --instance filler-plc sb/browse --body '{"max":200}'
 ```
 
 A request without a cursor starts at the beginning of the device's tag list. Pass the returned `cursor`
@@ -198,17 +188,8 @@ A body carrying `ref` selects the **hierarchical** form over the same inventory 
 edge-console tree browser drives. `ref: "root"` answers the device node with one `contains` ref per
 tag (or per configured push field); a tag id answers that leaf:
 
-```
-publish   ecv1/<device>/ethernet-ip-adapter/cmd/sb/browse
-          { "header": { "name": "sb/browse", ... },
-            "body": { "instance": "filler-plc", "ref": "root", "depth": 1, "maxRefs": 200 } }
-   → { "ok": true, "result": { "id": "filler-plc", "mode": "hierarchical",
-       "root": { "nodeId": "root", "name": "filler-plc", "nodeClass": "device", "dataType": null,
-                 "refs": [ { "referenceType": "contains",
-                             "target": { "nodeId": "LINE_SPEED", "name": "LINE_SPEED",
-                                         "nodeClass": "signal", "dataType": "REAL",
-                                         "configured": true, "supported": true } } ] },
-       "refCount": 1, "depth": 1, "truncated": false } }
+```bash
+ec-uns-cmd --broker localhost:1883 --device gw-01 --component ethernet-ip-adapter --instance filler-plc sb/browse --body '{"ref":"root","depth":1,"maxRefs":200}'
 ```
 
 `depth` clamps to 1..4 and `maxRefs` to 1..1000. The two argument families are exclusive: mixing
@@ -423,10 +404,8 @@ kubectl apply -f k8s/configmap.yaml
 component was started with (file, ConfigMap, Greengrass deployment, shadow, or configuration
 component) and applies it — useful when you changed the source out of band:
 
-```
-publish   ecv1/<device>/ethernet-ip-adapter/cmd/reload-config
-          { "header": { "name": "reload-config", "reply_to": "app/r", "correlation_id": "9" }, "body": {} }
-subscribe app/r   → { "ok": true, "result": { "reloaded": true } }
+```bash
+ec-uns-cmd --broker localhost:1883 --device gw-01 --component ethernet-ip-adapter reload-config
 ```
 
 A rejected candidate answers `{ "ok": false, "error": { "code": "RELOAD_FAILED", … } }` and the running

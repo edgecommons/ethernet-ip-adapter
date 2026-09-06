@@ -32,7 +32,7 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
 - **Protocol stack = the OWNED pure-Rust `crates/enip` crate** (package `ec-enip`, lib `enip`;
   `PROTOCOL-DESIGN.md`) — async/Tokio, `#![forbid(unsafe_code)]`, zero C deps, builds natively on
   Windows/MSVC and Linux. No external protocol library. It knows nothing about EdgeCommons; the
-  adapter consumes it only through the `src/device.rs` seam (D-EIP-1/17). Both update models exist:
+  adapter consumes it only through the `crates/ethernet-ip-adapter/src/device.rs` seam (D-EIP-1/17). Both update models exist:
   `mode: "poll"` (scheduled explicit-messaging polling, the default) and `mode: "push"` (class-1
   implicit I/O), per instance (D-EIP-2).
 - **Config lives entirely under `component.*`** (canonical-schema rule, no top-level block, no schema
@@ -59,8 +59,8 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
   both sides ("expected bool, device declares DWORD"); `sb/signals` reports `observedType`.
 - **Writes are allow-listed, secure-by-default**: empty `writes.allow[]` ⇒ all writes refused,
   matched on the stable `signal.id` (D-EIP-5).
-- **`sb/pause`/`sb/resume` are a deliberate southbound-contract extension** (D-EIP-3), a candidate
-  for core promotion — this repo does NOT edit core `SOUTHBOUND.md`.
+- **`sb/pause`/`sb/resume` are canonical southbound lifecycle verbs**. Their original introduction
+  is recorded by D-EIP-3; the current shared contract is core `SOUTHBOUND.md`.
 - **Every verb declares its command scope** (D-EIP-26): all nine register at
   `CommandScope::Instance`, so the library owns addressing — the topic's instance token, a body
   `instance`, and the `BAD_ARGS` refusal when the two conflict — and hands the handler the resolved
@@ -70,8 +70,8 @@ and surface deviations up front — do not simplify silently. `CLI-DOGFOODING.md
   `CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` token and the `paused` attribute from the same `Health`
   object that answers `sb/status`, and the `state` keepalive's `instances[]` publishes it — a paused
   instance is never indistinguishable from a stale one.
-- **The seam** (`src/device.rs`): `DeviceBackend`/`DeviceSession` traits know protocols and never
-  import the UNS/topics/envelopes/metrics. The in-process `SimBackend`/`SimSession` (`src/sim.rs`)
+- **The seam** (`crates/ethernet-ip-adapter/src/device.rs`): `DeviceBackend`/`DeviceSession` traits know protocols and never
+  import the UNS/topics/envelopes/metrics. The in-process `SimBackend`/`SimSession` (`crates/ethernet-ip-adapter/src/sim.rs`)
   models the cpppo tag layout so `cargo run` and the unit tests need no PLC or network.
 
 ## Template & conventions (mirror `../modbus-adapter` / `../telemetry-processor`)

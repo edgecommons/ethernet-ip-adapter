@@ -4,6 +4,10 @@ By the end you'll have the adapter polling an EtherNet/IP simulator and publishi
 MQTT, and you'll have read, written, and controlled a signal from a client. Then you'll see the same
 adapter consume a **class-1 implicit I/O** (push) stream. No hardware required.
 
+Command examples use [ec-uns-cmd](https://github.com/edgecommons/ec-uns-cmd), installed on `PATH`.
+`--body` is a native JSON argument object; the tool constructs protobuf, subscribes before publishing,
+and prints the reply `result` or `error` within a deadline. Topic instance addressing selects the device.
+
 ## 1. Prerequisites
 
 - A Rust toolchain (stable) and Docker.
@@ -32,17 +36,40 @@ You should see it connect, define its metric families, and start polling. `-t my
 
 ## 3. Watch values flow
 
-Subscribe to the UNS data class (any MQTT client) — one wildcard covers the whole fleet:
+Subscribe to the UNS data class (any MQTT client) — this filter covers instance-scope adapter data; component-scope fleet data also requires `ecv1/+/+/data/#`:
 
+Normal messaging carries protobuf bytes. In this organization workspace install the matching
+Python decoder with `pip install paho-mqtt -e ../core/libs/python`, then display a human-readable
+JSON projection with this subscriber. The here-document uses Bash; in PowerShell save its Python
+contents to a `.py` file and run `python <file>.py`.
 ```bash
-mosquitto_sub -t 'ecv1/+/+/+/data/#' -v
+python - <<'PY'
+import json
+import paho.mqtt.client as mqtt
+from edgecommons.messaging.message import Message
+
+c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+c.on_connect = lambda c, u, f, rc, p: c.subscribe("ecv1/my-thing/ethernet-ip-adapter/+/data/#", qos=1)
+def on_message(c, u, m):
+    message = Message.from_bytes(m.payload)
+    print(m.topic, json.dumps(message.to_diagnostic_json(), indent=2))
+c.on_message = on_message
+c.connect("localhost", 1883)
+try:
+    c.loop_forever()
+except KeyboardInterrupt:
+    pass
+finally:
+    c.unsubscribe("ecv1/my-thing/ethernet-ip-adapter/+/data/#")
+    c.disconnect()
+PY
 ```
 
 You'll see `SouthboundSignalUpdate` messages on
 `ecv1/my-thing/ethernet-ip-adapter/filler-plc/data/{signal}` for the changing signals (`line-speed`,
 `fill-temp`, `tank-level`, `product-count`, `zone-temps`, …), each with a `value`, a normalized
 `quality`, the CIP `address` (`{tagPath, type}`), and the top-level `identity`. Also try
-`ecv1/+/+/+/state` for the keepalive and `ecv1/+/+/+/metric/#` for `southbound_health` plus the
+`ecv1/+/+/state` for the keepalive and `ecv1/+/+/metric/#` for `southbound_health` plus the
 `EtherNetIpConnection`, `EtherNetIpInventory`, `EtherNetIpPoll`, `EtherNetIpPublish`, and
 `EtherNetIpCommand` operational metric families.
 
@@ -50,14 +77,10 @@ You'll see `SouthboundSignalUpdate` messages on
 
 Read/write/control go through the library **command inbox**
 (`ecv1/{device}/ethernet-ip-adapter/cmd/{verb}`): set `header.name` to the verb and `reply_to` to a
-topic you subscribe. With an EdgeCommons client this is one `request()` call; raw MQTT:
+topic you subscribe. With an EdgeCommons client this is one `request()` call; the CLI below handles it:
 
-```
-publish   ecv1/my-thing/ethernet-ip-adapter/cmd/sb/read
-          {"header":{"name":"sb/read","reply_to":"app/r","correlation_id":"1"},
-           "body":{"signals":[{"name":"tank-level"}]}}
-subscribe app/r   →  { "ok": true, "result": { "id": "filler-plc", "reads": [
-                        { "signal": { "id": "TANK_LEVEL", ... }, "value": 12.5, "quality": "GOOD", ... } ] } }
+```bash
+ec-uns-cmd --broker localhost:1883 --device my-thing --component ethernet-ip-adapter --instance filler-plc sb/read --body '{"signals":[{"name":"tank-level"}]}'
 ```
 
 `tank-level` has `scale: 0.1`, so a raw `125` reads back `12.5`.
@@ -67,12 +90,8 @@ subscribe app/r   →  { "ok": true, "result": { "id": "filler-plc", "reads": [
 `FILL_SETPOINT` and `MOTOR_RUN` are the two entries in the device's `writes.allow` list — everything
 else is refused before any device I/O:
 
-```
-publish   ecv1/my-thing/ethernet-ip-adapter/cmd/sb/write
-          {"header":{"name":"sb/write","reply_to":"app/r","correlation_id":"2"},
-           "body":{"writes":[{"name":"fill-setpoint","value":42.5}]}}
-subscribe app/r   →  { "ok": true, "result": { "id": "filler-plc", "written": 1,
-                        "results": [ { "signal": "FILL_SETPOINT", "value": 42.5, "ok": true } ] } }
+```bash
+ec-uns-cmd --broker localhost:1883 --device my-thing --component ethernet-ip-adapter --instance filler-plc sb/write --body '{"writes":[{"name":"fill-setpoint","value":42.5}]}'
 ```
 
 Read it back to confirm. Each write also emits an `evt/info/write-audit` (or `evt/warning/write-audit`
@@ -83,11 +102,9 @@ on failure) audit event on the `evt` class.
 Pause stops polling/publishing for one device while keeping its connection truthful with a slow liveness
 probe — useful during maintenance so you don't get a wall of `BAD` samples:
 
-```
-publish   ecv1/my-thing/ethernet-ip-adapter/cmd/sb/pause    {"header":{"name":"sb/pause",...},"body":{}}
-          →  { "ok": true, "result": { "id": "filler-plc", "paused": true, "changed": true } }
-publish   ecv1/my-thing/ethernet-ip-adapter/cmd/sb/resume   {"header":{"name":"sb/resume",...},"body":{}}
-          →  { "ok": true, "result": { "id": "filler-plc", "paused": false, "changed": true } }
+```bash
+ec-uns-cmd --broker localhost:1883 --device my-thing --component ethernet-ip-adapter --instance filler-plc sb/pause
+ec-uns-cmd --broker localhost:1883 --device my-thing --component ethernet-ip-adapter --instance filler-plc sb/resume
 ```
 
 ## 7. Poll a real EtherNet/IP simulator (cpppo)

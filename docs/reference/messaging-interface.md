@@ -1,7 +1,7 @@
 # Reference — Messaging Interface & CLI
 
 Every topic and message the adapter publishes or accepts, and the CLI flags. Addressing follows the
-**Unified Namespace (UNS)**: `ecv1/{device}/{component}/{instance}/{class}[/channel]`. For the
+**Unified Namespace (UNS)**: `ecv1/{device}/{component}[/{instance}]/{class}[/channel]`. For the
 data/control plane model see [explanation.md](../explanation.md); for client recipes, the
 [how-to guides](../how-to-guides.md).
 
@@ -15,7 +15,7 @@ data/control plane model see [explanation.md](../explanation.md); for client rec
 
 ## Envelope
 
-All messages use the EdgeCommons JSON envelope: `{header, identity, tags, body}`. The library stamps the
+All messages use the EdgeCommons protobuf envelope: `{header, identity, tags, body}`. The library stamps the
 top-level **`identity`** (`{hier, path, component, instance}`) on every message built from config. `tags`
 is arbitrary business metadata. Request/reply carries `header.reply_to` + `header.correlation_id`; the
 reply is published to `reply_to` with the same `correlation_id`.
